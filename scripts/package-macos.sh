@@ -115,11 +115,14 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   codesign --verify --strict "$APP/Contents/Resources/bin/codedb" 2>/dev/null &&
     codesign -dv "$APP/Contents/Resources/bin/codedb" 2>&1 | grep -q "Authority=Developer ID Application" ||
     codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP/Contents/Resources/bin/codedb"
-  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP"
+  # The entitlements let dictation reach the microphone under the hardened
+  # runtime (dist/macos/Harness.entitlements).
+  codesign --force --options runtime --timestamp \
+    --entitlements "$ROOT/dist/macos/Harness.entitlements" --sign "$CODESIGN_IDENTITY" "$APP"
 else
   # Ad-hoc signature so the app launches on Apple silicon (Gatekeeper still
   # requires right-click → Open on first launch without notarization).
-  codesign --deep --force --sign - "$APP"
+  codesign --deep --force --entitlements "$ROOT/dist/macos/Harness.entitlements" --sign - "$APP"
 fi
 
 # notarize <path>: submit to Apple and wait for the verdict. A rejection may

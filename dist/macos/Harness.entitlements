@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Dictation: Codex's voice helper runs as a child of Harness, so macOS
+         checks the microphone against Harness. Under the hardened runtime
+         that needs this entitlement as well as NSMicrophoneUsageDescription;
+         without either, capture silently yields silence. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
