@@ -86,6 +86,9 @@ pub fn credential_path(home: &Path, provider: &str) -> Option<PathBuf> {
                     .join("credentials")
                     .join("chatgpt-new.json");
             }
+            if provider == "anthropic" {
+                return anthropic_credentials_path(home, |name| std::env::var_os(name));
+            }
             home.join(format!(".{provider}"))
                 .join("credentials")
                 .join("graff-oauth.json")
@@ -111,15 +114,62 @@ pub fn list(home: &Path) -> Vec<GraffLoginProvider> {
                     plan_usage: record.map(|record| record.plan_usage),
                 };
             }
+            let path = credential_path(home, id).filter(|path| path.is_file());
             GraffLoginProvider {
                 id: (*id).to_string(),
                 name: (*name).to_string(),
-                signed_in: credential_path(home, id).is_some_and(|path| path.is_file()),
-                account: None,
+                signed_in: path.is_some(),
+                account: (*id == "anthropic")
+                    .then(|| path.as_deref().and_then(anthropic_account))
+                    .flatten(),
                 plan_usage: None,
             }
         })
         .collect()
+}
+
+/// Where Anthropic's CLI keeps the active profile's credentials, resolved as
+/// Anthropic's SDK and graff do: `ANTHROPIC_CONFIG_DIR`, else
+/// `%APPDATA%\\Anthropic` on Windows, else `$XDG_CONFIG_HOME/anthropic`, else
+/// `~/.config/anthropic`; the profile is `ANTHROPIC_PROFILE`, else the
+/// one-line `active_config`, else `default`.
+fn anthropic_credentials_path(
+    home: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    let set = |name: &str| env(name).filter(|value| !value.is_empty());
+    let dir = if let Some(dir) = set("ANTHROPIC_CONFIG_DIR") {
+        PathBuf::from(dir)
+    } else if cfg!(windows) {
+        set("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.to_path_buf())
+            .join("Anthropic")
+    } else if let Some(xdg) = set("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg).join("anthropic")
+    } else {
+        home.join(".config").join("anthropic")
+    };
+    let profile = set("ANTHROPIC_PROFILE")
+        .map(|name| name.to_string_lossy().into_owned())
+        .or_else(|| {
+            std::fs::read_to_string(dir.join("active_config"))
+                .ok()
+                .map(|text| text.trim().to_string())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| "default".to_string());
+    dir.join("credentials").join(format!("{profile}.json"))
+}
+
+/// The Console account a profile's credentials name, if any.
+fn anthropic_account(path: &Path) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    value
+        .get("account_email")
+        .and_then(|email| email.as_str())
+        .filter(|email| !email.is_empty())
+        .map(str::to_string)
 }
 
 /// The credential file's modified time: a sign-in landed when this differs
@@ -194,7 +244,13 @@ fn strip_ansi(line: &str) -> String {
 /// The sign-in page graff prints after "open this URL". Only a complete line
 /// counts: a URL still being written is not returned.
 pub fn scan_login_url(output: &str) -> Option<String> {
-    let after = &output[output.find("open this URL")?..];
+    // graff's own sign-ins say "open this URL"; Anthropic's CLI (run by
+    // `graff login anthropic`) says "Open this URL" or "If it doesn't open, visit:".
+    let at = ["open this URL", "Open this URL", "visit:"]
+        .iter()
+        .filter_map(|marker| output.find(marker))
+        .min()?;
+    let after = &output[at..];
     let rest = &after[after.find("https://")?..];
     let end = rest.find(char::is_whitespace)?;
     Some(rest[..end].to_string())
@@ -354,6 +410,64 @@ mod tests {
     const CHATGPT: &str = "\nSign in with ChatGPT (your browser should open it):\n\nhttps://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client&response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&scope=openid%20profile&state=st4te&nonce=n&code_challenge=c&code_challenge_method=S256\n\nwaiting for the sign-in on http://127.0.0.1:1455/auth/callback …\n";
 
     #[test]
+    fn anthropic_console_sign_in_is_read_where_the_sdk_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        #[cfg(not(windows))]
+        assert_eq!(
+            anthropic_credentials_path(home, |_: &str| None),
+            home.join(".config")
+                .join("anthropic")
+                .join("credentials")
+                .join("default.json")
+        );
+        let cfg = home.join("cfg");
+        let cfg_dir = cfg.clone().into_os_string();
+        let dir_only = move |name: &str| (name == "ANTHROPIC_CONFIG_DIR").then(|| cfg_dir.clone());
+        let creds = cfg.join("credentials");
+        assert_eq!(
+            anthropic_credentials_path(home, &dir_only),
+            creds.join("default.json")
+        );
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(cfg.join("active_config"), "work\n").unwrap();
+        assert_eq!(
+            anthropic_credentials_path(home, &dir_only),
+            creds.join("work.json")
+        );
+        let cfg_dir = cfg.clone().into_os_string();
+        let named = move |name: &str| match name {
+            "ANTHROPIC_CONFIG_DIR" => Some(cfg_dir.clone()),
+            "ANTHROPIC_PROFILE" => Some("ci".into()),
+            _ => None,
+        };
+        assert_eq!(
+            anthropic_credentials_path(home, named),
+            creds.join("ci.json")
+        );
+        let work = creds.join("work.json");
+        std::fs::write(
+            &work,
+            r#"{"access_token":"sk-ant-oat01-x","account_email":"dev@example.com"}"#,
+        )
+        .unwrap();
+        assert_eq!(anthropic_account(&work).as_deref(), Some("dev@example.com"));
+
+        // `ant auth login`'s own wording carries the sign-in page.
+        let ant = "Opening your browser to authenticate. If it doesn't open, visit:\n\n  https://platform.claude.com/oauth/authorize?client_id=c&state=s\n\nWaiting\n";
+        assert_eq!(
+            scan_login_url(ant).as_deref(),
+            Some("https://platform.claude.com/oauth/authorize?client_id=c&state=s")
+        );
+        let ssh =
+            "Open this URL to authorize:\n\n  https://platform.claude.com/oauth/authorize?x=1\n\n";
+        assert_eq!(
+            scan_login_url(ssh).as_deref(),
+            Some("https://platform.claude.com/oauth/authorize?x=1")
+        );
+    }
+
+    #[test]
     fn chatgpt_relay_reads_the_authorize_page_once_graff_listens() {
         let relay = scan_chatgpt_relay(CHATGPT).expect("relay");
         assert!(
@@ -477,7 +591,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = credential_path(dir.path(), "chatgpt-new").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let row = |home: &Path| list(home).pop().unwrap();
+        let row = |home: &Path| {
+            list(home)
+                .into_iter()
+                .find(|row| row.id == "chatgpt-new")
+                .unwrap()
+        };
         assert_eq!(
             (row(dir.path()).signed_in, row(dir.path()).plan_usage),
             (false, None)
@@ -565,7 +684,8 @@ mod tests {
                 ("xai", false),
                 ("kimi", false),
                 ("zai", false),
-                ("chatgpt-new", false)
+                ("chatgpt-new", false),
+                ("anthropic", false)
             ]
         );
         let path = credential_path(dir.path(), "kimi").unwrap();
@@ -580,7 +700,8 @@ mod tests {
                 ("xAI", false),
                 ("Kimi", true),
                 ("Z.AI", false),
-                ("ChatGPT", false)
+                ("ChatGPT", false),
+                ("Anthropic Console", false)
             ]
         );
     }

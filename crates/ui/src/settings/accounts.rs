@@ -2011,17 +2011,12 @@ impl AccountsPage {
                     .iter()
                     .filter(|p| p.id != "chatgpt-new")
                     .map(|p| {
-                        let status = if p.signed_in {
-                            "Signed in on this device"
-                        } else {
-                            "Not signed in"
+                        let status = match (p.signed_in, &p.account) {
+                            (true, Some(account)) => format!("Signed in as {account}"),
+                            (true, None) => "Signed in on this device".to_string(),
+                            (false, _) => "Not signed in".to_string(),
                         };
-                        (
-                            Some(p.id.as_str()),
-                            p.name.as_str(),
-                            status.to_string(),
-                            p.signed_in,
-                        )
+                        (Some(p.id.as_str()), p.name.as_str(), status, p.signed_in)
                     })
                     .collect();
                 entries.insert(
@@ -2469,11 +2464,16 @@ impl AccountsPage {
                 start,
                 submitting,
                 error,
+                provider,
                 ..
             } => {
                 let submitting = *submitting;
                 let relayed = start.mode == AgentLoginMode::RelayBrowser;
-                let body = if relayed {
+                let body = if provider.as_deref() == Some("anthropic") {
+                    "A browser window opened. Sign in to your Anthropic Console account and \
+                     pick a workspace, then paste the code Anthropic shows you below. graff \
+                     will run Claude models on that workspace's API credits."
+                } else if relayed {
                     "A browser window opened on this computer. Sign in to ChatGPT there; \
                      Harness catches the page it returns to and finishes the sign-in on the \
                      computer shown above, which keeps the login. If the browser instead \

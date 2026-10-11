@@ -1008,6 +1008,9 @@ pub const GRAFF_LOGIN_PROVIDERS: &[(&str, &str)] = &[
     ("kimi", "Kimi"),
     ("zai", "Z.AI"),
     ("chatgpt-new", "ChatGPT"),
+    // An Anthropic Console account, through Anthropic's own `ant` CLI; graff
+    // spends that workspace's API credits (graff ADR 0281).
+    ("anthropic", "Anthropic Console"),
 ];
 
 /// Where a person manages their ChatGPT plan's usage (OpenAI's UI guidelines
