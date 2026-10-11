@@ -2464,11 +2464,16 @@ impl AccountsPage {
                 start,
                 submitting,
                 error,
+                provider,
                 ..
             } => {
                 let submitting = *submitting;
                 let relayed = start.mode == AgentLoginMode::RelayBrowser;
-                let body = if relayed {
+                let body = if provider.as_deref() == Some("anthropic") {
+                    "A browser window opened. Sign in to your Anthropic Console account and \
+                     pick a workspace, then paste the code Anthropic shows you below. graff \
+                     will run Claude models on that workspace's API credits."
+                } else if relayed {
                     "A browser window opened on this computer. Sign in to ChatGPT there; \
                      Harness catches the page it returns to and finishes the sign-in on the \
                      computer shown above, which keeps the login. If the browser instead \
