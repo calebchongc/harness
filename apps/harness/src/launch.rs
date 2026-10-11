@@ -160,8 +160,11 @@ pub fn install_path_shims_and_auto_update_graff() {
     };
     runtime.block_on(async {
         tokio::time::sleep(GRAFF_CHECK_INITIAL_DELAY).await;
-        install_matching_tui().await;
+        // Retries alongside the graff checks below (a current-thread runtime
+        // still runs spawned tasks while the loop awaits).
+        let tui = tokio::spawn(install_matching_tui());
         if !bundle::managed_updates_allowed() {
+            let _ = tui.await;
             return;
         }
         let auto_update = bundle::auto_update_enabled();
@@ -211,6 +214,12 @@ pub fn install_path_shims_and_auto_update_graff() {
     });
 }
 
+/// How often, and for how long, to retry a terminal client that isn't
+/// downloadable yet: a release is published before its TUI tarballs finish
+/// building, so an app that updates right away first sees a 404.
+const TUI_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const TUI_RETRY_ATTEMPTS: u32 = 12;
+
 /// Install the terminal client (`graff tui`) that matches this build and point
 /// `~/.local/bin/graff-tui` at it. Nothing else updates the TUI, so without
 /// this a machine kept the first one it got. Dev builds are skipped: their
@@ -220,11 +229,19 @@ async fn install_matching_tui() {
         return;
     }
     use harness_adapters::tui_bundle;
-    let entry = match tui_bundle::ensure_installed(env!("CARGO_PKG_VERSION")).await {
-        Ok(entry) => entry,
-        Err(err) => {
-            tracing::warn!(error = %err, "couldn't install the terminal client");
-            return;
+    let mut attempt = 0;
+    let entry = loop {
+        attempt += 1;
+        match tui_bundle::ensure_installed(env!("CARGO_PKG_VERSION")).await {
+            Ok(entry) => break entry,
+            Err(err) if attempt < TUI_RETRY_ATTEMPTS => {
+                tracing::info!(error = %err, attempt, "terminal client not installed yet; retrying");
+                tokio::time::sleep(TUI_RETRY_INTERVAL).await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "couldn't install the terminal client");
+                return;
+            }
         }
     };
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
