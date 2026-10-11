@@ -2011,17 +2011,12 @@ impl AccountsPage {
                     .iter()
                     .filter(|p| p.id != "chatgpt-new")
                     .map(|p| {
-                        let status = if p.signed_in {
-                            "Signed in on this device"
-                        } else {
-                            "Not signed in"
+                        let status = match (p.signed_in, &p.account) {
+                            (true, Some(account)) => format!("Signed in as {account}"),
+                            (true, None) => "Signed in on this device".to_string(),
+                            (false, _) => "Not signed in".to_string(),
                         };
-                        (
-                            Some(p.id.as_str()),
-                            p.name.as_str(),
-                            status.to_string(),
-                            p.signed_in,
-                        )
+                        (Some(p.id.as_str()), p.name.as_str(), status, p.signed_in)
                     })
                     .collect();
                 entries.insert(
