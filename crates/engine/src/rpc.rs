@@ -474,6 +474,27 @@ struct SignOutGraffLoginParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ListMcpServersParams {
+    /// The project folder whose `.mcp.json` counts (the space's folder).
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerActionParams {
+    #[serde(default)]
+    cwd: Option<String>,
+    action: harness_proto::McpServerVerb,
+    /// None: a reconnect of every switched-on server.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LoginIdParams {
     login_id: String,
 }
@@ -1236,6 +1257,9 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
+        // A reconnect handshakes every server; a login waits on a browser page.
+        methods::LIST_MCP_SERVERS => Duration::from_secs(70),
+        methods::MCP_SERVER_ACTION => Duration::from_secs(6 * 60),
         _ => Duration::from_secs(30),
     }
 }
@@ -1332,6 +1356,9 @@ fn forwardable(method: &str) -> bool {
             | methods::CANCEL_AGENT_LOGIN
             | methods::LIST_GRAFF_LOGINS
             | methods::SIGN_OUT_GRAFF_LOGIN
+            // graff's MCP config, caches and sign-ins are per device.
+            | methods::LIST_MCP_SERVERS
+            | methods::MCP_SERVER_ACTION
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -3303,6 +3330,31 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&start)
             }
             methods::LIST_GRAFF_LOGINS => RpcReply::value(&self.agent_accounts.list_graff_logins()),
+            methods::LIST_MCP_SERVERS => {
+                let p: ListMcpServersParams = parse_params(params)?;
+                let home = self.agent_accounts.graff_home();
+                let rows = crate::mcp_servers::list(
+                    &home,
+                    p.cwd.as_deref().map(std::path::Path::new),
+                    &p.names,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&rows)
+            }
+            methods::MCP_SERVER_ACTION => {
+                let p: McpServerActionParams = parse_params(params)?;
+                let home = self.agent_accounts.graff_home();
+                let rows = crate::mcp_servers::act(
+                    &home,
+                    p.cwd.as_deref().map(std::path::Path::new),
+                    p.action,
+                    p.name,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&rows)
+            }
             methods::SIGN_OUT_GRAFF_LOGIN => {
                 let p: SignOutGraffLoginParams = parse_params(params)?;
                 let rows = self

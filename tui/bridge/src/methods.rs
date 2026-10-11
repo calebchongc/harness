@@ -22,6 +22,10 @@ fn err(error: RpcError) -> Reply {
     (Err(error), None)
 }
 
+fn wrap(result: Result<Value, RpcError>) -> Reply {
+    (result, None)
+}
+
 pub async fn handle(conn: &std::sync::Arc<Conn>, method: &str, params: Value) -> Reply {
     match method {
         "initialize" => ok(json!({
@@ -57,6 +61,12 @@ pub async fn handle(conn: &std::sync::Arc<Conn>, method: &str, params: Value) ->
         "turn/start" => crate::turn::start(conn, params),
         "turn/steer" => crate::turn::steer(conn, params),
         "turn/interrupt" => turn_interrupt(conn, params),
+        // `/mcp`: graff's MCP servers (crate::mcp).
+        "mcpServerStatus/list" => wrap(crate::mcp::status_list(conn, params).await),
+        "config/mcpServer/reload" => wrap(crate::mcp::reload(conn, params).await),
+        "graff/mcp/reconnect" => wrap(crate::mcp::reconnect(conn, params).await),
+        "graff/mcp/setEnabled" => wrap(crate::mcp::set_enabled(conn, params).await),
+        "mcpServer/oauth/login" => wrap(crate::mcp::oauth_login(conn, params).await),
         other => err(RpcError::method_not_found(other)),
     }
 }

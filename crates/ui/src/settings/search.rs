@@ -69,6 +69,11 @@ const ENTRIES: &[SettingsEntry] = &[
         "permission capture privacy screen",
     ),
     entry(
+        S::Mcp,
+        "MCP servers",
+        "mcp server servers tools reconnect connect plugin integration oauth sign in enable disable",
+    ),
+    entry(
         S::Agents,
         "Sign in to agent accounts",
         "login logout signin signout account credentials api key",

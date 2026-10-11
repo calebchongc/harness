@@ -1126,6 +1126,11 @@ impl AgentAccounts {
     /// and Kimi, a code to confirm), the app shows them, and the flow finishes
     /// when graff writes its credential. graff runs against the real home, so
     /// nothing is imported afterwards, and this service never reads the token.
+    /// The home graff runs with on this device (sign-ins, MCP config and caches).
+    pub fn graff_home(&self) -> std::path::PathBuf {
+        self.inner.config.graff_home.clone()
+    }
+
     pub async fn start_graff_login(&self, provider: &str) -> Result<AgentLoginStart, EngineError> {
         self.start_graff_login_with(provider, false).await
     }

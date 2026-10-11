@@ -244,6 +244,10 @@ pub mod methods {
     // `provider` for the sign-in itself). Same per-device forwarding.
     pub const LIST_GRAFF_LOGINS: &str = "ListGraffLogins";
     pub const SIGN_OUT_GRAFF_LOGIN: &str = "SignOutGraffLogin";
+    // graff's MCP servers on a device (`graff mcp status|reconnect|enable|
+    // disable|login`); per-device like the sign-ins above.
+    pub const LIST_MCP_SERVERS: &str = "ListMcpServers";
+    pub const MCP_SERVER_ACTION: &str = "McpServerAction";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
