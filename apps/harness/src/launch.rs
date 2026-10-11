@@ -148,10 +148,6 @@ pub fn install_path_shims_and_auto_update_graff() {
             to: to.to_string(),
         });
     }
-    if !bundle::managed_updates_allowed() {
-        return;
-    }
-    let auto_update = bundle::auto_update_enabled();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -164,6 +160,11 @@ pub fn install_path_shims_and_auto_update_graff() {
     };
     runtime.block_on(async {
         tokio::time::sleep(GRAFF_CHECK_INITIAL_DELAY).await;
+        install_matching_tui().await;
+        if !bundle::managed_updates_allowed() {
+            return;
+        }
+        let auto_update = bundle::auto_update_enabled();
         loop {
             bundle::note_check_started();
             if auto_update {
@@ -210,6 +211,36 @@ pub fn install_path_shims_and_auto_update_graff() {
     });
 }
 
+/// Install the terminal client (`graff tui`) that matches this build and point
+/// `~/.local/bin/graff-tui` at it. Nothing else updates the TUI, so without
+/// this a machine kept the first one it got. Dev builds are skipped: their
+/// version usually has no release yet.
+async fn install_matching_tui() {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    use harness_adapters::tui_bundle;
+    let entry = match tui_bundle::ensure_installed(env!("CARGO_PKG_VERSION")).await {
+        Ok(entry) => entry,
+        Err(err) => {
+            tracing::warn!(error = %err, "couldn't install the terminal client");
+            return;
+        }
+    };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let bin = home.join(".local").join("bin");
+    // An installed app replaces a live link to an older client; anything
+    // else only fills a missing or dead one (pruning killed the old target).
+    let replace_live = app_bundle().is_some_and(|bundle| is_installed_app(&bundle, &home));
+    if let Err(err) = std::fs::create_dir_all(&bin)
+        .and_then(|()| link_if_ours(&bin.join("graff-tui"), &entry, replace_live))
+    {
+        tracing::warn!("couldn't link graff-tui into {}: {err}", bin.display());
+    }
+}
+
 /// An app installed in `/Applications` or `~/Applications`, as opposed to a
 /// build run from wherever it was built.
 fn is_installed_app(bundle: &Path, home: &Path) -> bool {
@@ -218,7 +249,8 @@ fn is_installed_app(bundle: &Path, home: &Path) -> bool {
         .is_some_and(|dir| dir == Path::new("/Applications") || dir == home.join("Applications"))
 }
 
-/// A link is ours when it points into a Harness `.app` or `~/.harness/bin`.
+/// A link is ours when it points into a Harness `.app`, `~/.harness/bin` or
+/// `~/.harness/tui`.
 /// `replace_live` false keeps one of ours whose target still exists.
 fn link_if_ours(link: &Path, target: &Path, replace_live: bool) -> std::io::Result<()> {
     match std::fs::read_link(link) {
@@ -228,7 +260,8 @@ fn link_if_ours(link: &Path, target: &Path, replace_live: bool) -> std::io::Resu
             let current = current.to_string_lossy();
             let ours = (current.contains(".app/Contents/")
                 && (current.contains("Harness") || current.contains("harness")))
-                || current.contains("/.harness/bin/");
+                || current.contains("/.harness/bin/")
+                || current.contains("/.harness/tui/");
             if !ours || (live && !replace_live) {
                 return Ok(());
             }

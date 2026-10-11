@@ -31,14 +31,20 @@ pub fn using_plan_chip(theme: &Theme) -> AnyElement {
         .items_center()
         .gap(px(6.0))
         .text_size(crate::typography::ui_rems(11.5))
+        .min_w_0()
         .child(
+            // In a narrow pane this truncates; Manage usage stays whole.
             div()
+                .min_w_0()
+                .truncate()
                 .text_color(theme.text_muted)
                 .child(SharedString::from("Using ChatGPT plan")),
         )
         .child(
             div()
                 .id("composer-chatgpt-manage-usage")
+                .flex_none()
+                .whitespace_nowrap()
                 .text_color(theme.text_muted)
                 .cursor_pointer()
                 .hover(|style| style.text_color(theme.text).underline())
