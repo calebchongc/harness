@@ -6,6 +6,7 @@
 //! from the terminal.
 
 mod config;
+mod mcp;
 mod methods;
 mod models;
 mod tools;
