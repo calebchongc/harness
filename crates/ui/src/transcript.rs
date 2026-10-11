@@ -10175,6 +10175,22 @@ mod tests {
     /// the newest row must end exactly at the viewport bottom.
     #[gpui::test]
     fn scrolling_to_the_bottom_paints_each_row_once_and_settles(cx: &mut gpui::TestAppContext) {
+        scroll_to_bottom_settles(cx, None, 17);
+    }
+
+    /// The same in the narrow panes of a many-way split, whose frames come
+    /// slower because every pane paints.
+    #[gpui::test]
+    fn scrolling_to_the_bottom_settles_in_a_narrow_slow_pane(cx: &mut gpui::TestAppContext) {
+        scroll_to_bottom_settles(cx, Some(240.0), 50);
+    }
+
+    #[gpui::test]
+    fn scrolling_to_the_bottom_settles_in_a_modest_slow_pane(cx: &mut gpui::TestAppContext) {
+        scroll_to_bottom_settles(cx, Some(360.0), 50);
+    }
+
+    fn scroll_to_bottom_settles(cx: &mut gpui::TestAppContext, width: Option<f32>, frame_ms: u64) {
         use crate::transcript_paint_check::{
             ViewportFlicker, ViewportSample, painted_rows_anomaly,
         };
@@ -10193,6 +10209,11 @@ mod tests {
         });
         let window = cx.add_window(|_, cx| Host(cx.new(|cx| Transcript::new(state.clone(), cx))));
         let transcript = window.update(cx, |host, _, _| host.0.clone()).unwrap();
+        if let Some(width) = width {
+            window
+                .update(cx, |_, window, _| window.resize(size(px(width), px(800.0))))
+                .unwrap();
+        }
         let draw = |cx: &mut gpui::TestAppContext| {
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh();
@@ -10211,8 +10232,8 @@ mod tests {
         };
         let tick = |cx: &mut gpui::TestAppContext| {
             transcript.update(cx, |this, cx| {
-                this.own_turn_last_tick = Some(Instant::now() - Duration::from_millis(17));
-                this.spring_last_tick = Some(Instant::now() - Duration::from_millis(17));
+                this.own_turn_last_tick = Some(Instant::now() - Duration::from_millis(frame_ms));
+                this.spring_last_tick = Some(Instant::now() - Duration::from_millis(frame_ms));
                 if this.own_turn.is_some() || this.deferred_own_send.is_some() {
                     this.step_own_turn(cx);
                 }
@@ -10226,7 +10247,7 @@ mod tests {
             cx.update_window(window.into(), |_, window, cx| {
                 window.dispatch_event(
                     gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                        position: gpui::point(px(500.0), px(300.0)),
+                        position: gpui::point(px(100.0), px(300.0)),
                         delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(delta))),
                         ..Default::default()
                     }),
