@@ -250,6 +250,9 @@ enum LoginFlow {
         /// A ChatGPT sign-in being finished on another device: the only
         /// callback the host will deliver for it.
         relay: Option<graff_logins::ChatgptRelay>,
+        /// Anthropic Console: `ant auth login` (run by graff) ends with the
+        /// user pasting a code; it is written here.
+        stdin: Arc<Mutex<Option<harness_adapters::process::ChildStdin>>>,
     },
 }
 
@@ -1109,6 +1112,55 @@ impl AgentAccounts {
         }
     }
 
+    /// `graff login anthropic`: hand the code Anthropic's page showed to the
+    /// waiting `ant auth login`, then wait for graff to report the sign-in.
+    /// None when `login_id` is not such a sign-in.
+    async fn complete_graff_paste(
+        &self,
+        login_id: &str,
+        code: &str,
+    ) -> Option<Result<(), EngineError>> {
+        let (stdin, output, exit) = match lock(&self.inner.flows).get(login_id) {
+            Some(LoginFlow::Graff {
+                provider,
+                stdin,
+                output,
+                exit,
+                ..
+            }) if provider == "anthropic" => (stdin.clone(), output.clone(), exit.clone()),
+            _ => return None,
+        };
+        let code = code.trim();
+        if code.is_empty() {
+            return Some(Err(EngineError::Other(
+                "That code looks empty — paste the whole code.".into(),
+            )));
+        }
+        let Some(mut pipe) = lock(&stdin).take() else {
+            return Some(Err(EngineError::Other(
+                "This sign-in attempt expired — start again.".into(),
+            )));
+        };
+        use tokio::io::AsyncWriteExt;
+        if let Err(err) = pipe.write_all(format!("{code}\n").as_bytes()).await {
+            return Some(Err(EngineError::Other(format!(
+                "Could not hand the code to the sign-in: {err}"
+            ))));
+        }
+        let _ = pipe.flush().await;
+        drop(pipe);
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while lock(&exit).is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let text = lock(&output).clone();
+        Some(if graff_logins::saw_success(&text) {
+            Ok(())
+        } else {
+            Err(EngineError::Other(graff_logins::failure_message(&text)))
+        })
+    }
+
     /// Drop a pending sign-in for one graff provider: two children racing to
     /// write the same credential would confuse both.
     fn reap_graff_flows(&self, provider: &str) {
@@ -1126,6 +1178,11 @@ impl AgentAccounts {
     /// and Kimi, a code to confirm), the app shows them, and the flow finishes
     /// when graff writes its credential. graff runs against the real home, so
     /// nothing is imported afterwards, and this service never reads the token.
+    /// The home graff runs with on this device (sign-ins, MCP config and caches).
+    pub fn graff_home(&self) -> std::path::PathBuf {
+        self.inner.config.graff_home.clone()
+    }
+
     pub async fn start_graff_login(&self, provider: &str) -> Result<AgentLoginStart, EngineError> {
         self.start_graff_login_with(provider, false).await
     }
@@ -1186,8 +1243,13 @@ impl AgentAccounts {
                 other => format!("Could not resolve the graff CLI for sign-in: {other}"),
             })
         })?;
+        let pastes_code = provider == "anthropic";
         command
-            .stdin(harness_adapters::process::Stdio::null())
+            .stdin(if pastes_code {
+                harness_adapters::process::Stdio::piped()
+            } else {
+                harness_adapters::process::Stdio::null()
+            })
             .stdout(harness_adapters::process::Stdio::piped())
             .stderr(harness_adapters::process::Stdio::piped());
         // graff finds its credential dir from HOME: pin it to the home this
@@ -1197,13 +1259,14 @@ impl AgentAccounts {
         let before = graff_logins::credential_stamp(&home, provider);
         let first_registration = provider == "chatgpt-new"
             && !graff_logins::chatgpt_record(&home).is_some_and(|record| record.registered);
-        let child = command.spawn().map_err(|err| {
+        let mut child = command.spawn().map_err(|err| {
             EngineError::Other(if err.kind() == std::io::ErrorKind::NotFound {
                 "The `graff` CLI was not found on this device — install it first.".into()
             } else {
                 format!("Could not start graff login: {err}")
             })
         })?;
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
         let (child, output, exit) = wire_login_child(child);
         let login_id = new_id();
         lock(&self.inner.flows).insert(
@@ -1217,6 +1280,7 @@ impl AgentAccounts {
                 before,
                 first_registration,
                 relay: None,
+                stdin,
             },
         );
         // graff asks the provider for the link first, which takes longer than
@@ -1300,7 +1364,12 @@ impl AgentAccounts {
         Ok(AgentLoginStart {
             login_id,
             url,
-            mode: AgentLoginMode::Browser,
+            // Anthropic's page shows a code to paste back (CompleteAgentLogin).
+            mode: if pastes_code {
+                AgentLoginMode::PasteCode
+            } else {
+                AgentLoginMode::Browser
+            },
             code,
         })
     }
@@ -1420,6 +1489,10 @@ impl AgentAccounts {
         login_id: &str,
         code: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        if let Some(done) = self.complete_graff_paste(login_id, code).await {
+            done?;
+            return self.list(false).await;
+        }
         let verifier = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Claude { verifier, .. }) => verifier.clone(),
             _ => {
@@ -2818,6 +2891,54 @@ mod tests {
             reauth_route("graff", false, "xai"),
             "each graff provider is its own registration"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_anthropic_console_sign_in_takes_the_pasted_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let accounts = AgentAccounts::new(AgentAccountsConfig {
+            data_dir: home.join("data"),
+            claude_config_dir: home.join("claude"),
+            claude_config_file: home.join("claude.json"),
+            codex_home: home.join("codex"),
+            cursor_sdk_auth_file: home.join("cursor.json"),
+            graff_home: home.to_path_buf(),
+        });
+        // Stands in for `graff login anthropic`: reads the code `ant` asks for.
+        let mut command = harness_adapters::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read code; echo \"✓ graff will use your Anthropic Console sign-in ($code)\""])
+            .stdin(harness_adapters::process::Stdio::piped())
+            .stdout(harness_adapters::process::Stdio::piped())
+            .stderr(harness_adapters::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let (child, output, exit) = wire_login_child(child);
+        lock(&accounts.inner.flows).insert(
+            "fixture".into(),
+            LoginFlow::Graff {
+                provider: "anthropic".into(),
+                child,
+                started_at: Instant::now(),
+                output: output.clone(),
+                exit,
+                before: None,
+                first_registration: false,
+                relay: None,
+                stdin,
+            },
+        );
+        assert!(accounts.complete_graff_paste("other", "x").await.is_none());
+        accounts
+            .complete_graff_paste("fixture", "  pasted-code#state \n")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lock(&output).contains("(pasted-code#state)"));
+        // The code went in once; a second paste has nothing to write to.
+        assert!(accounts.complete_graff_paste("fixture", "again").await.unwrap().is_err());
     }
 
     #[tokio::test]

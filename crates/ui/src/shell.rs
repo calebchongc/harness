@@ -41,6 +41,7 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
+use crate::settings::mcp::McpPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
@@ -574,17 +575,20 @@ pub enum SettingsSection {
     Shortcuts,
     Appshots,
     Archived,
+    /// graff's MCP servers: state, tools, reconnect, on/off.
+    Mcp,
 }
 
 impl SettingsSection {
     /// Sidebar order: grouped under [`Self::group`] headings.
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Files,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
+        SettingsSection::Mcp,
         SettingsSection::Devices,
         SettingsSection::Appshots,
         SettingsSection::Archived,
@@ -597,7 +601,7 @@ impl SettingsSection {
             | SettingsSection::Notifications
             | SettingsSection::Shortcuts
             | SettingsSection::Files => "General",
-            SettingsSection::Harnesses | SettingsSection::Agents => "Agents",
+            SettingsSection::Harnesses | SettingsSection::Agents | SettingsSection::Mcp => "Agents",
             SettingsSection::Devices | SettingsSection::Appshots | SettingsSection::Archived => {
                 "Devices and data"
             }
@@ -621,6 +625,7 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "shortcuts",
             SettingsSection::Appshots => "appshots",
             SettingsSection::Archived => "archived",
+            SettingsSection::Mcp => "mcp",
         }
     }
 
@@ -642,6 +647,7 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
+            SettingsSection::Mcp => "MCP servers",
         }
     }
 }
@@ -1861,6 +1867,7 @@ pub struct Shell {
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
+    mcp_page: Option<Entity<McpPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -2219,6 +2226,7 @@ impl Shell {
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
+            Some("settings/mcp") => Route::Settings(SettingsSection::Mcp),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -2369,6 +2377,7 @@ impl Shell {
             nav,
             devices_page: None,
             archived_page: None,
+            mcp_page: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
@@ -4981,6 +4990,16 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Mcp => {
+                if self.mcp_page.is_none() {
+                    let state = self.state.clone();
+                    self.mcp_page = Some(cx.new(|cx| McpPage::new(state, cx)));
+                }
+                match &self.mcp_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
         }
     }
 
@@ -6700,6 +6719,7 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::Mcp => icons::REMOTE_SERVER,
         };
         let search = self.ensure_settings_search(cx);
         let search_input = search.input.clone();

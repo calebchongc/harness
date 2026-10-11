@@ -2508,6 +2508,28 @@ pub fn flavour_seed(chat_id: &str) -> u64 {
     fnv1a(chat_id.as_bytes())
 }
 
+/// When a split pane's working trailer started, or None when it shows none.
+///
+/// `chat` is `Some((working, turn_started_ms))` when the pane shows a chat:
+/// its session row decides, like the focused chat's. A trailing user message
+/// alone is not a run — a `/compact`, a failed or never-delivered send, or a
+/// chat whose host is offline left panes spinning (and the window redrawing)
+/// for days. Only a subagent doc, which has no session row, reads liveness off
+/// the doc: an assistant entry still streaming, or a steer awaiting its reply.
+pub fn pane_working_since(
+    chat: Option<(bool, Option<i64>)>,
+    last_role: MessageRole,
+    last_status: Option<MessageStatus>,
+    last_created_ms: i64,
+) -> Option<i64> {
+    match chat {
+        Some((false, _)) => None,
+        Some((true, started)) => Some(started.unwrap_or(last_created_ms)),
+        None => (last_status == Some(MessageStatus::Streaming) || last_role == MessageRole::User)
+            .then_some(last_created_ms),
+    }
+}
+
 /// The working trailer's "Sending…" bridge: true while an in-flight send is
 /// fresher than the session row's turn start — the row still carries the
 /// PREVIOUS turn (or none), so a timer would count the send round-trip and
@@ -7065,12 +7087,19 @@ impl Transcript {
             }
             let state = self.state.read(cx);
             let last = state.sub_transcript(doc_id).last()?;
-            let live =
-                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
-            if !live {
-                return None;
-            }
-            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
+            // A pane showing a chat (not a subagent doc) has a session row:
+            // follow it, as the focused chat and the sidebar do.
+            let chat = state.chats.iter().any(|c| &c.id == doc_id).then(|| {
+                (
+                    state.indicator_for(doc_id, now) == crate::state::Indicator::Working,
+                    state
+                        .session_for(doc_id)
+                        .and_then(|s| s.started_at)
+                        .map(|t| t.timestamp_millis()),
+                )
+            });
+            let since = pane_working_since(chat, last.role, last.status, last.created_at)?;
+            let elapsed = ((now.timestamp_millis() - since).max(0) / 1000) as i64;
             (false, false, elapsed, flavour_seed(doc_id))
         } else {
             let chat_id = self.chat_id.clone()?;
@@ -10146,6 +10175,22 @@ mod tests {
     /// the newest row must end exactly at the viewport bottom.
     #[gpui::test]
     fn scrolling_to_the_bottom_paints_each_row_once_and_settles(cx: &mut gpui::TestAppContext) {
+        scroll_to_bottom_settles(cx, None, 17);
+    }
+
+    /// The same in the narrow panes of a many-way split, whose frames come
+    /// slower because every pane paints.
+    #[gpui::test]
+    fn scrolling_to_the_bottom_settles_in_a_narrow_slow_pane(cx: &mut gpui::TestAppContext) {
+        scroll_to_bottom_settles(cx, Some(240.0), 50);
+    }
+
+    #[gpui::test]
+    fn scrolling_to_the_bottom_settles_in_a_modest_slow_pane(cx: &mut gpui::TestAppContext) {
+        scroll_to_bottom_settles(cx, Some(360.0), 50);
+    }
+
+    fn scroll_to_bottom_settles(cx: &mut gpui::TestAppContext, width: Option<f32>, frame_ms: u64) {
         use crate::transcript_paint_check::{
             ViewportFlicker, ViewportSample, painted_rows_anomaly,
         };
@@ -10164,6 +10209,11 @@ mod tests {
         });
         let window = cx.add_window(|_, cx| Host(cx.new(|cx| Transcript::new(state.clone(), cx))));
         let transcript = window.update(cx, |host, _, _| host.0.clone()).unwrap();
+        if let Some(width) = width {
+            window
+                .update(cx, |_, window, _| window.resize(size(px(width), px(800.0))))
+                .unwrap();
+        }
         let draw = |cx: &mut gpui::TestAppContext| {
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh();
@@ -10182,8 +10232,8 @@ mod tests {
         };
         let tick = |cx: &mut gpui::TestAppContext| {
             transcript.update(cx, |this, cx| {
-                this.own_turn_last_tick = Some(Instant::now() - Duration::from_millis(17));
-                this.spring_last_tick = Some(Instant::now() - Duration::from_millis(17));
+                this.own_turn_last_tick = Some(Instant::now() - Duration::from_millis(frame_ms));
+                this.spring_last_tick = Some(Instant::now() - Duration::from_millis(frame_ms));
                 if this.own_turn.is_some() || this.deferred_own_send.is_some() {
                     this.step_own_turn(cx);
                 }
@@ -10197,7 +10247,7 @@ mod tests {
             cx.update_window(window.into(), |_, window, cx| {
                 window.dispatch_event(
                     gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                        position: gpui::point(px(500.0), px(300.0)),
+                        position: gpui::point(px(100.0), px(300.0)),
                         delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(delta))),
                         ..Default::default()
                     }),
@@ -16796,6 +16846,22 @@ mod tests {
         ] {
             assert_eq!(format_elapsed(secs), expected, "elapsed seconds: {secs}");
         }
+    }
+
+    #[test]
+    fn a_chat_pane_spins_only_while_its_session_works() {
+        use MessageRole::{Assistant, User};
+        // A chat's trailing user message (a /compact, a dead send) with no
+        // working session: nothing to spin, however old.
+        assert_eq!(pane_working_since(Some((false, None)), User, Some(MessageStatus::Complete), 5), None);
+        assert_eq!(pane_working_since(Some((false, Some(1))), Assistant, Some(MessageStatus::Streaming), 5), None);
+        // Working: the timer starts at the session's turn, else the entry.
+        assert_eq!(pane_working_since(Some((true, Some(7))), Assistant, Some(MessageStatus::Streaming), 5), Some(7));
+        assert_eq!(pane_working_since(Some((true, None)), User, None, 5), Some(5));
+        // Subagent docs keep reading the doc itself.
+        assert_eq!(pane_working_since(None, Assistant, Some(MessageStatus::Streaming), 5), Some(5));
+        assert_eq!(pane_working_since(None, User, Some(MessageStatus::Complete), 5), Some(5));
+        assert_eq!(pane_working_since(None, Assistant, Some(MessageStatus::Complete), 5), None);
     }
 
     #[test]

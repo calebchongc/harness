@@ -10538,10 +10538,25 @@ impl Render for Composer {
                                 .flex()
                                 .items_center()
                                 .opacity(session_chrome_opacity)
-                                .child(div().flex_1().min_w_0().children(footer.flatten()))
-                                .children(
-                                    plan.map(|chip| div().flex_none().pr(px(10.0)).child(chip)),
+                                .overflow_hidden()
+                                // A narrow pane squeezes the left controls
+                                // first; they clip rather than draw under the
+                                // plan chip, which truncates before the ring.
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .children(footer.flatten()),
                                 )
+                                .children(plan.map(|chip| {
+                                    div()
+                                        .flex_shrink(1.0)
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .pr(px(10.0))
+                                        .child(chip)
+                                }))
                                 .children(crate::context_usage::has_window(usage).then(|| {
                                     div().flex_none().pr(px(10.0)).child(
                                         crate::context_usage::render(
@@ -11519,6 +11534,48 @@ mod tests {
                 assert_eq!(input.read(cx).selected_range, 2..8);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn narrow_pane_composer_settles(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        for width in [240.0_f32, 300.0, 360.0] {
+            handle
+                .update(cx, |composer, window, cx| {
+                    composer
+                        .state
+                        .update(cx, |state, _| state.selected_chat = Some("chat".into()));
+                    composer.on_state_changed(cx);
+                    composer.route_snap_until = None;
+                    composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+                    composer.set_available_width(width, cx);
+                    window.resize(size(px(width), px(800.0)));
+                })
+                .unwrap();
+            let mut trace = Vec::new();
+            for _ in 0..40 {
+                cx.update_window(handle.into(), |_, window, cx| {
+                    window.draw(cx).clear();
+                })
+                .unwrap();
+                handle
+                    .update(cx, |composer, _, cx| {
+                        // Let any resize hold expire between frames.
+                        composer.width_changed_at = None;
+                        trace.push((
+                            composer.expanded_mode,
+                            composer.last_target_height,
+                            composer.input.read(cx).last_width,
+                        ));
+                    })
+                    .unwrap();
+            }
+            let tail = &trace[20..];
+            assert!(
+                tail.windows(2).all(|w| w[0] == w[1]),
+                "composer keeps changing at {width}px: {trace:?}"
+            );
+        }
     }
 
     #[gpui::test]
