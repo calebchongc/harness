@@ -51,6 +51,10 @@
         <key>HARNESS_IPC_PORT</key>
         <string>__IPC_PORT__</string>
     </dict>
+    <!-- The composer's mic: dictation hears the microphone through Codex's
+         voice helper, which macOS attributes to Harness. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Harness uses the microphone to type what you dictate into the composer.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
