@@ -5514,7 +5514,10 @@ pub struct Composer {
     /// at most one flip can happen per layout pass.
     flip_epoch: u64,
     /// Compact-mode input capacity, learned while compact (layout-stable).
-    compact_capacity: f32,
+    /// `None` until measured. Negative when the controls crowd the input out
+    /// entirely, which is still a measurement: treating it as unknown made a
+    /// narrow composer flip modes on every frame.
+    compact_capacity: Option<f32>,
     /// Input width first measured after expanding — container-width deltas
     /// while expanded shift `compact_capacity` by the same amount.
     expanded_anchor: f32,
@@ -5754,7 +5757,7 @@ impl Composer {
             queue_shortcut_revealed: false,
             expanded_mode: false,
             flip_epoch: 0,
-            compact_capacity: 0.0,
+            compact_capacity: None,
             expanded_anchor: 0.0,
             last_seen_width: 0.0,
             last_available_width: None,
@@ -9574,7 +9577,12 @@ impl Render for Composer {
         let now = Instant::now();
         // Only measurements taken *after* the last flip may drive the next one
         // (at most one flip per layout pass — a flip invalidates the widths).
-        let measured_since_flip = epoch > self.flip_epoch && last_width > 0.0;
+        // A compact input laid out at zero width in a pane that has a width
+        // was squeezed out by the controls; that measurement must expand it.
+        let squeezed = !self.expanded_mode
+            && last_width <= 0.0
+            && self.last_available_width.is_some_and(|width| width > 0.0);
+        let measured_since_flip = epoch > self.flip_epoch && (last_width > 0.0 || squeezed);
         if measured_since_flip {
             // A same-mode width change is an interactive window/pane resize:
             // defer collapse until sizes settle for RESIZE_SETTLE_MS. Expansion
@@ -9590,7 +9598,7 @@ impl Render for Composer {
             } else {
                 // The compact pill's content box is the layout-stable capacity
                 // both thresholds measure against.
-                self.compact_capacity = last_width - 8.0;
+                self.compact_capacity = Some(last_width - 8.0);
             }
         }
         let resizing = self
@@ -9613,16 +9621,16 @@ impl Render for Composer {
         // while expanded, the learned value shifted by any container resize
         // (the expanded input width tracks the container 1:1).
         let capacity = if !self.expanded_mode {
-            if last_width > 0.0 {
+            if last_width > 0.0 || squeezed {
                 last_width - 8.0
             } else {
                 f32::MAX // before first measure default to compact
             }
-        } else if self.compact_capacity > 0.0 {
+        } else if let Some(compact) = self.compact_capacity {
             if self.expanded_anchor > 0.0 && last_width > 0.0 {
-                self.compact_capacity + (last_width - self.expanded_anchor)
+                compact + (last_width - self.expanded_anchor)
             } else {
-                self.compact_capacity
+                compact
             }
         } else {
             f32::MAX
@@ -11459,11 +11467,14 @@ mod tests {
             .read_with(cx, |composer, cx| {
                 assert!(
                     !composer.expanded_mode,
-                    "draft must fit the wide compact input: text={}, capacity={}",
+                    "draft must fit the wide compact input: text={}, capacity={:?}",
                     composer.input.read(cx).measured_text_width(),
                     composer.compact_capacity,
                 );
-                assert!(composer.input.read(cx).measured_text_width() < composer.compact_capacity);
+                assert!(
+                    composer.input.read(cx).measured_text_width()
+                        < composer.compact_capacity.unwrap()
+                );
                 composer.input.clone()
             })
             .unwrap();
@@ -11539,7 +11550,20 @@ mod tests {
     #[gpui::test]
     fn narrow_pane_composer_settles(cx: &mut gpui::TestAppContext) {
         let (_dir, handle) = composer_focus_window(cx);
-        for width in [240.0_f32, 300.0, 360.0] {
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.pickers.update(cx, |pickers, _| {
+                    pickers.select_for_test(
+                        harness_proto::HarnessId::Graff,
+                        "Graff",
+                        "codegraff/grok-4.7-with-a-long-model-name",
+                    )
+                });
+            })
+            .unwrap();
+        // Narrow to wide: each width starts from the previous one's state, as
+        // a pane does while a split is resized.
+        for width in (200..=480).step_by(10).map(|w| w as f32) {
             handle
                 .update(cx, |composer, window, cx| {
                     composer
@@ -11574,6 +11598,10 @@ mod tests {
             assert!(
                 tail.windows(2).all(|w| w[0] == w[1]),
                 "composer keeps changing at {width}px: {trace:?}"
+            );
+            assert!(
+                tail.iter().all(|(expanded, _, input)| *expanded || *input > 0.0),
+                "compact composer left no room for its input at {width}px: {trace:?}"
             );
         }
     }

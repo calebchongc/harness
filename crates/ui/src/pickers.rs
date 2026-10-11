@@ -6023,6 +6023,25 @@ impl Render for Pickers {
 }
 
 #[cfg(test)]
+impl Pickers {
+    /// Select a harness and model by id, as a chat's picks would.
+    pub(crate) fn select_for_test(&mut self, harness: HarnessId, name: &str, model: &str) {
+        self.config.harness = Some(harness);
+        self.config.model = Some(model.into());
+        self.harnesses = Loadable::Ready(vec![HarnessDescriptor {
+            id: harness,
+            name: name.into(),
+            installed: true,
+            can_install: false,
+            enabled: Some(true),
+            reasoning_levels: Vec::new(),
+            steering_mode: harness_proto::SteeringMode::StepBoundary,
+            supports_steering: false,
+        }]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use harness_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
