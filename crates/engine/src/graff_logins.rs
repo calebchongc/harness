@@ -413,32 +413,45 @@ mod tests {
     fn anthropic_console_sign_in_is_read_where_the_sdk_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let none = |_: &str| None;
+        #[cfg(not(windows))]
         assert_eq!(
-            anthropic_credentials_path(home, none),
-            home.join(".config/anthropic/credentials/default.json")
+            anthropic_credentials_path(home, |_: &str| None),
+            home.join(".config")
+                .join("anthropic")
+                .join("credentials")
+                .join("default.json")
         );
-        std::fs::create_dir_all(home.join(".config/anthropic/credentials")).unwrap();
-        std::fs::write(home.join(".config/anthropic/active_config"), "work\n").unwrap();
+        let cfg = home.join("cfg");
+        let cfg_dir = cfg.clone().into_os_string();
+        let dir_only = move |name: &str| (name == "ANTHROPIC_CONFIG_DIR").then(|| cfg_dir.clone());
+        let creds = cfg.join("credentials");
         assert_eq!(
-            anthropic_credentials_path(home, none),
-            home.join(".config/anthropic/credentials/work.json")
+            anthropic_credentials_path(home, &dir_only),
+            creds.join("default.json")
         );
-        let named = |name: &str| (name == "ANTHROPIC_PROFILE").then(|| "ci".into());
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(cfg.join("active_config"), "work\n").unwrap();
+        assert_eq!(
+            anthropic_credentials_path(home, &dir_only),
+            creds.join("work.json")
+        );
+        let cfg_dir = cfg.clone().into_os_string();
+        let named = move |name: &str| match name {
+            "ANTHROPIC_CONFIG_DIR" => Some(cfg_dir.clone()),
+            "ANTHROPIC_PROFILE" => Some("ci".into()),
+            _ => None,
+        };
         assert_eq!(
             anthropic_credentials_path(home, named),
-            home.join(".config/anthropic/credentials/ci.json")
+            creds.join("ci.json")
         );
-        let creds = home.join(".config/anthropic/credentials/work.json");
+        let work = creds.join("work.json");
         std::fs::write(
-            &creds,
+            &work,
             r#"{"access_token":"sk-ant-oat01-x","account_email":"dev@example.com"}"#,
         )
         .unwrap();
-        assert_eq!(
-            anthropic_account(&creds).as_deref(),
-            Some("dev@example.com")
-        );
+        assert_eq!(anthropic_account(&work).as_deref(), Some("dev@example.com"));
 
         // `ant auth login`'s own wording carries the sign-in page.
         let ant = "Opening your browser to authenticate. If it doesn't open, visit:\n\n  https://platform.claude.com/oauth/authorize?client_id=c&state=s\n\nWaiting\n";
