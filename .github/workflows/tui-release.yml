@@ -33,6 +33,13 @@ permissions:
   contents: write
 
 jobs:
+  # The wrapper's self-update, against a fake release over file:// (no build, a few seconds).
+  wrapper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tui/tests/self-update.sh
+
   build:
     strategy:
       fail-fast: false

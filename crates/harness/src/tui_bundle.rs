@@ -42,12 +42,37 @@ pub fn installed(root: &Path, version: &str) -> Option<PathBuf> {
     (entry.is_file() && dir.join("libexec").join("harness-tui-bridge").is_file()).then_some(entry)
 }
 
-/// Install this version's TUI unless it is already there, then drop the
-/// others. Returns the `graff-tui` entry point.
+/// A version directory name as numbers (`0.2.117` → [0, 2, 117]).
+fn version_key(name: &str) -> Option<Vec<u64>> {
+    let parts: Option<Vec<u64>> = name.split('.').map(|part| part.parse().ok()).collect();
+    parts.filter(|parts| parts.len() >= 3)
+}
+
+/// The newest complete install, as (version, `graff-tui`).
+fn newest_installed(root: &Path) -> Option<(String, PathBuf)> {
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let key = version_key(&name)?;
+            let graff_tui = installed(root, &name)?;
+            Some((key, name, graff_tui))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, name, graff_tui)| (name, graff_tui))
+}
+
+/// Install this version's TUI unless it, or a newer one, is already there,
+/// then drop the older ones. A newer one comes from the client updating
+/// itself (`tui/bin/harness-tui`); the app never downgrades it. Returns the
+/// `graff-tui` entry point.
 pub async fn ensure_installed(version: &str) -> anyhow::Result<PathBuf> {
     let root = root().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    if let Some(entry) = installed(&root, version) {
-        prune(&root, version);
+    if let Some((newest, entry)) = newest_installed(&root)
+        && version_key(&newest) >= version_key(version)
+    {
+        prune(&root, &newest);
         return Ok(entry);
     }
     let stem = asset_stem(version)
@@ -209,6 +234,27 @@ mod tests {
             root.join("codex-home").exists(),
             "the TUI's own state stays"
         );
+    }
+
+    #[test]
+    fn keeps_a_newer_client_the_tui_installed_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tui");
+        for version in ["0.2.109", "0.2.117", "0.2.120"] {
+            let install = root.join(version);
+            std::fs::create_dir_all(install.join("bin")).unwrap();
+            std::fs::create_dir_all(install.join("libexec")).unwrap();
+            std::fs::write(install.join("bin").join("graff-tui"), "").unwrap();
+            std::fs::write(install.join("libexec").join("harness-tui-bridge"), "").unwrap();
+        }
+        // Incomplete installs don't count.
+        std::fs::create_dir_all(root.join("0.3.0").join("bin")).unwrap();
+        let (newest, entry) = newest_installed(&root).unwrap();
+        assert_eq!(newest, "0.2.120");
+        assert_eq!(entry, root.join("0.2.120").join("bin").join("graff-tui"));
+        assert!(version_key("0.2.120") >= version_key("0.2.117"), "the app keeps it");
+        assert!(version_key("0.2.100") < version_key("0.2.117"), "the app replaces it");
+        assert!(version_key("0.10.0") > version_key("0.9.9"), "numeric, not lexical");
     }
 
     #[test]

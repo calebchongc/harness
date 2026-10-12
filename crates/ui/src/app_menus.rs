@@ -34,6 +34,9 @@ actions!(
         AppearanceLight,
         AppearanceDark,
         ClearBrowsingData,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
     ]
 );
 
@@ -66,6 +69,32 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &AppearanceSystem, cx| appearance::set_mode(AppearanceMode::System, cx));
     cx.on_action(|_: &AppearanceLight, cx| appearance::set_mode(AppearanceMode::Light, cx));
     cx.on_action(|_: &AppearanceDark, cx| appearance::set_mode(AppearanceMode::Dark, cx));
+    // Text size, like a browser's zoom keys: steps through the sizes Settings
+    // offers, persisted the same way.
+    cx.on_action(|_: &IncreaseFontSize, cx| change_font_size(cx, |size| size.stepped(1)));
+    cx.on_action(|_: &DecreaseFontSize, cx| change_font_size(cx, |size| size.stepped(-1)));
+    cx.on_action(|_: &ResetFontSize, cx| change_font_size(cx, |_| Default::default()));
+}
+
+fn change_font_size(
+    cx: &mut App,
+    next: impl FnOnce(crate::typography::UiFontSize) -> crate::typography::UiFontSize + 'static,
+) {
+    // Harness is single-window; without a key window (tests, a window that
+    // lost focus) the first one still takes the size.
+    let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
+        return;
+    };
+    // A key binding dispatches this while its window is mid-update, so the
+    // window can't be borrowed here; apply the size once the event is done.
+    cx.defer(move |cx| {
+        handle
+            .update(cx, |_, window, cx| {
+                let size = next(crate::typography::font_size(cx));
+                crate::typography::set_font_size(size, window, cx);
+            })
+            .ok();
+    });
 }
 
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
@@ -184,6 +213,13 @@ fn app_key_bindings(macos: bool) -> Vec<KeyBinding> {
         shell::OpenSettings,
         None,
     )];
+    let primary = if macos { "cmd" } else { "ctrl" };
+    bindings.extend([
+        KeyBinding::new(&format!("{primary}-="), IncreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}-+"), IncreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}--"), DecreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}-0"), ResetFontSize, None),
+    ]);
     if macos {
         bindings.extend([
             KeyBinding::new("cmd-q", Quit, None),
@@ -257,6 +293,10 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("Appearance: System", AppearanceSystem),
         MenuItem::action("Appearance: Light", AppearanceLight),
         MenuItem::action("Appearance: Dark", AppearanceDark),
+        MenuItem::separator(),
+        MenuItem::action("Bigger Text", IncreaseFontSize),
+        MenuItem::action("Smaller Text", DecreaseFontSize),
+        MenuItem::action("Actual Size", ResetFontSize),
     ]));
     if macos {
         // Standard Window menu; macOS appends the open-window list itself.
@@ -366,7 +406,10 @@ mod tests {
             vec![
                 AppearanceSystem.name(),
                 AppearanceLight.name(),
-                AppearanceDark.name()
+                AppearanceDark.name(),
+                IncreaseFontSize.name(),
+                DecreaseFontSize.name(),
+                ResetFontSize.name(),
             ]
         );
     }
@@ -407,6 +450,32 @@ mod tests {
         assert_eq!(find(&other, Quit.name()), None);
         // Off macOS the same close-the-innermost-thing action needs a key too.
         assert_eq!(find(&other, CloseTab.name()), Some(combo("ctrl-shift-w")));
+
+        // Text size: the browser zoom keys, Cmd on macOS and Ctrl elsewhere.
+        let all = |bindings: &[KeyBinding], name: &str| -> Vec<Keystroke> {
+            bindings
+                .iter()
+                .filter(|binding| binding.action().name() == name)
+                .flat_map(|binding| binding.keystrokes().iter().map(|ks| ks.inner().clone()))
+                .collect()
+        };
+        for (bindings, primary) in [(&macos, "cmd"), (&other, "ctrl")] {
+            assert_eq!(
+                all(bindings, IncreaseFontSize.name()),
+                vec![
+                    Keystroke::parse(&format!("{primary}-=")).unwrap(),
+                    Keystroke::parse(&format!("{primary}-+")).unwrap()
+                ]
+            );
+            assert_eq!(
+                all(bindings, DecreaseFontSize.name()),
+                vec![Keystroke::parse(&format!("{primary}--")).unwrap()]
+            );
+            assert_eq!(
+                all(bindings, ResetFontSize.name()),
+                vec![Keystroke::parse(&format!("{primary}-0")).unwrap()]
+            );
+        }
     }
 }
 
