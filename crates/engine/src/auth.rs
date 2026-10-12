@@ -369,6 +369,12 @@ pub struct Auth {
     inner: Arc<AuthInner>,
 }
 
+/// Present while this device was signed out by a rejected refresh rather
+/// than by the person; the app offers to sign back in until it is gone.
+pub fn lost_session_marker(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("signed-out.notice")
+}
+
 impl Auth {
     /// Build from config: dev mode unless a CodeGraff client id is configured.
     pub fn new(config: AuthConfig) -> Self {
@@ -700,6 +706,30 @@ impl Auth {
     pub fn sign_out(&self) {
         let mut sign_in = lock(&self.inner.sign_in);
         self.clear_session(&mut sign_in);
+        // Chosen, not lost: no "you've been signed out" notice.
+        self.set_lost_session(false);
+    }
+
+    /// Leave (or clear) the marker the app shows "You've been signed out"
+    /// from. A refresh the service rejected signs this device out without the
+    /// person asking, and the next launch opens the local workspace: without
+    /// the notice that reads as every chat having vanished.
+    fn set_lost_session(&self, lost: bool) {
+        if self.inner.config.sandbox_token_file.is_some() {
+            return;
+        }
+        let path = lost_session_marker(&self.inner.config.data_dir);
+        let outcome = if lost {
+            std::fs::write(&path, chrono::Utc::now().to_rfc3339())
+        } else {
+            match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+                _ => Ok(()),
+            }
+        };
+        if let Err(err) = outcome {
+            tracing::warn!(error = %err, "auth: failed to update the signed-out notice");
+        }
     }
 
     fn clear_session(&self, sign_in: &mut SignInLifecycle) {
@@ -962,6 +992,7 @@ impl Auth {
             org_id: org_id.clone(),
         };
         self.persist(Some(&session));
+        self.set_lost_session(false);
         *lock(&self.inner.stored) = Some(session);
         self.retry_refresh();
         tracing::info!(email = %result.user.email, org = org_id.as_deref().unwrap_or("<none>"),
@@ -1139,6 +1170,7 @@ impl Auth {
                 "auth: refresh rejected — session revoked; signing out"
             );
             self.clear_session(&mut sign_in);
+            self.set_lost_session(true);
             return Ok(None);
         }
         if !res.status().is_success() {

@@ -457,6 +457,11 @@ async fn revoked_refresh_token_signs_out() {
         "revocation must not rewrite the captured startup fact"
     );
     assert!(!dir.path().join("session.json").exists());
+    // The app says why the account's chats are gone (#300)…
+    assert!(harness_engine::lost_session_marker(dir.path()).exists());
+    // …until the person dismisses it or signs out on purpose.
+    auth.sign_out();
+    assert!(!harness_engine::lost_session_marker(dir.path()).exists());
 }
 
 #[tokio::test]
@@ -482,6 +487,10 @@ async fn offline_refresh_loop_backs_off_without_revoking_session() {
     );
     assert!(auth.state().is_signed_in());
     assert!(session_file.exists(), "offline must not revoke the session");
+    assert!(
+        !harness_engine::lost_session_marker(dir.path()).exists(),
+        "offline is not a sign-out"
+    );
     refresh_loop.abort();
 }
 
