@@ -281,7 +281,14 @@ impl InstallKind {
     /// Whether the engine's background checker runs for this install,
     /// signed in or not.
     pub fn checks_releases(&self) -> bool {
-        matches!(self, Self::MacApp { .. } | Self::Managed { .. })
+        match self {
+            Self::MacApp { .. } | Self::Managed { .. } => true,
+            // The zip install follows the release feed too; without the
+            // check it never learned of a release and never offered one.
+            #[cfg(windows)]
+            Self::WindowsPortable { .. } => true,
+            _ => false,
+        }
     }
 
     pub fn supports_desktop_update(&self) -> bool {
@@ -1046,6 +1053,13 @@ mod tests {
             .checks_releases()
         );
         assert!(!InstallKind::Unmanaged.checks_releases());
+        #[cfg(windows)]
+        assert!(
+            InstallKind::WindowsPortable {
+                directory: PathBuf::from(r"C:\Users\u\Harness")
+            }
+            .checks_releases()
+        );
     }
 
     #[test]

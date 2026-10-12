@@ -225,10 +225,10 @@ const TUI_RETRY_ATTEMPTS: u32 = 12;
 /// this a machine kept the first one it got. Dev builds are skipped: their
 /// version usually has no release yet.
 async fn install_matching_tui() {
-    if cfg!(debug_assertions) {
+    use harness_adapters::tui_bundle;
+    if cfg!(debug_assertions) || !tui_bundle::supported() {
         return;
     }
-    use harness_adapters::tui_bundle;
     let mut attempt = 0;
     let entry = loop {
         attempt += 1;
