@@ -13,6 +13,9 @@ use crate::pickers::CanvasDraft;
 
 mod opening;
 
+#[cfg(test)]
+mod sidebar_tests;
+
 /// Every pane holds another engine doc watch; Ghostty-scale grids aren't
 /// the point of a chat column.
 pub(super) const MAX_CHAT_PANES: usize = 8;
@@ -949,6 +952,15 @@ impl Shell {
             .clone()
             .filter(|_| matches!(self.route, Route::Chat))?;
         let len = split.panes.len();
+        // Stable widths keep title lengths and incomplete rows from stretching
+        // cards; use one column only when two compact cards cannot fit.
+        let gap = 6.0;
+        let available = (self.settings.sidebar_width - Theme::SPACE_SM * 2.0).max(0.0);
+        let card_width = if available >= 96.0 * 2.0 + gap {
+            (available - gap) / 2.0
+        } else {
+            available
+        };
         struct Card {
             title: SharedString,
             harness: Option<harness_proto::HarnessId>,
@@ -999,8 +1011,10 @@ impl Shell {
             row.push(
                 div()
                     .id(("chat-pane-card", ix))
-                    .flex_1()
-                    .min_w(px(96.0))
+                    .debug_selector(move || format!("chat-pane-card-{ix}"))
+                    .flex_none()
+                    .w(px(card_width))
+                    .min_w_0()
                     .px(px(8.0))
                     .py(px(7.0))
                     .rounded(px(10.0))
@@ -1057,7 +1071,7 @@ impl Shell {
                 .pb(px(8.0))
                 .flex()
                 .flex_col()
-                .child(div().flex().flex_row().flex_wrap().items_start().gap(px(6.0)).children(row))
+                .child(div().flex().flex_row().flex_wrap().items_start().gap(px(gap)).children(row))
                 .into_any_element(),
         )
     }
