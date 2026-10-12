@@ -340,6 +340,24 @@ impl SessionsEngine {
             .is_some_and(is_active)
     }
 
+    /// Whether dispatching `request` now would stop a turn that is still
+    /// running: the live run cannot take it through its mailbox (attachments,
+    /// a changed model/effort/sandbox, or a turn-boundary harness), so
+    /// dispatch would replace the runtime and cancel the turn mid-answer.
+    pub fn would_cancel_active_turn(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        request: &RunRequest,
+    ) -> bool {
+        if !self.turn_in_flight(chat_id) {
+            return false;
+        }
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .is_some_and(|h| !(h.steerable && h.runtime_config.can_route(harness_id, request)))
+    }
+
     /// Any run currently working or blocked on input — the auto-updater's
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {
@@ -519,16 +537,17 @@ impl SessionsEngine {
                 // below (write_user_message dedupes by id).
                 message_id = Some(user_id);
             }
-            if !same_runtime {
-                tracing::debug!(
-                    chat = %chat_id,
-                    "restarting live harness to apply changed run configuration"
-                );
-            }
             // Mailbox closed (runtime mid-teardown / non-steering harness) or
             // the routed run died with the message reclaimed, or configuration
             // changed beyond what the text-only mailbox can carry: replace it.
-            self.interrupt(chat_id).await?;
+            let reason = if accepted {
+                "replace: run died around the send"
+            } else if !same_runtime {
+                "replace: run configuration changed"
+            } else {
+                "replace: mailbox closed"
+            };
+            self.interrupt_for(chat_id, reason).await?;
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
@@ -752,6 +771,12 @@ impl SessionsEngine {
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        self.interrupt_for(chat_id, "stop").await
+    }
+
+    /// [`Self::interrupt`], logging why. The agent only sees a bare cancel, so
+    /// this line is what tells a user's Stop from a lifecycle teardown.
+    pub async fn interrupt_for(&self, chat_id: &str, reason: &str) -> Result<bool, EngineError> {
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -763,6 +788,13 @@ impl SessionsEngine {
         let Some((run_id, token, cancel, pending)) = target else {
             return Ok(false);
         };
+        tracing::info!(
+            chat = %chat_id,
+            run = %run_id,
+            mid_turn = self.turn_in_flight(chat_id),
+            reason,
+            "interrupting run"
+        );
         // Publish cancellation BEFORE waking the harness. Otherwise a fast
         // EOF after token.cancel() can beat this watch notification and be
         // classified as an error instead of an interrupted turn.
@@ -819,6 +851,7 @@ impl SessionsEngine {
         let Some(resolver) = pending.remove(request_id) else {
             return false;
         };
+        tracing::info!(chat = %chat_id, run = %run.run_id, reason = "question dismissed", "interrupting run");
         // Publish cancellation before waking the adapter, as in interrupt().
         // Dropping the resolver communicates cancellation, not an empty answer.
         let _ = run.cancel.send(true);
@@ -1024,7 +1057,7 @@ impl SessionsEngine {
     pub async fn shutdown(&self) {
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
-            if let Err(err) = self.interrupt(&chat_id).await {
+            if let Err(err) = self.interrupt_for(&chat_id, "engine shutdown").await {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
         }
