@@ -88,7 +88,7 @@ fn assert_pane_cards(cx: &mut gpui::TestAppContext, width: f32, count: usize, ta
         }))
     });
     let shell = host.read_with(cx, |host, _| host.0.clone());
-    assert_eq!(cx.debug_bounds("tabs-header").is_some(), tabs);
+    assert!(cx.debug_bounds("tabs-header").is_some());
     let cards: Vec<_> = [
         "chat-pane-card-0",
         "chat-pane-card-1",
@@ -127,7 +127,7 @@ fn assert_pane_cards(cx: &mut gpui::TestAppContext, width: f32, count: usize, ta
             Some("pane-0")
         );
     });
-    assert_eq!(cx.debug_bounds("tabs-header").is_some(), tabs);
+    assert!(cx.debug_bounds("tabs-header").is_some());
 }
 
 #[gpui::test]

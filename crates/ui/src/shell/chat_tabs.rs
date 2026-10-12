@@ -9,6 +9,9 @@
 use super::*;
 use crate::pickers::CanvasDraft;
 
+#[cfg(test)]
+mod header_tests;
+
 /// A tab's layout while it isn't the active one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ChatTab {
@@ -424,6 +427,11 @@ impl Shell {
                 .unwrap_or_else(|| "New session".into())
                 .into()
         };
+        // A single tab lives entirely in the live shell fields; the parked
+        // tab list is empty until another tab is opened (and after it closes).
+        if self.chat_tabs.is_empty() {
+            return vec![title(state.selected_chat.as_deref())];
+        }
         self.chat_tabs
             .iter()
             .enumerate()
@@ -437,7 +445,7 @@ impl Shell {
             .collect()
     }
 
-    /// The tab list, shown once there are two or more tabs. Click to switch;
+    /// The tab list, including the single live tab. Click to switch;
     /// the lit tab is the one on screen; drag a tab onto another to move it
     /// there. The lit tab's pane cards (`pane_strip`, taken) sit right under
     /// it, so they read as that tab's panes rather than the last tab's.
@@ -447,10 +455,11 @@ impl Shell {
         pane_strip: &mut Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.chat_tabs.len() < 2 || !matches!(self.route, Route::Chat) {
+        if !matches!(self.route, Route::Chat) {
             return None;
         }
         let labels = self.chat_tab_labels(cx);
+        let multiple = labels.len() > 1;
         let active = self.chat_tab;
         let accent = theme.accent;
         Some(
@@ -463,17 +472,19 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .child(
-                    div()
-                        .px(px(4.0))
-                        .pb(px(2.0))
-                        .flex()
-                        .flex_row()
-                        .justify_between()
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_muted.opacity(0.8))
-                        .child(SharedString::from(format!("Tabs · {}", labels.len()))),
-                )
+                .when(multiple, |list| {
+                    list.child(
+                        div()
+                            .px(px(4.0))
+                            .pb(px(2.0))
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_muted.opacity(0.8))
+                            .child(SharedString::from(format!("Tabs · {}", labels.len()))),
+                    )
+                })
                 .children(labels.into_iter().enumerate().flat_map(|(ix, title)| {
                     let lit = ix == active;
                     let key: SharedString = format!("chat-tab-{ix}").into();
@@ -497,7 +508,7 @@ impl Shell {
                         .text_size(crate::typography::ui_rems(12.5))
                         .text_color(if lit { theme.text } else { theme.text_muted })
                         .on_click(cx.listener(move |this, _, window, cx| this.switch_chat_tab(ix, window, cx)))
-                        .when(crate::click_activation_drag_enabled(), |row| {
+                        .when(multiple && crate::click_activation_drag_enabled(), |row| {
                             row.on_drag(
                                 ChatTabDrag {
                                     from: ix,
