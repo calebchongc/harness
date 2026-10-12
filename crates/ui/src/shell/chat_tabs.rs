@@ -530,7 +530,10 @@ impl Shell {
                         )
                         .child(div().flex_1().min_w_0().truncate().child(title))
                         .into_any_element();
-                    let strip = if lit { pane_strip.take() } else { None };
+                    // The strip owns its sidebar gutters. Cancel the tab list's
+                    // inset so grouping cards under a header does not narrow them.
+                    let strip = if lit { pane_strip.take() } else { None }
+                        .map(|strip| div().mx(px(-10.0)).child(strip).into_any_element());
                     std::iter::once(row).chain(strip)
                 }))
                 .into_any_element(),
