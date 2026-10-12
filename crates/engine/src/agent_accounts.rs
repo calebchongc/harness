@@ -92,6 +92,10 @@ const CLAUDE_SHARED_CREDENTIAL_KEYS: &[&str] = &[
 const USAGE_TTL: Duration = Duration::from_secs(60);
 /// An abandoned login flow (dialog dismissed without Cancel) is reaped past this.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
+/// How long a relayed sign-in may take to finish once its redirect reaches
+/// graff: the code exchange, registration and plan check. Inside the
+/// forwarding deadline for CompleteAgentLogin.
+const RELAY_FINISH_WAIT: Duration = Duration::from_secs(90);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Filesystem knobs — env-resolved in production ([`AgentAccountsConfig::detect`]),
@@ -1448,10 +1452,12 @@ impl AgentAccounts {
         login_id: &str,
         landed: &str,
     ) -> Option<Result<(), EngineError>> {
-        let relay = match lock(&self.inner.flows).get(login_id) {
+        let (relay, exit) = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Graff {
-                relay: Some(relay), ..
-            }) => relay.clone(),
+                relay: Some(relay),
+                exit,
+                ..
+            }) => (relay.clone(), exit.clone()),
             Some(LoginFlow::Graff { .. }) => {
                 return Some(Err(EngineError::Other(
                     "This sign-in finishes in the execution device's browser.".into(),
@@ -1468,17 +1474,45 @@ impl AgentAccounts {
         let client = match reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(15))
+            .timeout(RELAY_FINISH_WAIT)
             .build()
         {
             Ok(client) => client,
             Err(err) => return Some(Err(EngineError::Other(err.to_string()))),
         };
-        Some(match client.get(callback).send().await {
-            Ok(_) => Ok(()),
-            Err(_) => Err(EngineError::Other(
-                "The execution device is no longer waiting for this sign-in. Start again.".into(),
+        let started = Instant::now();
+        // graff answers only after it has exchanged the code with OpenAI
+        // (token, registration, plan check), which can outlast a short
+        // timeout. Only a refused connection means its listener is gone.
+        if let Err(err) = client.get(callback).send().await
+            && err.is_connect()
+        {
+            return Some(Err(EngineError::Other(
+                match self.poll_graff_login(login_id) {
+                    Some(AgentLoginPoll {
+                        status: AgentLoginStatus::Error,
+                        message: Some(message),
+                        ..
+                    }) => format!("The sign-in on the execution device already ended: {message}"),
+                    _ => "The execution device is no longer waiting for this sign-in. Start again."
+                        .into(),
+                },
+            )));
+        }
+        while lock(&exit).is_none() && started.elapsed() < RELAY_FINISH_WAIT {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // graff's own verdict; still running means it is finishing up and the
+        // account list picks the sign-in up when it lands.
+        Some(match self.poll_graff_login(login_id) {
+            Some(AgentLoginPoll {
+                status: AgentLoginStatus::Error,
+                message,
+                ..
+            }) => Err(EngineError::Other(
+                message.unwrap_or_else(|| "The sign-in did not finish.".into()),
             )),
+            _ => Ok(()),
         })
     }
 
