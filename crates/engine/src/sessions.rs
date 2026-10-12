@@ -1828,6 +1828,15 @@ fn sync_segment<'a>(
     Ok(())
 }
 
+/// An unresolved tool row other than the live plan (a singleton that never
+/// resolves): a command still running, or a call its agent never closed.
+fn open_tool(folded: &[MessagePart]) -> bool {
+    folded.iter().any(|p| match p {
+        MessagePart::Tool { id, resolved: false, .. } => id != harness_proto::LIVE_PLAN_TOOL_ID,
+        _ => false,
+    })
+}
+
 fn finish_segment<'a>(
     doc: &'a SessionDoc,
     writer: Option<SegmentWriter<'a>>,
@@ -2135,6 +2144,21 @@ async fn drive_run(
             Some(ms) => Some(std::time::Duration::from_millis(ms)),
             None => Some(std::time::Duration::from_secs(20)),
         };
+    // An agent-started turn whose fold still has an open tool row: the row may
+    // be a command still running, or a call the agent never closes (a meta
+    // tool's status lost on the wire, #1600). With no Done coming either way,
+    // the open row may only hold the watchdog off for this long, not forever,
+    // or the session stays Working on every device. A question still holds it
+    // indefinitely. `HARNESS_SELF_TURN_TOOL_QUIESCE_MS`; 0 = never park.
+    let self_open_tool_quiesce: Option<std::time::Duration> =
+        match std::env::var("HARNESS_SELF_TURN_TOOL_QUIESCE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(0) => None,
+            Some(ms) => Some(std::time::Duration::from_millis(ms)),
+            None => Some(std::time::Duration::from_secs(300)),
+        };
     let mut self_continued_turn = false;
     // Spawn chips that have SETTLED (tagged Done seen). Content events for a
     // settled chip with no live sink are dropped — a straggler frame after
@@ -2350,20 +2374,31 @@ async fn drive_run(
                     if self_continued_turn && let Some(short) = self_quiesce_after {
                         window = window.min(short);
                     }
+                    if self_continued_turn
+                        && open_tool(&folded)
+                        && let Some(long) = self_open_tool_quiesce
+                    {
+                        window = long;
+                    }
                     last_stream_activity + window
                 }), if quiesce_after.is_some()
                     && (self_continued_turn || !authoritative_prompt_end)
                     && idle_since.is_none()
                     && !interrupted
                     && steerable
-                    && !folded.iter().any(|p| match p {
-                        MessagePart::Tool { id, resolved: false, .. } => {
-                            id != harness_proto::LIVE_PLAN_TOOL_ID
-                        }
-                        MessagePart::Input { resolved: false, .. } => true,
-                        _ => false,
-                    }) =>
+                    && !folded
+                        .iter()
+                        .any(|p| matches!(p, MessagePart::Input { resolved: false, .. }))
+                    && (!open_tool(&folded)
+                        || (self_continued_turn && self_open_tool_quiesce.is_some())) =>
                 {
+                    // A self-continued turn parked past an open row: nothing
+                    // will close it now, so it must not spin on in the doc.
+                    for part in folded.iter_mut() {
+                        if let MessagePart::Tool { resolved, .. } = part {
+                            *resolved = true;
+                        }
+                    }
                     tracing::warn!(
                         chat = %chat_id,
                         quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
