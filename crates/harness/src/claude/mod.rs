@@ -33,6 +33,7 @@
 
 pub mod catalog;
 mod discovery;
+mod live_sessions;
 mod normalize;
 mod wire;
 mod workflow_tail;
@@ -511,6 +512,17 @@ impl ClaudeHarness {
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
+        // A replaced run's process may still be exiting: two processes on
+        // one session drop the new prompt (live_sessions.rs).
+        if let Some(resume) = request.resume.as_deref().filter(|_| !title_only)
+            && !live_sessions::wait_until_closed(resume, live_sessions::WAIT).await
+        {
+            tracing::warn!(
+                target: "harness_adapters::claude",
+                session = %resume,
+                "previous claude process still open; resuming anyway"
+            );
+        }
         let mut cmd = self.build_command(&exe, &request);
         if title_only {
             cmd.args([
@@ -732,6 +744,8 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     let mut norm = Normalizer::new();
+    // Held while this child lives, once its session id is known.
+    let mut registration: Option<live_sessions::Registration> = None;
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -767,7 +781,14 @@ async fn run_session(session: Session) {
                         }
                         continue;
                     }
-                    for ev in norm.normalize(frame, interrupted) {
+                    let events = norm.normalize(frame, interrupted);
+                    if registration.is_none()
+                        && !title_only
+                        && let Some(id) = norm.session_id.as_deref()
+                    {
+                        registration = Some(live_sessions::register(id));
+                    }
+                    for ev in events {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
                         // A workflow (or workflow agent) settle queues behind
                         // its transcripts so no line lands after it.
@@ -884,6 +905,8 @@ async fn run_session(session: Session) {
     }
 
     shutdown_child(&mut child, kill_grace).await;
+    // The child is gone: a resume of this session may start now.
+    drop(registration);
     if let Some(handle) = escalation {
         handle.abort();
     }
