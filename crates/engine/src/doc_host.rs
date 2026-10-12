@@ -4094,7 +4094,7 @@ impl DocHost {
             return Ok(false);
         }
         handle.queue_paused.store(true, Ordering::Release);
-        match sessions.interrupt(&handle.chat_id).await {
+        match sessions.interrupt_for(&handle.chat_id, "stop").await {
             Ok(true) => Ok(true),
             Ok(false) => {
                 handle.queue_paused.store(false, Ordering::Release);
@@ -4149,7 +4149,7 @@ impl DocHost {
         // Same reading of "busy" as the drain: a turn parked on a question is
         // still a turn, and it has to be stopped before this one starts.
         if send == QueueSend::Interrupt && sessions.turn_in_flight(chat_id) {
-            sessions.interrupt(chat_id).await?;
+            sessions.interrupt_for(chat_id, "send now").await?;
         }
         let previous = sessions.last_request(chat_id);
         let request = self
@@ -5204,6 +5204,17 @@ impl DocHost {
                     );
                 }
                 let harness = self.harness_for_request(chat_id, &request);
+                // A send the running turn cannot take (images, a changed
+                // model/effort/sandbox) would replace the runtime and cancel
+                // the turn mid-answer. Hold it for the turn's end instead.
+                if sessions.would_cancel_active_turn(chat_id, harness, &request) {
+                    self.hold_run_until_turn_end(handle, harness, &request, message_id)?;
+                    handle.queue_paused.store(false, Ordering::Release);
+                    return Ok((
+                        SessionCommandStatus::Applied,
+                        Some("held until the turn ends".into()),
+                    ));
+                }
                 // A row with no config renders no harness glyph (and every
                 // later dispatch falls back to the engine default), so stamp
                 // what this run actually executes with. Claimed rows and
@@ -5478,6 +5489,41 @@ impl DocHost {
         })?;
         handle.publish_queue();
         Ok(true)
+    }
+
+    /// Queue a fresh-turn request behind the running turn. The drain rebuilds
+    /// the run from the chat row, so the row takes the request's config first.
+    fn hold_run_until_turn_end(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        harness: HarnessId,
+        request: &harness_proto::RunRequest,
+        message_id: &str,
+    ) -> Result<(), EngineError> {
+        if let Some(ws) = self.workspace() {
+            let config = harness_proto::ChatConfig {
+                harness,
+                model: request.model.clone(),
+                reasoning: request.reasoning,
+                model_options: request.model_options.clone(),
+                sandbox: request.sandbox,
+            };
+            if let Err(err) = ws.set_chat_config(&handle.chat_id, &config) {
+                tracing::warn!(chat = %handle.chat_id, error = %err, "held run config stamp failed");
+            }
+        }
+        handle.doc.push_queued(&QueuedMessage {
+            id: message_id.to_string(),
+            text: request.prompt.clone(),
+            attachments: request.attachments.clone(),
+            hold_for_turn_end: false,
+            issued_by: self.inner.config.device_id.clone(),
+            issued_at: now_ms(),
+            edited_at: None,
+            delivery_gate: None,
+        })?;
+        handle.publish_queue();
+        Ok(())
     }
 
     async fn capture_source_context(&self, cwd: &str) -> Option<ConversationSourceContext> {
