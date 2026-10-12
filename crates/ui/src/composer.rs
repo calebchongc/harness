@@ -628,6 +628,11 @@ fn escape_dismisses_completion(key: &str, completion_open: bool) -> bool {
 /// needs the launcher and popover.
 const QUESTION_INLINE_MIN_WIDTH: f32 = 220.0;
 const QUESTION_INLINE_MIN_HEIGHT: f32 = 160.0;
+/// An inline question takes at most this share of its pane (and never less
+/// than the floor below), so the transcript it asks about stays readable
+/// above it; the question body scrolls inside the cap.
+const QUESTION_INLINE_SHARE: f32 = 0.55;
+const QUESTION_INLINE_FLOOR: f32 = 220.0;
 /// The popover is at least this wide so a question opened from a sliver of
 /// a pane wraps into readable lines.
 const QUESTION_POPOVER_MIN_WIDTH: f32 = 340.0;
@@ -9235,7 +9240,7 @@ impl Composer {
         };
         // Reserve room for the question and navigation even with a long answer
         // or a short window. The editor still grows naturally below this cap.
-        let answer_cap = (max_height * 0.35).min(TEXTAREA_MAX - TEXTAREA_PAD_V);
+        let answer_cap = (max_height * 0.45).min(TEXTAREA_MAX - TEXTAREA_PAD_V);
         self.input.update(cx, |input, cx| {
             if input.viewport_height != Some(answer_cap)
                 || input.settled_viewport_height != Some(answer_cap)
@@ -9958,7 +9963,11 @@ impl Render for Composer {
                 );
             }
             self.wizard_expanded = false;
-            let wizard = self.render_wizard((available - Theme::SPACE_LG).max(120.0), cx);
+            let cap = (available * QUESTION_INLINE_SHARE)
+                .max(QUESTION_INLINE_FLOOR)
+                .min(available - Theme::SPACE_LG)
+                .max(120.0);
+            let wizard = self.render_wizard(cap, cx);
             return container.child(motion::fade_quick(
                 "composer-wizard",
                 div().min_h_0().flex().flex_col().child(wizard),
@@ -11129,6 +11138,11 @@ mod tests {
             assert!(
                 panel.top() >= px(0.0) && panel.bottom() <= px(height),
                 "panel must fit: {panel:?}"
+            );
+            assert!(
+                panel.size.height
+                    <= px((height * QUESTION_INLINE_SHARE).max(QUESTION_INLINE_FLOOR) + 1.0),
+                "a long question must leave the transcript visible: {panel:?}"
             );
             assert!(
                 body.size.height > px(20.0),

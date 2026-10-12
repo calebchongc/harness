@@ -766,6 +766,13 @@ struct QuestionPanel: View {
     @State private var picked: [String: Set<String>] = [:]  // questionId → labels
     @State private var typed: [String: String] = [:]
     @State private var autoAdvanceTask: Task<Void, Never>?
+    @State private var promptHeight: CGFloat = 0
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    /// The question and its options scroll inside this height, so a long
+    /// question leaves the transcript above it readable and keeps the answer
+    /// field and Submit on screen.
+    private var promptCap: CGFloat { verticalSizeClass == .compact ? 120 : 300 }
 
     var body: some View {
         // `questions[min(page, count - 1)]` traps on an empty list (count - 1
@@ -780,38 +787,13 @@ struct QuestionPanel: View {
 
     private func panel(for question: UserInputQuestion) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(question.header.uppercased())
-                    .font(Theme.sans(10.5, weight: .medium))
-                    .kerning(1)
-                    .foregroundStyle(Theme.textMuted.opacity(0.6))
-                Spacer()
-                if questions.count > 1 {
-                    Text("\(page + 1)/\(questions.count)")
-                        .font(Theme.sans(10))
-                        .foregroundStyle(Theme.textMuted)
-                        .padding(.horizontal, 6)
-                        .frame(height: 20)
-                        .background(ink(0.06), in: RoundedRectangle(cornerRadius: 6))
-                }
+            ScrollView {
+                prompt(for: question)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { promptHeight = $0 }
             }
-
-            Text(question.question)
-                .font(Theme.sans(15, weight: .medium))
-                .foregroundStyle(Theme.text)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if question.multiSelect == true {
-                Text("Select one or more options.")
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted)
-            }
-
-            VStack(spacing: 4) {
-                ForEach(Array(question.options.enumerated()), id: \.offset) { ix, option in
-                    optionRow(question: question, ix: ix, option: option)
-                }
-            }
+            .id(page)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: min(max(promptHeight, 1), promptCap))
 
             VStack(alignment: .leading, spacing: 6) {
                 Rectangle().fill(hairline(0.06)).frame(height: 1)
@@ -850,6 +832,45 @@ struct QuestionPanel: View {
         .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(hairline(0.05), lineWidth: 1))
         .padding(.horizontal, 12)
         .transition(.opacity)
+    }
+
+    /// Header, question and options: the part that scrolls.
+    private func prompt(for question: UserInputQuestion) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(question.header.uppercased())
+                    .font(Theme.sans(10.5, weight: .medium))
+                    .kerning(1)
+                    .foregroundStyle(Theme.textMuted.opacity(0.6))
+                Spacer()
+                if questions.count > 1 {
+                    Text("\(page + 1)/\(questions.count)")
+                        .font(Theme.sans(10))
+                        .foregroundStyle(Theme.textMuted)
+                        .padding(.horizontal, 6)
+                        .frame(height: 20)
+                        .background(ink(0.06), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+
+            Text(question.question)
+                .font(Theme.sans(15, weight: .medium))
+                .foregroundStyle(Theme.text)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if question.multiSelect == true {
+                Text("Select one or more options.")
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+            }
+
+            VStack(spacing: 4) {
+                ForEach(Array(question.options.enumerated()), id: \.offset) { ix, option in
+                    optionRow(question: question, ix: ix, option: option)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func optionRow(question: UserInputQuestion, ix: Int, option: String) -> some View {
