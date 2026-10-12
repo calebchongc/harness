@@ -59,9 +59,14 @@ the edited row retains its place in the queue.
 Desktop defaults to automatic steering when supported; iOS defaults to holding
 messages until turn end. Both expose a persisted Queue/Steer preference.
 Cmd/Ctrl+Enter on desktop submits content, saves an active edit, or activates
-the most recently added queue row when the composer is empty. Command+Return on
-iOS activates the queue head. A blocked shortcut target is never skipped and an
-empty modified submit never stops the agent.
+the most recently added queue row when the composer is empty. The empty-composer
+shortcut also works after clicking Send or the transcript; focused controls and
+overlays retain first refusal, and a draft outside the editor is never submitted.
+Queue clicks, including Remove, restore composer focus immediately. After the
+latest row is removed, the shortcut targets the newest remaining row; it waits
+while removal is pending. Command+Return on iOS activates the queue head. A
+blocked shortcut target is never skipped and an empty modified submit never
+stops the agent.
 
 Queued submissions do not create optimistic transcript bubbles. Desktop retains
 the active reply's scroll runway and anchors a locally queued message only when

@@ -8043,6 +8043,36 @@ impl Composer {
         }
     }
 
+    /// The shell's bubbling fallback handles the queue chord after a click
+    /// outside the editor. Focused inputs keep their own submit/completion keys.
+    pub(crate) fn handle_queue_shortcut(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let chord = gpui::Keystroke::parse(&platform_combo("mod-enter")).unwrap();
+        if event.keystroke.key != chord.key
+            || event.keystroke.modifiers != chord.modifiers
+            || !self.queue_shortcut_ready(cx)
+        {
+            return false;
+        }
+        self.activate_latest_queued(cx)
+    }
+
+    fn queue_shortcut_ready(&self, cx: &App) -> bool {
+        self.editing_queued.is_none()
+            && !self.queue_edit_finishing
+            && self.wizard.is_none()
+            && self.preview.is_none()
+            && !self.pickers.read(cx).is_open()
+            && !composer_has_content(
+                self.input.read(cx).text(),
+                self.staged().len() + self.staged_appshots().len(),
+                self.staged_comments(cx).len(),
+            )
+    }
+
     /// Cmd/Ctrl+Enter remains an ordinary submit while the composer carries
     /// content. With a truly empty composer it instead activates the most
     /// recently queued row, and never turns an empty chord into Stop.
@@ -8057,7 +8087,9 @@ impl Composer {
         );
         match modified_submit_target(has_content) {
             ModifiedSubmitTarget::SubmitContent => self.on_submit(cx),
-            ModifiedSubmitTarget::ActivateLatestQueued => self.activate_latest_queued(cx),
+            ModifiedSubmitTarget::ActivateLatestQueued => {
+                self.activate_latest_queued(cx);
+            }
         }
     }
 
@@ -9786,13 +9818,7 @@ impl Render for Composer {
         // somewhere else.
         let show_queue_latest_shortcut = !wizard_active
             && self.queue_shortcut_revealed
-            && self.editing_queued.is_none()
-            && !self.pickers.read(cx).is_open()
-            && !composer_has_content(
-                self.input.read(cx).text(),
-                self.staged().len() + self.staged_appshots().len(),
-                self.staged_comments(cx).len(),
-            );
+            && self.queue_shortcut_ready(cx);
         let container = container.when_some(
             self.render_queue_panel(show_queue_latest_shortcut, window, cx),
             |el, panel| {
@@ -10887,6 +10913,72 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
         (dir, window)
+    }
+
+    #[gpui::test]
+    fn queue_shortcut_click_and_remove_restore_composer_focus(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.selected_chat = Some("queue-chat".into());
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "queue-chat", "deviceId": "host", "archived": false,
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    ];
+                    state.devices =
+                        vec![serde_json::from_value(serde_json::json!({
+                    "id": "host", "name": "Host", "platform": "macos",
+                    "capabilities": [harness_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1]
+                })).unwrap()];
+                    state.queue = vec![
+                        harness_doc::QueuedMessage::new("older", "first", "host"),
+                        harness_doc::QueuedMessage::new("newer", "second", "host"),
+                    ];
+                });
+                cx.notify();
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        // Plain row clicks and Remove must both reclaim the caret, including
+        // after the input's mouse-down-out listener blurs it.
+        for selector in ["queue-newer-row", "queue-newer-drop"] {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            let position = if selector.ends_with("row") {
+                point(bounds.left() + px(50.0), bounds.center().y)
+            } else {
+                bounds.center()
+            };
+            cx.update(|window, _| window.blur());
+            cx.simulate_click(position, gpui::Modifiers::default());
+            handle
+                .update(&mut cx, |composer, window, cx| {
+                    assert!(composer.input.focus_handle(cx).is_focused(window));
+                })
+                .unwrap();
+        }
+        // While removal awaits acknowledgement, do not send that row or
+        // silently skip it. Once removed, the second latest becomes the target.
+        handle
+            .update(&mut cx, |composer, window, cx| {
+                composer.queue_removing.insert("newer".into());
+                assert!(!composer.activate_latest_queued(cx));
+                composer.state.update(cx, |state, _| {
+                    state.queue.retain(|item| item.id != "newer");
+                });
+                composer.queue_removing.remove("newer");
+                assert_eq!(composer.state.read(cx).queue.last().unwrap().id, "older");
+                assert!(composer.activate_latest_queued(cx));
+                assert!(composer.input.focus_handle(cx).is_focused(window));
+            })
+            .unwrap();
     }
 
     #[gpui::test]

@@ -9,8 +9,8 @@
 //! its position.
 
 use gpui::{
-    AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
+    AnyElement, Context, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _,
+    Render, SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
 };
 
 use harness_doc::{QueueDeliveryGate, QueuedMessage};
@@ -336,6 +336,15 @@ impl Composer {
         );
 
         let panel = queue_panel_surface(&theme)
+            // The input's mouse-down-out handler blurs before this bubbles.
+            // Reclaim the caret on a queue click; controls that stop bubbling
+            // restore it in their click handlers instead.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
             .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             // The complete glass surface is a drop target, including its
             // padding.
@@ -444,7 +453,10 @@ impl Composer {
             icons::TRASH_BIN_MINIMALISTIC,
             !being_removed,
             theme,
-            cx.listener(move |this, _, _, cx| {
+            cx.listener(move |this, _, window, cx| {
+                // Restore synchronously, not when the host replies: a delayed
+                // acknowledgement must not steal focus from another input.
+                window.focus(&this.input.focus_handle(cx), cx);
                 this.remove_queued(drop_id.clone(), cx);
             }),
         );
@@ -463,7 +475,8 @@ impl Composer {
                 resolved_primary.is_some() && !being_removed,
             ),
             theme,
-            cx.listener(move |this, _, _, cx| {
+            cx.listener(move |this, _, window, cx| {
+                window.focus(&this.input.focus_handle(cx), cx);
                 this.activate_queued_primary(primary_id.clone(), primary_action, cx);
             }),
         );
@@ -512,6 +525,7 @@ impl Composer {
 
         let row = div()
             .id(SharedString::from(format!("{key}-row")))
+            .debug_selector(|| format!("{key}-row"))
             .h(px(ROW_HEIGHT))
             .flex_none()
             .px(px(ROW_PAD_X))
@@ -955,6 +969,7 @@ impl Composer {
         let accent = theme.accent;
         div()
             .id(SharedString::from(format!("{key}-{slot}")))
+            .debug_selector(|| format!("{key}-{slot}"))
             .group(own.clone())
             .role(gpui::Role::Button)
             .aria_label(label)
@@ -1252,21 +1267,21 @@ impl Composer {
     /// Cmd/Ctrl+Enter on an empty composer activates the same action shown on
     /// the most recently queued row: Send now, interrupting the current response.
     /// An edit/review gate or an old chat host makes it a no-op.
-    pub(crate) fn activate_latest_queued(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn activate_latest_queued(&mut self, cx: &mut Context<Self>) -> bool {
         if self.editing_queued.is_some() {
-            return;
+            return false;
         }
         let (id, delivery_blocked, host_supports_actions) = {
             let state = self.state.read(cx);
             let Some(chat_id) = state.selected_chat.as_deref() else {
-                return;
+                return false;
             };
             let Some(item) = latest_queued_message(&state.queue) else {
-                return;
+                return false;
             };
             (
                 item.id.clone(),
-                item.delivery_gate.is_some(),
+                item.delivery_gate.is_some() || self.queue_removing.contains(&item.id),
                 state.chat_host_supports(
                     chat_id,
                     harness_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
@@ -1275,9 +1290,10 @@ impl Composer {
         };
         let Some(action) = available_queue_primary_action(delivery_blocked, host_supports_actions)
         else {
-            return;
+            return false;
         };
         self.activate_queued_primary(id, action, cx);
+        true
     }
 
     /// Borrow the composer while the leased row reserves its queue position.
@@ -1893,12 +1909,15 @@ mod tests {
 
     #[test]
     fn queue_shortcut_targets_the_most_recently_added_row() {
-        let items = vec![
+        let mut items = vec![
             harness_doc::QueuedMessage::new("older", "first", "device"),
             harness_doc::QueuedMessage::new("newer", "second", "device"),
         ];
         assert_eq!(latest_queued_message(&items).unwrap().id, "newer");
-        assert!(latest_queued_message(&[]).is_none());
+        items.pop();
+        assert_eq!(latest_queued_message(&items).unwrap().id, "older");
+        items.pop();
+        assert!(latest_queued_message(&items).is_none());
     }
 
     #[test]

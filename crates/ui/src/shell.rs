@@ -9307,6 +9307,28 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
+        // Queue hints are window-wide, so the empty-composer chord must also
+        // work after the send button or transcript has taken focus. Bubble only:
+        // focused editors, terminals and popovers get first refusal.
+        if matches!(self.route, Route::Chat)
+            && !self.overlay_owns_keyboard(cx)
+            && !self.sync_flow.has_visible_overlay()
+            && self.delete_confirm.is_none()
+            && self.delete_space_confirm.is_none()
+            && self.rename_dialog.is_none()
+            && self.rename_space_dialog.is_none()
+            && self.chat_menu.get().is_none()
+            && self.space_menu.get().is_none()
+            && self.user_menu.get().is_none()
+            && self.spaces_menu.get().is_none()
+            && self.right_plus.get().is_none()
+            && self
+                .composer
+                .update(cx, |composer, cx| composer.handle_queue_shortcut(event, cx))
+        {
+            cx.stop_propagation();
+            return;
+        }
         let selected_chat = self.state.read(cx).selected_chat.clone();
         let indicator = selected_chat
             .as_deref()
@@ -16531,6 +16553,159 @@ mod shortcut_focus_regressions {
                     el.child(div().track_focus(&self.editor))
                 })
         }
+    }
+
+    struct QueueShortcutHost {
+        shell: Entity<Shell>,
+        neutral: FocusHandle,
+        unhandled: usize,
+    }
+
+    impl Render for QueueShortcutHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .on_key_down(cx.listener(|this, _: &gpui::KeyDownEvent, _, _| {
+                    this.unhandled += 1;
+                }))
+                .child(
+                    div()
+                        .size_full()
+                        .track_focus(&self.neutral)
+                        .on_key_down(cx.listener(|this, event, window, cx| {
+                            this.shell
+                                .update(cx, |shell, cx| shell.on_key_down(event, window, cx));
+                        }))
+                        .child(self.shell.read(cx).composer.clone()),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn queue_shortcut_works_after_editor_loses_focus(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(UiSettings::default(), dir.path(), cx);
+            crate::composer::init(cx, ComposerSendBehavior::Enter);
+        });
+        let host = cx.add_window(|_, cx| {
+            let state =
+                cx.new(|_| {
+                    let mut state = AppState::new();
+                    state.selected_chat = Some("queued-chat".into());
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "queued-chat", "deviceId": "host", "archived": false,
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    ];
+                    state.devices =
+                        vec![serde_json::from_value(serde_json::json!({
+                    "id": "host", "name": "Host", "platform": "macos",
+                    "capabilities": [harness_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1]
+                })).unwrap()];
+                    state.queue = vec![
+                        harness_doc::QueuedMessage::new("older", "first", "host"),
+                        harness_doc::QueuedMessage::new("newer", "second", "host"),
+                    ];
+                    state
+                });
+            let shell = cx.new(|cx| {
+                Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        codegraff_client_id: None,
+                        default_harness: harness_proto::HarnessId::Mock,
+                    },
+                    cx,
+                )
+            });
+            QueueShortcutHost {
+                shell,
+                neutral: cx.focus_handle(),
+                unhandled: 0,
+            }
+        });
+        cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        let shell = host.read_with(cx, |host, _| host.shell.clone()).unwrap();
+        let composer = shell.read_with(cx, |shell, _| shell.composer.clone());
+        for focused_editor in [true, false, false, true] {
+            host.update(cx, |host, window, cx| {
+                let focus = if focused_editor {
+                    composer.focus_handle(cx)
+                } else {
+                    // The shell uses neutral focus after the editor's
+                    // mouse-down-out handler blurs it (e.g. clicking Send).
+                    window.blur();
+                    host.neutral.clone()
+                };
+                window.focus(&focus, cx);
+            })
+            .unwrap();
+            cx.simulate_keystrokes(host.into(), &platform_combo("mod-enter"));
+            host.read_with(cx, |host, _| assert_eq!(host.unhandled, 0))
+                .unwrap();
+        }
+        host.update(cx, |host, window, cx| window.focus(&host.neutral, cx))
+            .unwrap();
+        // A background shortcut must not send an unfinished draft.
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("draft", cx));
+        });
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-enter"));
+        host.read_with(cx, |host, _| assert_eq!(host.unhandled, 1))
+            .unwrap();
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.input.read(cx).text(), "draft")
+        });
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("", cx));
+        });
+        // Do not skip a gated newest row to interrupt with an older row.
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.queue.last_mut().unwrap().delivery_gate =
+                    Some(harness_doc::QueueDeliveryGate::ReviewRequired {
+                        previous_lease_id: "lease".into(),
+                        owner_device_id: "host".into(),
+                        since_ms: 0,
+                        base_text_hash: "hash".into(),
+                    });
+            })
+        });
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-enter"));
+        host.read_with(cx, |host, _| assert_eq!(host.unhandled, 2))
+            .unwrap();
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.queue.last_mut().unwrap().delivery_gate = None;
+                state.devices[0].capabilities.clear();
+            })
+        });
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-enter"));
+        host.read_with(cx, |host, _| assert_eq!(host.unhandled, 3))
+            .unwrap();
     }
 
     #[gpui::test]
