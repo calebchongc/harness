@@ -1260,6 +1260,8 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // A reconnect handshakes every server; a login waits on a browser page.
         methods::LIST_MCP_SERVERS => Duration::from_secs(70),
         methods::MCP_SERVER_ACTION => Duration::from_secs(6 * 60),
+        // A relayed sign-in finishes on the host after graff exchanges the code.
+        methods::COMPLETE_AGENT_LOGIN => Duration::from_secs(120),
         _ => Duration::from_secs(30),
     }
 }

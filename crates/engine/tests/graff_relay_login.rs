@@ -7,7 +7,6 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use harness_engine::{AgentAccounts, AgentAccountsConfig};
 use harness_proto::{AgentLoginMode, AgentLoginStatus};
@@ -21,7 +20,7 @@ fn fake_graff(dir: &Path) -> PathBuf {
     std::fs::write(
         &path,
         r#"#!/usr/bin/env python3
-import http.server, os, shutil, sys, urllib.parse
+import http.server, os, shutil, sys, time, urllib.parse
 if sys.argv[1:2] == ["--version"]:
     print("graff 0.0.302.18"); sys.exit(0)
 if sys.argv[1:3] != ["login", "chatgpt-new"]:
@@ -36,6 +35,9 @@ class Callback(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(url.query)
         outcome["ok"] = (url.path == "/auth/callback" and query.get("state") == ["st4te"]
                          and query.get("code") == ["good"] and query.get("client_id") == ["issued"])
+        # Like the real graff, answer only after exchanging the code, which
+        # can take a while on a slow server.
+        time.sleep(float(os.environ.get("FAKE_EXCHANGE_SECS", "0")))
         self.send_response(200); self.end_headers(); self.wfile.write(b"done")
     def log_message(self, *args):
         pass
@@ -67,6 +69,8 @@ async fn chatgpt_recovery_finishes_on_another_device() {
     let fake = fake_graff(root.path());
     // SAFETY: the only test in this binary, so nothing else reads env meanwhile.
     unsafe { std::env::set_var("GRAFF_EXECUTABLE", &fake) };
+    // Longer than the 15 s the host used to allow for the whole exchange.
+    unsafe { std::env::set_var("FAKE_EXCHANGE_SECS", "17") };
     let home = root.path().join("graff-home");
     std::fs::create_dir_all(&home).unwrap();
     let accounts = AgentAccounts::new(AgentAccountsConfig {
@@ -134,16 +138,7 @@ async fn chatgpt_recovery_finishes_on_another_device() {
         )
         .await
         .unwrap()
-        .expect("delivered to graff");
-    let mut status = AgentLoginStatus::Pending;
-    for _ in 0..100 {
-        status = accounts.poll_login(login).await.unwrap().status;
-        if status != AgentLoginStatus::Pending {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert_eq!(status, AgentLoginStatus::Done);
+        .expect("a slow exchange still finishes the sign-in");
     assert!(
         accounts
             .list_graff_logins()
