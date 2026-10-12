@@ -20,6 +20,12 @@ pub fn root() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".harness").join("tui"))
 }
 
+/// Whether releases carry a terminal client for this machine (Windows has
+/// none yet).
+pub fn supported() -> bool {
+    asset_stem("0.0.0").is_some()
+}
+
 /// The release asset's base name for this machine, without `.tar.gz`.
 fn asset_stem(version: &str) -> Option<String> {
     let os = match std::env::consts::OS {
