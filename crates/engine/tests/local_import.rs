@@ -466,3 +466,53 @@ async fn later_local_work_imports_as_a_delta() {
     assert_eq!(skipped_chats, 2);
     synced.shutdown().await;
 }
+
+/// #301: both profiles registered the same folder on this device under
+/// different project ids. The import must not add a second project; the
+/// local chats join the one the account already has.
+#[tokio::test]
+async fn a_folder_both_profiles_registered_imports_as_one_project() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (device, chat_doc, chat_bare) = seed_local(dir.path()).await;
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    synced
+        .workspace
+        .create_space(
+            "space-account",
+            &device,
+            "/tmp/proj",
+            Some("Project".into()),
+            false,
+        )
+        .expect("account project for the same folder");
+    synced
+        .workspace
+        .create_chat("chat-account", Some("space-account"), None, None, None)
+        .expect("account chat");
+
+    let status = synced
+        .local_import
+        .as_ref()
+        .expect("importer")
+        .status()
+        .expect("status");
+    assert_eq!(status.available_spaces, 0, "the folder is already a project");
+    assert_eq!(status.available_chats, 2);
+
+    let (imported_chats, imported_spaces, _, _) = summary(&run_import(&synced));
+    assert_eq!((imported_chats, imported_spaces), (2, 0));
+
+    let spaces = synced.workspace.read_spaces().expect("spaces");
+    let for_folder: Vec<_> = spaces
+        .iter()
+        .filter(|s| s.device_id == device && s.path == "/tmp/proj")
+        .collect();
+    assert_eq!(for_folder.len(), 1, "one project per folder: {for_folder:?}");
+    assert_eq!(for_folder[0].id, "space-account");
+    for id in [chat_doc.as_str(), chat_bare.as_str(), "chat-account"] {
+        let chat = synced.workspace.chat(id).expect("read").expect("chat");
+        assert_eq!(chat.space_id.as_deref(), Some("space-account"), "{id}");
+    }
+    synced.shutdown().await;
+}
