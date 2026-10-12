@@ -9,6 +9,9 @@
 use super::*;
 use crate::pickers::CanvasDraft;
 
+#[cfg(test)]
+mod sidebar_tests;
+
 /// A tab's layout while it isn't the active one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ChatTab {
@@ -411,6 +414,29 @@ impl Shell {
             self.focus_chat_pane(pane, window, cx);
         }
         true
+    }
+
+    /// Sidebar navigation preserves the current tab: reveal an open chat in
+    /// its tab/pane, or give a previously unopened chat its own new tab.
+    pub(super) fn open_chat_in_tab(&mut self, chat_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::Chat;
+        if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
+            self.focus_composer(cx);
+            cx.notify();
+            return;
+        }
+        if let Some(pane) = self.chat_split.as_ref().and_then(|split| {
+            split.panes.iter().enumerate().position(|(ix, id)| {
+                ix != split.focus && id.as_deref() == Some(chat_id.as_str())
+            })
+        }) {
+            self.focus_chat_pane(pane, window, cx);
+            return;
+        }
+        if !self.reveal_chat_in_tabs(&chat_id, window, cx) {
+            self.new_chat_tab(Some(chat_id), window, cx);
+        }
     }
 
     /// Tab titles, active tab from the live state: the focused chat's title.

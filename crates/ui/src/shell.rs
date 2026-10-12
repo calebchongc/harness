@@ -7310,8 +7310,8 @@ impl Shell {
                     })
                 })
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_chat(select_id.clone(), cx);
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_chat_in_tab(select_id.clone(), window, cx);
                 }))
                 .on_mouse_down(
                     MouseButton::Right,
