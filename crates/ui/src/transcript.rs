@@ -1082,8 +1082,9 @@ fn wrap_cols(line: &str, cols: usize) -> Vec<SharedString> {
 
 /// Build a chip's full-invocation block — the complete tool call the header
 /// truncates to one line: the whole command, pattern, or URL, todo items one
-/// per line, MCP/unknown input as pretty-printed JSON. Reuses the output
-/// code-block payload so rendering and height stay one implementation.
+/// per line, MCP/unknown input as pretty-printed JSON. Short invocations that
+/// only repeat the header have no block. Reuses the output code-block payload
+/// so rendering and height stay one implementation.
 pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
     let text: String = match call {
         ToolCall::Exec { command } => command.clone(),
@@ -1141,6 +1142,15 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
             None => name.clone(),
         },
     };
+    let (_, header_detail) = tool_chip_content(call);
+    let header_only = single_line(&text) == header_detail
+        || matches!(call, ToolCall::Unknown { input: None, .. });
+    if header_only
+        && text.trim().lines().count() <= 1
+        && text.trim().chars().count() <= CALL_WRAP_COLS
+    {
+        return None;
+    }
     let mut lines: Vec<SharedString> = text
         .lines()
         .flat_map(|l| wrap_cols(l, CALL_WRAP_COLS))
@@ -7989,8 +7999,8 @@ impl Transcript {
                 best.map(|(_, d)| d).or_else(|| tool.detail.clone())
             })
             .collect();
-        // Full-invocation blocks — with them, EVERY chip expands: the click
-        // always answers "what exactly was this call?", output or not.
+        // Invocation blocks expose content beyond the header, never just
+        // repeat it. Output and sidecar fetches can still expand on their own.
         let invocations: Vec<Option<Arc<ToolDetail>>> = tools
             .iter()
             .map(|tool| tool.invocation.clone().filter(|_| !is_link_chip(tool)))
@@ -8053,9 +8063,10 @@ impl Transcript {
         let detail_folds: Vec<FoldState> = details
             .iter()
             .zip(&invocations)
+            .zip(&affordances)
             .enumerate()
-            .map(|(ix, (detail, invocation))| {
-                if detail.is_none() && invocation.is_none() {
+            .map(|(ix, ((detail, invocation), affordance))| {
+                if detail.is_none() && invocation.is_none() && affordance.is_none() {
                     return FoldState::default();
                 }
                 self.tool_details
@@ -8067,16 +8078,18 @@ impl Transcript {
         let detail_opens: Vec<bool> = details
             .iter()
             .zip(&invocations)
+            .zip(&affordances)
             .zip(&detail_folds)
             .zip(tools.iter())
-            .map(|(((detail, invocation), fold), tool)| {
+            .map(|((((detail, invocation), affordance), fold), tool)| {
                 // A STREAMING thought chip defaults open (the live thinking
                 // is the point); settled chips default closed. A user toggle
                 // overrides either way — and compact mode overrides all of
                 // it: nothing inside the fold opens itself.
                 let default_open =
                     tool.kind == ToolItemKind::Thought && !tool.resolved && !self.compact_mode;
-                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(default_open)
+                (detail.is_some() || invocation.is_some() || affordance.is_some())
+                    && fold.open.unwrap_or(default_open)
             })
             .collect();
         let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
@@ -8356,7 +8369,8 @@ impl Transcript {
                 }
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
-                if detail.is_none() && invocation.is_none() {
+                let affordance = affordances[ix].clone();
+                if detail.is_none() && invocation.is_none() && affordance.is_none() {
                     return reveal_tool_row(
                         tool_chip(
                             tool,
@@ -8374,7 +8388,6 @@ impl Transcript {
                         reveal,
                     );
                 }
-                let affordance = affordances[ix].clone();
                 let open = detail_opens[ix];
                 let dfold = detail_folds[ix];
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
@@ -16615,6 +16628,39 @@ mod tests {
         assert_eq!(
             lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
             vec!["Agent: scan-a — done · → APPLE", "model: claude-haiku-4-5"]
+        );
+
+        // Header-only invocations stay plain, including unlinked agent cards.
+        for call in [
+            ToolCall::Unknown {
+                name: "Wait for agent 1".into(),
+                input: None,
+            },
+            ToolCall::Unknown {
+                name: "Agent: Inspect configuration".into(),
+                input: None,
+            },
+            ToolCall::Exec {
+                command: "cargo test".into(),
+            },
+            ToolCall::ReadFile {
+                path: "src/main.rs".into(),
+            },
+            ToolCall::Mcp {
+                server: "example".into(),
+                tool: "list_items".into(),
+                input: None,
+            },
+        ] {
+            assert!(call_block(&call).is_none(), "{call:?}");
+        }
+        // Real input remains accessible even when the tool name fits.
+        assert!(
+            call_block(&ToolCall::Unknown {
+                name: "Agent: Inspect configuration".into(),
+                input: Some(serde_json::json!({"prompt": "Inspect configuration storage"})),
+            })
+            .is_some()
         );
 
         // Blank invocation → no block; the chip stays a plain card.
