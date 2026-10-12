@@ -11606,6 +11606,45 @@ mod tests {
         }
     }
 
+    /// #302: the text-size keys work while typing, and type nothing.
+    #[gpui::test]
+    fn text_size_keys_work_in_the_composer_without_typing(cx: &mut gpui::TestAppContext) {
+        use crate::typography::{self, FontAvailability, UiFontFamily, UiFontSize};
+        let (_dir, handle) = composer_focus_window(cx);
+        cx.update(|cx| {
+            typography::init(
+                UiFontFamily::Geist,
+                UiFontSize::default(),
+                UiFontFamily::GeistMono,
+                13.0,
+                UiFontFamily::GeistMono,
+                13.0,
+                FontAvailability::all(),
+                cx,
+            );
+            crate::app_menus::bind_keys(cx);
+        });
+        handle
+            .update(cx, |composer, window, cx| {
+                let focus = composer.input.read(cx).focus_handle.clone();
+                window.focus(&focus, cx);
+            })
+            .unwrap();
+        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        let size = |cx: &mut gpui::TestAppContext| cx.update(|cx| typography::font_size(cx));
+        let start = size(cx);
+        cx.simulate_keystrokes(handle.into(), &format!("{primary}-="));
+        assert_eq!(size(cx), start.stepped(1));
+        cx.simulate_keystrokes(handle.into(), &format!("{primary}-- {primary}--"));
+        assert_eq!(size(cx), start.stepped(-1));
+        cx.simulate_keystrokes(handle.into(), &format!("{primary}-0"));
+        assert_eq!(size(cx), UiFontSize::default());
+        let draft = handle
+            .read_with(cx, |composer, cx| composer.input.read(cx).text().to_string())
+            .unwrap();
+        assert!(draft.is_empty(), "the shortcuts typed into the draft: {draft:?}");
+    }
+
     #[gpui::test]
     fn queued_image_edit_preserves_question_picks_and_original_draft(
         cx: &mut gpui::TestAppContext,

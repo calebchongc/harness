@@ -108,6 +108,16 @@ impl UiFontSize {
             .min_by_key(|candidate| candidate.0.abs_diff(self.0))
             .unwrap_or_default()
     }
+
+    /// The next supported size up (`step` > 0) or down, held at the ends.
+    pub fn stepped(self, step: i32) -> Self {
+        let at = Self::ALL
+            .iter()
+            .position(|size| *size == self.normalized())
+            .unwrap_or(0) as i32;
+        let last = Self::ALL.len() as i32 - 1;
+        Self::ALL[(at + step).clamp(0, last) as usize]
+    }
 }
 
 impl Default for UiFontSize {
@@ -730,6 +740,17 @@ pub fn set_font_size(size: UiFontSize, window: &mut Window, cx: &mut App) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_size_steps_through_the_supported_sizes_and_holds_at_the_ends() {
+        assert_eq!(UiFontSize(14).stepped(1), UiFontSize(15));
+        assert_eq!(UiFontSize(16).stepped(1), UiFontSize(18));
+        assert_eq!(UiFontSize(16).stepped(-1), UiFontSize(15));
+        assert_eq!(UiFontSize(20).stepped(1), UiFontSize(20));
+        assert_eq!(UiFontSize(12).stepped(-1), UiFontSize(12));
+        // An off-table size steps from its nearest supported one.
+        assert_eq!(UiFontSize(17).stepped(1), UiFontSize(18));
+    }
 
     #[test]
     fn wire_values_round_trip_and_unknown_falls_back() {
