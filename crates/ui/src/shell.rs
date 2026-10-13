@@ -530,6 +530,14 @@ pub fn apply_keymap(
             None,
         ),
         KeyBinding::new(
+            &valid_or_default(
+                &keymap.close_tab_without_archiving,
+                ShortcutId::CloseTabWithoutArchiving.default_combo(),
+            ),
+            crate::app_menus::CloseTabWithoutArchiving,
+            None,
+        ),
+        KeyBinding::new(
             &valid_or_default(&keymap.new_project, ShortcutId::NewProject.default_combo()),
             AddSpacePalette,
             None,

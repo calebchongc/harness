@@ -652,7 +652,8 @@ fn group(id: ShortcutId) -> &'static str {
         | ShortcutId::NewSession
         | ShortcutId::NextSession
         | ShortcutId::PrevSession
-        | ShortcutId::ArchiveSession => "Sessions",
+        | ShortcutId::ArchiveSession
+        | ShortcutId::CloseTabWithoutArchiving => "Sessions",
         ShortcutId::JumpSession(_) => "Jump to session",
     }
 }
@@ -684,6 +685,9 @@ fn description(id: ShortcutId) -> &'static str {
             "Switch to the previous tab when two or more are open; otherwise select the previous session in the sidebar."
         }
         ShortcutId::ArchiveSession => "Move the current session to the archived shelf.",
+        ShortcutId::CloseTabWithoutArchiving => {
+            "Close the focused pane or tab without archiving, regardless of the archive-on-close setting."
+        }
         // One line per slot would repeat itself nine times; the ordinal is
         // already in the row's label.
         ShortcutId::JumpSession(_) => "Open the session at this place in the sidebar list.",
