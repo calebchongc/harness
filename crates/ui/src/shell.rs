@@ -1977,6 +1977,9 @@ pub struct Shell {
     /// Version whose update strip the user dismissed (advisory installs only —
     /// a newer release shows the strip again).
     update_dismissed: Option<String>,
+    /// This device was signed out by a rejected refresh, not by the person
+    /// (the engine's `signed-out.notice`): offer to sign back in.
+    lost_session: bool,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: harness_update::InstallKind,
@@ -2441,6 +2444,7 @@ impl Shell {
             _graff_notice_task: graff_notice_task,
             graff_update_task: None,
             update_dismissed: None,
+            lost_session: false,
             install: harness_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
@@ -2563,6 +2567,12 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let lost_session = state.read(cx).workspace_scope == Some(WorkspaceScope::Local)
+            && harness_engine::lost_session_marker(&self.data_dir).exists();
+        if lost_session != self.lost_session {
+            self.lost_session = lost_session;
+            cx.notify();
+        }
         self.prune_file_explorers(cx);
         self.chat_split_on_state_changed(cx);
         self.maybe_auto_download_update(cx);
@@ -8088,6 +8098,9 @@ impl Shell {
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
+            .when_some(self.render_signed_out_strip(theme, cx), |el, strip| {
+                el.child(strip)
+            })
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
                 el.child(
@@ -8112,6 +8125,59 @@ impl Shell {
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
+    }
+
+    /// "You've been signed out" strip, above the user menu: shown in the local
+    /// workspace after a rejected refresh signed this device out, so the
+    /// account's chats don't look deleted. Click signs in; × dismisses.
+    fn render_signed_out_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.lost_session {
+            return None;
+        }
+        Some(
+            div()
+                .id("signed-out-strip")
+                .debug_selector(|| "signed-out-strip".into())
+                .mx(px(Theme::SPACE_SM))
+                .mt(px(4.0))
+                .px(px(Theme::SPACE_SM))
+                .py(px(6.0))
+                .rounded(px(Theme::CONTROL_RADIUS))
+                .bg(theme.accent_wash)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(crate::typography::ui_rems(11.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.accent)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.accent.opacity(0.16)))
+                .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child("You've been signed out. Sign back in to sync your sessions."),
+                )
+                .child(
+                    div()
+                        .id("signed-out-dismiss")
+                        .flex_none()
+                        .px(px(4.0))
+                        .text_color(theme.text_muted)
+                        .child("×")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            let _ = std::fs::remove_file(harness_engine::lost_session_marker(
+                                &this.data_dir,
+                            ));
+                            this.lost_session = false;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Update strip: shown above the user menu whenever the engine's

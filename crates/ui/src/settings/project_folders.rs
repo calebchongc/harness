@@ -713,27 +713,78 @@ impl ProjectFoldersSettings {
     }
 }
 
+/// The Settings row's one-line summary. A starting folder belongs to one
+/// device, and New Project reads the device it opens on, so every custom
+/// folder is named with its device ("Custom on Server · /srv/work"); with
+/// none, the shown device's automatic folder.
+fn summary(
+    prefs: &HashMap<String, ProjectFolderPreference>,
+    devices: &[Device],
+    local: Option<&str>,
+    display: Option<&str>,
+    spaces: &[Space],
+) -> String {
+    let name = |id: &str| {
+        if Some(id) == local {
+            "this computer".to_string()
+        } else {
+            devices
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "another device".into())
+        }
+    };
+    let mut custom: Vec<(bool, String, String)> = prefs
+        .iter()
+        .filter_map(|(id, pref)| {
+            let path = pref
+                .override_path
+                .as_deref()
+                .filter(|p| valid_starting_folder(p))?;
+            Some((
+                Some(id.as_str()) != local,
+                name(id),
+                path.trim().to_string(),
+            ))
+        })
+        .collect();
+    if custom.is_empty() {
+        let automatic = display.and_then(|id| {
+            prefs
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
+                .starting_folder(id, spaces)
+        });
+        return format!("Automatic · {}", automatic.as_deref().unwrap_or("Home"));
+    }
+    // This computer first, then other devices by name.
+    custom.sort();
+    custom
+        .into_iter()
+        .map(|(_, device, path)| format!("Custom on {device} · {path}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 impl Render for ProjectFoldersSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let device_id = self
-            .display_device
-            .clone()
-            .or_else(|| self.state.read(cx).local_device_id.clone());
-        let preferred = device_id
-            .as_deref()
-            .and_then(|id| starting_folder(id, &self.state.read(cx).spaces, cx));
-        let overridden = super::with_current(cx, |settings| {
-            device_id
-                .as_ref()
-                .and_then(|id| settings.project_folders_by_device.get(id))
-                .is_some_and(|pref| pref.override_path.is_some())
-        });
-        let description = format!(
-            "{} · {}",
-            if overridden { "Custom" } else { "Automatic" },
-            preferred.as_deref().unwrap_or("Home")
-        );
+        let description = {
+            let state = self.state.read(cx);
+            let local = state.local_device_id.clone();
+            let display = self.display_device.clone().or_else(|| local.clone());
+            super::with_current(cx, |settings| {
+                summary(
+                    &settings.project_folders_by_device,
+                    &state.devices,
+                    local.as_deref(),
+                    display.as_deref(),
+                    &state.spaces,
+                )
+            })
+        };
         widgets::card_row(&theme, false)
             .child(widgets::row_tile(&theme, icons::FOLDER))
             .child(
@@ -762,6 +813,49 @@ impl Render for ProjectFoldersSettings {
 }
 #[cfg(test)]
 mod tests {
+    use harness_proto::Device;
+
+    fn device(id: &str, name: &str) -> Device {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": name, "platform": "linux", "lastSeenAt": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_summary_names_the_device_each_custom_folder_belongs_to() {
+        let devices = [device("local", "Laptop"), device("srv", "Server")];
+        let mut prefs = HashMap::new();
+        assert_eq!(
+            super::summary(&prefs, &devices, Some("local"), Some("local"), &[]),
+            "Automatic · Home"
+        );
+        prefs.insert(
+            "srv".to_string(),
+            ProjectFolderPreference {
+                override_path: Some("/srv/work".into()),
+                ..Default::default()
+            },
+        );
+        // Saved for the server: still visible after a restart, when the row
+        // would otherwise show this computer's Automatic.
+        assert_eq!(
+            super::summary(&prefs, &devices, Some("local"), Some("local"), &[]),
+            "Custom on Server · /srv/work"
+        );
+        prefs.insert(
+            "local".to_string(),
+            ProjectFolderPreference {
+                override_path: Some("~/code".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            super::summary(&prefs, &devices, Some("local"), None, &[]),
+            "Custom on this computer · ~/code; Custom on Server · /srv/work"
+        );
+    }
+
     use super::*;
 
     #[test]
