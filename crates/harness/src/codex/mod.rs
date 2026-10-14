@@ -1182,6 +1182,9 @@ async fn run_session(session: Session) {
         .is_some();
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
+    // The current turn ended on a rejected sign-in and the card was sent; its
+    // Done then carries no error text (the card already says what to do).
+    let mut reauth_sent = false;
 
     'main: loop {
         tokio::select! {
@@ -1322,6 +1325,23 @@ async fn run_session(session: Session) {
                         {
                             break 'main;
                         }
+                        let mut reauth = std::mem::take(&mut reauth_sent);
+                        if !reauth
+                            && !interrupted
+                            && params.pointer("/turn/error").is_some_and(normalize::rejected_sign_in)
+                        {
+                            reauth = true;
+                            if !send(
+                                &event_tx,
+                                AgentEvent::ReauthRequired {
+                                    provider: harness_proto::ReauthProvider::Codex,
+                                },
+                            )
+                            .await
+                            {
+                                break 'main;
+                            }
+                        }
                         let error = turn_error_message(&params).or_else(|| {
                             (params
                                 .pointer("/turn/status")
@@ -1331,7 +1351,7 @@ async fn run_session(session: Session) {
                         });
                         let status = if interrupted {
                             DoneStatus::Interrupted
-                        } else if error.is_some() {
+                        } else if reauth || error.is_some() {
                             DoneStatus::Errored
                         } else {
                             DoneStatus::Completed
@@ -1342,7 +1362,7 @@ async fn run_session(session: Session) {
                             AgentEvent::Done {
                                 status,
                                 result: None,
-                                error,
+                                error: error.filter(|_| !reauth),
                                 session_id: Some(thread_id.clone()),
                             },
                         )
@@ -1397,10 +1417,10 @@ async fn run_session(session: Session) {
                                     DoneStatus::Errored
                                 },
                                 result: None,
-                                error: Some(
+                                error: (!std::mem::take(&mut reauth_sent)).then(|| {
                                     turn_error_message(&params)
-                                        .unwrap_or_else(|| "Codex turn failed".into()),
-                                ),
+                                        .unwrap_or_else(|| "Codex turn failed".into())
+                                }),
                                 session_id: Some(thread_id.clone()),
                             },
                         )
@@ -1410,6 +1430,7 @@ async fn run_session(session: Session) {
 
                     "turn/aborted" => {
                         router.note_completed(&turn_id(&params));
+                        reauth_sent = false;
                         done_current = true;
                         if interrupted {
                             done_after_interrupt = true;
@@ -1425,6 +1446,30 @@ async fn run_session(session: Session) {
                         )
                         .await;
                         break 'main;
+                    }
+
+                    "error" if params
+                        .get("error")
+                        .is_some_and(normalize::rejected_sign_in) =>
+                    {
+                        // Retrying a rejected sign-in cannot succeed, so its
+                        // "Reconnecting... n/5" rows are noise; the final one
+                        // becomes the sign-in card (device code on a remote
+                        // device) instead of a raw 401.
+                        let retrying = params.get("willRetry").and_then(Value::as_bool) == Some(true);
+                        if !retrying && !reauth_sent {
+                            reauth_sent = true;
+                            if !send(
+                                &event_tx,
+                                AgentEvent::ReauthRequired {
+                                    provider: harness_proto::ReauthProvider::Codex,
+                                },
+                            )
+                            .await
+                            {
+                                break 'main;
+                            }
+                        }
                     }
 
                     "error" => {

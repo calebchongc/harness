@@ -537,8 +537,18 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             let id = format!("e{}", out.len());
             out.push(MessagePart::Error {
                 id,
-                message: "ChatGPT sign-in expired or was rejected. Sign in again to continue."
-                    .into(),
+                message: match provider {
+                    // Codex has its own sign-in, separate from graff's ChatGPT
+                    // one, and on a fresh server it was never made at all.
+                    harness_proto::ReauthProvider::Codex => {
+                        "Codex isn't signed in to ChatGPT on the computer running this chat, \
+                         or its sign-in expired. Sign in to continue."
+                    }
+                    harness_proto::ReauthProvider::ChatgptNew => {
+                        "ChatGPT sign-in expired or was rejected. Sign in again to continue."
+                    }
+                }
+                .into(),
                 reauth: Some(*provider),
             });
         }
