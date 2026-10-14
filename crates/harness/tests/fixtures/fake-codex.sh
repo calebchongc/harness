@@ -380,6 +380,18 @@ case "$turnline" in
   emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"boom"}}}}'
   ;;
 
+*scenario:signed-out*)
+  # codex-cli 0.159.2 with an empty CODEX_HOME: retries, then the final 401.
+  m401='unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a4a4'
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  for n in 1 2 3 4 5; do
+    emit "{\"method\":\"error\",\"params\":{\"error\":{\"message\":\"Reconnecting... $n/5\",\"codexErrorInfo\":{\"responseStreamDisconnected\":{\"httpStatusCode\":401}},\"additionalDetails\":\"$m401\"},\"willRetry\":true,\"threadId\":\"th-1\",\"turnId\":\"t-1\"}}"
+  done
+  emit "{\"method\":\"error\",\"params\":{\"error\":{\"message\":\"$m401\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}},\"additionalDetails\":null},\"willRetry\":false,\"threadId\":\"th-1\",\"turnId\":\"t-1\"}}"
+  emit "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"th-1\",\"turn\":{\"id\":\"t-1\",\"status\":\"failed\",\"error\":{\"message\":\"$m401\",\"codexErrorInfo\":{\"httpConnectionFailed\":{\"httpStatusCode\":401}}}}}}"
+  ;;
+
 *scenario:resumed-child*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
   emit '{"method":"turn/started","params":{"threadId":"child-alpha","turn":{"id":"alpha-resumed"}}}'
