@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point, Role,
-    ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
-    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
-    prelude::*, px, quad, relative, size,
+    Focusable, GlobalElementId, KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels,
+    Point, Role, ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task,
+    TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill,
+    img, point, prelude::*, px, quad, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1510,7 +1510,11 @@ fn input_bindings(context: &'static str) -> Vec<KeyBinding> {
         KeyBinding::new("shift-tab", OutdentList, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
         KeyBinding::new("backspace", Backspace, ctx),
+        // Shift held while proofreading: gpui matches modifiers exactly, so
+        // the shifted variants need explicit bindings or nothing deletes.
+        KeyBinding::new("shift-backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
+        KeyBinding::new("shift-delete", Delete, ctx),
         KeyBinding::new("left", Left, ctx),
         KeyBinding::new("right", Right, ctx),
         KeyBinding::new("up", Up, ctx),
@@ -1586,50 +1590,23 @@ fn input_bindings(context: &'static str) -> Vec<KeyBinding> {
     bindings
 }
 
-/// Bind the composer keymap. Call once at app boot.
-pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
-    let mut generic_bindings = input_bindings(GENERIC_COMPOSER_CONTEXT);
-    generic_bindings.push(KeyBinding::new(
-        "enter",
-        Submit,
-        Some(GENERIC_COMPOSER_CONTEXT),
-    ));
-
-    let mut message_bindings = input_bindings(MESSAGE_COMPOSER_CONTEXT);
-    for binding in message_enter_bindings(send_behavior, &platform_combo("mod-enter")) {
-        match binding.action {
-            MessageEnterBindingAction::Submit => message_bindings.push(KeyBinding::new(
-                &binding.keystroke,
-                Submit,
-                Some(MESSAGE_COMPOSER_CONTEXT),
-            )),
-            MessageEnterBindingAction::ModifiedSubmit => message_bindings.push(KeyBinding::new(
-                &binding.keystroke,
-                ModifiedSubmit,
-                Some(MESSAGE_COMPOSER_CONTEXT),
-            )),
-            MessageEnterBindingAction::NewlineOrAccept => message_bindings.push(KeyBinding::new(
-                &binding.keystroke,
-                MessageNewlineOrAccept,
-                Some(MESSAGE_COMPOSER_CONTEXT),
-            )),
-        }
-    }
-
+/// Palette-search context: TEXT-EDITING keys only. gpui dispatches matched
+/// keybindings BEFORE raw key listeners (window.rs `dispatch_key_event`),
+/// so anything bound here can never reach a palette's `on_key_down` —
+/// navigation keys (up/down/left/right/enter) are deliberately unbound and
+/// bubble to the palette frame instead.
+fn palette_input_bindings() -> Vec<KeyBinding> {
     let word_edit_prefix = if cfg!(target_os = "macos") {
         "alt"
     } else {
         "ctrl"
     };
-    // Palette-search context: TEXT-EDITING keys only. gpui dispatches matched
-    // keybindings BEFORE raw key listeners (window.rs `dispatch_key_event`),
-    // so anything bound here can never reach a palette's `on_key_down` —
-    // navigation keys (up/down/left/right/enter) are deliberately unbound and
-    // bubble to the palette frame instead.
     let palette = Some(PALETTE_SEARCH_CONTEXT);
     let mut palette_bindings = vec![
         KeyBinding::new("backspace", Backspace, palette),
+        KeyBinding::new("shift-backspace", Backspace, palette),
         KeyBinding::new("delete", Delete, palette),
+        KeyBinding::new("shift-delete", Delete, palette),
         KeyBinding::new("home", Home, palette),
         KeyBinding::new("end", End, palette),
         KeyBinding::new("shift-left", SelectLeft, palette),
@@ -1680,7 +1657,40 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-z"), Undo, palette));
         palette_bindings.push(KeyBinding::new(&format!("shift-{prefix}-z"), Redo, palette));
     }
-    cx.bind_keys(palette_bindings);
+    palette_bindings
+}
+
+/// Bind the composer keymap. Call once at app boot.
+pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
+    let mut generic_bindings = input_bindings(GENERIC_COMPOSER_CONTEXT);
+    generic_bindings.push(KeyBinding::new(
+        "enter",
+        Submit,
+        Some(GENERIC_COMPOSER_CONTEXT),
+    ));
+
+    let mut message_bindings = input_bindings(MESSAGE_COMPOSER_CONTEXT);
+    for binding in message_enter_bindings(send_behavior, &platform_combo("mod-enter")) {
+        match binding.action {
+            MessageEnterBindingAction::Submit => message_bindings.push(KeyBinding::new(
+                &binding.keystroke,
+                Submit,
+                Some(MESSAGE_COMPOSER_CONTEXT),
+            )),
+            MessageEnterBindingAction::ModifiedSubmit => message_bindings.push(KeyBinding::new(
+                &binding.keystroke,
+                ModifiedSubmit,
+                Some(MESSAGE_COMPOSER_CONTEXT),
+            )),
+            MessageEnterBindingAction::NewlineOrAccept => message_bindings.push(KeyBinding::new(
+                &binding.keystroke,
+                MessageNewlineOrAccept,
+                Some(MESSAGE_COMPOSER_CONTEXT),
+            )),
+        }
+    }
+
+    cx.bind_keys(palette_input_bindings());
     cx.bind_keys(generic_bindings);
     cx.bind_keys(message_bindings);
 }
@@ -11775,6 +11785,41 @@ mod tests {
                     ]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn shifted_delete_keystrokes_map_to_backspace_and_delete_actions() {
+        fn bound_to(bindings: &[KeyBinding], keystroke: &str) -> Vec<KeyBinding> {
+            let typed = Keystroke::parse(keystroke).expect("keystroke parses");
+            bindings
+                .iter()
+                .filter(|binding| {
+                    matches!(
+                        binding.match_keystrokes(std::slice::from_ref(&typed)),
+                        Some(false)
+                    )
+                })
+                .cloned()
+                .collect()
+        }
+
+        for bindings in [
+            input_bindings(MESSAGE_COMPOSER_CONTEXT),
+            input_bindings(GENERIC_COMPOSER_CONTEXT),
+            palette_input_bindings(),
+        ] {
+            let hits = bound_to(&bindings, "shift-backspace");
+            assert_eq!(
+                hits.len(),
+                1,
+                "shift-backspace must match exactly one binding"
+            );
+            assert!(hits[0].action().partial_eq(&Backspace));
+
+            let hits = bound_to(&bindings, "shift-delete");
+            assert_eq!(hits.len(), 1, "shift-delete must match exactly one binding");
+            assert!(hits[0].action().partial_eq(&Delete));
         }
     }
 
