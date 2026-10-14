@@ -1152,6 +1152,26 @@ impl Auth {
         let status = res.status().as_u16();
         if (400..500).contains(&status) && !matches!(status, 408 | 429) && organization_id.is_none()
         {
+            // Timeouts/rate limits are retryable. Other 4xx responses mean a
+            // rejected refresh (revoked session, deleted user) — it can NEVER
+            // succeed again. Degrade to SignedOut so every downstream retry loop
+            // quiets down. (Org-switch refreshes are exempt: a 4xx there means
+            // "not a member", not a dead session.)
+            // Name the cause: the edge answers `{error}` (an invalid credential, CodeGraff's grant
+            // refusal, a workspace mismatch), which the status alone cannot tell apart.
+            let reason = res
+                .text()
+                .await
+                .ok()
+                .and_then(|body| {
+                    serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+                        .or_else(|| {
+                            (!body.trim().is_empty()).then(|| body.chars().take(300).collect())
+                        })
+                })
+                .unwrap_or_default();
             let mut sign_in = lock(&self.inner.sign_in);
             if sign_in.generation != generation
                 || lock(&self.inner.stored)
@@ -1160,14 +1180,10 @@ impl Auth {
             {
                 return Ok(None);
             }
-            // Timeouts/rate limits are retryable. Other 4xx responses mean a
-            // rejected refresh (revoked session,
-            // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
-            // there means "not a member", not a dead session.)
             tracing::warn!(
                 status,
-                "auth: refresh rejected — session revoked; signing out"
+                reason = %reason,
+                "auth: refresh rejected — signing out"
             );
             self.clear_session(&mut sign_in);
             self.set_lost_session(true);
