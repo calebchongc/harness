@@ -32,6 +32,7 @@ pub mod local_import;
 pub mod mcp_servers;
 mod model_catalogs;
 pub mod profile;
+pub mod agents_prepare;
 pub mod project_actions;
 pub mod registry;
 pub mod repos;
