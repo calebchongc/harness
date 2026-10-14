@@ -1131,6 +1131,8 @@ impl Repos {
             Some(repo_path),
         )
         .await?;
+        // `.agents/linked` + `.agents/prepare` before any agent starts in it.
+        crate::agents_prepare::prepare_worktree(repo_path, &path).await;
         let checkout = self.checkout_identity(&path).await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
