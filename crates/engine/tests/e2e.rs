@@ -3086,3 +3086,156 @@ async fn tool_progress_streams_live_and_never_reaches_the_doc() {
     assert!(!doc.contains("LIVE-LOG"), "live output leaked into the doc: {doc}");
     assert!(doc.contains("tool-1"), "the tool chip itself still folds");
 }
+
+/// A persistent harness that can end just its current turn
+/// (`Harness::interrupt_turn`), like the Claude CLI: its process (here, the
+/// run task) outlives the interrupted turn and takes the next prompt as a
+/// steer. Counts runs, i.e. agent processes.
+struct TurnInterruptHarness {
+    runs: Arc<std::sync::atomic::AtomicUsize>,
+    turn_interrupt: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Harness for TurnInterruptHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Turn interrupt"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    fn interrupt_turn(&self, _chat_id: &str) -> bool {
+        self.turn_interrupt.notify_one();
+        true
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        mut controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(8);
+        let turn_interrupt = self.turn_interrupt.clone();
+        let token = controls.interrupt.clone();
+        tokio::spawn(async move {
+            let text = format!("{} started", request.prompt);
+            if tx.send(Ok(AgentEvent::TextDelta { text })).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                _ = turn_interrupt.notified() => {}
+                _ = token.cancelled() => {
+                    let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+                    return;
+                }
+            }
+            if tx.send(Ok(done(DoneStatus::Interrupted))).await.is_err() {
+                return;
+            }
+            // The same "process" takes the next prompt.
+            while let Some(steer) = tokio::select! {
+                steer = controls.steering.recv() => steer,
+                _ = token.cancelled() => None,
+            } {
+                let events = [
+                    AgentEvent::Steered {
+                        assistant_message_id: None,
+                        next_assistant_message_id: None,
+                    },
+                    AgentEvent::TextDelta {
+                        text: format!("{} answered", steer.prompt),
+                    },
+                    done(DoneStatus::Completed),
+                ];
+                for event in events {
+                    if tx.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_ends_only_the_turn_when_the_harness_keeps_its_process() {
+    // #364: Stop used to end the whole run, killing the agent process and
+    // every background task in it.
+    const TURN_CHAT: &str = "chat-turn-interrupt";
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let core = assemble(
+        dir.path(),
+        Arc::new(TurnInterruptHarness {
+            runs: runs.clone(),
+            turn_interrupt: Arc::new(tokio::sync::Notify::new()),
+        }),
+    );
+    let handle = core.doc_host.open(TURN_CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-first",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "message-first".into(),
+        },
+    );
+    wait_for(
+        || {
+            core.sessions.session_status(TURN_CHAT).map(|s| s.status) == Some(SessionStatus::Working)
+                && entries_for(&core, TURN_CHAT)
+                    .iter()
+                    .any(|entry| entry.status == Some(MessageStatus::Streaming))
+        },
+        "the first turn to stream",
+    )
+    .await;
+
+    assert!(core.sessions.interrupt(TURN_CHAT).await.unwrap());
+    assert_eq!(
+        core.sessions.session_status(TURN_CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
+    assert!(
+        entries_for(&core, TURN_CHAT)
+            .iter()
+            .any(|entry| entry.status == Some(MessageStatus::Aborted)),
+        "the interrupted turn is stamped aborted"
+    );
+
+    // The parked run takes the next message through its mailbox: no new
+    // process, so background tasks would have survived.
+    core.sessions
+        .dispatch(TURN_CHAT, HarnessId::Mock, run_request("second"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            entries_for(&core, TURN_CHAT).iter().any(|entry| {
+                entry.status == Some(MessageStatus::Complete)
+                    && entry.parts.iter().any(|part| {
+                        matches!(part, MessagePart::Text { text, .. } if text.contains("second answered"))
+                    })
+            })
+        },
+        "the next turn to complete in the same run",
+    )
+    .await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1, "one agent process");
+}

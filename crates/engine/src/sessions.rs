@@ -124,6 +124,13 @@ struct RunHandle {
     /// Bounded explicit-intake lane: `show_image` requests join the run's
     /// sequential event pipeline instead of bypassing it.
     image_tx: mpsc::Sender<ShowImageRequest>,
+    /// The run's harness, for turn-only interrupts
+    /// ([`harness_adapters::Harness::interrupt_turn`]).
+    harness: Arc<dyn Harness>,
+    /// Set when the engine asked for a turn-only interrupt: the run task
+    /// parks on that turn's `Done{Interrupted}` instead of ending the run,
+    /// keeping the agent process and its background tasks (#364).
+    turn_interrupted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
@@ -153,6 +160,10 @@ struct PendingShowImage {
 
 /// The only message callers may see for an import/jail rejection: no paths,
 /// no filesystem internals.
+/// How long (in 10 ms ticks) a turn-only interrupt may take to park the run:
+/// the adapters' own interrupt and kill graces (2 s + 3 s) plus slack.
+const TURN_INTERRUPT_WAIT_TICKS: usize = 800;
+
 const SHOW_IMAGE_ATTACH_ERROR: &str = "show_image could not attach the file; use a supported raster image inside the active workspace (maximum 24 MiB)";
 
 struct Inner {
@@ -643,6 +654,8 @@ impl SessionsEngine {
                 pending_inputs,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 image_tx,
+                harness: harness.clone(),
+                turn_interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -777,6 +790,14 @@ impl SessionsEngine {
     /// [`Self::interrupt`], logging why. The agent only sees a bare cancel, so
     /// this line is what tells a user's Stop from a lifecycle teardown.
     pub async fn interrupt_for(&self, chat_id: &str, reason: &str) -> Result<bool, EngineError> {
+        // A user's Stop or send-now ends only the current turn where the
+        // harness can, keeping the agent process and its background tasks
+        // (subagents, monitors, background shells) for the next turn (#364).
+        // Lifecycle teardowns (shutdown, replacement, deleted space) still
+        // end the whole run below.
+        if matches!(reason, "stop" | "send now") && self.interrupt_turn(chat_id, reason).await {
+            return Ok(true);
+        }
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -814,6 +835,45 @@ impl SessionsEngine {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(true)
+    }
+
+    /// End only the running turn of `chat_id`'s steerable run, through the
+    /// harness's own turn interrupt, and wait (bounded) for the run to park
+    /// between turns. False when the harness can't, no turn is running, or
+    /// the turn didn't end in time; the caller then interrupts the whole run.
+    async fn interrupt_turn(&self, chat_id: &str, reason: &str) -> bool {
+        if !self.turn_in_flight(chat_id) {
+            return false;
+        }
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .filter(|h| h.steerable)
+            .map(|h| (h.run_id.clone(), h.harness.clone(), h.turn_interrupted.clone()));
+        let Some((run_id, harness, requested)) = target else {
+            return false;
+        };
+        requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        if !harness.interrupt_turn(chat_id) {
+            requested.store(false, std::sync::atomic::Ordering::SeqCst);
+            return false;
+        }
+        tracing::info!(
+            chat = %chat_id,
+            run = %run_id,
+            reason,
+            "interrupting turn (agent process kept)"
+        );
+        // The turn's Done parks the run. A harness that misses its own
+        // deadline tears the process down itself, which also ends the wait.
+        for _ in 0..TURN_INTERRUPT_WAIT_TICKS {
+            if !self.is_live(chat_id, &run_id) || !self.turn_in_flight(chat_id) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        requested.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!(chat = %chat_id, run = %run_id, "turn interrupt timed out; interrupting run");
+        false
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such
@@ -3176,10 +3236,23 @@ async fn drive_run(
                 && turn_was_active
                 && !pending_steer)
                 .then(|| entry_id.clone());
-            // PERSISTENT SESSION: a cleanly completed turn on a steerable
-            // harness PARKS instead of ending — child + mailbox stay warm for
-            // the next routed dispatch; per-turn state resets for it.
-            if *status == DoneStatus::Completed && steerable && !interrupted {
+            // A turn the engine interrupted on its own (Stop, send-now) ends
+            // like a completed one: the agent process and its background
+            // tasks stay for the next turn (#364).
+            let turn_interrupted = *status == DoneStatus::Interrupted
+                && !interrupted
+                && lock(&inner.runs)
+                    .get(&chat_id)
+                    .filter(|h| h.run_id == run_id)
+                    .is_some_and(|h| {
+                        h.turn_interrupted
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    });
+            // PERSISTENT SESSION: a cleanly completed (or turn-interrupted)
+            // turn on a steerable harness PARKS instead of ending — child +
+            // mailbox stay warm for the next routed dispatch; per-turn state
+            // resets for it.
+            if (*status == DoneStatus::Completed || turn_interrupted) && steerable && !interrupted {
                 folded.clear();
                 dirty = false;
                 entry_id = new_id();

@@ -436,6 +436,90 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
     ));
 }
 
+/// Events up to the next Done, interrupting the turn once the scenario's
+/// first turn is streaming.
+async fn next_done(
+    harness: &ClaudeHarness,
+    stream: &mut futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        let ev = ev.expect("stream event");
+        let done = matches!(ev, AgentEvent::Done { .. });
+        if matches!(&ev, AgentEvent::TextDelta { text } if text.starts_with("first")) {
+            assert!(harness.interrupt_turn("turn-chat"));
+        }
+        events.push(ev);
+        if done {
+            break;
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn turn_interrupt_ends_the_turn_and_keeps_the_process() {
+    // #364: an interrupt used to kill the CLI and every background task in it.
+    let harness = ClaudeHarness::new()
+        .with_executable(fixture_path())
+        .with_graces(Duration::from_millis(200), Duration::from_millis(500));
+    let (mut controls, steer, _token) = controls("A");
+    controls.origin = Some(harness_adapters::RunOrigin {
+        chat_id: "turn-chat".into(),
+    });
+    assert!(!harness.interrupt_turn("turn-chat"), "no run yet");
+    let mut stream = harness
+        .run(request("scenario:turn-interrupt"), controls)
+        .await
+        .expect("run starts");
+    let pid = |events: &[AgentEvent], marker: &str| {
+        events.iter().find_map(|e| match e {
+            AgentEvent::TextDelta { text } if text.starts_with(marker) => {
+                text.split("pid=").nth(1)?.split(' ').next().map(str::to_owned)
+            }
+            _ => None,
+        })
+    };
+    let first = tokio::time::timeout(Duration::from_secs(10), next_done(&harness, &mut stream))
+        .await
+        .expect("interrupted turn ends");
+    assert!(matches!(
+        first.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        })
+    ));
+    // Past the SIGTERM grace: the turn's Done called the fallback off.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    steer
+        .send(SteerMessage {
+            prompt: "second".into(),
+            message_id: None,
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(10), next_done(&harness, &mut stream))
+        .await
+        .expect("next turn ends");
+    assert!(matches!(
+        second.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+    let first_pid = pid(&first, "first").expect("first turn's pid");
+    assert_eq!(pid(&second, "again"), Some(first_pid), "same claude process");
+    // Closing the mailbox ends the run, and the chat is released.
+    drop(steer);
+    tokio::time::timeout(Duration::from_secs(10), async { while stream.next().await.is_some() {} })
+        .await
+        .expect("run ends");
+    assert!(!harness.interrupt_turn("turn-chat"));
+}
+
 #[tokio::test]
 async fn interrupt_escalates_to_sigterm_and_ends_with_interrupted_done() {
     let harness = ClaudeHarness::new()

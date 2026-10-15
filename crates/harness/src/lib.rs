@@ -120,6 +120,16 @@ pub trait Harness: Send + Sync {
     fn authoritative_prompt_end(&self) -> bool {
         self.deterministic_turn_end()
     }
+    /// Interrupt only the current turn of `chat_id`'s live run, keeping the
+    /// agent process and its background work (subagents, monitors, background
+    /// shells) alive for the next turn. The turn ends with
+    /// `Done { status: Interrupted }` and the run stays open. Returns false
+    /// when the harness can't do that or has no live turn for the chat; the
+    /// caller then cancels the whole run ([`RunControls::interrupt`]).
+    fn interrupt_turn(&self, chat_id: &str) -> bool {
+        let _ = chat_id;
+        false
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
         Ok(None)
