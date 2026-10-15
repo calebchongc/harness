@@ -321,6 +321,58 @@ impl Shell {
         true
     }
 
+    /// The ✕ on a tab row: close that tab whole, every pane it shows, and
+    /// archive its sessions under the same rules as ⌘W
+    /// ([`Self::archive_closed_session`]). The lit tab hands off to the last
+    /// visited survivor; a parked one just leaves the list.
+    pub(super) fn close_chat_tab_at(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let len = self.chat_tabs.len();
+        if len < 2 || ix >= len || !matches!(self.route, Route::Chat) {
+            return false;
+        }
+        let tab = if ix == self.chat_tab {
+            self.park_chat_tab(cx)
+        } else {
+            self.chat_tabs[ix].clone()
+        };
+        let mut closing: Vec<String> = Vec::new();
+        let panes = tab
+            .split
+            .iter()
+            .flat_map(|split| split.panes.iter().flatten());
+        for id in tab.selected.iter().chain(panes) {
+            if !closing.contains(id) {
+                closing.push(id.clone());
+            }
+        }
+        if ix == self.chat_tab {
+            self.close_chat_tab(window, cx);
+        } else {
+            tracing::info!(closed = ix, tabs = len, "closing parked chat tab");
+            tab_after_close(ix, len, &mut self.chat_tab_history);
+            self.chat_tabs.remove(ix);
+            if self.chat_tab > ix {
+                self.chat_tab -= 1;
+            }
+            if self.chat_tabs.len() == 1 {
+                self.chat_tabs.clear();
+                self.chat_tab = 0;
+                self.chat_tab_history.clear();
+            }
+            self.persist_chat_tabs(cx);
+            cx.notify();
+        }
+        for chat_id in closing {
+            self.archive_closed_session(chat_id, window, cx);
+        }
+        true
+    }
+
     /// Includes the live pane even while Settings is covering the chat outlet.
     fn chat_still_open(&self, chat_id: &str, cx: &App) -> bool {
         self.state.read(cx).selected_chat.as_deref() == Some(chat_id)
@@ -515,6 +567,7 @@ impl Shell {
                 .children(labels.into_iter().enumerate().flat_map(|(ix, title)| {
                     let lit = ix == active;
                     let key: SharedString = format!("chat-tab-{ix}").into();
+                    let group: SharedString = format!("chat-tab-row-{ix}").into();
                     let row = div()
                         .id(("chat-tab", ix))
                         .debug_selector(move || format!("chat-tab-{ix}"))
@@ -558,14 +611,63 @@ impl Shell {
                         .on_drop(cx.listener(move |this, drag: &ChatTabDrag, _, cx| {
                             this.move_chat_tab(drag.from, ix, cx)
                         }))
-                        .child(
+                        .group(group.clone())
+                        .child({
+                            let number = || {
+                                div()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .child(SharedString::from(format!("{}", ix + 1)))
+                            };
+                            // Leading slot: the tab's number, ✕ on row hover
+                            // (two stacked layers, as on the right panel's
+                            // tabs). A lone tab has nothing to close.
                             div()
+                                .id(("chat-tab-close", ix))
+                                .debug_selector(move || format!("chat-tab-close-{ix}"))
                                 .flex_none()
-                                .w(px(14.0))
-                                .text_size(crate::typography::ui_rems(11.0))
-                                .text_color(theme.text_muted.opacity(0.7))
-                                .child(SharedString::from(format!("{}", ix + 1))),
-                        )
+                                .size(px(16.0))
+                                .rounded(px(4.0))
+                                .relative()
+                                .when(!multiple, |slot| slot.flex().items_center().child(number()))
+                                .when(multiple, |slot| {
+                                    slot.hover(|s| s.bg(crate::theme::wash(0.12)))
+                                        // The row owns a drag payload: claim the
+                                        // press so it closes instead of dragging.
+                                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                                            window.prevent_default();
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.close_chat_tab_at(ix, window, cx);
+                                        }))
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .inset_0()
+                                                .flex()
+                                                .items_center()
+                                                .group_hover(group.clone(), |s| s.opacity(0.0))
+                                                .child(number()),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .inset_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .opacity(0.0)
+                                                .group_hover(group.clone(), |s| s.opacity(1.0))
+                                                .child(
+                                                    icon(icons::CLOSE)
+                                                        .size(px(12.0))
+                                                        .text_color(theme.text_muted),
+                                                ),
+                                        )
+                                })
+                        })
                         .child(div().flex_1().min_w_0().truncate().child(title))
                         .into_any_element();
                     // The strip owns its sidebar gutters. Cancel the tab list's
