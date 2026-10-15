@@ -86,7 +86,7 @@ impl Shell {
     /// these are the very keys the shortcuts table invites them to press) or
     /// underneath the add-space palette, stranding the overlay over a session
     /// they never picked.
-    pub(super) fn cycle_session(&mut self, forward: bool, cx: &mut Context<Self>) {
+    pub(super) fn cycle_session(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
             return;
         }
@@ -95,7 +95,7 @@ impl Shell {
         let order = self.sidebar_visible_order(cx);
         let selected = self.state.read(cx).selected_chat.clone();
         if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
-            self.open_chat(target, cx);
+            self.open_chat_in_tab(target, window, cx);
         }
     }
 
