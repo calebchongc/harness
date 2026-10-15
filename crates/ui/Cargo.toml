@@ -65,6 +65,10 @@ required-features = ["project-palette-fixture"]
 name = "sidebar-fixture"
 required-features = ["project-palette-fixture"]
 
+[[example]]
+name = "footer-fixture"
+required-features = ["appshots-fixture", "project-palette-fixture"]
+
 [dependencies]
 url = "2"
 harness-proto.workspace = true

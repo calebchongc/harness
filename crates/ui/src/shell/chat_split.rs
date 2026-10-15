@@ -514,6 +514,16 @@ impl Shell {
         self.close_focused_chat_pane_archiving(window, cx).0
     }
 
+    /// The alternate close shortcut uses the same view removal without
+    /// consulting or changing the archive-on-close preference.
+    pub(crate) fn close_focused_chat_pane_without_archiving(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.close_focused_chat_view(window, cx)
+    }
+
     /// [`Self::close_focused_chat_pane`], plus what it did to the session.
     pub(super) fn close_focused_chat_pane_archiving(
         &mut self,

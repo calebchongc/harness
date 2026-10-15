@@ -13,6 +13,8 @@ use crate::pickers::CanvasDraft;
 mod sidebar_tests;
 #[cfg(test)]
 mod header_tests;
+#[cfg(test)]
+mod shortcut_tests;
 
 /// A tab's layout while it isn't the active one.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -273,7 +275,7 @@ impl Shell {
         if self.chat_tabs.len() >= 2 && matches!(self.route, Route::Chat) && !self.overlay_owns_keyboard(cx) {
             self.cycle_chat_tab(forward, window, cx);
         } else {
-            self.cycle_session(forward, cx);
+            self.cycle_session(forward, window, cx);
         }
     }
 
@@ -913,6 +915,73 @@ mod tests {
         assert_eq!(tabs[1].selected, None, "a deleted chat reopens as a new session");
         assert!(restore_chat_tabs(&saved[..1], 0, live).is_none());
         assert!(restore_chat_tabs(&saved, 2, live).is_none());
+    }
+
+    #[gpui::test]
+    fn close_tab_without_archiving_bypasses_enabled_preference(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel(128);
+        let (_replies, inbound) = tokio::sync::mpsc::channel(128);
+        let engine =
+            crate::state::EngineHandle::from_test_client(harness_rpc::RpcClient::new(out, inbound));
+        let dir = tempfile::tempdir().unwrap();
+        init_archive_test(cx, dir.path());
+        let window = archive_test_window(cx, dir.path());
+        cx.update(|cx| settings::set_archive_sessions_on_close(true, cx));
+        window
+            .update(cx, |shell, window, cx| {
+                window.activate_window();
+                shell.route = Route::Chat;
+                shell.state.update(cx, |state, _| {
+                    state.chats = ["keep", "closing", "pane"].map(archive_test_chat).into();
+                    state.selected_chat = Some("pane".into());
+                    state.set_test_engine(engine);
+                });
+                shell.chat_tabs = vec![
+                    ChatTab {
+                        selected: Some("keep".into()),
+                        ..Default::default()
+                    },
+                    ChatTab {
+                        selected: Some("closing".into()),
+                        ..Default::default()
+                    },
+                ];
+                shell.chat_tab = 1;
+                shell.chat_split = chat_split::ChatSplit::split(
+                    None,
+                    SplitAxis::Horizontal,
+                    Some("closing".into()),
+                    Some("pane".into()),
+                );
+            })
+            .unwrap();
+        // Close the split pane, its tab, then the last chat to a canvas.
+        // Repeating the shortcut on that canvas must leave the window open.
+        for expected in [Some("closing"), Some("keep"), None, None] {
+            cx.update(|cx| cx.dispatch_action(&crate::app_menus::CloseTabWithoutArchiving));
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, cx| {
+                    assert_eq!(shell.state.read(cx).selected_chat.as_deref(), expected);
+                    assert!(shell.chat_split.is_none());
+                    assert!(shell.state.read(cx).chats.iter().all(|chat| !chat.archived));
+                    assert!(settings::archive_sessions_on_close(cx));
+                    assert!(shell.sidebar_notice.is_none());
+                })
+                .unwrap();
+            while let Ok(request) = requests.try_recv() {
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                assert_ne!(request["method"], methods::MUTATE, "unexpected archive: {request}");
+            }
+        }
+        window
+            .update(cx, |shell, _, _| assert!(shell.chat_tabs.is_empty()))
+            .unwrap();
     }
 
     #[gpui::test]

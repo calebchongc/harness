@@ -530,6 +530,14 @@ pub fn apply_keymap(
             None,
         ),
         KeyBinding::new(
+            &valid_or_default(
+                &keymap.close_tab_without_archiving,
+                ShortcutId::CloseTabWithoutArchiving.default_combo(),
+            ),
+            crate::app_menus::CloseTabWithoutArchiving,
+            None,
+        ),
+        KeyBinding::new(
             &valid_or_default(&keymap.new_project, ShortcutId::NewProject.default_combo()),
             AddSpacePalette,
             None,
@@ -5287,12 +5295,12 @@ impl Shell {
     /// a short list does nothing. Reads the DISPLAYED order — sort and
     /// grouping view options permute the list, and the chip on a row must
     /// name the key that opens it.
-    fn jump_to_session(&mut self, slot: usize, cx: &mut Context<Self>) {
+    fn jump_to_session(&mut self, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(chat_id) = self.sidebar_visible_order(cx).into_iter().nth(slot) else {
             return;
         };
-        // Same path a click on that row takes.
-        self.open_chat(chat_id, cx);
+        // Same tab-preserving path a click on that row takes.
+        self.open_chat_in_tab(chat_id, window, cx);
     }
 
     /// Whether an overlay that owns the keyboard is up — the add-space
@@ -12521,11 +12529,11 @@ impl Render for Shell {
             // it. The MODEL menu advertises these same slots on its rows and
             // this matched binding beats its key handler to the dispatch —
             // forward the slot instead of eating it.
-            .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
+            .on_action(cx.listener(|this, jump: &JumpSession, window, cx| {
                 let pickers = this.composer.read(cx).pickers().clone();
                 let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
                 if !handled && !this.overlay_owns_keyboard(cx) {
-                    this.jump_to_session(jump.0, cx)
+                    this.jump_to_session(jump.0, window, cx)
                 }
             }))
             .on_modifiers_changed(
