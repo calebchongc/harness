@@ -13,6 +13,8 @@ use crate::pickers::CanvasDraft;
 mod sidebar_tests;
 #[cfg(test)]
 mod header_tests;
+#[cfg(test)]
+mod shortcut_tests;
 
 /// A tab's layout while it isn't the active one.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -273,7 +275,7 @@ impl Shell {
         if self.chat_tabs.len() >= 2 && matches!(self.route, Route::Chat) && !self.overlay_owns_keyboard(cx) {
             self.cycle_chat_tab(forward, window, cx);
         } else {
-            self.cycle_session(forward, cx);
+            self.cycle_session(forward, window, cx);
         }
     }
 
