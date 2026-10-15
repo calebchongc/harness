@@ -81,19 +81,39 @@ pub(super) fn index_after_move(ix: usize, from: usize, to: usize) -> usize {
     }
 }
 
-/// Saved tabs back as parked tabs, dropping chats that no longer exist.
-/// `None` unless there are two or more and the active index fits.
+/// What [`restore_chat_tabs`] brings back.
+#[derive(Debug, PartialEq)]
+pub(super) struct RestoredTabs {
+    /// The parked tabs; empty when one tab is left, which lives in the
+    /// shell's live fields like any lone tab.
+    pub tabs: Vec<ChatTab>,
+    pub active: usize,
+    /// Set when the saved active tab had nothing to show and was dropped:
+    /// the tab to load as the live one, in place of the saved live chat and
+    /// layout (which belonged to the dropped tab).
+    pub replace_live: Option<ChatTab>,
+}
+
+/// Saved tabs back as parked tabs, dropping chats that no longer exist and
+/// tabs left with nothing to show: a new-session canvas saved as `{}`, or a
+/// tab whose chats are all gone (#342). Restoring those as phantom "New
+/// session" tabs is never what the user wants. If the active tab is dropped,
+/// the nearest kept tab before it (else the first) takes over. `None` when
+/// there is nothing to change: fewer than two saved tabs, an active index
+/// that doesn't fit, nothing kept, or only the active tab kept.
 pub(super) fn restore_chat_tabs(
     saved: &[crate::settings::SavedChatTab],
     active: usize,
     live: impl Fn(&str) -> bool,
-) -> Option<(Vec<ChatTab>, usize)> {
+) -> Option<RestoredTabs> {
     if saved.len() < 2 || active >= saved.len() {
         return None;
     }
-    let tabs = saved
-        .iter()
-        .map(|tab| ChatTab {
+    let mut tabs = Vec::new();
+    let mut kept_active = None;
+    let mut kept_before_active: usize = 0;
+    for (ix, tab) in saved.iter().enumerate() {
+        let tab = ChatTab {
             split: tab
                 .layout
                 .as_ref()
@@ -101,9 +121,45 @@ pub(super) fn restore_chat_tabs(
             selected: tab.selected.clone().filter(|id| live(id)),
             project: tab.project.clone(),
             draft: None,
-        })
-        .collect();
-    Some((tabs, active))
+        };
+        let empty = tab.selected.is_none()
+            && tab
+                .split
+                .as_ref()
+                .is_none_or(|split| split.panes.iter().all(Option::is_none));
+        if empty {
+            continue;
+        }
+        if ix == active {
+            kept_active = Some(tabs.len());
+        } else if ix < active {
+            kept_before_active += 1;
+        }
+        tabs.push(tab);
+    }
+    if tabs.is_empty() {
+        return None;
+    }
+    let (active, replace_live) = match kept_active {
+        Some(active) => (active, None),
+        None => {
+            let active = kept_before_active.saturating_sub(1);
+            (active, Some(tabs[active].clone()))
+        }
+    };
+    if tabs.len() == 1 {
+        // Only the active tab is left, or a single tab replaces it.
+        return replace_live.map(|tab| RestoredTabs {
+            tabs: Vec::new(),
+            active: 0,
+            replace_live: Some(tab),
+        });
+    }
+    Some(RestoredTabs {
+        tabs,
+        active,
+        replace_live,
+    })
 }
 
 /// A chat tab dragged within the tab list.
@@ -1009,14 +1065,64 @@ mod tests {
                 layout: None,
             },
         ];
-        let live = |id: &str| id == "live";
-        let (tabs, active) = restore_chat_tabs(&saved, 1, live).unwrap();
-        assert_eq!(active, 1);
-        assert_eq!(tabs[0].selected.as_deref(), Some("live"));
-        assert_eq!(tabs[0].project.as_deref(), Some("space"));
-        assert_eq!(tabs[1].selected, None, "a deleted chat reopens as a new session");
+        let live = |id: &str| id == "live" || id == "other";
+        // The tab whose chat is gone has nothing to show: it is dropped, and
+        // the one tab left takes over as the live one.
+        let restored = restore_chat_tabs(&saved, 1, live).unwrap();
+        assert!(restored.tabs.is_empty());
+        let tab = restored.replace_live.unwrap();
+        assert_eq!(tab.selected.as_deref(), Some("live"));
+        assert_eq!(tab.project.as_deref(), Some("space"));
+        // Only the active tab left: nothing to change.
+        assert!(restore_chat_tabs(&saved, 0, live).is_none());
         assert!(restore_chat_tabs(&saved[..1], 0, live).is_none());
         assert!(restore_chat_tabs(&saved, 2, live).is_none());
+    }
+
+    #[test]
+    fn saved_empty_tabs_do_not_come_back_as_phantom_new_sessions() {
+        use crate::settings::SavedChatTab;
+        let tab = |selected: Option<&str>| SavedChatTab {
+            selected: selected.map(Into::into),
+            project: None,
+            layout: None,
+        };
+        let live = |id: &str| ["a", "b", "c"].contains(&id);
+        // #342: Cmd+T pressed during a freeze saved `{}` tabs, and the active
+        // index pointed at one of them.
+        let saved = [
+            tab(Some("a")),
+            tab(None),
+            tab(Some("b")),
+            tab(None),
+            tab(Some("c")),
+        ];
+        let restored = restore_chat_tabs(&saved, 3, live).unwrap();
+        let selected: Vec<_> = restored
+            .tabs
+            .iter()
+            .map(|t| t.selected.as_deref())
+            .collect();
+        assert_eq!(selected, [Some("a"), Some("b"), Some("c")]);
+        // The dropped active tab hands over to the nearest kept tab before it.
+        assert_eq!(restored.active, 1);
+        assert_eq!(
+            restored.replace_live.unwrap().selected.as_deref(),
+            Some("b")
+        );
+        // A kept active tab keeps its place, reindexed past the dropped ones.
+        let restored = restore_chat_tabs(&saved, 4, live).unwrap();
+        assert_eq!((restored.active, restored.replace_live), (2, None));
+        // An empty first tab hands over to the first kept tab after it.
+        let saved = [tab(None), tab(Some("a")), tab(Some("b"))];
+        let restored = restore_chat_tabs(&saved, 0, live).unwrap();
+        assert_eq!(restored.active, 0);
+        assert_eq!(
+            restored.replace_live.unwrap().selected.as_deref(),
+            Some("a")
+        );
+        // Nothing left to show: nothing to restore.
+        assert!(restore_chat_tabs(&[tab(None), tab(Some("gone"))], 0, live).is_none());
     }
 
     #[gpui::test]
