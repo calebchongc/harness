@@ -1430,7 +1430,6 @@ async fn run_session(session: Session) {
 
                     "turn/aborted" => {
                         router.note_completed(&turn_id(&params));
-                        reauth_sent = false;
                         done_current = true;
                         if interrupted {
                             done_after_interrupt = true;

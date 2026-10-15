@@ -97,14 +97,24 @@ impl RuntimeConfig {
         }
     }
 
-    fn can_route(&self, harness_id: HarnessId, request: &RunRequest) -> bool {
-        request.attachments.is_empty() && self == &Self::from_request(harness_id, request)
+    /// `steers_attachments`: the harness delivers a steer's images to the
+    /// live run ([`Harness::steers_attachments`]); otherwise images replace it.
+    fn can_route(
+        &self,
+        harness_id: HarnessId,
+        request: &RunRequest,
+        steers_attachments: bool,
+    ) -> bool {
+        (steers_attachments || request.attachments.is_empty())
+            && self == &Self::from_request(harness_id, request)
     }
 }
 
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    /// The harness delivers a steer's image attachments to the live run.
+    steers_attachments: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
@@ -124,6 +134,13 @@ struct RunHandle {
     /// Bounded explicit-intake lane: `show_image` requests join the run's
     /// sequential event pipeline instead of bypassing it.
     image_tx: mpsc::Sender<ShowImageRequest>,
+    /// The run's harness, for turn-only interrupts
+    /// ([`harness_adapters::Harness::interrupt_turn`]).
+    harness: Arc<dyn Harness>,
+    /// Set when the engine asked for a turn-only interrupt: the run task
+    /// parks on that turn's `Done{Interrupted}` instead of ending the run,
+    /// keeping the agent process and its background tasks (#364).
+    turn_interrupted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
@@ -150,6 +167,10 @@ struct PendingShowImage {
     image: crate::uploads::ImportedImage,
     reply: oneshot::Sender<Result<crate::uploads::ImportedImage, EngineError>>,
 }
+
+/// How long (in 10 ms ticks) a turn-only interrupt may take to park the run:
+/// the adapters' own interrupt and kill graces (2 s + 3 s) plus slack.
+const TURN_INTERRUPT_WAIT_TICKS: usize = 800;
 
 /// The only message callers may see for an import/jail rejection: no paths,
 /// no filesystem internals.
@@ -353,9 +374,11 @@ impl SessionsEngine {
         if !self.turn_in_flight(chat_id) {
             return false;
         }
-        lock(&self.inner.runs)
-            .get(chat_id)
-            .is_some_and(|h| !(h.steerable && h.runtime_config.can_route(harness_id, request)))
+        lock(&self.inner.runs).get(chat_id).is_some_and(|h| {
+            !(h.steerable
+                && h.runtime_config
+                    .can_route(harness_id, request, h.steers_attachments))
+        })
     }
 
     /// Any run currently working or blocked on input — the auto-updater's
@@ -470,7 +493,8 @@ impl SessionsEngine {
             (
                 h.run_id.clone(),
                 h.steerable,
-                h.runtime_config.can_route(harness_id, &request),
+                h.runtime_config
+                    .can_route(harness_id, &request, h.steers_attachments),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
             )
@@ -635,6 +659,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                steers_attachments: harness.steers_attachments(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 interrupt_token,
@@ -643,6 +668,8 @@ impl SessionsEngine {
                 pending_inputs,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 image_tx,
+                harness: harness.clone(),
+                turn_interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -777,6 +804,14 @@ impl SessionsEngine {
     /// [`Self::interrupt`], logging why. The agent only sees a bare cancel, so
     /// this line is what tells a user's Stop from a lifecycle teardown.
     pub async fn interrupt_for(&self, chat_id: &str, reason: &str) -> Result<bool, EngineError> {
+        // A user's Stop or send-now ends only the current turn where the
+        // harness can, keeping the agent process and its background tasks
+        // (subagents, monitors, background shells) for the next turn (#364).
+        // Lifecycle teardowns (shutdown, replacement, deleted space) still
+        // end the whole run below.
+        if matches!(reason, "stop" | "send now") && self.interrupt_turn(chat_id, reason).await {
+            return Ok(true);
+        }
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -814,6 +849,51 @@ impl SessionsEngine {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(true)
+    }
+
+    /// End only the running turn of `chat_id`'s steerable run, through the
+    /// harness's own turn interrupt, and wait (bounded) for the run to park
+    /// between turns. False when the harness can't, no turn is running, or
+    /// the turn didn't end in time; the caller then interrupts the whole run.
+    async fn interrupt_turn(&self, chat_id: &str, reason: &str) -> bool {
+        if !self.turn_in_flight(chat_id) {
+            return false;
+        }
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .filter(|h| h.steerable)
+            .map(|h| {
+                (
+                    h.run_id.clone(),
+                    h.harness.clone(),
+                    h.turn_interrupted.clone(),
+                )
+            });
+        let Some((run_id, harness, requested)) = target else {
+            return false;
+        };
+        requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        if !harness.interrupt_turn(chat_id) {
+            requested.store(false, std::sync::atomic::Ordering::SeqCst);
+            return false;
+        }
+        tracing::info!(
+            chat = %chat_id,
+            run = %run_id,
+            reason,
+            "interrupting turn (agent process kept)"
+        );
+        // The turn's Done parks the run. A harness that misses its own
+        // deadline tears the process down itself, which also ends the wait.
+        for _ in 0..TURN_INTERRUPT_WAIT_TICKS {
+            if !self.is_live(chat_id, &run_id) || !self.turn_in_flight(chat_id) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        requested.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!(chat = %chat_id, run = %run_id, "turn interrupt timed out; interrupting run");
+        false
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such
@@ -3176,10 +3256,23 @@ async fn drive_run(
                 && turn_was_active
                 && !pending_steer)
                 .then(|| entry_id.clone());
-            // PERSISTENT SESSION: a cleanly completed turn on a steerable
-            // harness PARKS instead of ending — child + mailbox stay warm for
-            // the next routed dispatch; per-turn state resets for it.
-            if *status == DoneStatus::Completed && steerable && !interrupted {
+            // A turn the engine interrupted on its own (Stop, send-now) ends
+            // like a completed one: the agent process and its background
+            // tasks stay for the next turn (#364).
+            let turn_interrupted = *status == DoneStatus::Interrupted
+                && !interrupted
+                && lock(&inner.runs)
+                    .get(&chat_id)
+                    .filter(|h| h.run_id == run_id)
+                    .is_some_and(|h| {
+                        h.turn_interrupted
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    });
+            // PERSISTENT SESSION: a cleanly completed (or turn-interrupted)
+            // turn on a steerable harness PARKS instead of ending — child +
+            // mailbox stay warm for the next routed dispatch; per-turn state
+            // resets for it.
+            if (*status == DoneStatus::Completed || turn_interrupted) && steerable && !interrupted {
                 folded.clear();
                 dirty = false;
                 entry_id = new_id();
@@ -3605,18 +3698,20 @@ mod tests {
         let mut follow_up = initial.clone();
         follow_up.prompt = "second".into();
         follow_up.resume = Some("session-1".into());
-        assert!(config.can_route(HarnessId::Grok, &follow_up));
+        assert!(config.can_route(HarnessId::Grok, &follow_up, false));
 
         follow_up.model = Some("grok-4.5".into());
-        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        assert!(!config.can_route(HarnessId::Grok, &follow_up, false));
         follow_up.model = initial.model.clone();
 
         follow_up.reasoning = Some(harness_proto::ReasoningLevel::Medium);
-        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        assert!(!config.can_route(HarnessId::Grok, &follow_up, false));
         follow_up.reasoning = initial.reasoning;
 
         follow_up.attachments.push("/tmp/image.png".into());
-        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        assert!(!config.can_route(HarnessId::Grok, &follow_up, false));
+        // A harness whose steers carry images takes the send live.
+        assert!(config.can_route(HarnessId::Grok, &follow_up, true));
     }
 
     #[test]
