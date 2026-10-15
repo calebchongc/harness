@@ -113,6 +113,18 @@ case "$first" in
   esac
   ;;
 
+*scenario:steer-image*)
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer-image"}'
+  # The steer line must carry the attached image as a base64 block.
+  read -r steer || exit 1
+  seen=no
+  case "$steer" in *'"type":"image"'*)
+    case "$steer" in *'"media_type":"image/png"'*) seen=yes ;; esac ;;
+  esac
+  emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"steer-image:$seen\"}}}"
+  emit '{"type":"result","subtype":"success","result":"steered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-steer-image"}'
+  ;;
+
 *scenario:steer*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer"}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'

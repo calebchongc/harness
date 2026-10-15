@@ -97,14 +97,24 @@ impl RuntimeConfig {
         }
     }
 
-    fn can_route(&self, harness_id: HarnessId, request: &RunRequest) -> bool {
-        request.attachments.is_empty() && self == &Self::from_request(harness_id, request)
+    /// `steers_attachments`: the harness delivers a steer's images to the
+    /// live run ([`Harness::steers_attachments`]); otherwise images replace it.
+    fn can_route(
+        &self,
+        harness_id: HarnessId,
+        request: &RunRequest,
+        steers_attachments: bool,
+    ) -> bool {
+        (steers_attachments || request.attachments.is_empty())
+            && self == &Self::from_request(harness_id, request)
     }
 }
 
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    /// The harness delivers a steer's image attachments to the live run.
+    steers_attachments: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
@@ -366,7 +376,11 @@ impl SessionsEngine {
         }
         lock(&self.inner.runs)
             .get(chat_id)
-            .is_some_and(|h| !(h.steerable && h.runtime_config.can_route(harness_id, request)))
+            .is_some_and(|h| {
+                !(h.steerable
+                    && h.runtime_config
+                        .can_route(harness_id, request, h.steers_attachments))
+            })
     }
 
     /// Any run currently working or blocked on input — the auto-updater's
@@ -481,7 +495,8 @@ impl SessionsEngine {
             (
                 h.run_id.clone(),
                 h.steerable,
-                h.runtime_config.can_route(harness_id, &request),
+                h.runtime_config
+                    .can_route(harness_id, &request, h.steers_attachments),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
             )
@@ -646,6 +661,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                steers_attachments: harness.steers_attachments(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 interrupt_token,
@@ -3678,18 +3694,20 @@ mod tests {
         let mut follow_up = initial.clone();
         follow_up.prompt = "second".into();
         follow_up.resume = Some("session-1".into());
-        assert!(config.can_route(HarnessId::Grok, &follow_up));
+        assert!(config.can_route(HarnessId::Grok, &follow_up, false));
 
         follow_up.model = Some("grok-4.5".into());
-        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        assert!(!config.can_route(HarnessId::Grok, &follow_up, false));
         follow_up.model = initial.model.clone();
 
         follow_up.reasoning = Some(harness_proto::ReasoningLevel::Medium);
-        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        assert!(!config.can_route(HarnessId::Grok, &follow_up, false));
         follow_up.reasoning = initial.reasoning;
 
         follow_up.attachments.push("/tmp/image.png".into());
-        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        assert!(!config.can_route(HarnessId::Grok, &follow_up, false));
+        // A harness whose steers carry images takes the send live.
+        assert!(config.can_route(HarnessId::Grok, &follow_up, true));
     }
 
     #[test]

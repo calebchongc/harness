@@ -384,6 +384,11 @@ impl Harness for ClaudeHarness {
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
     }
+    /// Steers inline their images (stream-json user frames take image
+    /// blocks), so an image send reaches the live process (#364).
+    fn steers_attachments(&self) -> bool {
+        true
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[
             ReasoningLevel::Low,
@@ -877,7 +882,13 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
+                    // Images ride the steer like the first prompt's: the live
+                    // process takes them, so an image send never replaces it.
+                    let images = load_image_blocks(&msg.attachments).await;
+                    let line = wire::user_message_line_with_images(
+                        &apply_ultrathink(reasoning, &msg.prompt),
+                        &images,
+                    );
                     let _ = stdin_tx.send(StdinMsg::Line(line));
                     turn_active = true;
                     // The CLI consumes the queued line at its own step

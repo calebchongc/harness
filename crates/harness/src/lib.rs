@@ -99,6 +99,12 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
     fn steering_mode(&self) -> SteeringMode;
+    /// Whether steers deliver [`SteerMessage::attachments`] to the live run.
+    /// When true, the engine routes a send with images into a steerable run
+    /// instead of replacing it (and its process).
+    fn steers_attachments(&self) -> bool {
+        false
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     /// Whether the agent's own CLI is present on this device — the settings
     /// gate for enabling the harness. Version probes are cached by executable identity.

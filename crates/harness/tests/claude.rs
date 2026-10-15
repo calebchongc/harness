@@ -520,6 +520,33 @@ async fn turn_interrupt_ends_the_turn_and_keeps_the_process() {
     assert!(!harness.interrupt_turn("turn-chat"));
 }
 
+/// An image send reaches the live process as a steer (#364): replacing the
+/// run for it would drop the background tasks running inside the CLI.
+#[tokio::test]
+async fn steer_inlines_its_image_attachments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let image = dir.path().join("shot.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\nfake").expect("write image");
+    let (controls, steer, _token) = controls("A");
+    steer
+        .send(SteerMessage {
+            prompt: "what is this?".into(),
+            message_id: None,
+            attachments: vec![image.display().to_string()],
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:steer-image"), controls).await;
+
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "steer-image:yes".into()
+        }),
+        "the steer line carried no image block: {events:?}"
+    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Steered { .. })));
+}
+
 #[tokio::test]
 async fn interrupt_escalates_to_sigterm_and_ends_with_interrupted_done() {
     let harness = ClaudeHarness::new()
