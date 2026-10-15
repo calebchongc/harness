@@ -474,9 +474,12 @@ async fn turn_interrupt_ends_the_turn_and_keeps_the_process() {
         .expect("run starts");
     let pid = |events: &[AgentEvent], marker: &str| {
         events.iter().find_map(|e| match e {
-            AgentEvent::TextDelta { text } if text.starts_with(marker) => {
-                text.split("pid=").nth(1)?.split(' ').next().map(str::to_owned)
-            }
+            AgentEvent::TextDelta { text } if text.starts_with(marker) => text
+                .split("pid=")
+                .nth(1)?
+                .split(' ')
+                .next()
+                .map(str::to_owned),
             _ => None,
         })
     };
@@ -511,12 +514,18 @@ async fn turn_interrupt_ends_the_turn_and_keeps_the_process() {
         })
     ));
     let first_pid = pid(&first, "first").expect("first turn's pid");
-    assert_eq!(pid(&second, "again"), Some(first_pid), "same claude process");
+    assert_eq!(
+        pid(&second, "again"),
+        Some(first_pid),
+        "same claude process"
+    );
     // Closing the mailbox ends the run, and the chat is released.
     drop(steer);
-    tokio::time::timeout(Duration::from_secs(10), async { while stream.next().await.is_some() {} })
-        .await
-        .expect("run ends");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while stream.next().await.is_some() {}
+    })
+    .await
+    .expect("run ends");
     assert!(!harness.interrupt_turn("turn-chat"));
 }
 
@@ -544,7 +553,11 @@ async fn steer_inlines_its_image_attachments() {
         }),
         "the steer line carried no image block: {events:?}"
     );
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::Steered { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. }))
+    );
 }
 
 #[tokio::test]

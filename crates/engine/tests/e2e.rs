@@ -3198,7 +3198,8 @@ async fn stop_ends_only_the_turn_when_the_harness_keeps_its_process() {
     );
     wait_for(
         || {
-            core.sessions.session_status(TURN_CHAT).map(|s| s.status) == Some(SessionStatus::Working)
+            core.sessions.session_status(TURN_CHAT).map(|s| s.status)
+                == Some(SessionStatus::Working)
                 && entries_for(&core, TURN_CHAT)
                     .iter()
                     .any(|entry| entry.status == Some(MessageStatus::Streaming))
@@ -3237,5 +3238,9 @@ async fn stop_ends_only_the_turn_when_the_harness_keeps_its_process() {
         "the next turn to complete in the same run",
     )
     .await;
-    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1, "one agent process");
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one agent process"
+    );
 }

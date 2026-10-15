@@ -168,12 +168,12 @@ struct PendingShowImage {
     reply: oneshot::Sender<Result<crate::uploads::ImportedImage, EngineError>>,
 }
 
-/// The only message callers may see for an import/jail rejection: no paths,
-/// no filesystem internals.
 /// How long (in 10 ms ticks) a turn-only interrupt may take to park the run:
 /// the adapters' own interrupt and kill graces (2 s + 3 s) plus slack.
 const TURN_INTERRUPT_WAIT_TICKS: usize = 800;
 
+/// The only message callers may see for an import/jail rejection: no paths,
+/// no filesystem internals.
 const SHOW_IMAGE_ATTACH_ERROR: &str = "show_image could not attach the file; use a supported raster image inside the active workspace (maximum 24 MiB)";
 
 struct Inner {
@@ -374,13 +374,11 @@ impl SessionsEngine {
         if !self.turn_in_flight(chat_id) {
             return false;
         }
-        lock(&self.inner.runs)
-            .get(chat_id)
-            .is_some_and(|h| {
-                !(h.steerable
-                    && h.runtime_config
-                        .can_route(harness_id, request, h.steers_attachments))
-            })
+        lock(&self.inner.runs).get(chat_id).is_some_and(|h| {
+            !(h.steerable
+                && h.runtime_config
+                    .can_route(harness_id, request, h.steers_attachments))
+        })
     }
 
     /// Any run currently working or blocked on input — the auto-updater's
@@ -864,7 +862,13 @@ impl SessionsEngine {
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
-            .map(|h| (h.run_id.clone(), h.harness.clone(), h.turn_interrupted.clone()));
+            .map(|h| {
+                (
+                    h.run_id.clone(),
+                    h.harness.clone(),
+                    h.turn_interrupted.clone(),
+                )
+            });
         let Some((run_id, harness, requested)) = target else {
             return false;
         };
