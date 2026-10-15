@@ -5172,9 +5172,9 @@ impl AppState {
     }
 }
 
-#[cfg(feature = "project-palette-fixture")]
+#[cfg(any(test, feature = "project-palette-fixture"))]
 impl AppState {
-    /// Seed provider metadata for the isolated native sidebar review fixture.
+    /// Seed provider metadata for isolated UI fixtures.
     pub fn fixture_sidebar_change_request(
         &mut self,
         snapshot: harness_proto::CheckoutChangeRequestStatus,
