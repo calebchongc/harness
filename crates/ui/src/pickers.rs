@@ -1312,7 +1312,7 @@ impl Pickers {
         true
     }
 
-    /// Pick the `slot`th model row (⌘N numbering skips section headers).
+    /// Pick the `slot`th model row (Mod+N numbering skips section headers).
     fn activate_model_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
         if let Some(ix) = model_slot_row(&self.model_rows(cx), slot) {
             self.activate_model_index(ix, cx);
@@ -2990,10 +2990,13 @@ impl Pickers {
             cx.stop_propagation();
             return;
         }
-        // ⌘1…⌘9 jump-picks the Nth visible model row (t3 modelPickerKeys;
-        // the chips on the rows advertise these).
+        // Mod+1…9 (⌘ on macOS, Ctrl elsewhere) jump-picks the Nth visible
+        // model row (t3 modelPickerKeys; the chips on the rows advertise
+        // these). The shell's jump-to-session binding normally wins and
+        // forwards the slot (`jump_model_slot`); this catches the default
+        // keys once that binding is rebound.
         if self.open_kind() == Some(PickerKind::HarnessModel)
-            && event.keystroke.modifiers.platform
+            && event.keystroke.modifiers.secondary()
             && let Ok(n) = event.keystroke.key.parse::<usize>()
             && (1..=9).contains(&n)
         {
@@ -4760,7 +4763,10 @@ impl Pickers {
             }))
             .child(body);
         if slot < 9 {
-            el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", slot + 1)));
+            el = el.child(popover::kbd_hint(
+                &theme,
+                &model_slot_hint(cfg!(target_os = "macos"), slot),
+            ));
         }
         el = el.child(
             div()
@@ -6022,6 +6028,14 @@ impl Render for Pickers {
     }
 }
 
+/// The chip on the model picker's `slot`th row: that slot's default
+/// jump-to-session keys, which pick the row while the menu is open ("⌘1" on
+/// macOS, "Ctrl+1" elsewhere, where ⌘ would mean the Windows key). Pure.
+fn model_slot_hint(mac: bool, slot: usize) -> String {
+    let combo = crate::settings::ShortcutId::JumpSession(slot).default_combo_on(mac);
+    crate::settings::badge_combo_on(mac, combo)
+}
+
 #[cfg(test)]
 impl Pickers {
     /// Select a harness and model by id, as a chat's picks would.
@@ -6045,6 +6059,14 @@ impl Pickers {
 mod tests {
     use super::*;
     use harness_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn model_slot_hints_name_each_platforms_keys() {
+        assert_eq!(model_slot_hint(true, 0), "⌘1");
+        assert_eq!(model_slot_hint(true, 8), "⌘9");
+        assert_eq!(model_slot_hint(false, 0), "Ctrl+1");
+        assert_eq!(model_slot_hint(false, 8), "Ctrl+9");
+    }
 
     struct ModelShortcutHost {
         focus_sub: Option<gpui::Subscription>,
