@@ -881,7 +881,7 @@ fn antigravity_spec() -> AcpAgentSpec {
         extra_paths: Vec::new,
         cli_executable: "agy_acp_server",
         cli_extra_paths: Vec::new,
-        install_hint: "Install Antigravity to enable, or set ANTIGRAVITY_ACP_EXECUTABLE to its ACP server",
+        install_hint: "Antigravity's ACP server is not installed (the agy CLI does not include it): install it from Settings, or set ANTIGRAVITY_ACP_EXECUTABLE to it",
         models: || {
             use ReasoningLevel::{High, Low, Medium};
             vec![
