@@ -331,13 +331,13 @@ enum PerfTransport {
     }
 }
 
-/// Performance batches require an explicit choice in Settings.
+/// Anonymous performance sharing is on by default and can be disabled in Settings.
 enum PerfSharing {
-    // Expanded resource diagnostics require a fresh explicit choice, not consent to the older timing-only report.
+    // Keep the existing preference so updates never overwrite an explicit opt-out.
     static let key = "share-performance-consent-v2"
 
     /// Pinned in `apps/parity/vectors/perf-stats.json`.
-    static let defaultEnabled = false
+    static let defaultEnabled = true
 
     /// Legacy stats endpoint, pinned in `apps/parity/vectors/perf-stats.json`. Not the active iOS destination.
     static let endpoint: String? = "https://otel.codegraff.com/v1/harness/stats"
@@ -346,31 +346,39 @@ enum PerfSharing {
     static let otlpEndpoint: String? = "https://otel.codegraff.com/v1/metrics"
 
     static var available: Bool { otlpEndpoint != nil }
-    /// `bool(forKey:)` reads an unset key as false, which would make "never chosen" mean off.
-    static var enabled: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? defaultEnabled }
+    static var enabled: Bool { isEnabled(in: .standard) }
+
+    /// Prefer the latest explicit choice, including opt-outs from earlier timing-only releases.
+    static func isEnabled(in defaults: UserDefaults) -> Bool {
+        for preference in [key, "share-performance-consent-v1", "share-performance"] {
+            if let chosen = defaults.object(forKey: preference) as? Bool { return chosen }
+        }
+        return defaultEnabled
+    }
 
     private static let installId = UUID().uuidString.lowercased()
     private static let uploader = PerfUploader(endpoint: otlpEndpoint, enabled: { collectingEnabled }, source: Perf.shared.histograms,
                                                body: { PerfOTLPBatch(meta: $0, window: $1).body() },
                                                post: { await PerfTransport.post($0, $1) })
 
-    private static let isDebugBuild: Bool = {
-        #if DEBUG
+    // Simulator and test runs must never send synthetic samples to the production collector.
+    private static let isDevelopmentBuild: Bool = {
+        #if DEBUG || targetEnvironment(simulator)
         true
         #else
         false
         #endif
     }()
 
-    static var collectingEnabled: Bool { available && enabled && !isDebugBuild }
+    static var collectingEnabled: Bool { available && enabled && !isDevelopmentBuild }
 
     @MainActor
     static func consentChanged() {
         PerfResourceRuntime.shared.consentChanged()
     }
 
-    /// Called periodically in the foreground and when the app goes to the background. Batches require consent,
-    /// a release build, and a phone that is neither hot nor in Low Power Mode; the post runs at utility priority
+    /// Called periodically in the foreground and when the app goes to the background. Batches require sharing on,
+    /// a physical-device release build, and a phone that is neither hot nor in Low Power Mode; the post runs at utility priority
     /// off the main thread and refuses mobile data. Samples that could not go now stay for the next attempt; samples
     /// recorded while sharing is off are dropped and never sent later.
     @MainActor

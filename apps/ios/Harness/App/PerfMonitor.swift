@@ -1,7 +1,7 @@
 // Local performance monitor (PerfMonitor.kt on Android). It answers "what is slow" without leaving the
 // device: operation timings against budgets, how long the main thread stays busy per turn, main-thread
 // stalls, startup, memory and thermal state. Settings > Performance shows it and can copy a report.
-// Expanded anonymous diagnostics upload only with explicit consent. Operations also appear in Instruments.
+// Anonymous diagnostics sharing is on by default and can be turned off in Settings. Operations also appear in Instruments.
 
 import Foundation
 import os

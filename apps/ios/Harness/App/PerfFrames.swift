@@ -93,7 +93,7 @@ final class PerfFrames: NSObject {
         stop()
         #else
         // Bail out before inspecting the view hierarchy when sharing is off or the transcript is idle.
-        guard PerfSharing.enabled else { stop(); return }
+        guard PerfSharing.collectingEnabled else { stop(); return }
         let scrolling = scrollView.map { $0.isDragging || $0.isDecelerating } ?? false
         guard scrolling || streaming else { stop(); return }
         let next = PerfFrameActivity.select(

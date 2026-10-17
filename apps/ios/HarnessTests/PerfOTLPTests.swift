@@ -254,18 +254,23 @@ final class PerfOTLPTests: XCTestCase {
         XCTAssertEqual(source.pendingSamples, 0, "a failed read must reset the baseline before recovery")
     }
 
-    func testExpandedDiagnosticsRequireNewConsentInsteadOfTimingOnlyConsent() {
-        let defaults = UserDefaults.standard
+    func testEarlierOptOutsSurviveUntilTheUserMakesANewerChoice() throws {
+        let suite = "PerfOTLPTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
         let oldKey = "share-performance-consent-v1"
-        let savedOld = defaults.object(forKey: oldKey), savedNew = defaults.object(forKey: PerfSharing.key)
-        defer {
-            if let savedOld { defaults.set(savedOld, forKey: oldKey) } else { defaults.removeObject(forKey: oldKey) }
-            if let savedNew { defaults.set(savedNew, forKey: PerfSharing.key) } else { defaults.removeObject(forKey: PerfSharing.key) }
-        }
+        let originalKey = "share-performance"
+        defaults.set(false, forKey: originalKey)
+        XCTAssertFalse(PerfSharing.isEnabled(in: defaults))
         defaults.set(true, forKey: oldKey)
-        defaults.removeObject(forKey: PerfSharing.key)
+        XCTAssertTrue(PerfSharing.isEnabled(in: defaults), "a newer explicit choice wins")
+        defaults.set(false, forKey: oldKey)
+        XCTAssertFalse(PerfSharing.isEnabled(in: defaults))
+        defaults.set(true, forKey: PerfSharing.key)
+        XCTAssertTrue(PerfSharing.isEnabled(in: defaults), "the current toggle overrides legacy choices")
+        defaults.set(false, forKey: PerfSharing.key)
+        XCTAssertFalse(PerfSharing.isEnabled(in: defaults))
         XCTAssertEqual(PerfSharing.key, "share-performance-consent-v2")
-        XCTAssertFalse(PerfSharing.enabled)
         XCTAssertEqual(PerfSharing.otlpEndpoint, "https://otel.codegraff.com/v1/metrics")
     }
 }
