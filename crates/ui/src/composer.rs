@@ -9354,6 +9354,9 @@ impl Composer {
             .w_full()
             .min_w_0()
             .whitespace_normal()
+            // The question body scrolls first; a wheel past its ends, or over the
+            // answer and buttons, must not scroll the transcript behind the panel.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .track_focus(&self.wizard_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)
@@ -10913,6 +10916,17 @@ mod tests {
     fn composer_focus_window(
         cx: &mut gpui::TestAppContext,
     ) -> (tempfile::TempDir, gpui::WindowHandle<Composer>) {
+        let dir = composer_test_init(cx);
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Composer::new(state, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        (dir, window)
+    }
+
+    fn composer_test_init(cx: &mut gpui::TestAppContext) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
@@ -10927,13 +10941,108 @@ mod tests {
             );
             crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
         });
-        let window = cx.add_window(|_, cx| {
+        dir
+    }
+
+    /// A scrolling transcript with the composer floating over its bottom edge.
+    struct QuestionOverTranscript {
+        composer: Entity<Composer>,
+        transcript: gpui::ScrollHandle,
+    }
+
+    impl Render for QuestionOverTranscript {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .relative()
+                .child(
+                    div()
+                        .id("transcript")
+                        .absolute()
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.transcript)
+                        .child(div().h(px(5000.0))),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(self.composer.clone()),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn wheel_over_agent_question_never_scrolls_the_transcript(cx: &mut gpui::TestAppContext) {
+        let _dir = composer_test_init(cx);
+        let handle = cx.add_window(|_, cx| {
             let state = cx.new(|_| AppState::new());
-            Composer::new(state, cx)
+            QuestionOverTranscript {
+                composer: cx.new(|cx| Composer::new(state, cx)),
+                transcript: gpui::ScrollHandle::new(),
+            }
         });
-        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+        let mut visual = gpui::VisualTestContext::from_window(handle.into(), cx);
+        handle
+            .update(cx, |host, window, cx| {
+                window.resize(size(px(420.0), px(700.0)));
+                host.composer.update(cx, |composer, cx| {
+                    composer.set_available_width(420.0, cx);
+                    composer.set_available_height(700.0, cx);
+                    let mut q = question("scroll", &["An option"; 12], false);
+                    q.question = "A question long enough that its body has to scroll. ".repeat(12);
+                    composer.wizard = Some(Wizard::new("scroll".into(), vec![q]));
+                    cx.notify();
+                });
+            })
             .unwrap();
-        (dir, window)
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let (body_scroll, transcript) = handle
+            .read_with(cx, |host, cx| {
+                (
+                    host.composer.read(cx).wizard_scroll.clone(),
+                    host.transcript.clone(),
+                )
+            })
+            .unwrap();
+        assert!(
+            body_scroll.max_offset().y > px(0.0),
+            "the question body must scroll"
+        );
+        let body = visual.debug_bounds("question-body").unwrap();
+        let submit = visual.debug_bounds("wizard-submit").unwrap();
+        // Past the end of the body (twice), back past its top, then over the footer.
+        for (at, dy) in [
+            (body.center(), -10_000.0),
+            (body.center(), -10_000.0),
+            (body.center(), 10_000.0),
+            (body.center(), 10_000.0),
+            (submit.center(), -500.0),
+        ] {
+            visual.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(dy))),
+                touch_phase: gpui::TouchPhase::Moved,
+                modifiers: Default::default(),
+            });
+            visual.update(|window, cx| window.draw(cx).clear());
+            assert_eq!(
+                transcript.offset().y,
+                px(0.0),
+                "the transcript behind the question moved"
+            );
+        }
+        assert_eq!(
+            body_scroll.offset().y,
+            px(0.0),
+            "the body still scrolls back to its top"
+        );
     }
 
     #[gpui::test]
