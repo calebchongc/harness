@@ -116,6 +116,7 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
                 }
             }
             MessagePart::Image { name, .. } => tools.push(format!("image: {name}")),
+            MessagePart::Visual { title, .. } => tools.push(format!("visual: {title}")),
             MessagePart::Reasoning { text, .. } => {
                 if options.include_reasoning && !text.trim().is_empty() {
                     reasoning_parts.push(text.as_str());
@@ -236,6 +237,29 @@ mod tests {
             continuation_of: None,
             duration_ms: None,
         }
+    }
+
+    #[test]
+    fn visual_transcript_contains_only_short_summary_not_source() {
+        let rendered = render_entries(
+            &[entry(
+                "a",
+                MessageRole::Assistant,
+                vec![MessagePart::Visual {
+                    id: "v".into(),
+                    title: "Overview".into(),
+                    script: "private native source".into(),
+                }],
+            )],
+            RenderOptions::default(),
+        );
+        assert!(rendered[0].text.is_empty());
+        assert_eq!(rendered[0].tools, vec!["visual: Overview"]);
+        assert!(
+            !serde_json::to_string(&rendered)
+                .unwrap()
+                .contains("private native source")
+        );
     }
 
     #[test]

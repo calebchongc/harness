@@ -1899,6 +1899,34 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({}))
             }
+            methods::SHOW_VISUAL => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct P {
+                    chat_id: String,
+                    id: String,
+                    title: String,
+                    script: String,
+                }
+                let p: P = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::BadParams("chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::BadParams("chat belongs to another device".into()));
+                }
+                self.sessions
+                    .show_visual(&p.chat_id, &p.id, &p.title, &p.script)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "attached": true,
+                    "id": format!("show-visual:{}", p.id),
+                    "title": p.title,
+                }))
+            }
             methods::SHOW_IMAGE => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -3876,6 +3904,7 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::SHOW_VISUAL));
         assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));

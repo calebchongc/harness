@@ -95,6 +95,9 @@ pub mod methods {
     /// method is deliberately NOT in the forwarding allowlist. Params
     /// `{ chatId, id, path, caption? }` → `{ attached, id, name, mimeType }`.
     pub const SHOW_IMAGE: &str = "ShowImage";
+    /// Publish bounded inline native visual data into a local live run.
+    /// Local-owner only, never forwarded. `{ chatId, id, title, script }`.
+    pub const SHOW_VISUAL: &str = "ShowVisual";
     /// Steer this row into the live turn without interrupting it.
     /// `{ chatId, id }` → `{ sent }`.
     pub const STEER_QUEUED_MESSAGE_NOW: &str = "SteerQueuedMessageNow";

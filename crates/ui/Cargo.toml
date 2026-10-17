@@ -54,6 +54,10 @@ name = "readme-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "visuals-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "onboarding-fixture"
 required-features = ["appshots-fixture"]
 
@@ -80,6 +84,7 @@ harness-rpc.workspace = true
 harness-update.workspace = true
 harness-syntax.workspace = true
 harness-theme.workspace = true
+harness-visual.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
