@@ -26,6 +26,6 @@
     "main.stall": "main_stall_ms"
   },
   "iosStrings": {
-    "shareFootnote": "Off until you choose to share. Sends how long things took, grouped into ranges, your device model, refresh rate and the app and OS versions, under a random id that changes on every launch. No chat content, account or persistent device identifiers. Reports are retained for 90 days. You can turn this off at any time."
+    "shareFootnote": "Off by default. If you choose to share, sends diagnostic ranges for operation timings, CPU use, memory footprint, disk writes and scroll/stream callback delays. Callback delays are responsiveness proxies, not actual GPU hitches. Includes your device model, refresh rate and app and OS versions, with a random id that changes each launch. No chat content, account or persistent device identifiers. Diagnostics are retained for 90 days. Turn sharing off at any time."
   }
 }

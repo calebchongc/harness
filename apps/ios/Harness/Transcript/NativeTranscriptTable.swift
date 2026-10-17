@@ -120,6 +120,7 @@ final class TranscriptViewport: UIView {
 @MainActor
 final class TranscriptTableView: UITableView, UITableViewDataSource, UITableViewDelegate {
     private let follow: ScrollState
+    private lazy var perfFrames = PerfFrames(scrollView: self)
     private var rows: [TranscriptRow] = []
     private var hiddenRows = 0
     private var topGrowScheduled = false
@@ -174,6 +175,11 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
         let tap = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
         tap.cancelsTouchesInView = false
         addGestureRecognizer(tap)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        perfFrames.didMoveToWindow()
     }
 
     var followsBottom: Bool { follow.pinned && !userOwnsScroll }
@@ -264,6 +270,10 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
         bottomSpacing = input.bottomSpacing
         let anchor = visibleAnchor()
         rows = input.rows
+        perfFrames.setStreaming(rows.contains {
+            if case .markdown(_, streaming: true) = $0.kind { return true }
+            return false
+        })
         guard window != nil, bounds.width > 0 else {
             reloadData()
             setNeedsLayout()
@@ -567,6 +577,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        perfFrames.refresh()
         cancelFollowAnimation()
         follow.interactionEpoch &+= 1
         follow.userScrolling = true
@@ -574,6 +585,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        perfFrames.refresh()
         let geometry = TranscriptGeometry(contentHeight: contentSize.height, viewportHeight: viewportHeight,
             offset: contentOffset.y + contentInset.top, bottom: contentSize.height - contentOffset.y - bounds.height)
         follow.observe(old: lastGeometry, new: geometry)
@@ -640,10 +652,14 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        perfFrames.refresh()
         if !decelerate { finishGesture() }
     }
 
-    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) { finishGesture() }
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        perfFrames.refresh()
+        finishGesture()
+    }
 
     private func finishGesture() {
         follow.endGesture()

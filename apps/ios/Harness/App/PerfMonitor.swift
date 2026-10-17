@@ -1,7 +1,7 @@
 // Local performance monitor (PerfMonitor.kt on Android). It answers "what is slow" without leaving the
 // device: operation timings against budgets, how long the main thread stays busy per turn, main-thread
-// stalls, startup, memory and thermal state. Nothing is uploaded; Settings > Performance shows it and can
-// copy a report. Operations also appear as signpost intervals in Instruments.
+// stalls, startup, memory and thermal state. Settings > Performance shows it and can copy a report.
+// Expanded anonymous diagnostics upload only with explicit consent. Operations also appear in Instruments.
 
 import Foundation
 import os
@@ -264,6 +264,9 @@ final class Perf: @unchecked Sendable {
         }
         observer = obs
         CFRunLoopAddObserver(CFRunLoopGetMain(), obs, .commonModes)
+        // startWatching is called on main but is deliberately not actor-isolated (the run-loop callbacks also use
+        // this monitor). Hop explicitly before touching the lifecycle-owned resource sampler.
+        DispatchQueue.main.async { PerfResourceRuntime.shared.start() }
 
         // iOS freezes the process wherever it is, which can be in the middle of a turn: the turn "ends" when
         // the app next runs, minutes later, and would be counted as one enormous stall. So turns are not

@@ -1,6 +1,6 @@
 // Settings > Performance (PerformanceScreen.kt on Android). Shows what the on-device monitor has seen this
 // run: startup, main-thread turns, each measured operation against its budget, memory and thermal state.
-// Nothing leaves the device; "Copy report" puts numbers on the clipboard so they can be pasted into an issue.
+// Optional diagnostic sharing is off by default. "Copy report" copies local numbers for an issue.
 
 import SwiftUI
 
@@ -62,7 +62,7 @@ struct PerformanceView: View {
                         Toggle("Share anonymous performance data", isOn: $share)
                             .accessibilityIdentifier("settings-share-performance")
                     } footer: {
-                        Text("Off until you choose to share. Sends how long things took, grouped into ranges, your device model, refresh rate and the app and OS versions, under a random id that changes on every launch. No chat content, account or persistent device identifiers. Reports are retained for 90 days. You can turn this off at any time.")
+                        Text("Off by default. If you choose to share, sends diagnostic ranges for operation timings, CPU use, memory footprint, disk writes and scroll/stream callback delays. Callback delays are responsiveness proxies, not actual GPU hitches. Includes your device model, refresh rate and app and OS versions, with a random id that changes each launch. No chat content, account or persistent device identifiers. Diagnostics are retained for 90 days. Turn sharing off at any time.")
                     }
                     .harnessListRow()
                 }
@@ -80,6 +80,7 @@ struct PerformanceView: View {
             }
             .harnessGroupedList()
         }
+        .onChange(of: share) { _, _ in PerfSharing.consentChanged() }
         .navigationTitle("Performance")
         .navigationBarTitleDisplayMode(.inline)
     }

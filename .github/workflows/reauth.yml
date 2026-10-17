@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - 'apps/ios/**'
+      - 'apps/parity/**'
       - '.github/workflows/reauth.yml'
   push:
     branches: [main, fix/chatgpt-phone-reauth]
     paths:
       - 'apps/ios/**'
+      - 'apps/parity/**'
       - '.github/workflows/reauth.yml'
   workflow_dispatch:
 
@@ -43,12 +45,18 @@ jobs:
         working-directory: apps/ios
         run: |
           xcodebuild -project Harness.xcodeproj -scheme Harness \
+            -configuration Release \
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
             -resultBundlePath "$RUNNER_TEMP/reauth-tests.xcresult" \
             -only-testing:HarnessTests/AgentReauthenticationTests \
             -only-testing:HarnessTests/GeneratedImageTests \
             -only-testing:HarnessTests/BrandMarkTests \
-            CODE_SIGNING_ALLOWED=NO test
+            -only-testing:HarnessTests/ParityTests \
+            -only-testing:HarnessTests/PerfMonitorTests \
+            -only-testing:HarnessTests/PerfResourcesTests \
+            -only-testing:HarnessTests/PerfOTLPTests \
+            -only-testing:HarnessTests/PerfFramesTests \
+            ENABLE_TESTABILITY=YES CODE_SIGNING_ALLOWED=NO test
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
