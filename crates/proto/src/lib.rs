@@ -15,6 +15,7 @@ pub mod preview;
 pub mod room_delivery;
 pub mod sidebar_pins;
 pub mod view;
+pub mod visual;
 pub mod workspace;
 
 pub use agent::*;

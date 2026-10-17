@@ -65,6 +65,8 @@ jobs:
           endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - wait: system-deps
+      - name: Native visual sandbox regressions
+        run: cargo test --locked -p harness-visual
       - name: package
         run: |
           scripts/package-linux.sh
@@ -220,6 +222,8 @@ jobs:
           secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
+      - name: Native visual sandbox regressions
+        run: cargo test --locked -p harness-visual
       - name: package portable app
         run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
       - uses: actions/upload-artifact@v4

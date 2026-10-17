@@ -10,7 +10,7 @@
 //! - `queue`:    LoroMovableList of LoroMap {
 //!   id, text, attachments?, issuedBy, issuedAt, editedAt? }        (any device writes)
 //!
-//! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error"|"image"|"delegation", text?: LoroText,
+//! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error"|"image"|"visual"|"delegation", text?: LoroText,
 //! reasoning?: LoroText, call?: json, isError?, questions?: json, resolved?, message? }.
 //! Text bodies are **LoroText** so streaming appends RLE-merge (1.03x oplog overhead vs
 //! 125x for whole-value rewrites).
@@ -74,6 +74,10 @@ struct DocPartJson {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    script: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     /// Thinking body for `kind: "reasoning"` (additive). Deliberately NOT the
@@ -146,6 +150,17 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             mime_type: Some(mime_type.clone()),
             ..Default::default()
         },
+        MessagePart::Visual { id, title, script } => {
+            harness_proto::visual::validate_visual(title, script)
+                .map_err(|error| DocError::Schema(error.into()))?;
+            DocPartJson {
+                id: id.clone(),
+                kind: "visual".into(),
+                title: Some(title.clone()),
+                script: Some(script.clone()),
+                ..Default::default()
+            }
+        }
         MessagePart::Text { id, text } => DocPartJson {
             id: id.clone(),
             kind: "text".into(),
@@ -233,10 +248,26 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
     })
 }
 
+/// Keep invalid/oversized visual source out of rendering, including salvage reads.
+fn visual_part(id: String, title: Option<String>, script: Option<String>) -> MessagePart {
+    match (title, script) {
+        (Some(title), Some(script))
+            if harness_proto::visual::validate_visual(&title, &script).is_ok() =>
+        {
+            MessagePart::Visual { id, title, script }
+        }
+        _ => MessagePart::Text {
+            id,
+            text: String::new(),
+        },
+    }
+}
+
 /// Doc part json → app part (mirror of `fromDocParts`; malformed degrades to empty text).
 fn from_doc_part(p: DocPartJson) -> MessagePart {
     match p.kind.as_str() {
         "image" => image_part(p.id, p.path, p.name, p.mime_type),
+        "visual" => visual_part(p.id, p.title, p.script),
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
             Some(call) => MessagePart::Tool {
                 id: p.id,
@@ -876,8 +907,8 @@ fn status_str(status: MessageStatus) -> &'static str {
 
 /// Append one part map to a parts list; text bodies become LoroText containers.
 fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
-    let map = parts.push_container(LoroMap::new())?;
     let doc_part = to_doc_part(part)?;
+    let map = parts.push_container(LoroMap::new())?;
     map.insert("id", doc_part.id.as_str())?;
     map.insert("kind", doc_part.kind.as_str())?;
     if let Some(text) = &doc_part.text {
@@ -894,6 +925,8 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
         ("path", &doc_part.path),
         ("name", &doc_part.name),
         ("mimeType", &doc_part.mime_type),
+        ("title", &doc_part.title),
+        ("script", &doc_part.script),
     ] {
         if let Some(value) = value {
             map.insert(key, value.as_str())?;
@@ -1085,6 +1118,10 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         .and_then(|x| x.as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{entry_id}#recovered-{ix}"));
+    if obj.get("kind").and_then(|v| v.as_str()) == Some("visual") {
+        let field = |key| obj.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        return Some(visual_part(id, field("title"), field("script")));
+    }
     if obj.get("kind").and_then(|v| v.as_str()) == Some("image") {
         let field = |key| obj.get(key).and_then(|v| v.as_str()).map(str::to_owned);
         return Some(image_part(
@@ -1376,6 +1413,8 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
         ("path", &doc_part.path),
         ("name", &doc_part.name),
         ("mimeType", &doc_part.mime_type),
+        ("title", &doc_part.title),
+        ("script", &doc_part.script),
     ] {
         if let Some(value) = value {
             map.insert(key, value.as_str())?;
@@ -1727,6 +1766,56 @@ mod tests {
         placeholder.invalidate(head.id());
         cache.absorb_invalidations(placeholder);
         assert_eq!(doc.read_entries_cached(&mut cache).unwrap(), doc.read_entries().unwrap());
+    }
+
+    #[test]
+    fn generated_visual_persists_updates_roundtrips_and_salvages() {
+        let doc = SessionDoc::init("visuals").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![MessagePart::Visual {
+            id: "v".into(),
+            title: "Overview".into(),
+            script: "source one".into(),
+        }];
+        writer.sync(&parts).unwrap();
+        if let MessagePart::Visual { title, script, .. } = &mut parts[0] {
+            *title = "Updated".into();
+            *script = "source two".into();
+        }
+        writer.sync(&parts).unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, parts);
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            SessionDoc::from_doc(imported).read_entries().unwrap()[0].parts,
+            parts
+        );
+        let valid = serde_json::json!({"kind":"visual", "id":"v", "title":"Overview", "script":"source", "isError":42});
+        assert!(serde_json::from_value::<DocPartJson>(valid.clone()).is_err());
+        assert!(matches!(
+            salvage_part(&valid, "a", 0),
+            Some(MessagePart::Visual { .. })
+        ));
+        for bad in [
+            serde_json::json!({"kind":"visual", "id":"v", "text":"must not leak"}),
+            serde_json::json!({"kind":"visual", "id":"v", "title":" ", "script":"source"}),
+            serde_json::json!({"kind":"visual", "id":"v", "title":"Overview", "script":"é".repeat(32769)}),
+        ] {
+            assert!(
+                matches!(from_doc_part(serde_json::from_value(bad.clone()).unwrap()), MessagePart::Text { text, .. } if text.is_empty())
+            );
+            assert!(
+                matches!(salvage_part(&bad, "a", 0), Some(MessagePart::Text { text, .. }) if text.is_empty())
+            );
+        }
+        assert!(
+            to_doc_part(&MessagePart::Visual {
+                id: "bad".into(),
+                title: "Overview".into(),
+                script: "x".repeat(65537),
+            })
+            .is_err()
+        );
     }
 
     #[test]

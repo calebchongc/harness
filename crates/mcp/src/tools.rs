@@ -202,6 +202,20 @@ fn catalog() -> Vec<ToolDef> {
             })),
         },
         ToolDef {
+            name: "show_visual",
+            description: "Publish a bounded native visual inline in this chat. Provide a short title and Luau source returning a render function, e.g. return function() return ui.text(\"Hello\") end. Native constructors: ui.column, row, text, stat, chart, button, toggle, slider, rule. No HTML, styling, files, or network. Setup and first render are validated in an isolated bounded runtime; source stays inline. This does not send a message or start another model run.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+                    "script": { "type": "string", "minLength": 1, "maxLength": 65536,
+                        "description": "Luau source, nonblank, at most 64 KiB UTF-8. Initialize state in locals and return function() return <node> end. DSL: ui.column{nodes...}, ui.row{nodes...}, ui.text('text'), ui.stat{label='Count',value=42}, ui.chart{label='Trend',values={1,2},labels={'A','B'}}, ui.button{label='Add',onClick=function() ... end}, ui.toggle{label='Enabled',value=false,onChange=function(value) ... end}, ui.slider{label='Target',value=3,min=0,max=10,onChange=function(value) ... end}, ui.rule{}. Only these properties; no CSS/style/HTML or external assets. Callbacks update locals; host re-renders without model calls. State is temporary and resets on reopen/eviction. Dense arrays and finite numbers only. Per render: 512 nodes, depth 24, 8 KiB total text, 256 chart values. Runtime: 16 MiB, 20 ms per setup/render/event. Keep handlers small; first-render validation does not test all interactions. Use clear labels, units and data provenance; label synthetic estimates. Mobile shows a title-only desktop notice." }
+                },
+                "required": ["title", "script"]
+            }),
+        },
+        ToolDef {
             name: "show_image",
             description: "Display an existing screenshot or raster image inline in this chat for the user to inspect. The file must be inside the active chat workspace and within the image size limit. This attaches a copy; it does not capture the screen, generate an image, send a message, or start another model run.",
             input_schema: json!({
@@ -322,6 +336,13 @@ struct ShowImageArgs {
     caption: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShowVisualArgs {
+    title: String,
+    script: String,
+}
+
 fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
     serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))
 }
@@ -413,7 +434,7 @@ impl Tools {
         if self.harness.origin().chat_id.is_none() {
             // Without an injected origin chat there is no destination to
             // publish into; hide rather than offer an arbitrary selector.
-            tools.retain(|t| t.name != "show_image");
+            tools.retain(|t| !matches!(t.name, "show_image" | "show_visual"));
         }
         tools.extend(rooms::catalog());
         tools
@@ -443,6 +464,7 @@ impl Tools {
             "dismiss_input" => self.dismiss_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             "show_image" => self.show_image(parse(args)?).await,
+            "show_visual" => self.show_visual(parse(args)?).await,
             other if rooms::handles(other) => return self.call_room_tool(other, args).await,
             other => return Err(format!("unknown tool: {other}")),
         };
@@ -1120,6 +1142,27 @@ impl Tools {
             .await
     }
 
+    async fn show_visual(&self, args: ShowVisualArgs) -> anyhow::Result<Value> {
+        let chat_id = self.harness.origin().chat_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "show_visual needs a chat context: this server is not running inside a chat"
+            )
+        })?;
+        harness_proto::visual::validate_visual(&args.title, &args.script)
+            .map_err(anyhow::Error::msg)?;
+        self.harness
+            .call(
+                harness_rpc::methods::SHOW_VISUAL,
+                json!({
+                    "chatId": chat_id,
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "title": args.title,
+                    "script": args.script,
+                }),
+            )
+            .await
+    }
+
     /// Whether this server speaks for a chat (an agent-to-agent caller).
     fn from_chat(&self) -> bool {
         self.harness.origin().chat_id.is_some()
@@ -1222,6 +1265,15 @@ mod tests {
                         .unwrap()
                         .push((method.to_owned(), params));
                     RpcReply::Value(json!({ "commandId": "cmd-1", "id": "q-1" }))
+                }
+                methods::SHOW_VISUAL => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(
+                        json!({ "attached": true, "id": params["id"], "title": params["title"] }),
+                    )
                 }
                 methods::SHOW_IMAGE => {
                     self.writes
@@ -1608,6 +1660,76 @@ mod tests {
             "dev-local"
         );
     }
+    #[tokio::test]
+    async fn show_visual_requires_origin_and_rejects_spoofed_or_unbounded_args() {
+        let world = Arc::new(World::default());
+        let no_chat = tools(world.clone(), Origin::default());
+        assert!(no_chat.has("show_visual"));
+        assert!(no_chat.list().iter().all(|t| t.name != "show_visual"));
+        assert!(
+            no_chat
+                .call("show_visual", json!({"title":"Title", "script":"source"}))
+                .await
+                .unwrap_err()
+                .contains("chat context")
+        );
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let def = tools
+            .list()
+            .into_iter()
+            .find(|t| t.name == "show_visual")
+            .unwrap();
+        assert_eq!(def.input_schema["additionalProperties"], false);
+        assert_eq!(def.input_schema["required"], json!(["title", "script"]));
+        for args in [
+            json!({"title":"Title", "script":"source", "chat":"other"}),
+            json!({"title":"Title", "script":"source", "chatId":"other"}),
+            json!({"title":"Title", "script":"source", "id":"spoof"}),
+            json!({"title":"Title", "script":"source", "targetDeviceId":"other"}),
+            json!({"title":" ", "script":"source"}),
+            json!({"title":"x".repeat(201), "script":"source"}),
+            json!({"title":"Title", "script":"\n\t"}),
+            json!({"title":"Title", "script":"é".repeat(32769)}),
+        ] {
+            assert!(tools.call("show_visual", args).await.is_err());
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn show_visual_injects_origin_and_uuid_and_preserves_source() {
+        let world = Arc::new(World::default());
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let title = "界".repeat(200);
+        let script = "é".repeat(32768);
+        let reply = tools
+            .call("show_visual", json!({"title":title, "script":script}))
+            .await
+            .unwrap();
+        assert_eq!(reply["attached"], true);
+        assert!(reply.get("script").is_none());
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        let (method, params) = &writes[0];
+        assert_eq!(method, methods::SHOW_VISUAL);
+        assert_eq!(params["chatId"], "chat-beta-2");
+        assert_eq!(params["title"], title);
+        assert_eq!(params["script"], script);
+        assert!(uuid::Uuid::parse_str(params["id"].as_str().unwrap()).is_ok());
+    }
+
     #[tokio::test]
     async fn show_image_requires_origin_chat() {
         let world = Arc::new(World::default());

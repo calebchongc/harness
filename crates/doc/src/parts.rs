@@ -164,6 +164,12 @@ pub enum MessagePart {
         name: String,
         mime_type: String,
     },
+    /// Bounded native visual source, stored atomically outside prose fields.
+    Visual {
+        id: String,
+        title: String,
+        script: String,
+    },
     /// Model thinking. Carries its body in a dedicated doc field (`reasoning`,
     /// never `text`) so pre-reasoning desktop builds — whose unknown-kind
     /// fallback renders `text` as prose — degrade to an invisible empty text
@@ -252,6 +258,7 @@ impl MessagePart {
         match self {
             MessagePart::Text { id, .. }
             | MessagePart::Image { id, .. }
+            | MessagePart::Visual { id, .. }
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Delegation { id, .. }
@@ -289,6 +296,7 @@ impl MessagePart {
                 name,
                 mime_type,
             } => id.len() + path.len() + name.len() + mime_type.len(),
+            MessagePart::Visual { id, title, script } => id.len() + title.len() + script.len(),
             MessagePart::Error { message, .. } => message.len(),
         }
     }
@@ -339,6 +347,21 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 *existing = image;
             } else {
                 out.push(image);
+            }
+        }
+        AgentEvent::GeneratedVisual { id, title, script } => {
+            if harness_proto::visual::validate_visual(title, script).is_err() {
+                return;
+            }
+            let visual = MessagePart::Visual {
+                id: id.clone(),
+                title: title.clone(),
+                script: script.clone(),
+            };
+            if let Some(existing) = out.iter_mut().find(|p| p.id() == id) {
+                *existing = visual;
+            } else {
+                out.push(visual);
             }
         }
         AgentEvent::ReasoningDelta { text } => {
@@ -907,6 +930,39 @@ mod tests {
         );
         assert!(flat.iter().all(|p| p.byte_len() <= MSG_INLINE_MAX));
         assert_eq!(flat[1].id(), "r0~1");
+    }
+
+    #[test]
+    fn generated_visual_fold_is_ordered_atomic_bounded_and_idempotent() {
+        let mut parts = vec![];
+        fold_event_into_parts(&mut parts, &text_delta("before"));
+        let event = AgentEvent::GeneratedVisual {
+            id: "v".into(),
+            title: "Overview".into(),
+            script: "x".repeat(64 * 1024),
+        };
+        fold_event_into_parts(&mut parts, &event);
+        fold_event_into_parts(&mut parts, &text_delta("after"));
+        fold_event_into_parts(&mut parts, &event);
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[1], MessagePart::Visual { id, .. } if id == "v"));
+        assert_eq!(parts[1].byte_len(), 1 + "Overview".len() + 64 * 1024);
+        assert_eq!(join_continuations(split_parts(&parts)), parts);
+        let serialized = serde_json::to_value(&parts[1]).unwrap();
+        assert_eq!(serialized["kind"], "visual");
+        assert_eq!(
+            serde_json::from_value::<MessagePart>(serialized).unwrap(),
+            parts[1]
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::GeneratedVisual {
+                id: "bad".into(),
+                title: "Overview".into(),
+                script: "x".repeat(64 * 1024 + 1),
+            },
+        );
+        assert_eq!(parts.len(), 3);
     }
 
     #[test]

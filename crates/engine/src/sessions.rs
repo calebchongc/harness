@@ -134,6 +134,8 @@ struct RunHandle {
     /// Bounded explicit-intake lane: `show_image` requests join the run's
     /// sequential event pipeline instead of bypassing it.
     image_tx: mpsc::Sender<ShowImageRequest>,
+    /// Bounded native-visual intake; shares the normal sequential publish pipeline.
+    visual_tx: mpsc::Sender<ShowVisualRequest>,
     /// The run's harness, for turn-only interrupts
     /// ([`harness_adapters::Harness::interrupt_turn`]).
     harness: Arc<dyn Harness>,
@@ -166,6 +168,20 @@ struct PendingShowImage {
     request_id: String,
     image: crate::uploads::ImportedImage,
     reply: oneshot::Sender<Result<crate::uploads::ImportedImage, EngineError>>,
+}
+
+struct ShowVisualRequest {
+    id: String,
+    title: String,
+    script: String,
+    reply: oneshot::Sender<Result<(), EngineError>>,
+}
+
+struct PendingShowVisual {
+    request_id: String,
+    title: String,
+    script: String,
+    reply: oneshot::Sender<Result<(), EngineError>>,
 }
 
 /// How long (in 10 ms ticks) a turn-only interrupt may take to park the run:
@@ -613,6 +629,7 @@ impl SessionsEngine {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (image_tx, image_rx) = mpsc::channel::<ShowImageRequest>(8);
+        let (visual_tx, visual_rx) = mpsc::channel::<ShowVisualRequest>(8);
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
 
         // Input bridge: the harness asks questions; we mint the request id, park the
@@ -668,6 +685,7 @@ impl SessionsEngine {
                 pending_inputs,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 image_tx,
+                visual_tx,
                 harness: harness.clone(),
                 turn_interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
@@ -696,6 +714,7 @@ impl SessionsEngine {
             controls,
             engine_rx,
             image_rx,
+            visual_rx,
             cancel_rx,
             RunResumeState {
                 user_message_id: user_id,
@@ -999,6 +1018,44 @@ impl SessionsEngine {
         })?
     }
 
+    /// Publish native visual data through the live run, ACKing only after journal+doc sync.
+    pub async fn show_visual(
+        &self,
+        chat_id: &str,
+        id: &str,
+        title: &str,
+        script: &str,
+    ) -> Result<(), EngineError> {
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(EngineError::Other("show_visual id is invalid".into()));
+        }
+        harness_proto::visual::validate_visual(title, script)
+            .map_err(|error| EngineError::Other(error.into()))?;
+        let tx = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| h.visual_tx.clone())
+            .ok_or_else(|| {
+                EngineError::Other("No active run accepts visuals for this chat".into())
+            })?;
+        let (reply, rx) = oneshot::channel();
+        tx.send(ShowVisualRequest {
+            id: id.into(),
+            title: title.into(),
+            script: script.into(),
+            reply,
+        })
+        .await
+        .map_err(|_| EngineError::Other("Run no longer accepts visual requests".into()))?;
+        rx.await.map_err(|_| {
+            EngineError::Other("Run ended before the visual request completed".into())
+        })?
+    }
+
     /// Boot recovery: for every journal whose last event is not `Done` (a run died
     /// mid-stream), stamp this device's abandoned `streaming` doc entries `aborted`
     /// with a VISIBLE "Run interrupted by engine restart" error part, close the
@@ -1188,7 +1245,17 @@ impl Inner {
         .unwrap_or_else(|err| Err(EngineError::Other(err.to_string())))
     }
 
-    /// Journal + broadcast one event (the two unconditional legs of the pipeline).
+    fn visual_run_active(&self, chat_id: &str, run_id: &str) -> bool {
+        lock(&self.runs).get(chat_id).is_some_and(|run| {
+            run.run_id == run_id
+                && !*run.cancel.borrow()
+                && !run.interrupt_token.is_cancelled()
+                && !run
+                    .turn_interrupted
+                    .load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
     /// Sanitize before ANY journal/publish path, including nested subagent events.
     async fn prepare_generated_image(
         &self,
@@ -1205,6 +1272,13 @@ impl Inner {
         {
             parents.push(parent_tool_use_id);
             leaf = *event;
+        }
+        if let AgentEvent::GeneratedVisual { title, script, .. } = &leaf {
+            if harness_proto::visual::validate_visual(title, script).is_err()
+                || check_visual_script(script.clone()).await.is_err()
+            {
+                return vec![];
+            }
         }
         let events = if let AgentEvent::GeneratedImage { id, path, .. } = leaf {
             let key = std::iter::once(chat_id)
@@ -2060,6 +2134,16 @@ fn apply_reasoning_update(
     workspace.set_chat_config(chat_id, &config)
 }
 
+/// Only the bounded visual runtime evaluates source; never on an async executor thread.
+async fn check_visual_script(script: String) -> Result<(), EngineError> {
+    tokio::task::spawn_blocking(move || harness_visual::check(&script))
+        .await
+        .map_err(|_| EngineError::Other("visual validation worker failed".into()))?
+        .map_err(|_| {
+            EngineError::Other("visual script failed bounded first-render validation".into())
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
@@ -2071,6 +2155,7 @@ async fn drive_run(
     controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut image_rx: mpsc::Receiver<ShowImageRequest>,
+    mut visual_rx: mpsc::Receiver<ShowVisualRequest>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
 ) {
@@ -2168,6 +2253,17 @@ async fn drive_run(
     // Namespaced GeneratedImage id → request waiting for its journal+doc ACK.
     // Entries drop with the run, so a retiring run never strands a caller.
     let mut pending_show_images: HashMap<String, PendingShowImage> = HashMap::new();
+    let mut seen_show_visuals: HashMap<String, (String, String)> = HashMap::new();
+    for entry in doc_ref.read_entries().unwrap_or_default() {
+        for part in entry.parts {
+            if let MessagePart::Visual { id, title, script } = part
+                && let Some(request_id) = id.strip_prefix("show-visual:")
+            {
+                seen_show_visuals.insert(request_id.into(), (title, script));
+            }
+        }
+    }
+    let mut pending_show_visuals: HashMap<String, PendingShowVisual> = HashMap::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
@@ -2421,6 +2517,50 @@ async fn drive_run(
                         }
                     }
                 }
+                Some(req) = visual_rx.recv() => {
+                    if interrupted || *cancel_rx.borrow() || !inner.visual_run_active(&chat_id, &run_id) {
+                        let _ = req.reply.send(Err(EngineError::Other(
+                            "Run was interrupted; no visual can be published".into(),
+                        )));
+                        continue;
+                    }
+                    if idle_since.is_some() {
+                        let _ = req.reply.send(Err(EngineError::Other(
+                            "Run is parked idle; no visual can be published".into(),
+                        )));
+                        continue;
+                    }
+                    if let Some((title, script)) = seen_show_visuals.get(&req.id) {
+                        let result = if title == &req.title && script == &req.script {
+                            Ok(())
+                        } else {
+                            Err(EngineError::Other("show_visual id already used with different parameters".into()))
+                        };
+                        let _ = req.reply.send(result);
+                        continue;
+                    }
+                    if check_visual_script(req.script.clone()).await.is_err() {
+                        let _ = req.reply.send(Err(EngineError::Other(
+                            "show_visual script failed bounded first-render validation".into(),
+                        )));
+                        continue;
+                    }
+                    // A cancel/turn-only interrupt may arrive during the bounded blocking check.
+                    if *cancel_rx.borrow() || !inner.visual_run_active(&chat_id, &run_id) {
+                        let _ = req.reply.send(Err(EngineError::Other(
+                            "Run was interrupted; no visual can be published".into(),
+                        )));
+                        continue;
+                    }
+                    let visual_id = format!("show-visual:{}", req.id);
+                    prepared_events.push_back(AgentEvent::GeneratedVisual {
+                        id: visual_id.clone(), title: req.title.clone(), script: req.script.clone(),
+                    });
+                    pending_show_visuals.insert(visual_id, PendingShowVisual {
+                        request_id: req.id, title: req.title, script: req.script, reply: req.reply,
+                    });
+                    continue;
+                }
                 Some(event) = engine_rx.recv() => event,
                 next = stream.next() => match next {
                     Some(Ok(event)) => event,
@@ -2572,6 +2712,16 @@ async fn drive_run(
         {
             let _ = pending.reply.send(Err(EngineError::Other(
                 "Run was interrupted; no image can be published".into(),
+            )));
+            continue;
+        }
+
+        if let AgentEvent::GeneratedVisual { id, .. } = &event
+            && (interrupted || *cancel_rx.borrow() || !inner.visual_run_active(&chat_id, &run_id))
+            && let Some(pending) = pending_show_visuals.remove(id)
+        {
+            let _ = pending.reply.send(Err(EngineError::Other(
+                "Run was interrupted; no visual can be published".into(),
             )));
             continue;
         }
@@ -3182,6 +3332,31 @@ async fn drive_run(
                 Ok(pending.image)
             } else {
                 Err(EngineError::Other(SHOW_IMAGE_ATTACH_ERROR.into()))
+            };
+            let _ = pending.reply.send(result);
+        }
+
+        if let AgentEvent::GeneratedVisual { id, .. } = &event
+            && let Some(pending) = pending_show_visuals.remove(id)
+        {
+            let synced = publish_seq != 0
+                && sync_segment(
+                    doc_ref,
+                    &mut writer,
+                    &entry_id,
+                    &device_id,
+                    segment_started,
+                    &folded,
+                )
+                .is_ok();
+            let result = if synced {
+                dirty = false;
+                seen_show_visuals.insert(pending.request_id, (pending.title, pending.script));
+                Ok(())
+            } else {
+                Err(EngineError::Other(
+                    "show_visual could not sync the visual into the chat".into(),
+                ))
             };
             let _ = pending.reply.send(result);
         }
