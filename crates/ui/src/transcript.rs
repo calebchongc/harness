@@ -1238,6 +1238,10 @@ pub fn diff_to_file(diff: &harness_proto::ToolDiff) -> crate::changes::FileDiff 
 
 #[derive(Clone)]
 pub enum RowKind {
+    Visual {
+        title: String,
+        script: String,
+    },
     GeneratedImage {
         owner: String,
         path: String,
@@ -1812,6 +1816,25 @@ pub fn rows_for_entry(
                                 },
                             });
                         }
+                    }
+                    MessagePart::Visual {
+                        id: part_id,
+                        title,
+                        script,
+                    } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(format!("{title}\0{script}").as_bytes()),
+                            turn_start: false,
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                            kind: RowKind::Visual {
+                                title: title.clone(),
+                                script: script.clone(),
+                            },
+                        });
                     }
                     MessagePart::Image {
                         id: part_id,
@@ -3449,6 +3472,9 @@ pub struct Transcript {
     /// don't need it (the pin branch already opens at the end).
     land_end_pending: bool,
     row_cache: HashMap<String, CachedRows>,
+    // Bounded resident sandboxes; state is local to this chat/view, not synced.
+    visual_views: HashMap<SharedString, (u64, Entity<crate::visuals::VisualView>)>,
+    visual_order: std::collections::VecDeque<SharedString>,
     /// The prepared-row `Arc` each LEADING message's rows were cloned from in
     /// the last build (stops at the first message built another way). A
     /// message whose prepared `Arc` is unchanged has byte-identical rows, so
@@ -3804,6 +3830,8 @@ impl Transcript {
             viewport_finalize_scheduled: false,
             viewport_layout_revision: 0,
             row_cache: HashMap::new(),
+            visual_views: HashMap::new(),
+            visual_order: std::collections::VecDeque::new(),
             row_sources: Vec::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
@@ -4978,6 +5006,8 @@ impl Transcript {
             self.rows.clear();
             self.row_sources.clear();
             self.row_cache.clear();
+            self.visual_views.clear();
+            self.visual_order.clear();
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
@@ -7516,6 +7546,28 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
+            RowKind::Visual { title, script } => {
+                self.visual_order.retain(|id| id != &row.id);
+                self.visual_order.push_back(row.id.clone());
+                if self
+                    .visual_views
+                    .get(&row.id)
+                    .is_none_or(|(version, _)| *version != row.version)
+                {
+                    if self.visual_views.len() >= 8
+                        && !self.visual_views.contains_key(&row.id)
+                        && let Some(oldest) = self.visual_order.pop_front()
+                    {
+                        self.visual_views.remove(&oldest);
+                    }
+                    let view = cx.new(|cx| {
+                        crate::visuals::VisualView::new(title.clone(), script.clone(), cx)
+                    });
+                    self.visual_views
+                        .insert(row.id.clone(), (row.version, view));
+                }
+                self.visual_views[&row.id].1.clone().into_any_element()
+            }
             RowKind::GeneratedImage {
                 owner,
                 path,
@@ -9761,6 +9813,12 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
                 acc.extend_from_slice(field.as_bytes());
                 acc.push(0);
             }
+        }
+        if let MessagePart::Visual { title, script, .. } = part {
+            acc.extend_from_slice(title.as_bytes());
+            acc.push(0);
+            acc.extend_from_slice(script.as_bytes());
+            acc.push(0);
         }
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
@@ -13093,6 +13151,46 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(rows[2].kind, RowKind::GeneratedImage { .. }));
+    }
+
+    #[test]
+    fn native_visual_rows_preserve_order_and_same_length_edits() {
+        let mut entry = assistant(
+            "a",
+            MessageStatus::Complete,
+            vec![
+                text_part("before", "Before"),
+                MessagePart::Visual {
+                    id: "visual-1".into(),
+                    title: "Scenario".into(),
+                    script: "return function() return ui.text('one') end".into(),
+                },
+                text_part("after", "After"),
+            ],
+        );
+        for compact in [false, true] {
+            let rows = rows_for_entry(&entry, false, compact, &mut parse);
+            let visual = rows
+                .iter()
+                .find(|row| matches!(row.kind, RowKind::Visual { .. }))
+                .unwrap();
+            assert_eq!(visual.id.as_ref(), "a#visual-1");
+            assert!(
+                visual.compact_fold.is_none(),
+                "visuals stay outside work accordions"
+            );
+        }
+        assert!(!assistant_copy_text(&entry).unwrap().contains("ui.text"));
+        let fingerprint = entry_fingerprint(&entry, false);
+        let version = rows_for_entry(&entry, false, false, &mut parse)[1].version;
+        if let MessagePart::Visual { script, .. } = &mut entry.parts[1] {
+            *script = script.replace("one", "two");
+        }
+        assert_ne!(entry_fingerprint(&entry, false), fingerprint);
+        assert_ne!(
+            rows_for_entry(&entry, false, false, &mut parse)[1].version,
+            version
+        );
     }
 
     #[test]

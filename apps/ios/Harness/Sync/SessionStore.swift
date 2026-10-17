@@ -716,6 +716,12 @@ final class SessionStore {
         switch kind {
         case "text":
             return .text(id: id, text: m["text"]?.stringValue ?? "")
+        case "visual":
+            // Mobile shows only the bounded title; source is never read or executed.
+            guard let title = m["title"]?.stringValue,
+                  !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  title.unicodeScalars.count <= 200 else { return nil }
+            return .text(id: id, text: "Native visual: \(title) — open in Harness desktop")
         case "image":
             let reference = GeneratedImageReference(path: m["path"]?.stringValue ?? "",
                                                     name: m["name"]?.stringValue ?? "",

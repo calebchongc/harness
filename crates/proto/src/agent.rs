@@ -482,6 +482,12 @@ pub enum AgentEvent {
         name: String,
         mime_type: String,
     },
+    /// Atomic, bounded native visual source. The engine never evaluates it inline.
+    GeneratedVisual {
+        id: String,
+        title: String,
+        script: String,
+    },
     ReasoningDelta {
         text: String,
     },
@@ -812,6 +818,19 @@ pub struct ToolProgressItem {
 #[cfg(test)]
 mod generated_image_tests {
     use super::*;
+
+    #[test]
+    fn generated_visual_event_round_trip() {
+        let event = AgentEvent::GeneratedVisual {
+            id: "show-visual:one".into(),
+            title: "Overview".into(),
+            script: "return function() return ui.text(\"Hello\") end".into(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "generatedVisual");
+        assert_eq!(value["title"], "Overview");
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
+    }
 
     #[test]
     fn generated_image_event_round_trip() {
