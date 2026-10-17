@@ -207,6 +207,8 @@ jobs:
             -only-testing:HarnessTests/PerfResourcesTests \
             -only-testing:HarnessTests/PerfOTLPTests \
             -only-testing:HarnessTests/PerfFramesTests \
+            -only-testing:HarnessTests/LivePerfTests \
+            -only-testing:HarnessTests/TranscriptScrollMatrixTests \
             -only-testing:HarnessTests/BrandMarkTests \
             CODE_SIGNING_ALLOWED=NO test
 

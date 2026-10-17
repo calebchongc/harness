@@ -391,6 +391,46 @@ final class TranscriptScrollMatrixTests: XCTestCase {
         }
     }
 
+    /// Finishing a fence adds a trailing block to an already-full tail
+    /// window. The oldest row leaves the table, but unchanged realized rows
+    /// must retain both their measured heights and their screen positions.
+    func testFinishingLongCodeWhileReadingPreservesRealizedRowMeasurements() async {
+        let corpus = Self.corpora.first { $0.name == "long-code" }!
+        await mount(corpus)
+        applyChunk(corpus, index: 0)
+        await settle(120)
+        await drag(by: -900)
+        await settle(120)
+        XCTAssertFalse(harness.scroll.pinned)
+        for chunk in 1..<(Self.chunkCount - 1) {
+            applyChunk(corpus, index: chunk)
+            await settle(80)
+        }
+        let viewportTop = table.superview!.convert(table.superview!.bounds, to: window).minY
+        let anchors = table.visibleCells.compactMap { cell -> (String, CGFloat, CGFloat)? in
+            guard let id = cell.accessibilityIdentifier else { return nil }
+            let y = presentedY(cell)
+            guard y > viewportTop, y < viewportTop + 300 else { return nil }
+            return (id, y, cell.bounds.height)
+        }
+        XCTAssertFalse(anchors.isEmpty, "history must have a fully visible anchor")
+        applyChunk(corpus, index: Self.chunkCount - 1)
+        for _ in 0..<4 {
+            try? await Task.sleep(for: .milliseconds(16))
+            for (id, y, height) in anchors {
+                guard let cell = table.visibleCells.first(where: { $0.accessibilityIdentifier == id }) else {
+                    XCTFail("unchanged history row \(id) disappeared"); continue
+                }
+                XCTAssertEqual(cell.bounds.height, height, accuracy: 1,
+                               "a tail-window shift changed the measured height of \(id)")
+                XCTAssertLessThan(abs(presentedY(cell) - y), 4,
+                                  "a tail-window shift moved unchanged history row \(id)")
+            }
+        }
+        XCTAssertFalse(harness.scroll.pinned)
+        assertViewportRealized("long-code/final-window-shift")
+    }
+
     /// A structural (non-append) row change while reading history must not
     /// pass through an estimated-height content size. UITableView resets
     /// every height on `reloadData`; a 300-turn transcript collapsed toward
