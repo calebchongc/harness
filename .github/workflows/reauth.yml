@@ -43,11 +43,17 @@ jobs:
         working-directory: apps/ios
         run: |
           xcodebuild -project Harness.xcodeproj -scheme Harness \
+            -configuration Release \
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
             -resultBundlePath "$RUNNER_TEMP/reauth-tests.xcresult" \
             -only-testing:HarnessTests/AgentReauthenticationTests \
             -only-testing:HarnessTests/GeneratedImageTests \
             -only-testing:HarnessTests/BrandMarkTests \
+            -only-testing:HarnessTests/ParityTests \
+            -only-testing:HarnessTests/PerfMonitorTests \
+            -only-testing:HarnessTests/PerfResourcesTests \
+            -only-testing:HarnessTests/PerfOTLPTests \
+            -only-testing:HarnessTests/PerfFramesTests \
             CODE_SIGNING_ALLOWED=NO test
       - name: Upload test results
         if: always()

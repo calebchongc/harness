@@ -1,7 +1,7 @@
 # Performance monitor
 
-Both apps time themselves on the device and show the result under Settings > Performance. Nothing is uploaded, and
-"Copy report" produces plain numbers (no chat content, names or identifiers) to paste into an issue.
+Both apps time themselves on the device and show the result under Settings > Performance. Optional sharing requires
+explicit consent and is off by default. "Copy report" produces plain numbers (no chat content, names or identifiers).
 
 | | iOS (`PerfMonitor.swift`) | Android (`perf/Perf.kt`) |
 | --- | --- | --- |
@@ -21,17 +21,32 @@ monitor does not name yet, so add a span there.
 
 ## Sharing anonymous performance numbers
 
-All the apps report to the same stats endpoint, `POST /v1/harness/stats`, in the same shape: samples counted into fixed
-ranges (22 bounds from 1 ms to 60 s plus an overflow range), so batches from any number of launches and devices add up
-to exact fleet percentiles. The desktop app already did this (`crates/ui/src/perf_stats.rs`); iOS and Android now send
-the same batch with `os` set to `ios` or `android` and their own metric names.
+iOS sends **OpenTelemetry OTLP/HTTP JSON** to `POST /v1/metrics`: one resource, one
+`harness.ios.performance` instrumentation scope, and delta explicit-bucket histograms. The payload uses standard
+OTLP nanosecond timestamp strings, string-encoded 64-bit counts, units, bounds, sums and maxima. It does not require
+an SDK dependency or send raw samples. Android and desktop retain `POST /v1/harness/stats`; the legacy mobile vectors
+continue to test that format. Bucket percentiles estimate a range's upper bound, not an exact sample percentile.
 
-On by default, with a "Share anonymous performance data" switch in Settings to turn it off. `PerfSharing.endpoint` on
-each app is `https://otel.codegraff.com/v1/harness/stats` (pinned in `vectors/perf-stats.json`); with no endpoint the
-switch is hidden and nothing is sent. While it is on, a batch goes out as the app goes to the background. A person who has turned
-it off stays off: only a never-chosen setting reads as on.
+Sharing is off by default. The expanded iOS diagnostics require a new explicit consent choice in Settings; an older
+choice does not silently enable resource collection. iOS samples its own process every five foreground seconds:
+CPU utilization (`1`, where 1 means one occupied core), physical memory footprint (`By`), physical disk-write bytes
+per sampled interval (`By`) and write rate (`By/s`). Counter failures and suspension gaps are omitted, never made into
+zero samples. Disk I/O counters are not logical filesystem writes or SQLite attribution.
 
-- **Content:** `vectors/perf-stats.json` pins the JSON both apps produce (`schema` `harness.mobile.stats.v1`): `os`,
+While a visible transcript scrolls or streams, iOS also records display-link callback delay (`ms`) using the current
+refresh interval. This is a responsiveness proxy, **not measured GPU/render-server hitch time or FPS**. Its display
+link stops while idle/backgrounded or sharing is disabled. Existing operation and main-thread timings use `ms`.
+
+The receiver accepts only the fixed iOS meter, metric names, units, histogram bounds and coarse resource attributes;
+it rejects extra attributes/exemplars or cumulative histograms before storing anything. Metadata is app/OS version,
+architecture, hardware model and maximum refresh rate, plus a random per-launch `service.instance.id`. No account,
+persistent device/session identifier, process ID, raw uptime, chat content or paths are exported. Aggregates retain
+90 days. Uploads happen periodically in the foreground and on backgrounding, no more than once per ten minutes,
+subject to consent, power, thermal and network restrictions.
+
+Legacy format (Android and iOS compatibility tests):
+
+- **Content:** `vectors/perf-stats.json` pins the legacy JSON (`schema` `harness.mobile.stats.v1`): `os`,
   `arch`, app and OS version, the hardware model (never the name the owner gave it, capped at 40 characters), the
   refresh rate, the time window, and per metric a count, sum, max and the range counts. Metric names outside the list
   are dropped before sending, each sample is clamped to 0..60000 ms, and values are made to fit what the server
@@ -51,9 +66,12 @@ it off stays off: only a never-chosen setting reads as on.
 - **Never uploaded:** debug builds, or while Battery Saver or Low Power Mode is on, or at a moderate or higher thermal
   state. Android also waits for an unmetered network; iOS refuses expensive and constrained networks.
 - **Transport:** a JSON POST over https (loopback http for tests), with no cookies, credentials, cache or redirects.
-- **Store listings and disclosure:** collecting on by default means declaring diagnostics (performance data, not linked
-  to the user) in the App Store privacy answers and the Play data safety form, and saying so in the privacy policy
-  before the endpoint is switched on.
+- **Store listings and disclosure:** declare diagnostics (performance data, not linked to the user) in store privacy
+  answers and the privacy policy. The iOS privacy manifest already declares Performance Data and the elapsed-time API
+  reason; absolute system uptime is never exported.
+
+The remaining legacy batch details above describe Android and the compatibility vectors. iOS uses the same bounded
+aggregation/transport policy with its OTLP encoder; resource samples have their own units rather than milliseconds.
 
 How the app treats the server's answer:
 
@@ -66,7 +84,9 @@ How the app treats the server's answer:
 
 ## What it costs the device
 
-The monitor must not be what slows the app or drains the phone, so its cost is bounded and was measured.
+The monitor must not be what slows the app or drains the phone. The historical measurements below concern the
+existing Android monitor, except the explicitly named iOS debug recording threshold. They do not measure the added
+iOS resource sampler or display link; physical-device CPU, write and battery overhead still needs a device baseline.
 
 - **Per call:** recording an operation takes about 0.07 µs on Android and tallying a frame, including its range count, about 0.07 µs (a unit test
   fails above 5 µs; the iOS test fails above 25 µs in a debug build, to catch a hundredfold regression).

@@ -1,7 +1,7 @@
 // The anonymous performance batch and when it may be sent (PerfStats.kt and PerfUpload.kt on Android). It is the
 // desktop app's format: samples are counted into fixed ranges, so batches from any number of launches add up to exact
-// fleet percentiles. Numbers and fixed names only: no chat content, account, device or session identifiers, and the id
-// is random per launch. `apps/parity/vectors/perf-stats.json` pins the JSON and the sending rules for both apps.
+// fleet percentiles. No chat content, account or persistent device identifiers; the id is random per launch.
+// `apps/parity/vectors/perf-stats.json` pins legacy JSON and retry rules; iOS explicitly opts into OTLP encoding.
 
 import Foundation
 import UIKit
@@ -34,7 +34,7 @@ enum PerfMetric {
     ]
 }
 
-struct PerfMetricBatch {
+struct PerfMetricBatch: Sendable {
     let name: String
     let count: Int
     let sumMs: Double
@@ -42,7 +42,7 @@ struct PerfMetricBatch {
     let buckets: [Int]
 }
 
-struct PerfWindow {
+struct PerfWindow: Sendable {
     let startMs: Int
     let endMs: Int
     let metrics: [PerfMetricBatch]
@@ -58,6 +58,8 @@ final class PerfHistograms: @unchecked Sendable {
     ]
     static let bucketCount = bucketsMs.count + 1
     static let maxSampleMs = 60_000.0
+    /// Legacy metric order and clamping stay pinned to the mobile parity vectors.
+    static let metricOrder = PerfMetric.order + PerfOTLP.metricOrder
     /// Six days: inside the server's seven-day limit on how long a window may be.
     static let maxWindowMs = 6 * 24 * 60 * 60 * 1000
 
@@ -76,16 +78,32 @@ final class PerfHistograms: @unchecked Sendable {
     private let now: @Sendable () -> Int
     private var metrics: [String: Histogram] = [:]
     private var windowStartMs: Int
+    private var consentGeneration: UInt64 = 0
+
+    var generation: UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return consentGeneration
+    }
+
+    /// Invalidates both buffered samples and any window currently awaiting an upload response.
+    func discard() {
+        lock.lock(); defer { lock.unlock() }
+        metrics.removeAll()
+        windowStartMs = now()
+        consentGeneration &+= 1
+    }
 
     init(now: @escaping @Sendable () -> Int = { Int(Date().timeIntervalSince1970 * 1000) }) {
         self.now = now
         windowStartMs = now()
     }
 
-    func add(_ metric: String, ms: Double) {
-        guard ms.isFinite, PerfMetric.order.contains(metric) else { return }
-        let clamped = min(max(ms, 0), Self.maxSampleMs)
+    func add(_ metric: String, ms: Double, ifGeneration generation: UInt64? = nil) {
+        guard ms.isFinite, Self.metricOrder.contains(metric) else { return }
+        let limit = PerfOTLP.resourceMetricOrder.contains(metric) ? PerfOTLP.maxResourceSample : Self.maxSampleMs
+        let clamped = min(max(ms, 0), limit)
         lock.lock(); defer { lock.unlock() }
+        if let generation, generation != consentGeneration { return }
         var h = metrics[metric] ?? Histogram()
         h.buckets[Self.bucketIndex(clamped)] += 1
         h.count += 1
@@ -109,7 +127,7 @@ final class PerfHistograms: @unchecked Sendable {
         windowStartMs = end
         let taken = metrics
         metrics.removeAll()
-        let batches = PerfMetric.order.compactMap { name -> PerfMetricBatch? in
+        let batches = Self.metricOrder.compactMap { name -> PerfMetricBatch? in
             guard let h = taken[name], h.count > 0 else { return nil }
             return PerfMetricBatch(name: name, count: h.count, sumMs: h.sumMs, maxMs: h.maxMs, buckets: h.buckets)
         }
@@ -117,8 +135,9 @@ final class PerfHistograms: @unchecked Sendable {
     }
 
     /// Puts an unsent window back, so its samples go out with the next one.
-    func restore(_ window: PerfWindow) {
+    func restore(_ window: PerfWindow, ifGeneration generation: UInt64? = nil) {
         lock.lock(); defer { lock.unlock() }
+        if let generation, generation != consentGeneration { return }
         windowStartMs = min(windowStartMs, window.startMs)
         for m in window.metrics {
             var h = metrics[m.name] ?? Histogram()
@@ -132,7 +151,7 @@ final class PerfHistograms: @unchecked Sendable {
 }
 
 /// What identifies the batch: the app, the OS and the hardware model, never a person.
-struct PerfBatchMeta {
+struct PerfBatchMeta: Sendable {
     /// Random and fresh for every launch, in the `install_id` field the desktop format already has.
     let installId: String
     let os: String
@@ -204,8 +223,8 @@ enum PerfPolicy {
 }
 
 /// Decides when a batch may go out. An endpoint must exist, sharing must be on, the window must have samples, at most
-/// one attempt goes out per interval, and samples recorded while nothing can be sent are dropped rather than held for
-/// later.
+/// one request is in flight. Successful sends and retryable 4xx responses start the minimum interval; transport/5xx
+/// failures may retry at the next opportunity (the shared legacy policy). Disabled samples are discarded, not queued.
 actor PerfUploader {
     static let minIntervalMs = 10 * 60_000
 
@@ -215,28 +234,41 @@ actor PerfUploader {
     private let now: @Sendable () -> Int
     /// Posts the body and returns the HTTP status, or 0 when the connection failed.
     private let post: @Sendable (String, String) async -> Int
+    private let body: @Sendable (PerfBatchMeta, PerfWindow) -> String
     private var lastAttemptAt: Int?
     private var stopped = false
+    private var inFlight = false
 
     init(endpoint: String?, enabled: @escaping @Sendable () -> Bool, source: PerfHistograms,
          now: @escaping @Sendable () -> Int = { Int(Date().timeIntervalSince1970 * 1000) },
+         body: @escaping @Sendable (PerfBatchMeta, PerfWindow) -> String = { PerfStatsBatch(meta: $0, window: $1).body() },
          post: @escaping @Sendable (String, String) async -> Int) {
         self.endpoint = endpoint
         self.enabled = enabled
         self.source = source
         self.now = now
         self.post = post
+        self.body = body
     }
 
     /// True when a batch was sent. A 2xx is sent. 429 and other 4xx keep the samples and start the wait. 400, 413 and
     /// 415 mean the batch itself is wrong, so it is dropped and sending stops for the rest of the launch. 5xx and a
     /// failed connection keep the samples and start no wait: they are tried again at the next chance.
     func flush(meta: PerfBatchMeta) async -> Bool {
+        // Check consent before backoff/in-flight guards: turning sharing off must also clear held samples.
+        guard let endpoint, enabled(), !stopped else { source.discard(); return false }
+        guard !inFlight else { return false }
         let t = now()
         if let last = lastAttemptAt, t - last < Self.minIntervalMs { return false }
-        guard let window = source.take() else { return false }
-        guard let endpoint, enabled(), !stopped else { return false }
-        let status = await post(endpoint, PerfStatsBatch(meta: meta, window: window).body())
+        let generation = source.generation
+        guard let window = source.take(), source.generation == generation, enabled() else { return false }
+        inFlight = true
+        defer { inFlight = false }
+        let status = await post(endpoint, body(meta, window))
+        // Awaiting the network lets other actor calls and consent changes run. Never resurrect a revoked window,
+        // even if sharing has since been enabled again.
+        guard enabled() else { source.discard(); return false }
+        guard source.generation == generation else { return false }
         switch status {
         case 200..<300:
             lastAttemptAt = t
@@ -246,10 +278,10 @@ actor PerfUploader {
             return false
         case 400..<500:
             lastAttemptAt = t
-            source.restore(window)
+            source.restore(window, ifGeneration: generation)
             return false
         default:
-            source.restore(window)
+            source.restore(window, ifGeneration: generation)
             return false
         }
     }
@@ -301,22 +333,25 @@ enum PerfTransport {
 
 /// Performance batches require an explicit choice in Settings.
 enum PerfSharing {
-    // A fresh key prevents an older opt-out preference from becoming consent.
-    static let key = "share-performance-consent-v1"
+    // Expanded resource diagnostics require a fresh explicit choice, not consent to the older timing-only report.
+    static let key = "share-performance-consent-v2"
 
     /// Pinned in `apps/parity/vectors/perf-stats.json`.
     static let defaultEnabled = false
 
-    /// Where batches go: the stats endpoint the desktop app already uses, which accepts the mobile schema. Pinned in
-    /// `apps/parity/vectors/perf-stats.json`. With no endpoint nothing is offered and nothing is sent.
+    /// Legacy stats endpoint, pinned in `apps/parity/vectors/perf-stats.json`. Not the active iOS destination.
     static let endpoint: String? = "https://otel.codegraff.com/v1/harness/stats"
 
-    static var available: Bool { endpoint != nil }
+    /// Active iOS OTLP endpoint. Keep `endpoint` above as the legacy parity contract, not the active destination.
+    static let otlpEndpoint: String? = "https://otel.codegraff.com/v1/metrics"
+
+    static var available: Bool { otlpEndpoint != nil }
     /// `bool(forKey:)` reads an unset key as false, which would make "never chosen" mean off.
     static var enabled: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? defaultEnabled }
 
     private static let installId = UUID().uuidString.lowercased()
-    private static let uploader = PerfUploader(endpoint: endpoint, enabled: { enabled }, source: Perf.shared.histograms,
+    private static let uploader = PerfUploader(endpoint: otlpEndpoint, enabled: { collectingEnabled }, source: Perf.shared.histograms,
+                                               body: { PerfOTLPBatch(meta: $0, window: $1).body() },
                                                post: { await PerfTransport.post($0, $1) })
 
     private static let isDebugBuild: Bool = {
@@ -327,14 +362,21 @@ enum PerfSharing {
         #endif
     }()
 
-    /// Called when the app goes to the background. A batch is only built, and only sent, when sharing is on, this is
-    /// not a debug build, and the phone is neither hot nor in Low Power Mode; the post itself runs at utility priority
+    static var collectingEnabled: Bool { available && enabled && !isDebugBuild }
+
+    @MainActor
+    static func consentChanged() {
+        PerfResourceRuntime.shared.consentChanged()
+    }
+
+    /// Called periodically in the foreground and when the app goes to the background. Batches require consent,
+    /// a release build, and a phone that is neither hot nor in Low Power Mode; the post runs at utility priority
     /// off the main thread and refuses mobile data. Samples that could not go now stay for the next attempt; samples
     /// recorded while sharing is off are dropped and never sent later.
     @MainActor
     static func flush() {
         guard available else { return }
-        if !enabled || isDebugBuild { _ = Perf.shared.histograms.take(); return }
+        if !collectingEnabled { Perf.shared.histograms.discard(); return }
         guard PerfPolicy.deviceIsCalm(lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled, thermal: Perf.thermalLabel) else { return }
         let meta = batchMeta()
         Task.detached(priority: .utility) { _ = await uploader.flush(meta: meta) }
