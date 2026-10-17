@@ -202,7 +202,7 @@ pub fn openai_login(snapshot: &AgentAccountsSnapshot) -> (bool, Option<String>) 
 /// A graff provider's display name for the sign-in dialog title.
 fn graff_provider_name(id: Option<&str>) -> &'static str {
     if id == Some("chatgpt-new") {
-        return "ChatGPT (new)";
+        return "ChatGPT";
     }
     GRAFF_LOGIN_PROVIDERS
         .iter()
@@ -1931,7 +1931,7 @@ impl AccountsPage {
                             .size(px(16.0))
                             .text_color(theme.text_muted),
                     )
-                    .child(widgets::row_title(theme, "ChatGPT (new)")),
+                    .child(widgets::row_title(theme, "ChatGPT")),
             )
             .child(
                 widgets::section_card(theme)
@@ -1939,7 +1939,7 @@ impl AccountsPage {
                     .child(self.render_graff_row(
                         1000,
                         Some("chatgpt-new"),
-                        "ChatGPT (graff)",
+                        "ChatGPT",
                         row.status(),
                         matches!(row, ChatgptPlanRow::Ready { .. }),
                         theme,
@@ -2021,7 +2021,7 @@ impl AccountsPage {
                     .collect();
                 entries.insert(
                     entries.len().min(1),
-                    (None, "ChatGPT (legacy Codex)", openai, openai_signed_in),
+                    (None, "ChatGPT (old Codex)", openai, openai_signed_in),
                 );
                 div()
                     .children(entries.into_iter().enumerate().map(
@@ -3323,10 +3323,7 @@ mod tests {
         assert_eq!(graff(Some("xai")).title(), "Sign in to xAI");
         assert_eq!(graff(Some("kimi")).title(), "Sign in to Kimi");
         assert_eq!(graff(Some("zai")).title(), "Sign in to Z.AI");
-        assert_eq!(
-            graff(Some("chatgpt-new")).title(),
-            "Sign in to ChatGPT (new)"
-        );
+        assert_eq!(graff(Some("chatgpt-new")).title(), "Sign in to ChatGPT");
         assert_eq!(graff(None).title(), "Sign in to graff");
         assert_eq!(graff(Some("nope")).title(), "Sign in to graff");
         // The other harnesses keep their titles.
