@@ -48,6 +48,9 @@ jobs:
             -only-testing:HarnessTests/AgentReauthenticationTests \
             -only-testing:HarnessTests/GeneratedImageTests \
             -only-testing:HarnessTests/BrandMarkTests \
+            -only-testing:HarnessTests/LivePerfTests \
+            -only-testing:HarnessTests/PerfMonitorTests \
+            -only-testing:HarnessTests/TranscriptScrollMatrixTests \
             CODE_SIGNING_ALLOWED=NO test
       - name: Upload test results
         if: always()
