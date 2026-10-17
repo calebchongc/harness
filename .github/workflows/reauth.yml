@@ -47,6 +47,7 @@ jobs:
             -resultBundlePath "$RUNNER_TEMP/reauth-tests.xcresult" \
             -only-testing:HarnessTests/AgentReauthenticationTests \
             -only-testing:HarnessTests/GeneratedImageTests \
+            -only-testing:HarnessTests/BrandMarkTests \
             CODE_SIGNING_ALLOWED=NO test
       - name: Upload test results
         if: always()
