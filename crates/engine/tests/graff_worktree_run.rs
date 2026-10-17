@@ -215,9 +215,19 @@ async fn graff_chats_run_and_resume_in_graffs_own_worktree() {
     assert!(!harness_trees.exists(), "the host mints no harness/<name> tree for Graff");
 
     let chat = core.workspace.chat(CHAT).unwrap().expect("chat row");
-    assert_eq!(chat.cwd.as_deref(), Some(tree.as_str()), "the chat moved into Graff's tree");
-    assert_eq!(chat.branch.as_deref(), Some(format!("actual-{name}").as_str()));
-    let context = chat.source_context.as_ref().expect("runtime source context");
+    assert_eq!(
+        chat.cwd.as_deref(),
+        Some(tree.as_str()),
+        "the chat moved into Graff's tree"
+    );
+    assert_eq!(
+        chat.branch.as_deref(),
+        Some(format!("actual-{name}").as_str())
+    );
+    let context = chat
+        .source_context
+        .as_ref()
+        .expect("runtime source context");
     assert_eq!(context.cwd, tree);
     assert_eq!(context.repo_root, tree);
     assert_eq!(
