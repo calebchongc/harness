@@ -54,7 +54,7 @@ jobs:
             -only-testing:HarnessTests/PerfResourcesTests \
             -only-testing:HarnessTests/PerfOTLPTests \
             -only-testing:HarnessTests/PerfFramesTests \
-            CODE_SIGNING_ALLOWED=NO test
+            ENABLE_TESTABILITY=YES CODE_SIGNING_ALLOWED=NO test
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
