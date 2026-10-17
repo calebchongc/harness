@@ -1,7 +1,7 @@
 # Performance monitor
 
-Both apps time themselves on the device and show the result under Settings > Performance. Optional sharing requires
-explicit consent and is off by default. "Copy report" produces plain numbers (no chat content, names or identifiers).
+Both apps time themselves on the device and show the result under Settings > Performance. Anonymous sharing is
+on by default and can be turned off in Settings; existing explicit opt-outs are preserved. "Copy report" produces plain numbers (no chat content, names or identifiers).
 
 | | iOS (`PerfMonitor.swift`) | Android (`perf/Perf.kt`) |
 | --- | --- | --- |
@@ -27,8 +27,9 @@ OTLP nanosecond timestamp strings, string-encoded 64-bit counts, units, bounds, 
 an SDK dependency or send raw samples. Android and desktop retain `POST /v1/harness/stats`; the legacy mobile vectors
 continue to test that format. Bucket percentiles estimate a range's upper bound, not an exact sample percentile.
 
-Sharing is off by default. The expanded iOS diagnostics require a new explicit consent choice in Settings; an older
-choice does not silently enable resource collection. iOS samples its own process every five foreground seconds:
+Sharing is on by default. iOS honors the latest explicit setting, including opt-outs from earlier timing-only
+releases. Only physical-device release builds collect or upload diagnostics; simulator and debug builds never do.
+iOS samples its own process every five foreground seconds:
 CPU utilization (`1`, where 1 means one occupied core), physical memory footprint (`By`), physical disk-write bytes
 per sampled interval (`By`) and write rate (`By/s`). Counter failures and suspension gaps are omitted, never made into
 zero samples. Disk I/O counters are not logical filesystem writes or SQLite attribution.
@@ -42,7 +43,7 @@ it rejects extra attributes/exemplars or cumulative histograms before storing an
 architecture, hardware model and maximum refresh rate, plus a random per-launch `service.instance.id`. No account,
 persistent device/session identifier, process ID, raw uptime, chat content or paths are exported. Aggregates retain
 90 days. Uploads happen periodically in the foreground and on backgrounding, no more than once per ten minutes,
-subject to consent, power, thermal and network restrictions.
+subject to the sharing setting, power, thermal and network restrictions.
 
 Legacy format (Android and iOS compatibility tests):
 

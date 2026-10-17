@@ -133,20 +133,18 @@ final class PerfMonitorTests: XCTestCase {
         XCTAssertEqual(refused, 0, "plain http to a real host must not be sent")
     }
 
-    func testSharingRequiresFreshConsentAndCanBeTurnedOff() {
-        let key = PerfSharing.key
-        let saved = UserDefaults.standard.object(forKey: key)
-        let oldKey = "share-performance"
-        let oldSaved = UserDefaults.standard.object(forKey: oldKey)
-        defer { if let oldSaved { UserDefaults.standard.set(oldSaved, forKey: oldKey) } else { UserDefaults.standard.removeObject(forKey: oldKey) } }
-        UserDefaults.standard.set(true, forKey: oldKey)
-        defer { if let saved { UserDefaults.standard.set(saved, forKey: key) } else { UserDefaults.standard.removeObject(forKey: key) } }
-        UserDefaults.standard.removeObject(forKey: key)
-        XCTAssertFalse(PerfSharing.enabled, "a never-chosen setting must not upload")
-        UserDefaults.standard.set(false, forKey: key)
-        XCTAssertFalse(PerfSharing.enabled, "an explicit off must stay off")
-        UserDefaults.standard.set(true, forKey: key)
-        XCTAssertTrue(PerfSharing.enabled)
+    func testSharingDefaultsOnAndCanBeTurnedOff() throws {
+        let suite = "PerfMonitorTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(PerfSharing.isEnabled(in: defaults), "a never-chosen setting defaults on")
+        defaults.set(false, forKey: PerfSharing.key)
+        XCTAssertFalse(PerfSharing.isEnabled(in: defaults), "an explicit off must stay off")
+        defaults.set(true, forKey: PerfSharing.key)
+        XCTAssertTrue(PerfSharing.isEnabled(in: defaults))
+        #if DEBUG || targetEnvironment(simulator)
+        XCTAssertFalse(PerfSharing.collectingEnabled, "development runs must not send production telemetry")
+        #endif
     }
 
     /// The monitor sits on hot paths (every run loop turn, every parse), so its per-call cost has a ceiling.

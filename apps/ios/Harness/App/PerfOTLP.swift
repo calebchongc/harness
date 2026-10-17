@@ -150,7 +150,7 @@ final class PerfResourceSampler: @unchecked Sendable {
 }
 
 /// Main-thread lifecycle only; counters themselves are read off-main. Local operation timings remain available
-/// without consent, but the expanded resource diagnostics are never even sampled without explicit release consent.
+/// with sharing off; resource diagnostics are sampled only in physical-device release builds with sharing on.
 @MainActor
 final class PerfResourceRuntime {
     static let shared = PerfResourceRuntime()
