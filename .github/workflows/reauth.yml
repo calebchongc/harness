@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - 'apps/ios/**'
+      - 'apps/parity/**'
       - '.github/workflows/reauth.yml'
   push:
     branches: [main, fix/chatgpt-phone-reauth]
     paths:
       - 'apps/ios/**'
+      - 'apps/parity/**'
       - '.github/workflows/reauth.yml'
   workflow_dispatch:
 
