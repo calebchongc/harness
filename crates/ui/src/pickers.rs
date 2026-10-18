@@ -3725,9 +3725,10 @@ impl Pickers {
                 .selected_chat
                 .as_ref()
                 .and_then(|_| state.selected_chat_row().cloned());
-            let change_request = session
-                .as_ref()
-                .and_then(|chat| state.change_request_for_chat(chat).cloned());
+            let change_request = session.as_ref().and_then(|chat| {
+                let pr = state.change_request_for_chat(chat).cloned()?;
+                Some((pr, state.change_request_provenance(chat)))
+            });
             (space, session, change_request)
         };
         let row = || {
@@ -3802,7 +3803,7 @@ impl Pickers {
                     .child(right)
                     .when_some(graff_card, |el, card| el.child(card))
                     .child(div().flex_1().min_w_0())
-                    .when_some(change_request, |el, summary| {
+                    .when_some(change_request, |el, (summary, provenance)| {
                         el.child(
                             div()
                                 .flex_none()
@@ -3810,6 +3811,7 @@ impl Pickers {
                                 .child(crate::change_requests::pull_request_badge(
                                     "composer-pull-request".into(),
                                     summary,
+                                    provenance,
                                     crate::change_requests::ChangeRequestBadgeSurface::Composer,
                                     &theme,
                                 )),

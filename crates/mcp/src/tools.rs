@@ -748,6 +748,7 @@ impl Tools {
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 room_gen: None,
+                source_context_unavailable_at: None,
             };
             let sent = self
                 .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")

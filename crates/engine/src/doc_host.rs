@@ -5580,6 +5580,11 @@ impl DocHost {
     /// If that checkout drifted since the chat's last turn (another branch,
     /// or another checkout in the same folder), the dispatch is held behind a
     /// question instead and this returns `None` (#354).
+    ///
+    /// The context is recorded only once dispatch accepts the request: one
+    /// rejected before it ran leaves the previous context in place. A run
+    /// whose checkout could not be observed marks that context unavailable
+    /// rather than leaving it to pass as current (#356).
     pub(crate) async fn dispatch_with_source_context(
         &self,
         sessions: &SessionsEngine,
@@ -5597,16 +5602,19 @@ impl DocHost {
             return Ok(None);
         }
         let (request, message_id) = self.release_branch_drift(chat_id, request, message_id)?;
-        if let Some(workspace) = self.workspace()
-            && let Some(context) = context
-            && let Err(err) = workspace.set_chat_source_context(chat_id, &context)
-        {
-            tracing::warn!(chat = %chat_id, error = %err, "conversation source stamp failed");
-        }
-        sessions
+        let run_id = sessions
             .dispatch(chat_id, harness, request, message_id)
-            .await
-            .map(Some)
+            .await?;
+        if let Some(workspace) = self.workspace() {
+            let stamped = match &context {
+                Some(context) => workspace.set_chat_source_context(chat_id, context),
+                None => workspace.mark_chat_source_context_unavailable(chat_id),
+            };
+            if let Err(err) = stamped {
+                tracing::warn!(chat = %chat_id, error = %err, "conversation source stamp failed");
+            }
+        }
+        Ok(Some(run_id))
     }
 
     /// Create (or reuse) the isolated worktree a Run's [`harness_proto::WorktreeSpec`]

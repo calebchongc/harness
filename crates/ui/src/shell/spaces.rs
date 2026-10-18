@@ -6614,6 +6614,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 

@@ -1152,9 +1152,29 @@ impl RegistryDoc {
             OpKind::Update,
             fields([
                 ("sourceContext", serde_json::to_value(context)?),
+                ("sourceContextUnavailableAt", Value::Null),
                 ("branch", json!(context.branch)),
                 ("checkoutId", json!(context.checkout_id)),
             ]),
+        );
+        Ok(true)
+    }
+
+    /// The chat's latest accepted run could not observe its checkout. The
+    /// last known context stays for history, qualified as not current.
+    pub fn mark_chat_source_context_unavailable(
+        &mut self,
+        chat_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("sourceContextUnavailableAt", json!(at.timestamp_millis()))]),
         );
         Ok(true)
     }

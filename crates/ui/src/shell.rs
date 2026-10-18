@@ -7025,7 +7025,10 @@ impl Shell {
         time_ago: SharedString,
         space_name: SharedString,
         branch: Option<SharedString>,
-        change_request: Option<harness_proto::ChangeRequestSummary>,
+        change_request: Option<(
+            harness_proto::ChangeRequestSummary,
+            crate::change_requests::ChangeRequestProvenance,
+        )>,
         harness: Option<harness_proto::HarnessId>,
         status: harness_proto::ChatIndicator,
         selected: bool,
@@ -7560,11 +7563,12 @@ impl Shell {
                         // Stable invisible spring keeps the optional PR badge
                         // pinned right without changing no-PR paint.
                         .child(div().flex_1().min_w_0())
-                        .when_some(change_request, |el, summary| {
+                        .when_some(change_request, |el, (summary, provenance)| {
                             el.child(if preview {
                                 crate::change_requests::pull_request_badge_preview(
                                     format!("{row_id}-pr").into(),
                                     summary,
+                                    provenance,
                                     crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                                     theme,
                                 )
@@ -7572,6 +7576,7 @@ impl Shell {
                                 crate::change_requests::pull_request_badge_with_query(
                                     format!("{row_id}-pr").into(),
                                     summary,
+                                    provenance,
                                     crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                                     search_query,
                                     theme,
@@ -13117,6 +13122,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
             parent_chat_id: None,
             last_prompt_at: None,
         }
@@ -15058,6 +15064,7 @@ mod exit_regressions {
                     space_id: None,
                     last_seen_at: None,
                     room_gen: None,
+                    source_context_unavailable_at: None,
                 };
                 shell.state.update(cx, |state, cx| {
                     state.chats = vec![chat("a"), chat("idle"), chat("busy")];
@@ -15144,6 +15151,7 @@ mod exit_regressions {
                         space_id: None,
                         last_seen_at: None,
                         room_gen: None,
+                        source_context_unavailable_at: None,
                     }];
                     state.select_chat(Some("chat".into()), cx);
                 });
@@ -15227,6 +15235,7 @@ mod exit_regressions {
                         space_id: Some("harness".into()),
                         last_seen_at: None,
                         room_gen: None,
+                        source_context_unavailable_at: None,
                     }];
                     state.select_chat(Some("harness-chat".into()), cx);
                 });
@@ -15426,6 +15435,7 @@ mod exit_regressions {
                         space_id: Some("folio".into()),
                         last_seen_at: None,
                         room_gen: None,
+                        source_context_unavailable_at: None,
                     }];
                     state.select_chat(Some("folio-chat".into()), cx);
                 });
@@ -15553,6 +15563,7 @@ mod exit_regressions {
                         space_id: None,
                         last_seen_at: None,
                         room_gen: None,
+                        source_context_unavailable_at: None,
                     }];
                     state.selected_chat = Some("graff-chat".into());
                 });
@@ -15845,6 +15856,7 @@ mod exit_regressions {
                     space_id: None,
                     last_seen_at: None,
                     room_gen: None,
+                    source_context_unavailable_at: None,
                 }];
                 state.selected_chat = Some("graff-chat".into());
                 state.transcript = vec![

@@ -659,7 +659,10 @@ impl Shell {
                     .map(str::trim)
                     .filter(|branch| !branch.is_empty())
                     .map(SharedString::from);
-                let pr = state.change_request_for_chat(chat).cloned();
+                let pr = state
+                    .change_request_for_chat(chat)
+                    .cloned()
+                    .map(|pr| (pr, state.change_request_provenance(chat)));
                 let harness = self
                     .settings
                     .sidebar_show_harness
