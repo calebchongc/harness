@@ -379,6 +379,7 @@ impl WorkspaceDoc {
             "sourceContext",
             LoroValue::from(serde_json::to_value(context)?),
         )?;
+        row.insert("sourceContextUnavailableAt", LoroValue::Null)?;
         row.insert("branch", context.branch.as_str())?;
         row.insert("checkoutId", context.checkout_id.as_str())?;
         self.doc.commit();
@@ -689,6 +690,8 @@ pub(crate) struct RawChat {
     checkout_id: Option<String>,
     #[serde(default)]
     source_context: Option<harness_proto::ConversationSourceContext>,
+    #[serde(default)]
+    source_context_unavailable_at: Option<i64>,
     /// LENIENT: a config this build can't decode (a harness/reasoning/sandbox
     /// id from a NEWER peer — field incident: pre-v0.2.10 laptops dropped
     /// every `"opencode"` chat row wholesale, so new sessions silently never
@@ -748,6 +751,7 @@ impl From<RawChat> for Chat {
             branch: raw.branch,
             checkout_id: raw.checkout_id,
             source_context: raw.source_context,
+            source_context_unavailable_at: raw.source_context_unavailable_at.map(dt),
             config: raw.config,
             last_message_preview: raw.last_message_preview,
             last_message_at: raw.last_message_at.map(dt),
@@ -869,6 +873,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 

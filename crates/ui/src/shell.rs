@@ -2335,6 +2335,13 @@ impl Shell {
             shell: shell.downgrade(),
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
         });
+        // Only a cold start waits for the engine. A window reopened from the
+        // Dock (or a notification) around a ready engine must not replay the
+        // setup splash and look like a restart (#369).
+        let splash = match state.read(cx).connection {
+            ConnectionStatus::Connecting => SplashPhase::Visible,
+            ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
+        };
         Self {
             state,
             sidebar_pane,
@@ -2515,7 +2522,7 @@ impl Shell {
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
             render_time: None,
-            splash: SplashPhase::Visible,
+            splash,
             splash_task: None,
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
@@ -2595,6 +2602,9 @@ impl Shell {
         self.prune_file_explorers(cx);
         self.chat_split_on_state_changed(cx);
         self.maybe_auto_download_update(cx);
+        if let Some(chat_id) = state.update(cx, |state, _| state.take_linked_chat()) {
+            self.open_chat_preserving_tabs(chat_id, cx);
+        }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.sidebar_notice = Some(notice.into());
         }
@@ -4267,7 +4277,15 @@ impl Shell {
                 panel.changes_open = true;
                 panel.right_active = surface;
             });
-            self.apply_nav(NavEntry::Chat(key), cx);
+            if key.is_empty() {
+                // A blank-canvas editor belongs in the current tab/pane.
+                self.apply_nav(NavEntry::Chat(key), cx);
+            } else {
+                self.suspend_file_images(cx);
+                self.open_chat_preserving_tabs(key, cx);
+                self.close_user_menu(cx);
+                self.close_chat_menu(cx);
+            }
         }
     }
 
@@ -7007,7 +7025,10 @@ impl Shell {
         time_ago: SharedString,
         space_name: SharedString,
         branch: Option<SharedString>,
-        change_request: Option<harness_proto::ChangeRequestSummary>,
+        change_request: Option<(
+            harness_proto::ChangeRequestSummary,
+            crate::change_requests::ChangeRequestProvenance,
+        )>,
         harness: Option<harness_proto::HarnessId>,
         status: harness_proto::ChatIndicator,
         selected: bool,
@@ -7542,11 +7563,12 @@ impl Shell {
                         // Stable invisible spring keeps the optional PR badge
                         // pinned right without changing no-PR paint.
                         .child(div().flex_1().min_w_0())
-                        .when_some(change_request, |el, summary| {
+                        .when_some(change_request, |el, (summary, provenance)| {
                             el.child(if preview {
                                 crate::change_requests::pull_request_badge_preview(
                                     format!("{row_id}-pr").into(),
                                     summary,
+                                    provenance,
                                     crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                                     theme,
                                 )
@@ -7554,6 +7576,7 @@ impl Shell {
                                 crate::change_requests::pull_request_badge_with_query(
                                     format!("{row_id}-pr").into(),
                                     summary,
+                                    provenance,
                                     crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                                     search_query,
                                     theme,
@@ -13099,6 +13122,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
             parent_chat_id: None,
             last_prompt_at: None,
         }
@@ -14210,6 +14234,56 @@ mod exit_regressions {
     use gpui::{AppContext, TestAppContext};
 
     #[gpui::test]
+    fn only_a_cold_start_shows_the_setup_splash(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        // The Dock reopen hands the new window the retained app state.
+        let state = cx.new(|_| AppState::new());
+        let open = |cx: &mut TestAppContext| {
+            let state = state.clone();
+            let window = cx.add_window(|_, cx| {
+                Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        codegraff_client_id: None,
+                        default_harness: harness_proto::HarnessId::Mock,
+                    },
+                    cx,
+                )
+            });
+            window.read_with(cx, |shell, _| shell.splash).unwrap()
+        };
+        assert_eq!(
+            open(cx),
+            SplashPhase::Visible,
+            "cold start waits for the engine"
+        );
+        state.update(cx, |state, _| state.connection = ConnectionStatus::Ready);
+        assert_eq!(
+            open(cx),
+            SplashPhase::Gone,
+            "warm reopen skips the setup splash"
+        );
+    }
+
+    #[gpui::test]
     fn settings_search_opens_the_matching_section_and_clears(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
@@ -14990,6 +15064,7 @@ mod exit_regressions {
                     space_id: None,
                     last_seen_at: None,
                     room_gen: None,
+                    source_context_unavailable_at: None,
                 };
                 shell.state.update(cx, |state, cx| {
                     state.chats = vec![chat("a"), chat("idle"), chat("busy")];
@@ -15076,6 +15151,7 @@ mod exit_regressions {
                         space_id: None,
                         last_seen_at: None,
                         room_gen: None,
+                        source_context_unavailable_at: None,
                     }];
                     state.select_chat(Some("chat".into()), cx);
                 });
@@ -15159,6 +15235,7 @@ mod exit_regressions {
                         space_id: Some("harness".into()),
                         last_seen_at: None,
                         room_gen: None,
+                        source_context_unavailable_at: None,
                     }];
                     state.select_chat(Some("harness-chat".into()), cx);
                 });
@@ -15358,6 +15435,7 @@ mod exit_regressions {
                         space_id: Some("folio".into()),
                         last_seen_at: None,
                         room_gen: None,
+                        source_context_unavailable_at: None,
                     }];
                     state.select_chat(Some("folio-chat".into()), cx);
                 });
@@ -15485,6 +15563,7 @@ mod exit_regressions {
                         space_id: None,
                         last_seen_at: None,
                         room_gen: None,
+                        source_context_unavailable_at: None,
                     }];
                     state.selected_chat = Some("graff-chat".into());
                 });
@@ -15777,6 +15856,7 @@ mod exit_regressions {
                     space_id: None,
                     last_seen_at: None,
                     room_gen: None,
+                    source_context_unavailable_at: None,
                 }];
                 state.selected_chat = Some("graff-chat".into());
                 state.transcript = vec![
@@ -16240,9 +16320,20 @@ mod exit_regressions {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
             crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
         });
         let window = cx.add_window(|_, cx| {
             let state = cx.new(|_| AppState::new());
+            // This fixture exercises exit/save gating, not navigation between
+            // chats; the dirty editor belongs to the already-selected chat.
+            state.update(cx, |state, cx| state.select_chat(Some("test".into()), cx));
             Shell::new(
                 state,
                 EngineBootConfig {

@@ -80,9 +80,11 @@ enum PhoneSplit: String, CaseIterable, Identifiable {
 
     /// The pane actually shown. Typing in the session's composer gives the session the screen above the
     /// keyboard, whatever the handle's rest; the rest comes back when the composer lets the keyboard go
-    /// (sending puts it away).
-    static func shownPane(resting: StackedPane, composerFocused: Bool) -> StackedPane {
-        composerFocused ? .session : resting
+    /// (sending puts it away). With nothing open in the detail there is no session to give the screen to:
+    /// its rest shows the list instead of an empty placeholder with the list folded away.
+    static func shownPane(resting: StackedPane, composerFocused: Bool, hasDetail: Bool = true) -> StackedPane {
+        guard hasDetail else { return resting == .session ? .list : resting }
+        return composerFocused ? .session : resting
     }
 
     /// Height the session keeps below a stacked list: its header, a few rows and the composer.
@@ -125,6 +127,8 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
     let arrangement: PhoneSplit.Arrangement
     /// The session the detail shows: opening one from a list that has the screen brings the split back.
     var selection: String? = nil
+    /// Whether the detail shows anything (a session, a project, a new session), not its empty placeholder.
+    var hasDetail = true
     @ViewBuilder var list: List
     @ViewBuilder var detail: Detail
     @State private var availableHeight: CGFloat = .infinity
@@ -161,7 +165,8 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
         // The list's height in the split (the keyboard can shrink it) and with the whole screen.
         let open = PhoneSplit.stackedListHeight(extent: arrangement.listExtent, available: availableHeight)
         let full = availableHeight.isFinite ? max(availableHeight - Self.handleFolded, open) : open
-        let shown = PhoneSplit.shownPane(resting: dragEnabled ? pane : .split, composerFocused: composerFocused)
+        let shown = PhoneSplit.shownPane(
+            resting: dragEnabled ? pane : .split, composerFocused: composerFocused, hasDetail: hasDetail)
         let resting = PhoneSplit.stackedListHeight(for: shown, open: open, full: full)
         let height = dragEnabled ? PhoneSplit.draggedListHeight(resting: resting, drag: drag, extent: full) : resting
         // Mid-drag the handle is a plain grabber; at rest it shows the way back to a folded pane.
@@ -220,6 +225,11 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
             // Picking a session from a list that has the screen opens it in the split.
             if chat != nil, pane == .list { setPane(.split) }
         }
+        .onChange(of: hasDetail) { _, shown in
+            // Back from the last screen in the detail returns to the list. Left at the session's rest it
+            // showed an empty placeholder with the list folded away; at the split's, half the screen blank.
+            if !shown { setPane(.list) }
+        }
         .onAppear {
             FeatureUsage.record(.splitShown, for: .stackedSplitDrag)
             if dragEnabled, !FeatureOnboarding.hasSeen(.stackedSplitDrag) {
@@ -235,12 +245,17 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
     private func tapHandle() {
         if composerFocused {
             dismissKeyboard()
+        } else if !hasDetail {
+            // Nothing open to give the screen to: the handle moves between the split and the list.
+            setPane(pane == .split ? .list : .split)
         } else {
             setPane(pane == .split ? .session : .split)
         }
     }
 
     private func setPane(_ next: PhoneSplit.StackedPane) {
+        // A fold with nothing open would rest on an empty screen: the list takes it instead.
+        let next = next == .session && !hasDetail ? .list : next
         if next != pane {
             let event: FeatureUsageEvent = switch next {
             case .session: .folded
