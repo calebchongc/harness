@@ -34,7 +34,6 @@ struct HomeView: View {
     @AppStorage("homeCollapsedGroups") private var collapsedGroupsRaw = ""
     // Not persisted: a filter left on across launches reads as lost sessions.
     @State private var searchText = ""
-    @State private var statusFilter: HomeStatusFilter = .all
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private var selectedSpace: Space? {
@@ -264,11 +263,8 @@ struct HomeView: View {
         List {
             sessionsSection
             // The desktop's archived shelf sits under the active list,
-            // scoped by the same space filter and search. Archived sessions
-            // are never running or waiting, so a status filter hides it.
-            if statusFilter == .all {
-                ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
-            }
+            // scoped by the same space filter and search.
+            ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
         }
         // In the phone split the field sits in the pane's own bar: the floating one overlaps the rows of a
         // short pane.
@@ -568,8 +564,7 @@ struct HomeView: View {
 
     @ViewBuilder private var sessionsSection: some View {
         let scoped = selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats
-        let chats = HomeFilter.apply(scoped, query: searchText, status: statusFilter,
-                                     indicator: model.indicator(for:), names: model.homeFilterNames)
+        let chats = HomeFilter.apply(scoped, query: searchText, names: model.homeFilterNames)
         let grouping = HomeGroupBy(rawValue: groupByRaw) ?? .none
         if showSplitOffer {
             Section {
@@ -583,21 +578,19 @@ struct HomeView: View {
         }
         if !scoped.isEmpty {
             Section {
-                HStack(spacing: 6) {
-                    HomeStatusChips(selection: $statusFilter, counts: statusCounts(scoped))
-                    groupPill
-                }
+                groupPill
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 6, trailing: 16))
             }
             .listSectionSeparator(.hidden)
             // What's running or waiting, above the history. Hidden while
-            // searching or filtering so it never competes with a query.
+            // searching so it never competes with a query.
             let now = NowStrip.active(in: scoped, model: model)
             // Not in the phone split: the list beside the open session already shows what is running or
             // waiting, and the cards would take most of a narrow pane.
-            if statusFilter == .all, searchText.isEmpty, !now.isEmpty, phoneArrangement == nil {
+            if searchText.isEmpty, !now.isEmpty, phoneArrangement == nil {
                 Section {
                     NowStrip(chats: now) { open(.chat($0)) }
                         .listRowBackground(Color.clear)
@@ -609,7 +602,7 @@ struct HomeView: View {
         }
         if chats.isEmpty {
             // A search can still hit the archived shelf below.
-            let archivedHit = statusFilter == .all && !searchText.isEmpty
+            let archivedHit = !searchText.isEmpty
                 && !model.archivedMatches(in: selectedSpace?.id, query: searchText).isEmpty
             if !archivedHit {
                 Section {
@@ -650,17 +643,6 @@ struct HomeView: View {
             }
             .motionAnimation(Motion.resort, value: chats.map(\.id))
         }
-    }
-
-    private func statusCounts(_ chats: [Chat]) -> [HomeStatusFilter: Int] {
-        var counts: [HomeStatusFilter: Int] = [:]
-        for chat in chats {
-            let indicator = model.indicator(for: chat)
-            for filter in HomeStatusFilter.allCases where filter.matches(indicator) {
-                counts[filter, default: 0] += 1
-            }
-        }
-        return counts
     }
 
     /// Collapsed section ids, persisted (comma-separated).
