@@ -102,18 +102,29 @@ fn check_painted_rows(
     list: &ListState,
     rows: usize,
     check: &RefCell<crate::transcript_paint_check::ViewportFlicker>,
+    view: impl FnOnce() -> String,
 ) {
     use crate::transcript_paint_check::{ViewportSample, painted_rows_anomaly};
     let painted = list.painted_items();
     let anomaly = painted_rows_anomaly(&painted);
+    check.borrow_mut().remember(&painted);
     let flicker =
         ViewportSample::new(rows, &painted).is_some_and(|sample| check.borrow_mut().record(sample));
     if (anomaly.is_some() || flicker) && check.borrow_mut().should_report(Instant::now()) {
         let top = list.logical_scroll_top();
+        // What moved between the last two frames, and the scroll state that
+        // drew them: the cause is still unconfirmed, so say enough to find it.
+        let difference = if flicker {
+            check.borrow().difference()
+        } else {
+            String::new()
+        };
         tracing::warn!(
             problem = anomaly
                 .as_deref()
                 .unwrap_or("viewport alternating between two positions"),
+            difference = %difference,
+            view = %view(),
             rows,
             painted = painted.len(),
             scroll_item = top.item_ix,
@@ -10077,13 +10088,28 @@ impl Render for Transcript {
                 let used = self.row_gutter;
                 let rows = self.rows.len();
                 let paint_check = self.paint_check.clone();
+                let view = (
+                    self.pinned,
+                    self.own_turn.is_some(),
+                    self.spring_last_tick.is_some(),
+                    self.scroll_anim.is_some(),
+                    self.user_collapse_scroll.is_some(),
+                    self.content_width,
+                );
                 gpui::canvas(
                     move |_, window, _| {
                         let width = f32::from(list.viewport_bounds().size.width);
                         if (row_gutter(width) - used).abs() > 0.5 {
                             window.refresh();
                         }
-                        check_painted_rows(&list, rows, &paint_check);
+                        check_painted_rows(&list, rows, &paint_check, || {
+                            let (pinned, own_turn, spring, anim, collapse, content) = view;
+                            format!(
+                                "pinned={pinned} own_turn={own_turn} spring={spring} \
+                                 anim={anim} collapse={collapse} gutter={used:.1} \
+                                 width={width:.1} content={content:.1}"
+                            )
+                        });
                     },
                     |_, _, _, _| {},
                 )
