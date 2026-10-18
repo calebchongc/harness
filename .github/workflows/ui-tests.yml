@@ -60,7 +60,7 @@ jobs:
         run: |
           cargo test --locked -p harness-sync --lib
           cargo test --locked -p harness-update --lib
-          cargo test --locked -p harness-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles --test diff_sync_idle --test show_visual --test branch_drift --test graff_worktree_run --test m5c_accounts_uploads_titles --test worktree_on_run
+          cargo test --locked -p harness-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles --test diff_sync_idle --test show_visual --test branch_drift --test graff_worktree_run --test m5c_accounts_uploads_titles --test worktree_on_run --test graff_login
       - name: graff trace observer
         run: cargo test --locked -p harness-observe
 
