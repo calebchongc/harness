@@ -74,19 +74,34 @@ xcodebuild test \
   -only-testing:HarnessTests/ImageDropEdgeCaseTests \
   -only-testing:HarnessTests/ImageDropLifecycleTests \
   -only-testing:HarnessTests/ComposerEditorTests \
+  -only-testing:HarnessUITests/ImageDropUITests \
   -parallel-testing-enabled NO \
   CODE_SIGNING_ALLOWED=NO
 ```
 
-The focused suite contains 22 tests: the six original drop tests, fourteen
-additional edge/lifecycle tests, and the existing composer marked-text and
-clipboard-image tests.
-It covers real `NSItemProvider` data and file imports, JPEG byte preservation,
-animated GIF frame preservation, TIFF-to-JPEG conversion, exact 24 MiB limits,
-failed providers/alternate representations, mixed text/image drags, duplicates,
-slow loading, draft isolation, canceled hover, native editor selection, and the
-actual SwiftUI editor's drop-delegate wiring.
+The focused suite contains **31 tests: 26 unit/hosted-view tests and five
+real drag-gesture UI tests**.
 
-These are simulator unit/hosted-view tests. They do **not** synthesize the
-system screenshot-thumbnail gesture or prove live relay/agent receipt. Use the
-physical-device steps above for those checks.
+The import tests cover actual `NSItemProvider` data and file imports, JPEG/GIF
+preservation, TIFF/HEIC-to-JPEG conversion, exact 24 MiB limits, oversized
+representation bypass attempts, empty/truncated images, invalid SVG,
+mislabelled image types, provider failures/alternate representations, mixed
+text/image drags, duplicates, slow loading, draft isolation, canceled hover,
+native editor selection, and the SwiftUI editor's drop-delegate wiring.
+
+The UI tests perform real press-and-drag gestures over the actual transcript
+and composer. They check keyboard-visible and landscape drops, independent
+attachment removal, multi-image drags, invalid and canceled drops, disabled
+Send during slow imports, normal plain-text drops, session navigation, and
+that image drops never send automatically.
+
+For repeatability, a DEBUG-only `-image-drop-fixture` flag adds deterministic
+UIKit drag sources while in `-demo` mode. The fixture supplies item providers
+through normal drag interactions; it does not call the drop handler or inject
+attachments. It is not compiled into release builds and its drags are
+restricted to the app. To explore it manually, launch a debug build with
+`-demo -route chat:chat-tabs -image-drop-fixture`.
+
+The UI checks use an in-app source, not the system screenshot thumbnail or
+another app. They do **not** prove the physical-device screenshot gesture or
+live relay/agent receipt. Use the physical-device steps above for those checks.

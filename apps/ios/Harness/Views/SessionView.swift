@@ -285,6 +285,13 @@ struct SessionView: View {
             }
         }
         .background(Theme.bg.ignoresSafeArea())
+        .overlay(alignment: .top) {
+            #if DEBUG
+            if model.demo != nil, ProcessInfo.processInfo.arguments.contains("-image-drop-fixture") {
+                ImageDropFixture()
+            }
+            #endif
+        }
         .onDrop(of: [UTType.image], isTargeted: Binding(
             get: { attachmentDraft.targeted },
             set: { attachmentDraft.targeted = $0 }

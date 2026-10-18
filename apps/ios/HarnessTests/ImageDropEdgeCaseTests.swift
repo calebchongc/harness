@@ -148,6 +148,59 @@ final class ImageDropEdgeCaseTests: XCTestCase {
         XCTAssertNotNil(draft.error)
     }
 
+    func testHEICTranscodesToJPEGWithoutChangingDimensions() async throws {
+        let heic = try encoded(.heic, colors: [.blue])
+        let draft = draft()
+        XCTAssertTrue(draft.receive([provider(heic, type: .heic)]))
+        await finish(draft)
+        let staged = try XCTUnwrap(draft.items.first)
+        XCTAssertTrue(staged.name.hasSuffix(".jpg"))
+        XCTAssertEqual(staged.image.size, UIImage(data: heic)?.size)
+        XCTAssertNotEqual(staged.data, heic)
+        XCTAssertNil(draft.error)
+    }
+
+    func testSVGEmptyAndTruncatedRasterDoNotEraseExistingAttachment() async throws {
+        let draft = draft()
+        let original = try XCTUnwrap(StagedAttachment.stage(data: try XCTUnwrap(image().pngData())))
+        draft.items = [original]
+        let svg = Data("<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"8\" height=\"8\"/></svg>".utf8)
+        let truncated = Data([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13])
+        XCTAssertTrue(draft.receive([provider(svg, type: .svg), provider(Data()), provider(truncated)]))
+        await finish(draft)
+        XCTAssertEqual(draft.items.map(\.id), [original.id])
+        XCTAssertEqual(draft.error, "3 images couldn't be attached (unsupported or over 24 MB).")
+    }
+
+    func testOversizedRepresentationCannotBypassLimitWithSmallerAlternative() async throws {
+        let source = DataOnlyImageProvider()
+        let oversized = Data(count: maxAttachmentBytes + 1)
+        source.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
+            completion(oversized, nil)
+            return nil
+        }
+        let jpeg = try XCTUnwrap(image().jpegData(compressionQuality: 0.8))
+        source.registerDataRepresentation(forTypeIdentifier: UTType.jpeg.identifier, visibility: .all) { completion in
+            completion(jpeg, nil)
+            return nil
+        }
+        let draft = draft()
+        XCTAssertTrue(draft.receive([source]))
+        await finish(draft)
+        XCTAssertTrue(draft.items.isEmpty)
+        XCTAssertNotNil(draft.error)
+    }
+
+    func testMislabelledProviderUsesActualImageBytesForFilename() async throws {
+        let jpeg = try XCTUnwrap(image().jpegData(compressionQuality: 0.8))
+        let draft = draft()
+        XCTAssertTrue(draft.receive([provider(jpeg, type: .png)]))
+        await finish(draft)
+        XCTAssertEqual(draft.items.first?.data, jpeg)
+        XCTAssertTrue(draft.items.first?.name.hasSuffix(".jpg") == true)
+        XCTAssertNil(draft.error)
+    }
+
     func testDroppingSameImageTwiceCreatesIndependentlyRemovableAttachments() async throws {
         let draft = draft()
         let data = try XCTUnwrap(image().pngData())

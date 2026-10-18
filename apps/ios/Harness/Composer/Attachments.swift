@@ -521,6 +521,8 @@ struct AttachmentStripView: View {
                             .strokeBorder(hairline(0.11), lineWidth: 1))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Preview attached image")
+                .accessibilityIdentifier("composer-attachment-\(att.id)")
                 .overlay(alignment: .topTrailing) {
                     Button {
                         remove(att.id)
@@ -534,6 +536,8 @@ struct AttachmentStripView: View {
                     }
                     .buttonStyle(.plain)
                     .offset(x: 5, y: -5)
+                    .accessibilityLabel("Remove attached image")
+                    .accessibilityIdentifier("composer-remove-attachment-\(att.id)")
                 }
             }
         }
