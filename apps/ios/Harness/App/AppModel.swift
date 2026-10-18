@@ -122,6 +122,13 @@ final class AppModel {
 
     func restore() {
         if demo != nil { return }
+        // After a restart iOS can launch the app in the background before the first unlock, when the
+        // Keychain, the saved account and the cached docs can't be read yet. Read then, a sign-in that is
+        // there looks absent and the phone opens signed out. Wait for the unlock instead.
+        guard UIApplication.shared.isProtectedDataAvailable else {
+            restoreAfterUnlock()
+            return
+        }
         DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
         // Debug-rig config overrides (cfprefsd caching defeats external
@@ -248,11 +255,38 @@ final class AppModel {
             connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,
                     tokens: nil, devBearer: devBearer(userId: storedUserId, orgId: storedOrgId))
         case .codegraff:
-            guard let access = Keychain.load(key: "codegraffAccessToken"),
-                  let refresh = Keychain.load(key: "codegraffRefreshToken") else { return }
+            let refresh = Keychain.read(key: "codegraffRefreshToken")
+            let access = Keychain.read(key: "codegraffAccessToken")
+            if refresh == .unavailable || access == .unavailable {
+                restoreAfterUnlock()
+                return
+            }
+            guard case .found(let access) = access, case .found(let refresh) = refresh else { return }
             connect(url: url, mode: .codegraff, userId: storedUserId, orgId: storedOrgId,
                     tokens: AuthTokens(accessToken: access, refreshToken: refresh), devBearer: nil)
         }
+    }
+
+    /// The restore waiting for the Keychain: on the unlock, or the next time the app comes to the front.
+    @ObservationIgnored private var restoreWaitsForUnlock = false
+    @ObservationIgnored private var unlockObserver: NSObjectProtocol?
+
+    private func restoreAfterUnlock() {
+        restoreWaitsForUnlock = true
+        guard unlockObserver == nil else { return }
+        unlockObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.retryRestoreIfWaiting() }
+        }
+    }
+
+    private func retryRestoreIfWaiting() {
+        guard restoreWaitsForUnlock, UIApplication.shared.isProtectedDataAvailable else { return }
+        restoreWaitsForUnlock = false
+        if let unlockObserver { NotificationCenter.default.removeObserver(unlockObserver) }
+        unlockObserver = nil
+        restore()
     }
 
     // MARK: Sign-in flows
@@ -1028,6 +1062,8 @@ final class AppModel {
     /// online event on success, so every PARKED backoff (not just the rooms
     /// the kick reaches) lands a redial in ~1 RTT.
     func foregrounded() {
+        Keychain.flushPending()
+        retryRestoreIfWaiting()
         workspace?.setActive(true)
         refreshSignInIfDue()
         kickAllRooms()
