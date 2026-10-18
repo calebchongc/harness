@@ -125,6 +125,8 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
     let arrangement: PhoneSplit.Arrangement
     /// The session the detail shows: opening one from a list that has the screen brings the split back.
     var selection: String? = nil
+    /// Whether the detail shows anything (a session, a project, a new session), not its empty placeholder.
+    var hasDetail = true
     @ViewBuilder var list: List
     @ViewBuilder var detail: Detail
     @State private var availableHeight: CGFloat = .infinity
@@ -219,6 +221,11 @@ struct PhoneSplitContainer<List: View, Detail: View>: View {
         .onChange(of: selection) { _, chat in
             // Picking a session from a list that has the screen opens it in the split.
             if chat != nil, pane == .list { setPane(.split) }
+        }
+        .onChange(of: hasDetail) { _, shown in
+            // Back from the last screen in the detail returns to the list. Left at the session's rest it
+            // showed an empty placeholder with the list folded away; at the split's, half the screen blank.
+            if !shown { setPane(.list) }
         }
         .onAppear {
             FeatureUsage.record(.splitShown, for: .stackedSplitDrag)

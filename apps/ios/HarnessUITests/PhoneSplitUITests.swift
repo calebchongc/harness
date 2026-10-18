@@ -57,12 +57,13 @@ final class PhoneSplitUITests: XCTestCase {
         XCTAssertLessThan(listButton(app).frame.maxY, header(app).frame.minY, "the list sits above the session")
     }
 
-    private func launchRollout(_ half: String, onboardingSeen: Bool) -> XCUIApplication {
+    private func launchRollout(_ half: String, onboardingSeen: Bool,
+                               chat: String = "chat-tabs") -> XCUIApplication {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
         Thread.sleep(forTimeInterval: 1)
         let app = XCUIApplication()
-        app.launchArguments = ["-demo", "-sethomefilter", "", "-route", "chat:chat-tabs", "-phoneSplit", "stacked",
+        app.launchArguments = ["-demo", "-sethomefilter", "", "-route", "chat:\(chat)", "-phoneSplit", "stacked",
                                "-rollout.stackedSplitDrag", half,
                                "-onboarding.stackedSplitDrag.seen", onboardingSeen ? "YES" : "NO"]
         app.launch()
@@ -110,6 +111,50 @@ final class PhoneSplitUITests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.8)
         XCTAssertTrue(listButton(app).isHittable, "tapping the icon brings the list back")
         XCTAssertEqual(handle.label, "Hide the session list")
+    }
+
+    /// Back from a session that had the whole screen returns to the list, not to an empty pane with the
+    /// list folded away.
+    func testBackFromAFullScreenSessionReturnsToTheList() {
+        let app = launchRollout("on", onboardingSeen: true)
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        let handle = app.buttons["stacked-split-handle"]
+        XCTAssertTrue(handle.waitForExistence(timeout: 5), "no split handle")
+        let start = handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let top = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08))
+        start.press(forDuration: 0.1, thenDragTo: top)
+        Thread.sleep(forTimeInterval: 0.8)
+        XCTAssertFalse(listButton(app).isHittable, "the session has the screen")
+
+        // The session's own Back: the folded list keeps a navigation bar of its own.
+        let headerY = header(app).frame.midY
+        let back = app.navigationBars.buttons.allElementsBoundByIndex.first {
+            $0.isHittable && abs($0.frame.midY - headerY) < 30 && $0.frame.maxX < header(app).frame.minX
+        }
+        XCTAssertNotNil(back, "no Back button beside the session header")
+        back?.tap()
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-back-to-list")
+        XCTAssertFalse(header(app).exists, "the session closed")
+        XCTAssertTrue(listButton(app).isHittable, "Back returns to the list")
+    }
+
+    /// Typing an answer to a question gives the session the screen above the keyboard, as the composer
+    /// does, so the answer field is not hidden behind the keyboard.
+    func testTypingAnAnswerGivesTheSessionTheScreen() {
+        let app = launchRollout("on", onboardingSeen: true, chat: "chat-picker")
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        XCTAssertTrue(listButton(app).isHittable, "the list starts open")
+        let answer = app.textFields["Or type your own answer"]
+        XCTAssertTrue(answer.waitForExistence(timeout: 5), "no question panel")
+        answer.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5), "the keyboard came up")
+        answer.typeText("both, but local first")
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-question-typing")
+        XCTAssertFalse(listButton(app).isHittable, "the list gets out of the way")
+        XCTAssertTrue(answer.isHittable, "the answer field is above the keyboard")
+        XCTAssertLessThan(answer.frame.maxY, app.keyboards.firstMatch.frame.minY)
     }
 
     func testDraggingTheStackedHandleDownGivesTheListTheScreenAndItsIconBringsTheSessionBack() {
