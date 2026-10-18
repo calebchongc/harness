@@ -12,7 +12,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use harness_adapters::{Harness, HarnessError, RunControls};
-use harness_doc::{MessagePart, SessionCommandPayload};
+use harness_doc::{MessagePart, SessionCommandPayload, SessionCommandStatus};
 use harness_engine::{EngineCore, HarnessRegistry};
 use harness_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
@@ -114,6 +114,16 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
 }
 
 fn send(core: &EngineCore, id: &str, text: &str, cwd: &str) {
+    send_with_attachments(core, id, text, cwd, Vec::new());
+}
+
+fn send_with_attachments(
+    core: &EngineCore,
+    id: &str,
+    text: &str,
+    cwd: &str,
+    attachments: Vec<String>,
+) {
     let payload = SessionCommandPayload::Run {
         request: RunRequest {
             prompt: text.into(),
@@ -124,7 +134,7 @@ fn send(core: &EngineCore, id: &str, text: &str, cwd: &str) {
             cwd: cwd.into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
-            attachments: Vec::new(),
+            attachments,
             resume: None,
             worktree: None,
         },
@@ -314,19 +324,9 @@ async fn a_drifted_checkout_asks_before_the_chat_continues() {
     let (request_id, _) = wait_question(&core).await;
     // Sent while the question waits: held with it, after it in the transcript.
     send(&core, "m10", "tenth", &cwd);
-    wait_for(
-        || {
-            let handle = core.doc_host.open(CHAT).unwrap();
-            handle
-                .doc()
-                .read_entries()
-                .unwrap()
-                .iter()
-                .any(|e| e.id == "m10")
-        },
-        "the second held message",
-    )
-    .await;
+    // The optimistic transcript entry precedes the async checkout check;
+    // wait until this command is actually held before restarting the engine.
+    wait_send_applied(&core, "m10").await;
     core.shutdown().await;
     drop(core);
 
@@ -341,5 +341,227 @@ async fn a_drifted_checkout_asks_before_the_chat_continues() {
     assert!(resumed.ends_with("ninth\n\ntenth"), "{resumed}");
     assert!(!resumed.contains("eighth"), "{resumed}");
     assert_eq!(context_branch(&core), "zeta");
+    core.shutdown().await;
+}
+
+fn test_repo(root: &Path) -> (std::path::PathBuf, String) {
+    let repo = root.canonicalize().unwrap().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "alpha"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+    let cwd = repo.to_string_lossy().into_owned();
+    (repo, cwd)
+}
+
+fn create_chat(core: &EngineCore, cwd: &str) {
+    core.workspace
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some(cwd.into()))
+        .unwrap();
+    core.workspace.rename_chat(CHAT, "Pre-titled").unwrap();
+}
+
+async fn wait_turn(core: &EngineCore, prompts: &Arc<Mutex<Vec<String>>>, count: usize) {
+    wait_for(
+        || prompts.lock().unwrap().len() == count && !core.sessions.turn_in_flight(CHAT),
+        "the completed turn",
+    )
+    .await;
+}
+
+async fn wait_send_applied(core: &EngineCore, id: &str) {
+    wait_for(
+        || core.doc_host.open(CHAT).unwrap().doc().read_commands().unwrap().iter().any(|command| {
+            matches!(&command.payload, SessionCommandPayload::Run { message_id, .. } if message_id == id)
+                && command.status == SessionCommandStatus::Applied
+        }),
+        "the held send to finish persisting",
+    ).await;
+}
+
+fn attachment(core: &EngineCore, name: &str) -> String {
+    std::fs::create_dir_all(core.uploads.dir()).unwrap();
+    let path = core.uploads.dir().join(name);
+    std::fs::write(&path, b"fixture image bytes").unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_attachments_survive_restart_without_relying_on_prompt_trailers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cwd) = test_repo(tmp.path());
+    let data = tmp.path().join("data");
+    let (core, prompts) = engine(&data);
+    create_chat(&core, &cwd);
+    send(&core, "first", "establish alpha", &cwd);
+    wait_turn(&core, &prompts, 1).await;
+
+    git(&repo, &["switch", "-c", "beta"]);
+    let first = attachment(&core, "first.png");
+    let second = attachment(&core, "second.png");
+    send_with_attachments(&core, "image-1", "first image", &cwd, vec![first.clone()]);
+    let (request_id, _) = wait_question(&core).await;
+    send_with_attachments(&core, "image-2", "second image", &cwd, vec![second.clone()]);
+    wait_send_applied(&core, "image-2").await;
+    core.shutdown().await;
+    drop(core);
+
+    let (core, prompts) = engine(&data);
+    answer(&core, &request_id, "Continue on beta");
+    wait_turn(&core, &prompts, 1).await;
+    let request = core.sessions.last_request(CHAT).unwrap();
+    assert_eq!(request.attachments, [first, second]);
+    assert!(
+        request.prompt.ends_with("first image\n\nsecond image"),
+        "{}",
+        request.prompt
+    );
+    assert!(open_question(&core).is_none());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_continue_requires_new_consent_and_preserves_the_held_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cwd) = test_repo(tmp.path());
+    let data = tmp.path().join("data");
+    let (core, prompts) = engine(&data);
+    create_chat(&core, &cwd);
+    send(&core, "first", "establish alpha", &cwd);
+    wait_turn(&core, &prompts, 1).await;
+    git(&repo, &["switch", "-c", "beta"]);
+    let image = attachment(&core, "held.png");
+    send_with_attachments(
+        &core,
+        "held",
+        "keep this request",
+        &cwd,
+        vec![image.clone()],
+    );
+    let (old_id, _) = wait_question(&core).await;
+    wait_send_applied(&core, "held").await;
+    core.shutdown().await;
+    drop(core);
+
+    // The displayed beta question survives restart, but the folder changed again.
+    git(&repo, &["switch", "-c", "gamma"]);
+    let (core, prompts) = engine(&data);
+    answer(&core, &old_id, "Continue on beta");
+    let mut new_question = None;
+    wait_for(
+        || {
+            new_question = open_question(&core).filter(|(id, _)| id != &old_id);
+            new_question.is_some()
+        },
+        "fresh consent for gamma",
+    )
+    .await;
+    let (new_id, question) = new_question.unwrap();
+    assert_eq!(question.options[0], "Continue on gamma");
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "stale consent must not dispatch"
+    );
+    assert_eq!(
+        context_branch(&core),
+        "alpha",
+        "stale consent must not advance context"
+    );
+    core.shutdown().await;
+    drop(core);
+
+    // Re-prompting must not lose the original request on a second restart.
+    let (core, prompts) = engine(&data);
+    answer(&core, &new_id, "Continue on gamma");
+    wait_turn(&core, &prompts, 1).await;
+    let request = core.sessions.last_request(CHAT).unwrap();
+    assert_eq!(request.attachments, [image]);
+    assert!(request.prompt.ends_with("keep this request"));
+    assert!(request.prompt.contains("now on `gamma`"));
+    assert!(request.prompt.contains("ran on `alpha`"));
+    assert_eq!(context_branch(&core), "gamma");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn many_held_sends_cannot_hide_the_question_even_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cwd) = test_repo(tmp.path());
+    let data = tmp.path().join("data");
+    let (core, prompts) = engine(&data);
+    create_chat(&core, &cwd);
+    send(&core, "first", "establish alpha", &cwd);
+    wait_turn(&core, &prompts, 1).await;
+    git(&repo, &["switch", "-c", "beta"]);
+    send(&core, "held-first", "held first", &cwd);
+    let (request_id, _) = wait_question(&core).await;
+    for index in 0..70 {
+        let id = format!("held-{index}");
+        send(&core, &id, &format!("held {index}"), &cwd);
+        wait_send_applied(&core, &id).await;
+    }
+    wait_send_applied(&core, "held-69").await;
+    assert_eq!(
+        open_question(&core).unwrap().0,
+        request_id,
+        "do not create another question"
+    );
+    let tail = core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_opening_tail(64)
+        .unwrap();
+    assert!(
+        !tail.iter().flat_map(|entry| &entry.parts).any(|part| {
+            matches!(
+                part,
+                MessagePart::Input {
+                    resolved: false,
+                    ..
+                }
+            )
+        }),
+        "this fixture really pushes the question outside the small tail"
+    );
+    core.shutdown().await;
+    drop(core);
+
+    let (core, prompts) = engine(&data);
+    send(&core, "after-restart", "after restart", &cwd);
+    wait_send_applied(&core, "after-restart").await;
+    let entries = core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap();
+    let open_count = entries
+        .iter()
+        .flat_map(|entry| &entry.parts)
+        .filter(|part| {
+            matches!(part, MessagePart::Input { request_id, resolved: false, .. }
+            if request_id.starts_with("branch-drift-"))
+        })
+        .count();
+    assert_eq!(open_count, 1, "restart must find the original question");
+    assert_eq!(open_question(&core).unwrap().0, request_id);
+    assert!(prompts.lock().unwrap().is_empty());
+
+    git(&repo, &["switch", "alpha"]);
+    send(&core, "release", "release", &cwd);
+    wait_turn(&core, &prompts, 1).await;
+    let prompt = prompts.lock().unwrap()[0].clone();
+    let expected = std::iter::once("held first".to_string())
+        .chain((0..70).map(|index| format!("held {index}")))
+        .chain(["after restart".to_string(), "release".to_string()])
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assert_eq!(
+        prompt, expected,
+        "all held sends are delivered once, in order"
+    );
+    assert!(open_question(&core).is_none());
     core.shutdown().await;
 }

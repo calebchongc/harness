@@ -18,9 +18,9 @@ pub(super) const REQUEST_PREFIX: &str = "branch-drift-";
 const CONTINUE: &str = "Continue on ";
 const SWITCH_BACK: &str = "Switch back to ";
 const DONT_SEND: &str = "Don't send";
-/// While a drift question is open nothing dispatches past it, so it sits
-/// among the last few entries: only held sends land after it.
+/// Start small, but held user messages can push a question beyond this tail.
 const OPEN_QUESTION_TAIL_PARTS: usize = 64;
+const HELD_REQUESTS_MAP: &str = "branch_drift_held";
 
 /// How a chat's checkout changed since its last turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,8 +53,9 @@ pub(crate) fn detect(
     })
 }
 
-/// A dispatch waiting on the user's answer. Kept in memory; after a restart
-/// the answer rebuilds it from the transcript (see `rebuild_held`).
+/// A dispatch waiting on the user's answer. Also stored in the chat document
+/// under the question id, preserving attachments and configuration on restart.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct HeldDispatch {
     harness: HarnessId,
     request: harness_proto::RunRequest,
@@ -135,14 +136,70 @@ pub(super) fn open_question(entries: &[SessionMessageEntry]) -> Option<(String, 
 }
 
 fn open_question_in_tail(handle: &ChatDocHandle) -> Option<(String, String)> {
-    let tail = handle
-        .doc
-        .read_opening_tail(OPEN_QUESTION_TAIL_PARTS)
-        .ok()?;
-    open_question(&tail)
+    let mut limit = OPEN_QUESTION_TAIL_PARTS;
+    loop {
+        let tail = handle.doc.read_opening_tail(limit).ok()?;
+        if let Some(question) = open_question(&tail) {
+            return Some(question);
+        }
+        // Only user messages can follow an open drift question. Stop at an
+        // assistant entry, or the beginning of the transcript; otherwise grow
+        // the window so arbitrarily many held sends cannot hide the question.
+        if tail
+            .iter()
+            .any(|entry| entry.role == MessageRole::Assistant)
+            || tail
+                .iter()
+                .map(|entry| entry.parts.len().max(1))
+                .sum::<usize>()
+                < limit
+        {
+            return None;
+        }
+        limit = limit.checked_mul(2)?;
+    }
 }
 
 impl DocHost {
+    fn load_branch_drift_held(
+        &self,
+        handle: &ChatDocHandle,
+        request_id: &str,
+    ) -> Result<Option<Vec<HeldDispatch>>, EngineError> {
+        let Some(value) = handle.doc.doc().get_map(HELD_REQUESTS_MAP).get(request_id) else {
+            return Ok(None); // Compatibility with questions written before this metadata existed.
+        };
+        let loro::ValueOrContainer::Value(loro::LoroValue::String(json)) = value else {
+            return Err(EngineError::Other(
+                "invalid held branch-drift requests".into(),
+            ));
+        };
+        let mut held: Vec<HeldDispatch> = serde_json::from_str(&json).map_err(|error| {
+            EngineError::Other(format!("invalid held branch-drift requests: {error}"))
+        })?;
+        for dispatch in &mut held {
+            // Persisted paths are not authority to read outside this host's
+            // uploads jail, including when the document arrived from a peer.
+            self.resolve_request_attachments(&mut dispatch.request);
+        }
+        Ok(Some(held))
+    }
+
+    fn clear_branch_drift_held(
+        &self,
+        handle: &ChatDocHandle,
+        request_id: &str,
+    ) -> Result<(), EngineError> {
+        handle
+            .doc
+            .doc()
+            .get_map(HELD_REQUESTS_MAP)
+            .delete(request_id)
+            .map_err(DocError::from)?;
+        handle.doc.doc().commit();
+        Ok(())
+    }
+
     /// Whether this dispatch would continue the chat on a checkout that
     /// drifted since its last turn. A turn already in flight is not
     /// re-checked: what arrives then is steered into the running turn.
@@ -177,6 +234,11 @@ impl DocHost {
         let handle = self.open(chat_id)?;
         let held = lock(&self.inner.branch_drift_holds).remove(chat_id);
         let open = open_question_in_tail(&handle);
+        let held = match (&open, held) {
+            (_, Some(held)) => Some(held),
+            (Some((_, request_id)), None) => self.load_branch_drift_held(&handle, request_id)?,
+            (None, None) => None,
+        };
         let held = match (held, &open) {
             (Some(held), _) => held,
             (None, Some((entry_id, _))) => self
@@ -192,6 +254,7 @@ impl DocHost {
         };
         if let Some((_, request_id)) = open {
             handle.doc.resolve_input(&request_id)?;
+            self.clear_branch_drift_held(&handle, &request_id)?;
             handle.publish_messages();
             self.save_snapshot(&handle);
         }
@@ -229,16 +292,25 @@ impl DocHost {
         // A question left open across a restart still owns the messages it
         // was asked about.
         let rebuilt = match &open {
-            Some((entry_id, _)) if !lock(&self.inner.branch_drift_holds).contains_key(chat_id) => {
-                self.rebuild_held(
-                    chat_id,
-                    &handle.doc.read_entries()?,
-                    entry_id,
-                    message_id.as_deref(),
-                )
+            Some((entry_id, request_id))
+                if !lock(&self.inner.branch_drift_holds).contains_key(chat_id) =>
+            {
+                match self.load_branch_drift_held(&handle, request_id)? {
+                    Some(held) => merge_held(held),
+                    None => self.rebuild_held(
+                        chat_id,
+                        &handle.doc.read_entries()?,
+                        entry_id,
+                        message_id.as_deref(),
+                    ),
+                }
             }
             _ => None,
         };
+        let request_id = open
+            .as_ref()
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| format!("{REQUEST_PREFIX}{}", new_id()));
         {
             let mut holds = lock(&self.inner.branch_drift_holds);
             let held = holds.entry(chat_id.to_string()).or_default();
@@ -248,10 +320,19 @@ impl DocHost {
                 request,
                 message_id,
             });
+            let json = serde_json::to_string(held).map_err(|error| {
+                EngineError::Other(format!("held requests serialization failed: {error}"))
+            })?;
+            handle
+                .doc
+                .doc()
+                .get_map(HELD_REQUESTS_MAP)
+                .insert(&request_id, json)
+                .map_err(DocError::from)?;
+            handle.doc.doc().commit();
         }
         if open.is_none() {
             let can_switch_back = self.can_switch_back(&cwd, drift).await;
-            let request_id = format!("{REQUEST_PREFIX}{}", new_id());
             handle.doc.push_message(&SessionMessageEntry {
                 id: new_id(),
                 role: MessageRole::Assistant,
@@ -307,40 +388,112 @@ impl DocHost {
         };
         let held = lock(&self.inner.branch_drift_holds).remove(chat_id.as_str());
         let held = match held {
+            Some(held) => Some(held),
+            None => self.load_branch_drift_held(handle, request_id)?,
+        };
+        let held = match held {
             Some(held) => merge_held(held),
             None => self.rebuild_held(chat_id, &entries, &entry_id, None),
         };
-        handle.doc.resolve_input(request_id)?;
-        handle.publish_messages();
-        self.save_snapshot(handle);
         let choice = answers
             .and_then(|answers| answers.first())
             .and_then(|answer| answer.labels.first())
             .map(String::as_str)
             .unwrap_or(DONT_SEND);
         let Some(mut held) = held else {
+            handle.doc.resolve_input(request_id)?;
+            self.clear_branch_drift_held(handle, request_id)?;
+            handle.publish_messages();
+            self.save_snapshot(handle);
             return Ok((
                 SessionCommandStatus::Applied,
                 Some("nothing was waiting to send".into()),
             ));
         };
-        if choice.starts_with(CONTINUE) {
-            // Accept the new checkout as this chat's context, then tell the
-            // agent what moved under it.
+        let continue_context = if let Some(accepted_branch) = choice.strip_prefix(CONTINUE) {
+            let displayed_choice =
+                entries
+                    .iter()
+                    .find(|entry| entry.id == entry_id)
+                    .and_then(|entry| {
+                        entry.parts.iter().find_map(|part| match part {
+                            MessagePart::Input {
+                                request_id: id,
+                                questions,
+                                ..
+                            } if id == request_id => questions
+                                .first()?
+                                .options
+                                .iter()
+                                .find(|option| option.starts_with(CONTINUE)),
+                            _ => None,
+                        })
+                    });
+            let Some(current) = self.capture_source_context(&held.request.cwd).await else {
+                // No fresh observation means no consent. Leave the question
+                // and its durable request intact so the user can retry.
+                lock(&self.inner.branch_drift_holds).insert(chat_id.to_string(), vec![held]);
+                return Ok((
+                    SessionCommandStatus::Rejected,
+                    Some("could not verify the checkout; please retry".into()),
+                ));
+            };
+            if displayed_choice.map(String::as_str) != Some(choice)
+                || current.branch != accepted_branch
+            {
+                // Consent applies only to the displayed branch, never to a
+                // newer observation. Re-prompt without advancing context.
+                let previous = self
+                    .workspace()
+                    .and_then(|ws| ws.chat(chat_id).ok().flatten())
+                    .and_then(|chat| chat.source_context);
+                let drift = Drift {
+                    from_branch: previous
+                        .as_ref()
+                        .map(|p| p.branch.clone())
+                        .unwrap_or_else(|| accepted_branch.to_string()),
+                    to_branch: current.branch,
+                    checkout_replaced: previous
+                        .as_ref()
+                        .is_some_and(|p| p.checkout_id != current.checkout_id),
+                };
+                handle.doc.resolve_input(request_id)?;
+                self.clear_branch_drift_held(handle, request_id)?;
+                self.hold_for_branch_drift(
+                    chat_id,
+                    &drift,
+                    held.harness,
+                    held.request,
+                    held.message_id,
+                )
+                .await?;
+                return Ok((
+                    SessionCommandStatus::Applied,
+                    Some("branch changed again; confirmation required".into()),
+                ));
+            }
+            Some(current)
+        } else {
+            None
+        };
+        handle.doc.resolve_input(request_id)?;
+        self.clear_branch_drift_held(handle, request_id)?;
+        handle.publish_messages();
+        self.save_snapshot(handle);
+        if let Some(current) = continue_context {
+            // Accept only the observation that matched the displayed choice.
             let previous = self
                 .workspace()
                 .and_then(|ws| ws.chat(chat_id).ok().flatten())
                 .and_then(|chat| chat.source_context);
-            if let Some(current) = self.capture_source_context(&held.request.cwd).await {
-                if let Some(drift) = previous.as_ref().and_then(|p| detect(p, &current)) {
-                    held.request.prompt =
-                        format!("{}\n\n{}", continue_note(&drift), held.request.prompt);
-                }
-                if let Some(ws) = self.workspace()
-                    && let Err(err) = ws.set_chat_source_context(chat_id, &current)
-                {
-                    tracing::warn!(chat = %chat_id, error = %err, "drift acknowledgement stamp failed");
-                }
+            if let Some(drift) = previous.as_ref().and_then(|p| detect(p, &current)) {
+                held.request.prompt =
+                    format!("{}\n\n{}", continue_note(&drift), held.request.prompt);
+            }
+            if let Some(ws) = self.workspace()
+                && let Err(err) = ws.set_chat_source_context(chat_id, &current)
+            {
+                tracing::warn!(chat = %chat_id, error = %err, "drift acknowledgement stamp failed");
             }
         } else if let Some(branch) = choice.strip_prefix(SWITCH_BACK) {
             if let Err(err) = self.switch_back(&held.request.cwd, branch).await {
@@ -404,8 +557,8 @@ impl DocHost {
         repos.switch_ref(path, branch).await.map(|_| ())
     }
 
-    /// After a restart the held dispatch is gone from memory. Rebuild it from
-    /// the chat row and the user messages the question holds: those since
+    /// Compatibility fallback for older questions without durable request
+    /// metadata. Rebuild from the chat row and held user messages: those since
     /// the last turn before it, including any sent while it waited, except
     /// `exclude` (the send being handled now, already written). `None` when
     /// it holds none (crash recovery re-runs on its own).
