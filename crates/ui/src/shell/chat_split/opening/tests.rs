@@ -73,6 +73,7 @@ fn chat(project: Option<&str>) -> Chat {
         space_id: project.map(str::to_owned),
         last_seen_at: None,
         room_gen: None,
+        source_context_unavailable_at: None,
     }
 }
 

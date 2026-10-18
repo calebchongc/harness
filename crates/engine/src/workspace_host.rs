@@ -954,6 +954,7 @@ impl WorkspaceHost {
                 branch: None,
                 checkout_id: None,
                 source_context: None,
+                source_context_unavailable_at: None,
                 config,
                 last_message_preview: None,
                 last_message_at: None,
@@ -1173,6 +1174,21 @@ impl WorkspaceHost {
         context: &harness_proto::ConversationSourceContext,
     ) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_source_context(chat_id, context))?)
+    }
+
+    /// The chat's latest accepted run could not observe its checkout: keep
+    /// the last known context, qualified as not current (#356). Written once
+    /// until the next successful capture, so a non-repository chat does not
+    /// rewrite its row on every turn.
+    pub fn mark_chat_source_context_unavailable(&self, chat_id: &str) -> Result<bool, EngineError> {
+        if self
+            .chat(chat_id)?
+            .is_none_or(|chat| chat.source_context_unavailable_at.is_some())
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .mutate(|doc| doc.mark_chat_source_context_unavailable(chat_id, chrono::Utc::now()))?)
     }
 
     /// Retarget a chat onto another folder (mid-session switch to an existing

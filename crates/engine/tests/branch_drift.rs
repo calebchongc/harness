@@ -1,7 +1,8 @@
 //! A chat whose checkout changed branch since its last turn does not silently
 //! continue there (#354): the send is held behind a question, and each answer
 //! (continue on the new branch, switch back, don't send) does what it says,
-//! including after an engine restart.
+//! including after an engine restart. And the recorded checkout is the one an
+//! accepted run actually used (#356).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use harness_adapters::{Harness, HarnessError, RunControls};
-use harness_doc::{MessagePart, SessionCommandPayload};
+use harness_doc::{MessagePart, SessionCommandPayload, SessionCommandStatus};
 use harness_engine::{EngineCore, HarnessRegistry};
 use harness_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
@@ -113,11 +114,15 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
     }
 }
 
-fn send(core: &EngineCore, id: &str, text: &str, cwd: &str) {
+fn send(core: &EngineCore, id: &str, text: &str, cwd: &str) -> String {
+    send_with(core, id, text, cwd, HarnessId::Graff)
+}
+
+fn send_with(core: &EngineCore, id: &str, text: &str, cwd: &str, harness: HarnessId) -> String {
     let payload = SessionCommandPayload::Run {
         request: RunRequest {
             prompt: text.into(),
-            harness: Some(HarnessId::Graff),
+            harness: Some(harness),
             model: None,
             reasoning: None,
             model_options: Default::default(),
@@ -132,7 +137,7 @@ fn send(core: &EngineCore, id: &str, text: &str, cwd: &str) {
     };
     core.doc_host
         .queue_command(CHAT, payload)
-        .expect("queue run");
+        .expect("queue run")
 }
 
 fn answer(core: &EngineCore, request_id: &str, label: &str) {
@@ -341,5 +346,87 @@ async fn a_drifted_checkout_asks_before_the_chat_continues() {
     assert!(resumed.ends_with("ninth\n\ntenth"), "{resumed}");
     assert!(!resumed.contains("eighth"), "{resumed}");
     assert_eq!(context_branch(&core), "zeta");
+    core.shutdown().await;
+}
+
+/// #356: the source context records where an ACCEPTED run ran. A request
+/// rejected before it ran leaves the previous one; a run whose checkout
+/// can't be observed keeps the last known one but marks it unavailable,
+/// until a later run observes its checkout again.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_an_accepted_run_records_its_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "alpha"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+    let cwd = repo.to_string_lossy().into_owned();
+
+    let (core, prompts) = engine(&root.join("data"));
+    core.workspace
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some(cwd.clone()))
+        .unwrap();
+    core.workspace.rename_chat(CHAT, "Pre-titled").unwrap();
+    let turns = |n: usize| {
+        let prompts = prompts.clone();
+        move || prompts.lock().unwrap().len() == n
+    };
+    let chat = |core: &EngineCore| core.workspace.chat(CHAT).unwrap().expect("chat row");
+
+    send(&core, "m1", "first", &cwd);
+    wait_for(turns(1), "first turn").await;
+    let first = chat(&core).source_context.expect("context");
+
+    // Rejected before it ran (no such agent here): nothing is recorded.
+    git(&repo, &["commit", "--allow-empty", "-m", "second"]);
+    let command = send_with(&core, "m2", "rejected", &cwd, HarnessId::Codex);
+    wait_for(
+        || {
+            let handle = core.doc_host.open(CHAT).unwrap();
+            handle
+                .doc()
+                .read_commands()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == command && c.status == SessionCommandStatus::Rejected)
+        },
+        "the rejected command",
+    )
+    .await;
+    let after_rejection = chat(&core);
+    assert_eq!(
+        after_rejection.source_context.as_ref().unwrap().head_sha,
+        first.head_sha,
+        "a rejected request does not record the checkout it would have used"
+    );
+    assert_eq!(after_rejection.source_context_unavailable_at, None);
+
+    // Moved to a folder that is not a repository: the run goes ahead, and the
+    // repository context is kept only as the last known one.
+    let plain = root.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let plain = plain.to_string_lossy().into_owned();
+    core.workspace.set_chat_cwd(CHAT, &plain).unwrap();
+    send(&core, "m3", "third", &plain);
+    wait_for(turns(2), "the turn outside a repository").await;
+    let outside = chat(&core);
+    assert!(outside.source_context_unavailable_at.is_some());
+    assert_eq!(
+        outside.source_context.as_ref().unwrap().cwd,
+        cwd,
+        "history kept"
+    );
+
+    // Back in the repository: observed again, current again.
+    core.workspace.set_chat_cwd(CHAT, &cwd).unwrap();
+    send(&core, "m4", "fourth", &cwd);
+    wait_for(turns(3), "the turn back in the repository").await;
+    let back = chat(&core);
+    assert_eq!(back.source_context_unavailable_at, None);
+    assert_eq!(
+        back.source_context.unwrap().head_sha.as_deref(),
+        Some(git(&repo, &["rev-parse", "HEAD"]).as_str())
+    );
     core.shutdown().await;
 }

@@ -7,7 +7,9 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{AnyElement, Context, Render, SharedString, Window, div, prelude::*, px};
-use harness_proto::{ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, Space};
+use harness_proto::{
+    ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, ConversationSourceContext, Space,
+};
 
 use crate::theme::Theme;
 
@@ -274,7 +276,7 @@ pub(crate) fn desired_watch_targets(
         .filter(|chat| !chat.archived)
         .filter(|chat| !is_unsupported(&chat.device_id))
         .filter_map(|chat| {
-            let source = chat.source_context.as_ref()?;
+            let source = current_source_context(chat)?;
             let (cwd, branch, checkout_id) = (
                 source.repo_root.as_str(),
                 source.branch.as_str(),
@@ -325,13 +327,9 @@ pub fn change_request_for_chat<'a>(
     if branch.is_empty() {
         return None;
     }
-    let source = chat.source_context.as_ref()?;
+    let source = current_source_context(chat)?;
     let cwd = source.repo_root.as_str();
-    let checkout_id = chat
-        .source_context
-        .as_ref()
-        .map(|source| source.checkout_id.as_str())
-        .or(chat.checkout_id.as_deref());
+    let checkout_id = Some(source.checkout_id.as_str());
 
     snapshots
         .into_iter()
@@ -350,10 +348,26 @@ pub fn change_request_for_chat<'a>(
 /// rows are intentionally rejected: their scalar branch may describe an old
 /// state of either a shared checkout or a worktree.
 pub(crate) fn conversation_branch<'a>(chat: &'a Chat, _spaces: &'a [Space]) -> Option<&'a str> {
-    chat.source_context
-        .as_ref()
+    current_source_context(chat)
         .map(|source| source.branch.as_str())
         .filter(|branch| !branch.trim().is_empty())
+}
+
+/// The chat's source context when it describes where the chat runs now
+/// (#356). Not when the latest accepted run could not observe its checkout,
+/// and not after the chat was moved to another folder that no run has
+/// observed yet: the last known context then belongs to the old place.
+pub(crate) fn current_source_context(chat: &Chat) -> Option<&ConversationSourceContext> {
+    let source = chat.source_context.as_ref()?;
+    if chat.source_context_unavailable_at.is_some() {
+        return None;
+    }
+    let same_folder =
+        |cwd: &str| cwd.trim_end_matches(['/', '\\']) == source.cwd.trim_end_matches(['/', '\\']);
+    if chat.cwd.as_deref().is_some_and(|cwd| !same_folder(cwd)) {
+        return None;
+    }
+    Some(source)
 }
 
 #[cfg(test)]
@@ -384,6 +398,7 @@ mod tests {
             space_id: Some("space".into()),
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 
@@ -429,6 +444,33 @@ mod tests {
             observed_at: Utc.timestamp_opt(2, 0).unwrap(),
         });
         chat
+    }
+
+    /// #356: a context the latest run could not confirm, or one left behind
+    /// by a move to another folder, is history, not where the chat runs.
+    #[test]
+    fn only_a_current_source_context_finds_a_pull_request() {
+        let current = with_source(chat("chat", "local", Some("/repo"), None), "feature/pr");
+        let snapshot = snapshot("local", "/repo", "checkout");
+        assert!(change_request_for_chat(&current, &[], [&snapshot]).is_some());
+
+        let mut unavailable = current.clone();
+        unavailable.source_context_unavailable_at = Some(Utc.timestamp_opt(3, 0).unwrap());
+        assert!(change_request_for_chat(&unavailable, &[], [&snapshot]).is_none());
+        assert_eq!(conversation_branch(&unavailable, &[]), None);
+        assert!(desired_watch_targets(&[unavailable], &[], |_| false).is_empty());
+
+        let mut moved = current.clone();
+        moved.cwd = Some("/elsewhere".into());
+        assert!(change_request_for_chat(&moved, &[], [&snapshot]).is_none());
+        assert!(desired_watch_targets(&[moved], &[], |_| false).is_empty());
+
+        let mut trailing = current;
+        trailing.cwd = Some("/repo/".into());
+        assert!(
+            change_request_for_chat(&trailing, &[], [&snapshot]).is_some(),
+            "the same folder spelled with a trailing slash"
+        );
     }
 
     #[test]
