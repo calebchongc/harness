@@ -418,6 +418,15 @@ fn parse_inline_container(cur: &mut Cursor, style: &InlineStyle) -> Vec<InlineRu
         }
         parse_inline_event(cur, &mut runs, style);
     }
+    // Display math at the end of a paragraph leaves a line break with
+    // nothing after it.
+    if let Some(last) = runs.last_mut().filter(|run| run.text.ends_with('\n')) {
+        let trimmed = last.text.trim_end_matches('\n').len();
+        last.text.truncate(trimmed);
+        if last.text.is_empty() {
+            runs.pop();
+        }
+    }
     // Autolink AFTER merging: pulldown splits Text events at would-be
     // emphasis chars ("…/Foo_(bar)" arrives as three events), so scanning
     // per-event would truncate URLs at every underscore.
@@ -435,7 +444,15 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
         }
     };
     match event {
-        Event::Text(t) => push(runs, t.into_string(), style.clone()),
+        Event::Text(t) => {
+            // A line that display math opened starts at its first word.
+            let text = if runs.last().is_some_and(|run| run.text.ends_with('\n')) {
+                t.trim_start_matches(' ').to_owned()
+            } else {
+                t.into_string()
+            };
+            push(runs, text, style.clone())
+        }
         Event::Code(t) => {
             let mut s = style.clone();
             s.code = true;
@@ -443,6 +460,24 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
         }
         Event::SoftBreak => push(runs, " ".into(), style.clone()),
         Event::HardBreak => push(runs, "\n".into(), style.clone()),
+        // Formulas (`super::math`) read as Unicode; display math takes a
+        // line of its own, wherever in the paragraph the model put it.
+        Event::InlineMath(t) => push(runs, super::math::to_unicode(&t), style.clone()),
+        Event::DisplayMath(t) => {
+            if let Some(last) = runs.last_mut() {
+                let kept = last.text.trim_end_matches(' ').len();
+                last.text.truncate(kept);
+            }
+            let at_line_start = runs.last().is_none_or(|run| run.text.ends_with('\n'));
+            let mut text = if at_line_start {
+                String::new()
+            } else {
+                "\n".into()
+            };
+            text.push_str(&super::math::to_unicode(&t));
+            text.push('\n');
+            push(runs, text, style.clone());
+        }
         Event::Html(t) | Event::InlineHtml(t) => {
             if let Some(reference) = super::content_reference::file_reference(&t) {
                 let mut style = style.clone();
