@@ -27,6 +27,16 @@ When `HARNESS_CHAT_ID` is set, every `send_message` is prefixed with a
 human reading that transcript can tell an agent-to-agent message from a typed
 one, and the server refuses to message its own chat.
 
+Direct peer messages are for actionable questions, blockers, and final requested
+results—not acknowledgements or progress updates. The header explicitly says no
+reply is needed otherwise. Use an unmentioned room post for progress; it wakes
+nobody. The server refuses another send to the same recipient while a message
+from that sender remains queued, preserving the earlier message and any pending
+human approval. This preflight is not a cross-process atomic queue reservation.
+New peer envelopes carry a relay depth: a chain stops after four deliveries;
+a new human request resets it. Legacy peer headers count as the first delivery.
+These are coordination safeguards, not authentication of text supplied by users.
+
 ### Parent links
 
 A chat created through `create_chat` records the creating chat as its parent:

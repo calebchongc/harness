@@ -291,6 +291,8 @@ struct DocHostInner {
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
     links: OnceLock<Arc<harness_rpc::LinkCache>>,
+    /// Dispatches held on a branch-drift question, per chat (#354).
+    branch_drift_holds: Mutex<HashMap<String, Vec<branch_drift::HeldDispatch>>>,
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
@@ -864,6 +866,7 @@ impl DocHost {
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
+                branch_drift_holds: Mutex::new(HashMap::new()),
                 http: reqwest::Client::builder()
                     .pool_max_idle_per_host(2)
                     .pool_idle_timeout(std::time::Duration::from_secs(10))
@@ -1534,6 +1537,12 @@ impl DocHost {
                                     handle.publication_failed.store(true, Ordering::Release);
                                     lock(&handle.chat2_pending_local).push((batch_id.clone(), bytes.clone()));
                                     tracing::error!(chat = %publication_chat, %err, "chat2: durable outbox write failed");
+                                    // The snapshot is now this edit's only
+                                    // durable copy: stop spacing saves out.
+                                    if let Some(persistence) = &handle.persistence {
+                                        persistence.set_outbox_backed(false);
+                                        persistence.dirty(true);
+                                    }
                                     false
                                 }
                             };
@@ -1545,6 +1554,9 @@ impl DocHost {
                         true
                     }));
                 *lock(&handle.chat2_local_sub) = Some(sub);
+                if let Some(persistence) = &handle.persistence {
+                    persistence.set_outbox_backed(true);
+                }
                 // Re-queue survives the adopt: our own pending commands
                 // become fresh entries in the new lineage (the
                 // processed_commands ledger still guards double execution).
@@ -4057,6 +4069,9 @@ impl DocHost {
                 Some(QueueDeliveryGate::ReviewRequired { .. }) => return,
                 None => {}
             }
+            if self.branch_drift_pending(handle) {
+                return; // The answer dispatches; nothing jumps the question.
+            }
             // In flight, not just Working: an agent parked on a question owns
             // the turn too, and the composer queues on the same reading. Taking
             // `AwaitingInput` for idle would send the follow-up as a fresh turn
@@ -5275,6 +5290,19 @@ impl DocHost {
                 self.interrupt_and_pause_queue(sessions, handle).await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
+            SessionCommandPayload::DismissInput { request_id }
+                if request_id.starts_with(branch_drift::REQUEST_PREFIX) =>
+            {
+                self.answer_branch_drift(sessions, handle, request_id, None)
+                    .await
+            }
+            SessionCommandPayload::RespondInput {
+                request_id,
+                answers,
+            } if request_id.starts_with(branch_drift::REQUEST_PREFIX) => {
+                self.answer_branch_drift(sessions, handle, request_id, Some(answers.as_slice()))
+                    .await
+            }
             SessionCommandPayload::DismissInput { request_id } => {
                 let _drain = handle.drain_lock.lock().await;
                 let open = handle.doc.read_entries()?.iter().any(|entry| {
@@ -5526,20 +5554,16 @@ impl DocHost {
         Ok(())
     }
 
-    async fn capture_source_context(&self, cwd: &str) -> Option<ConversationSourceContext> {
-        let repos = self.inner.repos.get()?;
-        let path = Path::new(cwd);
-        let identity = repos.checkout_identity(path).await.ok()?;
-        let branch = repos.current_branch(path).await.ok()?;
-        let head_sha = repos.head_sha(path).await.ok().flatten();
-        Some(ConversationSourceContext {
-            checkout_id: identity.id,
-            repo_root: identity.root.to_string_lossy().into_owned(),
-            cwd: cwd.to_string(),
-            branch,
-            head_sha,
-            observed_at: chrono::Utc::now(),
-        })
+    pub(crate) async fn capture_source_context(
+        &self,
+        cwd: &str,
+    ) -> Option<ConversationSourceContext> {
+        self.inner
+            .repos
+            .get()?
+            .capture_source_context(Path::new(cwd))
+            .await
+            .ok()
     }
 
     /// Every fresh harness dispatch crosses this boundary, including
@@ -5547,6 +5571,10 @@ impl DocHost {
     /// dispatch so the conversation records the checkout the harness will
     /// actually observe, rather than whichever checkout state was current on
     /// an earlier turn.
+    ///
+    /// If that checkout drifted since the chat's last turn (another branch,
+    /// or another checkout in the same folder), the dispatch is held behind a
+    /// question instead and this returns `None` (#354).
     pub(crate) async fn dispatch_with_source_context(
         &self,
         sessions: &SessionsEngine,
@@ -5554,9 +5582,18 @@ impl DocHost {
         harness: HarnessId,
         request: harness_proto::RunRequest,
         message_id: Option<String>,
-    ) -> Result<String, EngineError> {
+    ) -> Result<Option<String>, EngineError> {
+        let context = self.capture_source_context(&request.cwd).await;
+        if let Some(context) = &context
+            && let Some(drift) = self.drift_since_last_turn(sessions, chat_id, context)
+        {
+            self.hold_for_branch_drift(chat_id, &drift, harness, request, message_id)
+                .await?;
+            return Ok(None);
+        }
+        let (request, message_id) = self.release_branch_drift(chat_id, request, message_id)?;
         if let Some(workspace) = self.workspace()
-            && let Some(context) = self.capture_source_context(&request.cwd).await
+            && let Some(context) = context
             && let Err(err) = workspace.set_chat_source_context(chat_id, &context)
         {
             tracing::warn!(chat = %chat_id, error = %err, "conversation source stamp failed");
@@ -5564,6 +5601,7 @@ impl DocHost {
         sessions
             .dispatch(chat_id, harness, request, message_id)
             .await
+            .map(Some)
     }
 
     /// Create (or reuse) the isolated worktree a Run's [`harness_proto::WorktreeSpec`]
@@ -5813,6 +5851,9 @@ fn encode_part_segment(part_id: &str) -> String {
     }
     out
 }
+
+#[path = "doc_host_branch_drift.rs"]
+mod branch_drift;
 
 #[cfg(test)]
 mod transfer_progress_tests {
