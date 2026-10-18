@@ -3,32 +3,25 @@ package harness.codegraff.android
 import harness.codegraff.android.core.AgentDescriptorRecord
 import harness.codegraff.android.core.ChangeRequestRecord
 import harness.codegraff.android.core.ChatConfigRecord
+import harness.codegraff.android.core.ChatRecord
 import harness.codegraff.android.core.ConnectivitySnapshot
 import harness.codegraff.android.core.ConnectivityState
+import harness.codegraff.android.core.DeviceRecord
 import harness.codegraff.android.core.FolderEntryRecord
 import harness.codegraff.android.core.FolderListingRecord
 import harness.codegraff.android.core.HarnessInfoRecord
 import harness.codegraff.android.core.HostStatus as HostStatusRecord
-import harness.codegraff.android.core.ModelInfoRecord
-import harness.codegraff.android.core.RelayException
-import harness.codegraff.android.core.RepoRefRecord
-import harness.codegraff.android.model.ChangeRequestState
-import harness.codegraff.android.model.Connection
-import harness.codegraff.android.model.ConnectivityRules
-import harness.codegraff.android.model.ConnectivityUi
-import harness.codegraff.android.model.HarnessCatalog
-import harness.codegraff.android.model.HostNotice
-import harness.codegraff.android.model.HostStatus
-import harness.codegraff.android.core.ChatRecord
-import harness.codegraff.android.core.DeviceRecord
 import harness.codegraff.android.core.MessageEntryRecord
 import harness.codegraff.android.core.MessagePartRecord
 import harness.codegraff.android.core.MessageRoleRecord
 import harness.codegraff.android.core.MessageStatusRecord
 import harness.codegraff.android.core.MobileCoreInterface
+import harness.codegraff.android.core.ModelInfoRecord
 import harness.codegraff.android.core.NewChatConfig
 import harness.codegraff.android.core.QueueDeliveryGateRecord
 import harness.codegraff.android.core.QueuedMessageRecord
+import harness.codegraff.android.core.RelayException
+import harness.codegraff.android.core.RepoRefRecord
 import harness.codegraff.android.core.SessionRowRecord
 import harness.codegraff.android.core.SessionSnapshot
 import harness.codegraff.android.core.SessionStatusRecord
@@ -36,8 +29,15 @@ import harness.codegraff.android.core.SpaceRecord
 import harness.codegraff.android.core.TaskItemRecord
 import harness.codegraff.android.core.ToolFieldRecord
 import harness.codegraff.android.core.WorkspaceSnapshot
+import harness.codegraff.android.model.ChangeRequestState
 import harness.codegraff.android.model.ChatConfig
 import harness.codegraff.android.model.ChatIndicator
+import harness.codegraff.android.model.Connection
+import harness.codegraff.android.model.ConnectivityRules
+import harness.codegraff.android.model.ConnectivityUi
+import harness.codegraff.android.model.HarnessCatalog
+import harness.codegraff.android.model.HostNotice
+import harness.codegraff.android.model.HostStatus
 import harness.codegraff.android.model.MessagePart
 import harness.codegraff.android.model.QueueDeliveryGate
 import harness.codegraff.android.model.SessionStatus
@@ -46,11 +46,14 @@ import harness.codegraff.android.sync.LiveSync
 import harness.codegraff.android.sync.toModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -203,6 +206,9 @@ class LiveSyncTest {
     fun aSessionScreenOpensAndClosesTheChatAndOnlyThatChatIsRemapped() = runTest(dispatcher) {
         val (model, core, feed) = live()
         model.attachSession("a")
+        // The open runs on the IO dispatcher, outside the test's: wait for its snapshot, or it can land
+        // after the ones below and replace them.
+        withContext(Dispatchers.Default) { withTimeout(5_000) { feed.sessions.first { "a" in it } } }
         model.detachSession("a")
         advanceUntilIdle()
         assertTrue("close a" in core.calls)
