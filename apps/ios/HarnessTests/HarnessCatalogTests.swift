@@ -68,10 +68,24 @@ final class HarnessCatalogTests: XCTestCase {
     func testResolvePreservesUnknownConfiguredModel() {
         let catalog = HarnessCatalog.models(for: "claude-code")
         XCTAssertEqual(HarnessCatalog.resolve(modelId: "claude-opus-5[1m]", in: catalog,
-                                              harness: "claude-code").id, "claude-opus-5")
+                                              harness: "claude-code").id, "claude-opus-5[1m]")
         let unknown = HarnessCatalog.resolve(modelId: "foo-9", in: catalog, harness: "claude-code")
         XCTAssertEqual(unknown.id, "foo-9")
         XCTAssertEqual(unknown.label, "foo-9")
+    }
+
+    func testLongContextAliasesKeepWireIdentityAndWindowAcrossHydration() {
+        let catalog = HarnessCatalog.models(for: "claude-code")
+        for saved in ["claude-opus-5[1m]", "claude-opus-5-1m"] {
+            let pending = HarnessCatalog.resolve(modelId: saved, in: [], harness: "claude-code")
+            let loaded = HarnessCatalog.resolve(modelId: saved, in: catalog, harness: "claude-code")
+            XCTAssertEqual(pending.id, saved)
+            XCTAssertEqual(loaded.id, pending.id)
+            let option = loaded.options.first { $0.id == "contextWindow" }
+            XCTAssertEqual(option?.defaultChoice, "1m")
+            XCTAssertEqual(option.flatMap { $0.choices.first { $0.id == "1m" } }?.label, "1M")
+            XCTAssertEqual(HarnessCatalog.resolveExisting(modelId: saved, in: catalog)?.id, "claude-opus-5")
+        }
     }
 
     func testUnknownHarnessDoesNotInheritClaudeModelsOrOptions() {

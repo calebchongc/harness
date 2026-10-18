@@ -273,6 +273,7 @@ struct ComposerView: View {
     /// Live catalog for the chat's harness from its space's device.
     @State private var catalogs: [String: [ModelInfo]] = [:]
     @State private var catalogsLoading = true
+    @State private var catalogRetry = 0
     @State private var catalogSource: String?
     @State private var queueEdit: QueueComposerEdit?
     private var editingQueuedId: String? { queueEdit?.lease.rowId }
@@ -444,7 +445,8 @@ struct ComposerView: View {
                 ),
                 lockedHarness: true,
                 catalogs: scopedCatalogs,
-                catalogsLoading: catalogsLoading || catalogSource != catalogKey
+                catalogsLoading: catalogsLoading || catalogSource != catalogKey,
+                onRetry: { catalogRetry += 1 }
             )
         }
         .sheet(isPresented: $showTraitPicker) {
@@ -462,16 +464,24 @@ struct ComposerView: View {
                 set: { writeOption(option: option, choiceId: $0) }
             ))
         }
-        .task(id: catalogKey) {
-            catalogsLoading = true
-            catalogs = [:]
-            catalogSource = catalogKey
-            if let cached = DocDisk.loadModels(deviceId: chat.deviceId, harness: harness), !cached.isEmpty {
-                catalogs[harness] = cached
+        .task(id: "\(catalogKey)|\(model.deviceOnline(chat.deviceId))|\(catalogRetry)") {
+            let source = catalogKey
+            let ownerHarness = harness
+            if catalogSource != source {
+                catalogs = [:]
+                catalogSource = source
+                if let cached = DocDisk.loadModels(deviceId: chat.deviceId, harness: ownerHarness), !cached.isEmpty {
+                    catalogs[ownerHarness] = cached
+                }
             }
-            let catalog = await model.listModels(deviceId: chat.deviceId, harness: harness)
-            guard !Task.isCancelled else { return }
-            catalogs[harness] = catalog.items
+            // Same-host refresh/reconnect keeps real rows visible. Failure
+            // must not blank good in-memory metadata if the disk cache failed.
+            catalogsLoading = true
+            let catalog = await model.listModels(deviceId: chat.deviceId, harness: ownerHarness)
+            guard !Task.isCancelled, catalogSource == source, catalogKey == source else { return }
+            if catalog.isLive || catalogs[ownerHarness]?.isEmpty != false {
+                catalogs[ownerHarness] = catalog.items
+            }
             catalogsLoading = false
         }
         .task(id: queueEdit?.terminal == true ? nil : queueEditLease?.leaseId) {

@@ -346,7 +346,24 @@ enum HarnessCatalog {
     static func resolve(modelId: String?, in models: [ModelInfo], harness: String) -> ModelInfo {
         guard let modelId else { return models.first ?? defaultModel(for: harness) }
         if let existing = resolveExisting(modelId: modelId, in: models) {
-            return existing
+            guard existing.id != modelId else { return existing }
+            // A legacy long-context alias can borrow metadata from its base,
+            // but hydration must not rewrite its wire identity or its window.
+            var options = existing.options
+            let context = existing.options.first { $0.id == "contextWindow" } ?? claudeContextWindow
+            var choices = context.choices
+            if !choices.contains(where: { $0.id == "1m" }) {
+                choices.append(ModelOptionChoiceInfo(id: "1m", label: "1M"))
+            }
+            let resolvedContext = ModelOptionInfo(id: context.id, label: context.label,
+                                                  choices: choices, defaultChoice: "1m")
+            if let index = options.firstIndex(where: { $0.id == "contextWindow" }) {
+                options[index] = resolvedContext
+            } else {
+                options.append(resolvedContext)
+            }
+            return ModelInfo(id: modelId, label: existing.label, description: existing.description,
+                             reasoningLevels: existing.reasoningLevels, options: options)
         }
         return ModelInfo(id: modelId, label: curatedLabel(modelId, harness: harness) ?? modelId,
                          description: nil, reasoningLevels: [], options: [])

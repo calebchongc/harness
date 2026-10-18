@@ -721,9 +721,16 @@ final class AppModel {
     /// Live model catalog from the selected execution device (the desktop's
     /// "catalog source = the device that runs the session" rule). A failed
     /// request can use cached metadata, but must never invent runnable models.
+    @ObservationIgnored private var demoModelFailuresRemaining = 1
+
     func listModels(deviceId: String, harness: String) async -> DeviceCatalog<ModelInfo> {
         if demo != nil {
-            try? await Task.sleep(for: .seconds(ProcessInfo.processInfo.arguments.contains("-slow-catalog") ? 15 : 0.1))
+            let args = ProcessInfo.processInfo.arguments
+            try? await Task.sleep(for: .seconds(args.contains("-slow-catalog") ? 15 : 0.1))
+            if args.contains("-models-fail-once"), harness == "codex", demoModelFailuresRemaining > 0 {
+                demoModelFailuresRemaining -= 1
+                return DeviceCatalog(items: [], isLive: false)
+            }
             return DeviceCatalog(items: HarnessCatalog.models(for: harness), isLive: true)
         }
         if let live = await workspace?.listModels(deviceId: deviceId, harness: harness) {
@@ -734,10 +741,18 @@ final class AppModel {
         return DeviceCatalog(items: DocDisk.loadModels(deviceId: deviceId, harness: harness) ?? [], isLive: false)
     }
 
+    @ObservationIgnored private var demoRefFailuresRemaining = 1
+
     /// Refs of the space's repo (git spaces only).
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            let args = ProcessInfo.processInfo.arguments
+            try? await Task.sleep(for: .seconds(args.contains("-slow-refs") ? 2 : 0.12))
+            if args.contains("-refs-empty") { return [] }
+            if args.contains("-refs-fail-once"), demoRefFailuresRemaining > 0 {
+                demoRefFailuresRemaining -= 1
+                return nil
+            }
             return demo.listRefs(spacePath: space.path)
         }
         return await workspace?.listRefs(deviceId: space.deviceId, repoPath: space.path)

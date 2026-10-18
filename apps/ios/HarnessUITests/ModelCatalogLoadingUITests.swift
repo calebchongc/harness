@@ -91,6 +91,19 @@ final class ModelCatalogLoadingUITests: XCTestCase {
         XCTAssertTrue(app.buttons["High"].exists)
     }
 
+    func testExistingChatCatalogCanRetryAfterFailureWithoutReopening() {
+        app.launchArguments = ["-demo", "-route", "chat:chat-tabs", "-sheet", "config", "-models-fail-once"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["model-picker-unavailable"].waitForExistence(timeout: 5))
+        let retry = app.buttons["model-picker-retry"]
+        XCTAssertTrue(retry.exists)
+        retry.tap()
+        let saved = app.scrollViews.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "GPT-5.6-Terra,")).firstMatch
+        XCTAssertTrue(saved.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.staticTexts["model-picker-unavailable"].exists)
+        XCTAssertEqual(app.buttons["model-picker-confirm"].label, "Close")
+    }
+
     func testEmptyAgentDiscoveryDoesNotOfferDefaultsOrEnableUnconfiguredSend() {
         launchNewSession(modelId: "", arguments: ["-no-agents"])
         let select = app.buttons["Select model"]

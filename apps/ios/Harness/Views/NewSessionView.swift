@@ -35,12 +35,14 @@ struct NewSessionView: View {
     /// Live or cached metadata, scoped to the execution device.
     @State private var catalogs: [String: [ModelInfo]] = [:]
     @State private var catalogsLoading = true
+    @State private var catalogRetry = 0
     @State private var confirmedHarnesses: [HarnessInfo]?
     @State private var confirmedCatalogs: [String: [ModelInfo]] = [:]
     @State private var optionSelections: [String: String] = [:]
     /// Never expose a previous host's metadata during a destination change.
     @State private var catalogDevice: String?
-    @State private var refs: [RepoRef] = []
+    @State private var refCatalog = RefCatalogState()
+    @State private var refsRetry = 0
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
     @State private var busy = false
@@ -220,7 +222,9 @@ struct NewSessionView: View {
             SessionHostPickerSheet(selectedDeviceId: deviceId) { selectedHostId = $0 }
         }
         .sheet(isPresented: $showRefPicker) {
-            RefPickerSheet(refs: refs, selected: selectedRef) { ref in
+            RefPickerSheet(refs: refs, selected: selectedRef, loading: refsLoading,
+                           loadError: refCatalog.scope == refsScope ? refCatalog.error : nil,
+                           onRetry: { refsRetry += 1 }) { ref in
                 await pickRef(ref)
             }
         }
@@ -230,17 +234,19 @@ struct NewSessionView: View {
                 pickCheckout(kind)
             }
         }
-        .task(id: space?.id) {
-            // Load refs for the branch chip (git spaces only).
-            guard let space, space.gitDetected else { return }
-            if let loaded = await model.listRefs(space: space) {
-                refs = loaded
-                if selectedRef == nil {
-                    selectedRef = loaded.first(where: \.current)?.name ?? loaded.first?.name
-                }
+        .task(id: "\(refsScope ?? "")|\(deviceId.map(model.deviceOnline) ?? false)|\(refsRetry)") {
+            guard let space, space.gitDetected else {
+                refCatalog.clear()
+                selectedRef = nil
+                return
             }
+            if refCatalog.scope != refsScope {
+                selectedRef = nil
+                checkoutKind = .local
+            }
+            await loadRefs(for: space)
         }
-        .task(id: "\(deviceId ?? "")|\(deviceId.map(model.deviceOnline) ?? false)") {
+        .task(id: "\(deviceId ?? "")|\(deviceId.map(model.deviceOnline) ?? false)|\(catalogRetry)") {
             guard let deviceId else {
                 liveHarnesses = nil
                 catalogs = [:]
@@ -261,11 +267,9 @@ struct NewSessionView: View {
                 if let cached = DocDisk.loadModels(deviceId: deviceId, harness: harness), !cached.isEmpty {
                     catalogs[harness] = cached
                 }
-            } else if !model.deviceOnline(deviceId) {
-                catalogsLoading = false
-                return
             }
-            // Refresh on reconnect, but keep existing rows/picks visible.
+            // Reconnect and explicit retry preserve rows/picks. Presence is
+            // advisory: a stale offline beat must not suppress a manual retry.
             catalogsLoading = true
             let result = await model.listHarnesses(deviceId: deviceId)
             guard !Task.isCancelled else { return }
@@ -300,7 +304,8 @@ struct NewSessionView: View {
                 get: { reasoning },
                 set: { storedReasoning = $0 ?? "" }
             ), harnesses: harnesses, catalogs: scopedCatalogs,
-               catalogsLoading: catalogsLoading || catalogDevice != deviceId)
+               catalogsLoading: catalogsLoading || catalogDevice != deviceId,
+               onRetry: { catalogRetry += 1 })
         }
         .sheet(isPresented: $showTraitPicker) {
             TraitPickerSheet(reasoning: Binding(
@@ -358,7 +363,8 @@ struct NewSessionView: View {
             ComposerShell(
                 draft: $draft,
                 placeholder: "Do anything…",
-                sendEnabled: deviceId != nil && !selectedModel.id.isEmpty && !selectionUnavailable,
+                sendEnabled: deviceId != nil && !selectedModel.id.isEmpty && !selectionUnavailable
+                    && (refsScope == nil || refCatalog.scope == refsScope),
                 showStop: false,
                 busy: busy,
                 alwaysExpanded: true,
@@ -434,6 +440,32 @@ struct NewSessionView: View {
 
     // MARK: Checkout model (pickers.rs port)
 
+    private var refsScope: String? {
+        guard let space, space.gitDetected else { return nil }
+        return "\(space.id)/\(space.deviceId)/\(space.path)"
+    }
+
+    private var refs: [RepoRef] {
+        refCatalog.scope == refsScope ? refCatalog.items : []
+    }
+
+    private var refsLoading: Bool {
+        refsScope != nil && (refCatalog.scope != refsScope || refCatalog.loading)
+    }
+
+    private func loadRefs(for space: Space) async {
+        let scope = "\(space.id)/\(space.deviceId)/\(space.path)"
+        let request = refCatalog.begin(scope: scope)
+        let loaded = await model.listRefs(space: space)
+        guard !Task.isCancelled, refsScope == scope else { return }
+        guard refCatalog.finish(request, items: loaded,
+            failure: "Couldn't load refs from the device. Check its connection and try again.") else { return }
+        if selectedRef == nil, let loaded {
+            // Only a reported current ref can name the current checkout.
+            selectedRef = loaded.first(where: \.current)?.name
+        }
+    }
+
     private var selectedRefRow: RepoRef? {
         refs.first { $0.name == selectedRef }
     }
@@ -452,7 +484,7 @@ struct NewSessionView: View {
 
     /// ref_label: "From <ref>" only when a NEW worktree will be created off it.
     private var refLabel: String {
-        guard let name = selectedRef else { return "Select ref" }
+        guard refCatalog.scope == refsScope, let name = selectedRef else { return "Select ref" }
         return checkoutKind == .newWorktree ? "From \(name)" : name
     }
 
@@ -470,12 +502,14 @@ struct NewSessionView: View {
             return nil
         }
         guard let space else { return nil }
+        let scope = refsScope
         let error = await model.switchSpaceRef(space: space, refName: row.name)
+        guard !Task.isCancelled, refsScope == scope else {
+            return "The destination changed. Choose the ref again."
+        }
         if error == nil {
             selectedRef = row.name
-            if let reloaded = await model.listRefs(space: space) {
-                refs = reloaded
-            }
+            await loadRefs(for: space)
         }
         return error
     }
@@ -491,7 +525,8 @@ struct NewSessionView: View {
     }
 
     private var canSend: Bool {
-        guard !busy, deviceId != nil, !selectedModel.id.isEmpty, !selectionUnavailable else { return false }
+        guard !busy, deviceId != nil, !selectedModel.id.isEmpty, !selectionUnavailable,
+              refsScope == nil || refCatalog.scope == refsScope else { return false }
         return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !attachments.isEmpty
     }
@@ -689,6 +724,7 @@ struct ModelPickerSheet: View {
     /// Live or cached metadata; a missing entry is not a static default.
     var catalogs: [String: [ModelInfo]] = [:]
     var catalogsLoading = false
+    var onRetry: (() -> Void)?
 
     private func models(for harness: String) -> [ModelInfo] {
         catalogs[harness] ?? []
@@ -731,6 +767,11 @@ struct ModelPickerSheet: View {
                 VStack(alignment: .leading, spacing: 22) {
                     VStack(alignment: .leading, spacing: 4) {
                         SheetLabel("Model")
+                        if let onRetry, !catalogsLoading {
+                            Button("Refresh models", action: onRetry)
+                                .font(Theme.sans(13))
+                                .accessibilityIdentifier("model-picker-retry")
+                        }
                         if !modelId.isEmpty, selectedModel == nil {
                             Text("Current selection: \(modelId)")
                                 .font(Theme.sans(13))
@@ -1046,6 +1087,9 @@ struct RefPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     let refs: [RepoRef]
     let selected: String?
+    var loading = false
+    var loadError: String?
+    var onRetry: () -> Void = {}
     /// Returns an error message to keep the sheet open, or nil to close.
     let onPick: (RepoRef) async -> String?
 
@@ -1064,13 +1108,29 @@ struct RefPickerSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     SheetLabel("Ref")
-                    if refs.isEmpty {
-                        Text("Loading refs from the device…")
+                    if loading {
+                        ProgressView(refs.isEmpty ? "Loading refs from the device…" : "Refreshing refs…")
+                            .accessibilityIdentifier("refs-loading")
+                    }
+                    if let loadError {
+                        Text(loadError)
+                            .font(Theme.sans(13))
+                            .foregroundStyle(Theme.danger)
+                            .accessibilityIdentifier("refs-load-error")
+                        Button("Retry", action: onRetry)
+                            .disabled(loading)
+                            .accessibilityIdentifier("refs-retry")
+                    }
+                    if refs.isEmpty, !loading, loadError == nil {
+                        Text("No refs available. This repository may not have a commit yet.")
                             .font(Theme.sans(13))
                             .foregroundStyle(Theme.textFaint)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 28)
-                    } else if shownRefs.isEmpty {
+                            .accessibilityIdentifier("refs-empty")
+                        Button("Retry", action: onRetry)
+                            .accessibilityIdentifier("refs-retry")
+                    } else if !refs.isEmpty, shownRefs.isEmpty {
                         Text("No refs match \u{201C}\(query)\u{201D}")
                             .font(Theme.sans(13))
                             .foregroundStyle(Theme.textFaint)
