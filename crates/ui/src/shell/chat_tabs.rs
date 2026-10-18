@@ -21,9 +21,6 @@ pub(super) mod navigation_tests;
 /// The most of the sidebar's height the tab list may take before it scrolls.
 const MAX_SIDEBAR_SHARE: f32 = 0.4;
 
-/// The most of the sidebar's height the tab list may take before it scrolls.
-const MAX_SIDEBAR_SHARE: f32 = 0.4;
-
 /// A tab's layout while it isn't the active one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ChatTab {
