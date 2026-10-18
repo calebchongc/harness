@@ -1979,6 +1979,14 @@ impl AppState {
             .change_request_for_chat(chat, &self.spaces)
     }
 
+    /// Whether a chat's branch PR is the chat's own or found from a shared branch (#357).
+    pub(crate) fn change_request_provenance(
+        &self,
+        chat: &Chat,
+    ) -> crate::change_requests::ChangeRequestProvenance {
+        crate::change_requests::change_request_provenance(chat, &self.chats, &self.spaces)
+    }
+
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }

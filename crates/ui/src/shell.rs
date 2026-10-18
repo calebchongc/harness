@@ -6950,7 +6950,10 @@ impl Shell {
         time_ago: SharedString,
         space_name: SharedString,
         branch: Option<SharedString>,
-        change_request: Option<harness_proto::ChangeRequestSummary>,
+        change_request: Option<(
+            harness_proto::ChangeRequestSummary,
+            crate::change_requests::ChangeRequestProvenance,
+        )>,
         harness: Option<harness_proto::HarnessId>,
         status: harness_proto::ChatIndicator,
         selected: bool,
@@ -7485,11 +7488,12 @@ impl Shell {
                         // Stable invisible spring keeps the optional PR badge
                         // pinned right without changing no-PR paint.
                         .child(div().flex_1().min_w_0())
-                        .when_some(change_request, |el, summary| {
+                        .when_some(change_request, |el, (summary, provenance)| {
                             el.child(if preview {
                                 crate::change_requests::pull_request_badge_preview(
                                     format!("{row_id}-pr").into(),
                                     summary,
+                                    provenance,
                                     crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                                     theme,
                                 )
@@ -7497,6 +7501,7 @@ impl Shell {
                                 crate::change_requests::pull_request_badge_with_query(
                                     format!("{row_id}-pr").into(),
                                     summary,
+                                    provenance,
                                     crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                                     search_query,
                                     theme,
