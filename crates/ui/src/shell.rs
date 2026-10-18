@@ -704,6 +704,11 @@ enum BrowserOpen {
     Url(String),
     /// A page a tool saved on this device (graff views, MCP Apps).
     View(harness_proto::ToolView),
+    Html(
+        crate::files::client::WorkspaceFilesClient,
+        crate::markdown::content_reference::HtmlPreview,
+        String,
+    ),
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -3472,6 +3477,42 @@ impl Shell {
         {
             return LinkOutcome::Rejected;
         }
+        if let Some(request) =
+            crate::markdown::content_reference::html_preview(&activation.target.original)
+        {
+            if !matches!(
+                activation.action,
+                LinkAction::Primary | LinkAction::Internal
+            ) {
+                return LinkOutcome::Rejected;
+            }
+            if !cfg!(any(target_os = "macos", target_os = "linux")) {
+                self.sidebar_notice = Some("HTML previews need a native Browser host (macOS or Linux). Open the source file instead.".into());
+                cx.notify();
+                return LinkOutcome::Rejected;
+            }
+            let context = crate::files::client::FilesRequestContext::for_chat(
+                self.state.read(cx),
+                &self.active_chat,
+            );
+            let Some(context) = context else {
+                return LinkOutcome::Rejected;
+            };
+            let Some(path) =
+                crate::markdown::content_reference::workspace_path(&request.path, &context.cwd)
+            else {
+                self.sidebar_notice = Some("This HTML preview is outside its chat workspace. Move a self-contained copy into the workspace first.".into());
+                cx.notify();
+                return LinkOutcome::Rejected;
+            };
+            let Some(handle) = self.state.read(cx).engine().cloned() else {
+                return LinkOutcome::Rejected;
+            };
+            let client = crate::files::client::WorkspaceFilesClient::new(handle, context);
+            self.set_surfaces_open(true, cx);
+            self.open_browser_surface(BrowserOpen::Html(client, request, path), window, cx);
+            return LinkOutcome::Internal;
+        }
         if activation.target.navigation.is_err() {
             return if matches!(
                 activation.action,
@@ -3580,7 +3621,7 @@ impl Shell {
             crate::browser::BrowserSurface::new(self.browser_context.clone(), remote, window, cx)
         });
         // A saved view has no project to discover previews for.
-        if !matches!(open, BrowserOpen::View(_))
+        if !matches!(open, BrowserOpen::View(_) | BrowserOpen::Html(..))
             && let Some(handle) = self.state.read(cx).engine().cloned()
         {
             let chat_id = self.active_chat.clone();
@@ -3600,6 +3641,13 @@ impl Shell {
                         this.add_browser_surface(url.clone(), window, cx);
                     }
                 }
+                crate::browser::BrowserEvent::OpenSource(path) => {
+                    if this.panel_key(cx) == owner
+                        && this.resolved_right_active(cx) == RightSurface::Browser(id)
+                    {
+                        this.open_workspace_file_link(path, window, cx);
+                    }
+                }
                 crate::browser::BrowserEvent::Close => {
                     this.close_right_surface(RightSurface::Browser(id), window, cx)
                 }
@@ -3615,6 +3663,9 @@ impl Shell {
         browser.update(cx, |browser, cx| match open {
             BrowserOpen::Url(url) => browser.navigate(&url, window, cx),
             BrowserOpen::View(view) => browser.open_view(view, window, cx),
+            BrowserOpen::Html(client, request, path) => {
+                browser.read_preview(client, request, path, window, cx)
+            }
             BrowserOpen::Blank => browser.focus_address(window, cx),
         });
     }
@@ -15878,6 +15929,19 @@ mod exit_regressions {
                     shell.activate_session_link(&activation, window, cx),
                     LinkOutcome::Rejected
                 );
+                let web_target = activation.target.clone();
+                activation.target = LinkTarget::new(
+                    "Preview",
+                    "\u{e200}visualize\u{e202}{\"path\":\"/workspace/design.html\"}\u{e201}",
+                );
+                activation.action = LinkAction::Internal;
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected,
+                    "a stale preview must be rejected before any file RPC or tab creation"
+                );
+                assert_eq!(shell.browsers.len(), 3);
+                activation.target = web_target;
                 activation.source_session = Some("first-session".into());
                 shell.state.update(cx, |state, _| {
                     state.selected_chat = Some("switch-in-progress".into())

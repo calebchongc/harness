@@ -993,7 +993,11 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             if url != super::mend::PENDING_LINK_URL {
                 // Merge adjacent runs of the same link into one clickable range.
                 match links.last_mut() {
-                    Some((range, last_url)) if range.end == start && last_url == url => {
+                    Some((range, last_url))
+                        if range.end == start
+                            && last_url == url
+                            && !run.style.content_reference =>
+                    {
                         range.end = text.len();
                     }
                     _ => links.push((start..text.len(), url.clone())),
