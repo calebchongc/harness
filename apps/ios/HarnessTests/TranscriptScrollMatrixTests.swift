@@ -278,20 +278,19 @@ final class TranscriptScrollMatrixTests: XCTestCase {
     }
 
     private func anchorRowID() -> String? {
-        let rows = harness.store.transcriptCache.rows(revision: harness.store.revision,
-            entries: harness.store.entries, pendingSends: harness.store.pendingSends)
-        let top = table.contentOffset.y + table.contentInset.top
-        return (table.indexPathsForVisibleRows ?? []).sorted()
-            .first { table.rectForRow(at: $0).maxY > top && $0.row < rows.count }
-            .map { rows[$0.row].id }
+        let top = table.superview!.convert(table.superview!.bounds, to: window).minY
+        // The table contains only the retained tail window. Its row indices
+        // are not indices into the full transcript; measure the realized
+        // cell's identity so inserts cannot silently change the test anchor.
+        return table.visibleCells.sorted { $0.frame.minY < $1.frame.minY }
+            .first { table.convert($0.frame, to: window).maxY > top }?
+            .accessibilityIdentifier
     }
 
-    /// Window-space top of the row, or .nan when it no longer exists.
+    /// Window-space top of the realized row, or .nan if it disappeared.
     private func rowTop(_ id: String) -> CGFloat {
-        let rows = harness.store.transcriptCache.rows(revision: harness.store.revision,
-            entries: harness.store.entries, pendingSends: harness.store.pendingSends)
-        guard let row = rows.firstIndex(where: { $0.id == id }) else { return .nan }
-        return table.convert(table.rectForRow(at: IndexPath(row: row, section: 0)), to: window).minY
+        guard let cell = table.visibleCells.first(where: { $0.accessibilityIdentifier == id }) else { return .nan }
+        return presentedY(cell)
     }
 
     private func anchorCell() -> UITableViewCell? {
@@ -507,6 +506,7 @@ final class TranscriptScrollMatrixTests: XCTestCase {
         await settle(200)
         guard let anchorID = anchorRowID() else { XCTFail("no anchor row"); return }
         let start = rowTop(anchorID)
+        let beforeLayout = visibleLayout()
         let before = table.contentSize.height
         var minObserved = before
         let observation = table.observe(\.contentSize, options: [.new]) { _, change in
@@ -523,7 +523,7 @@ final class TranscriptScrollMatrixTests: XCTestCase {
             for _ in 0..<4 {
                 try? await Task.sleep(for: .milliseconds(16))
                 XCTAssertLessThan(abs(rowTop(anchorID) - start), 4,
-                    "anchor \(anchorID) moved on structural update \(step)\n\(visibleLayout())")
+                    "anchor \(anchorID) moved on structural update \(step)\nbefore:\n\(beforeLayout)\nafter:\n\(visibleLayout())")
             }
             XCTAssertFalse(harness.scroll.pinned, "structural update must not re-pin a reader")
         }
