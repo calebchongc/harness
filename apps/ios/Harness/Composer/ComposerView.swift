@@ -767,7 +767,11 @@ struct QuestionPanel: View {
     @State private var typed: [String: String] = [:]
     @State private var autoAdvanceTask: Task<Void, Never>?
     @State private var promptHeight: CGFloat = 0
+    @FocusState private var typing: Bool
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    /// Inside a stacked phone split: typing an answer gives the session the screen, as the composer does.
+    /// Without it the list kept the top half and the answer field sat behind the keyboard.
+    @Environment(\.stackedComposerFocus) private var stackedComposerFocus
 
     /// The question and its options scroll inside this height, so a long
     /// question leaves the transcript above it readable and keeps the answer
@@ -782,6 +786,9 @@ struct QuestionPanel: View {
             EmptyView()
         } else {
             panel(for: questions[min(max(page, 0), questions.count - 1)])
+                .onChange(of: typing) { _, typing in stackedComposerFocus?(typing) }
+                // Answered or dismissed while typing: the split gets its rest back.
+                .onDisappear { if typing { stackedComposerFocus?(false) } }
         }
     }
 
@@ -801,6 +808,8 @@ struct QuestionPanel: View {
                     get: { typed[question.id] ?? "" },
                     set: { typed[question.id] = $0 }
                 ))
+                .focused($typing)
+                .onSubmit { advance() }
                 .font(Theme.sans(13))
                 .foregroundStyle(Theme.text)
                 .padding(.top, 6)
@@ -941,6 +950,7 @@ struct QuestionPanel: View {
             }
             return UserInputAnswer(questionId: q.id, labels: Array(picked[q.id, default: []]))
         }
+        typing = false
         respond(requestId, answers)
     }
 }

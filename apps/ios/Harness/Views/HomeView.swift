@@ -166,7 +166,8 @@ struct HomeView: View {
                 }
                 .navigationSplitViewStyle(.balanced)
             } else if let arrangement = phoneArrangement {
-                PhoneSplitContainer(arrangement: arrangement, selection: selectedChatId) {
+                PhoneSplitContainer(arrangement: arrangement, selection: selectedChatId,
+                                    hasDetail: !path.isEmpty) {
                     NavigationStack { sidebar }
                 } detail: {
                     primaryStack
