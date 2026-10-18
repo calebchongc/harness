@@ -20,6 +20,7 @@ use harness_proto::{
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::turn_replies::{REPLIES_TRUNCATED_NOTE, turn_replies};
 
+mod peer_messages;
 mod rooms;
 use crate::harness::{HarnessInfo, TurnOutcome, Harness, session_for, short};
 
@@ -149,7 +150,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "send_message",
-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn when the harness supports it, and otherwise queues for the end of the turn. With wait=true, blocks until the turn finishes and returns the assistant's reply. From a chat, returns a status snapshot immediately: the recipient replies into your chat on its own, so end your turn.",
+            description: "Send an actionable question, blocker, or final requested result to a chat, not acknowledgements or progress updates. Use unmentioned room posts for progress (they wake nobody). Messages are attributed to your chat; peer reply chains are bounded and another send is refused while your earlier message is queued. mode 'auto' starts an idle chat, steers when supported, otherwise queues. With wait=true, terminal callers wait for the reply; from a chat it returns a status snapshot, so end your turn rather than polling.",
             input_schema: chat_key_schema(json!({
                 "text": { "type": "string" },
                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
@@ -820,7 +821,32 @@ impl Tools {
         let baseline = session_for(&sessions, &chat);
         let mode = args.mode.as_deref().unwrap_or("auto");
         let sent_at = now_millis();
-        let body = self.attribute(&chat, text).await;
+        let body = self.attribute(&chat, text).await?;
+        if let Some(origin) = self.harness.origin().chat_id.as_deref() {
+            let queue = self
+                .harness
+                .snapshot(
+                    harness_rpc::methods::WATCH_QUEUE,
+                    json!({ "chatId": chat.id }),
+                )
+                .await?;
+            let items = queue
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("WatchQueue: unexpected shape"))?;
+            if items.iter().any(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| peer_messages::from_sender(text, origin))
+            }) {
+                anyhow::bail!(
+                    "your earlier message is still queued in chat {}; no new message was sent. \
+                     Do not retry or send acknowledgements/progress; use an unmentioned room post \
+                     for progress and leave the pending question for the human",
+                    short(&chat.id)
+                );
+            }
+        }
         let mut result = json!({
             "chatId": chat.id,
             "title": chat.title,
@@ -948,13 +974,15 @@ impl Tools {
     /// Prefix the sender's identity when this server speaks for a chat, so
     /// the receiving agent (and the human reading that transcript) can tell
     /// an agent-to-agent message from a typed one.
-    async fn attribute(&self, target: &Chat, text: &str) -> String {
+    async fn attribute(&self, target: &Chat, text: &str) -> anyhow::Result<String> {
         let Some(origin_id) = self.harness.origin().chat_id.as_deref() else {
-            return text.to_owned();
+            return Ok(text.to_owned());
         };
         if origin_id == target.id {
-            return text.to_owned();
+            return Ok(text.to_owned());
         }
+        let entries = self.harness.transcript(origin_id).await?;
+        let depth = peer_messages::next_depth(&render_entries(&entries, RenderOptions::default()))?;
         let title = match self.harness.resolve_chat(origin_id).await {
             Ok(chat) => chat.title,
             Err(_) => None,
@@ -965,10 +993,7 @@ impl Tools {
             }
             _ => short(origin_id).to_owned(),
         };
-        format!(
-            "[Message from Harness chat {label}. Reply to it with the Harness `send_message` tool, chat {}.]\n\n{text}",
-            short(origin_id)
-        )
+        Ok(peer_messages::frame(&label, origin_id, depth, text))
     }
 
     /// Pick and perform the delivery the composer would.
@@ -1208,6 +1233,7 @@ mod tests {
     #[derive(Default)]
     struct World {
         writes: Mutex<Vec<(String, Value)>>,
+        queued: Mutex<Vec<Value>>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1244,6 +1270,7 @@ mod tests {
                     }
                 ])),
                 methods::WATCH_SESSIONS => stream(json!([])),
+                methods::WATCH_QUEUE => stream(json!({ "items": *self.queued.lock().unwrap() })),
                 methods::LIST_HARNESSES => RpcReply::Value(json!([
                     { "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
                       "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true },
@@ -1437,9 +1464,86 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.ends_with("please review"));
+        assert!(prompt.contains("Relay depth: 1/4."));
+        assert!(prompt.contains("Do not send acknowledgements or progress updates."));
+        assert!(!prompt.contains("Reply to it with"));
         assert_eq!(params["command"]["request"]["cwd"], "/repo/comet");
         assert_eq!(params["command"]["request"]["harness"], "claude-code");
         assert_eq!(params["command"]["request"]["model"], "opus");
+    }
+
+    #[tokio::test]
+    async fn peer_updates_do_not_pile_up_behind_a_pending_message() {
+        let world = Arc::new(World::default());
+        world.queued.lock().unwrap().push(json!({
+            "id": "existing",
+            "text": "[Message from Harness chat Beta (chat-bet). Reply to it with Harness.]\n\nEarlier result"
+        }));
+        let peer = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        for mode in ["auto", "run", "steer", "queue"] {
+            let err = peer
+                .call(
+                    "send_message",
+                    json!({
+                        "chat": "alpha", "text": "Another acknowledgement", "mode": mode
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.contains("earlier message is still queued"), "{err}");
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+        assert_eq!(
+            world.queued.lock().unwrap().len(),
+            1,
+            "never discard earlier work"
+        );
+
+        // A human client is not silenced by the agent's pending update.
+        let human = tools(world.clone(), Origin::default());
+        human
+            .call(
+                "send_message",
+                json!({
+                    "chat": "alpha", "text": "Human instruction", "mode": "queue"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(world.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn another_senders_pending_message_does_not_block_peer_delivery() {
+        let world = Arc::new(World::default());
+        world.queued.lock().unwrap().push(json!({
+            "id": "existing", "text": peer_messages::frame("Other", "chat-other", 1, "result")
+        }));
+        let peer = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        peer.call(
+            "send_message",
+            json!({
+                "chat": "alpha", "text": "Requested result", "mode": "queue"
+            }),
+        )
+        .await
+        .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, methods::QUEUE_MESSAGE);
+        assert_eq!(writes[0].1["holdForTurnEnd"], true);
     }
 
     #[tokio::test]
