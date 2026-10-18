@@ -673,6 +673,8 @@ impl Shell {
                             .child(SharedString::from(format!("Tabs · {}", labels.len()))),
                     )
                 })
+                // Tabs have their own viewport, outside the sessions fade.
+                // Fade the whole subtree, including the active tab's pane cards.
                 .child(rows.children(labels.into_iter().enumerate().flat_map(|(ix, title)| {
                     let lit = ix == active;
                     let key: SharedString = format!("chat-tab-{ix}").into();
@@ -785,7 +787,11 @@ impl Shell {
                     let strip = if lit { pane_strip.take() } else { None }
                         .map(|strip| div().flex_none().mx(px(-10.0)).child(strip).into_any_element());
                     std::iter::once(row).chain(strip)
-                })))
+                })).map(|rows| {
+                    crate::edge_fade::edge_faded(SIDEBAR_GLASS_FADE_BAND, true, true, rows)
+                        .band_top(18.0)
+                        .fade_overflow_y(&self.chat_tab_scroll)
+                }))
                 .into_any_element(),
         )
     }
