@@ -74,6 +74,41 @@ final class HarnessCatalogTests: XCTestCase {
         XCTAssertEqual(unknown.label, "foo-9")
     }
 
+    func testUnknownHarnessDoesNotInheritClaudeModelsOrOptions() {
+        XCTAssertTrue(HarnessCatalog.models(for: "dynamic-agent").isEmpty)
+        let fallback = HarnessCatalog.defaultModel(for: "dynamic-agent")
+        XCTAssertEqual(fallback.label, "Default model")
+        XCTAssertTrue(fallback.options.isEmpty)
+        XCTAssertTrue(fallback.reasoningLevels.isEmpty)
+    }
+
+    func testSavedSelectionSurvivesMissingAndHydratedCatalogs() {
+        let savedId = "saved-live-only"
+        let pending = HarnessCatalog.resolve(modelId: savedId, in: [], harness: "dynamic-agent")
+        XCTAssertEqual(pending.id, savedId)
+        XCTAssertEqual(pending.label, savedId)
+        XCTAssertTrue(pending.options.isEmpty)
+        let live = ModelInfo(id: savedId, label: "Saved live model", description: nil,
+                             reasoningLevels: ["high"])
+        let hydrated = HarnessCatalog.resolve(modelId: savedId, in: [live], harness: "dynamic-agent")
+        XCTAssertEqual(hydrated.id, pending.id)
+        XCTAssertEqual(hydrated, live)
+    }
+
+    func testUnavailableSelectionRequiresLiveEvidence() {
+        let harness = "dynamic-agent"
+        let saved = "saved-live-only"
+        XCTAssertFalse(HarnessCatalog.selectionUnavailable(harness: harness, modelId: saved,
+            liveHarnesses: nil, liveModels: nil), "offline/unverified selections remain queueable")
+        XCTAssertTrue(HarnessCatalog.selectionUnavailable(harness: harness, modelId: saved,
+            liveHarnesses: [], liveModels: nil), "a live empty agent list is authoritative")
+        XCTAssertTrue(HarnessCatalog.selectionUnavailable(harness: harness, modelId: saved,
+            liveHarnesses: [HarnessInfo(id: harness, label: "Agent")], liveModels: []))
+        let model = ModelInfo(id: saved, label: "Saved", description: nil, reasoningLevels: [])
+        XCTAssertFalse(HarnessCatalog.selectionUnavailable(harness: harness, modelId: saved,
+            liveHarnesses: [HarnessInfo(id: harness, label: "Agent")], liveModels: [model]))
+    }
+
     func testClaudeCatalogStartsWithFable51AndContextWindow() {
         let first = HarnessCatalog.models(for: "claude-code").first
         XCTAssertEqual(first?.id, "claude-fable-5-1")

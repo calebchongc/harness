@@ -30,15 +30,16 @@ struct NewSessionView: View {
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPhotoPicker = false
     @State private var attachError: String?
-    /// Live harness list from the selected device (Settings → Agents gate);
-    /// static pair until it loads.
+    /// Only agents actually discovered on this device are offered.
     @State private var liveHarnesses: [HarnessInfo]?
-    /// Live per-harness catalogs from the selected device (static fallback).
+    /// Live or cached metadata, scoped to the execution device.
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var catalogsLoading = true
+    @State private var confirmedHarnesses: [HarnessInfo]?
+    @State private var confirmedCatalogs: [String: [ModelInfo]] = [:]
     @State private var optionSelections: [String: String] = [:]
-    /// The device the agent list and catalogs were loaded for, and whether that load reached it live.
+    /// Never expose a previous host's metadata during a destination change.
     @State private var catalogDevice: String?
-    @State private var catalogLive = false
     @State private var refs: [RepoRef] = []
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
@@ -75,20 +76,37 @@ struct NewSessionView: View {
     }
 
     private var harnesses: [HarnessInfo] {
-        liveHarnesses ?? HarnessCatalog.harnesses
+        catalogDevice == deviceId ? (liveHarnesses ?? []) : []
     }
 
-    private var models: [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+    private var scopedCatalogs: [String: [ModelInfo]] {
+        catalogDevice == deviceId ? catalogs : [:]
+    }
+
+    private var models: [ModelInfo] { scopedCatalogs[harness] ?? [] }
+
+    private var selectionUnavailable: Bool {
+        guard catalogDevice == deviceId else { return false }
+        return HarnessCatalog.selectionUnavailable(harness: harness, modelId: selectedModel.id,
+            liveHarnesses: confirmedHarnesses, liveModels: confirmedCatalogs[harness])
     }
 
     private var selectedModel: ModelInfo {
-        HarnessCatalog.resolveExisting(modelId: storedModel, in: models)
-            ?? models.first
-            ?? HarnessCatalog.defaultModel(for: harness)
+        if storedModel.isEmpty, models.isEmpty {
+            return ModelInfo(id: "", label: catalogsLoading ? "Loading models…" : "Select model",
+                             description: nil, reasoningLevels: [])
+        }
+        // Catalog hydration may add metadata, but must never replace a saved
+        // model with a static default (including in the config sent by Send).
+        return HarnessCatalog.resolve(modelId: storedModel.isEmpty ? nil : storedModel,
+                               in: models, harness: harness)
     }
 
     private var reasoning: String? {
+        guard !selectedModel.id.isEmpty else { return nil }
+        if HarnessCatalog.resolveExisting(modelId: selectedModel.id, in: models) == nil {
+            return storedReasoning.isEmpty ? nil : storedReasoning
+        }
         if selectedModel.reasoningLevels.isEmpty { return nil }
         if selectedModel.reasoningLevels.contains(storedReasoning) { return storedReasoning }
         return HarnessCatalog.defaultReasoning(for: selectedModel)
@@ -223,47 +241,56 @@ struct NewSessionView: View {
             }
         }
         .task(id: "\(deviceId ?? "")|\(deviceId.map(model.deviceOnline) ?? false)") {
-            // Live harness list + a model catalog per harness, all from the
-            // device that will run the session (the picker shows one sectioned
-            // list across harnesses, so it needs every catalog up front).
-            // Keyed on reachability too: opened offline, it reloads once the
-            // device comes back instead of staying on the fallback. A host whose
-            // presence flaps re-runs this constantly: a list already loaded live
-            // stays, and a refresh never blanks the picker or the picks in it.
             guard let deviceId else {
                 liveHarnesses = nil
                 catalogs = [:]
+                confirmedHarnesses = nil
+                confirmedCatalogs = [:]
                 optionSelections = [:]
                 catalogDevice = nil
+                catalogsLoading = false
                 return
             }
-            let online = model.deviceOnline(deviceId)
-            if catalogDevice == deviceId {
-                if catalogLive || !online { return }
-            } else {
-                liveHarnesses = nil
+            if catalogDevice != deviceId {
+                liveHarnesses = DocDisk.loadHarnesses(deviceId: deviceId)
                 catalogs = [:]
+                confirmedHarnesses = nil
+                confirmedCatalogs = [:]
                 optionSelections = [:]
-                catalogLive = false
+                catalogDevice = deviceId
+                if let cached = DocDisk.loadModels(deviceId: deviceId, harness: harness), !cached.isEmpty {
+                    catalogs[harness] = cached
+                }
+            } else if !model.deviceOnline(deviceId) {
+                catalogsLoading = false
+                return
             }
-            let list = await model.listHarnesses(deviceId: deviceId)
+            // Refresh on reconnect, but keep existing rows/picks visible.
+            catalogsLoading = true
+            let result = await model.listHarnesses(deviceId: deviceId)
             guard !Task.isCancelled else { return }
-            catalogDevice = deviceId
+            let list = result.items
             liveHarnesses = list
-            if !list.contains(where: { $0.id == harness }), let first = list.first {
+            confirmedHarnesses = result.isLive ? list : nil
+            if storedModel.isEmpty, !list.contains(where: { $0.id == harness }), let first = list.first {
                 harness = first.id
             }
-            await withTaskGroup(of: (String, [ModelInfo]).self) { group in
+            await withTaskGroup(of: (String, DeviceCatalog<ModelInfo>).self) { group in
                 for h in list {
+                    if catalogs[h.id] == nil, let cached = DocDisk.loadModels(deviceId: deviceId, harness: h.id),
+                       !cached.isEmpty {
+                        catalogs[h.id] = cached
+                    }
                     group.addTask { (h.id, await model.listModels(deviceId: deviceId, harness: h.id)) }
                 }
                 for await (id, catalog) in group {
                     guard !Task.isCancelled else { return }
-                    catalogs[id] = catalog
+                    catalogs[id] = catalog.items
+                    confirmedCatalogs[id] = catalog.isLive ? catalog.items : nil
                 }
             }
             guard !Task.isCancelled else { return }
-            catalogLive = online
+            catalogsLoading = false
         }
         .sheet(isPresented: $showPicker) {
             ModelPickerSheet(harness: $harness, modelId: Binding(
@@ -272,7 +299,8 @@ struct NewSessionView: View {
             ), reasoning: Binding(
                 get: { reasoning },
                 set: { storedReasoning = $0 ?? "" }
-            ), harnesses: harnesses, catalogs: catalogs)
+            ), harnesses: harnesses, catalogs: scopedCatalogs,
+               catalogsLoading: catalogsLoading || catalogDevice != deviceId)
         }
         .sheet(isPresented: $showTraitPicker) {
             TraitPickerSheet(reasoning: Binding(
@@ -312,6 +340,13 @@ struct NewSessionView: View {
 
     private var composer: some View {
         VStack(spacing: 6) {
+            if selectionUnavailable {
+                Text("Selected agent or model is unavailable on this device. Choose another model.")
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.warning)
+                    .padding(.horizontal, 24)
+                    .accessibilityIdentifier("model-selection-unavailable")
+            }
             if let attachError {
                 Text(attachError)
                     .font(Theme.sans(12))
@@ -323,7 +358,7 @@ struct NewSessionView: View {
             ComposerShell(
                 draft: $draft,
                 placeholder: "Do anything…",
-                sendEnabled: deviceId != nil,
+                sendEnabled: deviceId != nil && !selectedModel.id.isEmpty && !selectionUnavailable,
                 showStop: false,
                 busy: busy,
                 alwaysExpanded: true,
@@ -456,7 +491,7 @@ struct NewSessionView: View {
     }
 
     private var canSend: Bool {
-        guard !busy, deviceId != nil else { return false }
+        guard !busy, deviceId != nil, !selectedModel.id.isEmpty, !selectionUnavailable else { return false }
         return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !attachments.isEmpty
     }
@@ -649,20 +684,21 @@ struct ModelPickerSheet: View {
     @Binding var reasoning: String?
     /// True when reconfiguring a live chat: the harness can't change mid-chat.
     var lockedHarness = false
-    /// Harness sections to offer (the device's live list; static fallback).
+    /// Only host-discovered or per-host cached agents are offered.
     var harnesses: [HarnessInfo] = []
-    /// Live per-harness catalogs from the device (static fallback when absent).
+    /// Live or cached metadata; a missing entry is not a static default.
     var catalogs: [String: [ModelInfo]] = [:]
+    var catalogsLoading = false
 
     private func models(for harness: String) -> [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+        catalogs[harness] ?? []
     }
 
     private var sections: [HarnessInfo] {
         if lockedHarness {
             return [HarnessInfo(id: harness, label: HarnessCatalog.label(for: harness))]
         }
-        return harnesses.isEmpty ? HarnessCatalog.harnesses : harnesses
+        return harnesses
     }
 
     /// Accordion state: which harness sections show their models. Seeded with
@@ -684,7 +720,9 @@ struct ModelPickerSheet: View {
 
     /// While searching, only sections with a match, each open.
     private var shownSections: [HarnessInfo] {
-        searching ? sections.filter { !shown(for: $0.id).isEmpty } : sections
+        searching ? sections.filter {
+            !shown(for: $0.id).isEmpty || (catalogsLoading && catalogs[$0.id] == nil)
+        } : sections
     }
 
     var body: some View {
@@ -693,7 +731,24 @@ struct ModelPickerSheet: View {
                 VStack(alignment: .leading, spacing: 22) {
                     VStack(alignment: .leading, spacing: 4) {
                         SheetLabel("Model")
-                        if searching, shownSections.isEmpty {
+                        if !modelId.isEmpty, selectedModel == nil {
+                            Text("Current selection: \(modelId)")
+                                .font(Theme.sans(13))
+                                .foregroundStyle(Theme.textMuted)
+                                .accessibilityIdentifier("model-picker-current")
+                        }
+                        if sections.isEmpty {
+                            if catalogsLoading {
+                                ProgressView("Loading agents…")
+                                    .accessibilityIdentifier("model-picker-loading")
+                            } else {
+                                Text("No agents available from this device. Check its connection and enabled agents.")
+                                    .font(Theme.sans(13))
+                                    .foregroundStyle(Theme.textMuted)
+                                    .accessibilityIdentifier("model-picker-unavailable")
+                            }
+                        }
+                        if searching, shownSections.isEmpty, !catalogsLoading, !sections.isEmpty {
                             Text("No models match \u{201C}\(query)\u{201D}")
                                 .font(Theme.sans(13))
                                 .foregroundStyle(Theme.textFaint)
@@ -705,10 +760,19 @@ struct ModelPickerSheet: View {
                                 sectionHeader(h)
                             }
                             if sections.count == 1 || searching || openSections.contains(h.id) {
+                                if catalogs[h.id] == nil, catalogsLoading {
+                                    ProgressView("Loading models…")
+                                        .accessibilityIdentifier("model-picker-loading")
+                                } else if models(for: h.id).isEmpty {
+                                    Text("No models available from this device. Check its connection and model settings.")
+                                        .font(Theme.sans(13))
+                                        .foregroundStyle(Theme.textMuted)
+                                        .accessibilityIdentifier("model-picker-unavailable")
+                                }
                                 ForEach(shown(for: h.id)) { m in
                                     PickRow(title: m.label,
                                             subtitle: m.description,
-                                            selected: harness == h.id && m.id == modelId) {
+                                            selected: harness == h.id && m.id == selectedModel?.id) {
                                         select(harness: h.id, model: m)
                                     }
                                 }
@@ -716,6 +780,7 @@ struct ModelPickerSheet: View {
                         }
                     }
                     .onAppear { openSections = [harness] }
+                    .onChange(of: harness) { _, value in openSections.insert(value) }
                 }
                 .padding(20)
                 .padding(.bottom, 12)
@@ -734,6 +799,7 @@ struct ModelPickerSheet: View {
                             .font(.system(size: 13, weight: .semibold))
                     }
                     .accessibilityLabel("Close")
+                    .accessibilityIdentifier("model-picker-confirm")
                 }
             }
         }

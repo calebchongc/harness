@@ -49,6 +49,13 @@ struct ModelInfo: Identifiable, Hashable {
     }
 }
 
+/// Catalog provenance matters: an offline cache is not evidence that a saved
+/// selection is unavailable, while a successful empty response is authoritative.
+struct DeviceCatalog<Item> {
+    let items: [Item]
+    let isLive: Bool
+}
+
 enum HarnessCatalog {
     /// Static fallback = the engine's `default_enabled()` pair. The ACP
     /// agents (grok/hermes/pi) appear only through a device's live
@@ -175,7 +182,7 @@ enum HarnessCatalog {
                           description: "Ultra-fast lightweight coding", reasoningLevels: codexXhighLadder,
                           options: codexServiceTier),
             ]
-        default:  // claude-code (mock shares it)
+        case "claude-code", "mock":
             return [
                 ModelInfo(id: "claude-fable-5-1", label: "Fable 5.1",
                           description: "Most intelligent model for building agents", reasoningLevels: fullLadder,
@@ -199,6 +206,8 @@ enum HarnessCatalog {
                           description: "Fastest model for everyday tasks", reasoningLevels: [],
                           options: [toggle(id: "thinking", label: "Thinking")]),
             ]
+        default:
+            return []
         }
     }
 
@@ -224,8 +233,17 @@ enum HarnessCatalog {
         )
     }
 
+    static func selectionUnavailable(harness: String, modelId: String,
+                                     liveHarnesses: [HarnessInfo]?, liveModels: [ModelInfo]?) -> Bool {
+        if let liveHarnesses, !liveHarnesses.contains(where: { $0.id == harness }) { return true }
+        if !modelId.isEmpty, let liveModels,
+           resolveExisting(modelId: modelId, in: liveModels) == nil { return true }
+        return false
+    }
+
     static func defaultModel(for harness: String) -> ModelInfo {
-        models(for: harness)[0]
+        models(for: harness).first
+            ?? ModelInfo(id: "default", label: "Default model", description: nil, reasoningLevels: [])
     }
 
     /// pickers.rs — High when available, then Medium, then the first level.
