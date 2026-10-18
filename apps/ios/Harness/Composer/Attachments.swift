@@ -133,6 +133,7 @@ struct StagedAttachment: Identifiable, Hashable {
     /// serves (png/jpg/gif/webp) as-is; transcode everything else (HEIC
     /// camera shots, mainly) to JPEG.
     static func stage(data: Data) -> StagedAttachment? {
+        guard data.count <= maxAttachmentBytes else { return nil }
         var bytes = data
         var ext = sniffExtension(data)
         if ext == nil {
