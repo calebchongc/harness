@@ -969,15 +969,9 @@ impl Shell {
             .clone()
             .filter(|_| matches!(self.route, Route::Chat))?;
         let len = split.panes.len();
-        // Stable widths keep title lengths and incomplete rows from stretching
-        // cards; use one column only when two compact cards cannot fit.
+        // Always size two equal tracks from the strip's actual content box,
+        // including inside a tab. Titles truncate; incomplete rows stay compact.
         let gap = 6.0;
-        let available = (self.settings.sidebar_width - Theme::SPACE_SM * 2.0).max(0.0);
-        let card_width = if available >= 96.0 * 2.0 + gap {
-            (available - gap) / 2.0
-        } else {
-            available
-        };
         struct Card {
             title: SharedString,
             harness: Option<harness_proto::HarnessId>,
@@ -1029,12 +1023,10 @@ impl Shell {
                 div()
                     .id(("chat-pane-card", ix))
                     .debug_selector(move || format!("chat-pane-card-{ix}"))
-                    .flex_none()
-                    .w(px(card_width))
                     .min_w_0()
                     .px(px(8.0))
-                    .py(px(7.0))
-                    .rounded(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(7.0))
                     .border_1()
                     .border_color(if focused { theme.accent.opacity(0.55) } else { theme.border })
                     .bg(if focused { theme.ink(0.05) } else { theme.ink(0.015) })
@@ -1049,6 +1041,8 @@ impl Shell {
                     }))
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap(px(5.0))
@@ -1059,6 +1053,7 @@ impl Shell {
                                         .unwrap_or((icons::CHAT_ROUND_LINE, None));
                                     icon(path)
                                         .size(px(11.0))
+                                        .flex_none()
                                         .text_color(tint.unwrap_or(if focused {
                                             theme.accent
                                         } else {
@@ -1084,11 +1079,14 @@ impl Shell {
         Some(
             div()
                 .id("sidebar-pane-strip")
+                .w_full()
+                .min_w_0()
+                .flex_none()
                 .px(px(Theme::SPACE_SM))
                 .pb(px(8.0))
                 .flex()
                 .flex_col()
-                .child(div().flex().flex_row().flex_wrap().items_start().gap(px(gap)).children(row))
+                .child(div().w_full().min_w_0().grid().grid_cols(2).items_start().gap(px(gap)).children(row))
                 .into_any_element(),
         )
     }
