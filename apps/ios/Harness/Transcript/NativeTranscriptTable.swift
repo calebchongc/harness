@@ -406,12 +406,10 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
             measuredHeights.removeAll(keepingCapacity: true)
             measuredWidth = bounds.width
         }
-        // During a batch update `rows` already contains the new tail window,
-        // while UIKit can still lay out cells at their old index paths. A
-        // completed code fence appends a block and evicts a row at the head;
-        // associating those old paths with new row ids poisons the estimates
-        // of unchanged history rows. Cache the realized cell's own identity
-        // and height, just as didEndDisplaying does, across that transition.
+        // A structural update can lay out retained cells while UIKit is
+        // changing their index paths. Cache each realized cell's own
+        // identity and height, just as didEndDisplaying does, rather than
+        // attributing a measurement through a transitioning row index.
         for cell in visibleCells {
             guard let id = cell.accessibilityIdentifier, cell.bounds.height > 0 else { continue }
             measuredHeights[id] = cell.bounds.height
