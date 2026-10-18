@@ -34,6 +34,34 @@ final class DemoDataset {
         self.agents = agents
     }
 
+    /// Deterministic header fixtures for overflow, all-idle fallback and long titles.
+    func configureHeaderStatusFixture(count: Int, allIdle: Bool) {
+        guard let template = chats.first else { return }
+        let now = nowMs()
+        let count = max(1, min(24, count))
+        sessions = [:]
+        chats = (0..<count).map { index in
+            var chat = template
+            chat.id = index == 0 ? "chat-veil" : "header-status-\(index)"
+            chat.title = "Session \(index + 1) — A long planning conversation 📝"
+            chat.lastPromptAt = now - Int64(index * 1_000)
+            chat.lastMessageAt = now - Int64(index * 1_000)
+            chat.lastSeenAt = allIdle ? now : now - 100_000
+            let status: SessionStatus
+            switch index % 4 {
+            case 0: status = .working
+            case 1: status = .awaitingInput
+            case 2: status = .idle
+            default: status = .errored
+            }
+            sessions[chat.id] = SessionRow(chatId: chat.id, deviceId: chat.deviceId,
+                                          status: allIdle ? .idle : status,
+                                          startedAt: now, updatedAt: now)
+            return chat
+        }
+        changeRequests = [:]
+    }
+
     /// The three onboarding agents, all found and on.
     private static let allAgentsReady = [AgentDescriptor(id: "graff"), AgentDescriptor(id: "claude-code"), AgentDescriptor(id: "codex")]
 

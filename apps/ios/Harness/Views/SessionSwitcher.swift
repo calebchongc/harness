@@ -25,14 +25,15 @@ struct JuggledSessions {
     var indicators: [String: ChatIndicator] = [:]
 
     @MainActor
-    init(model: AppModel) {
+    init(model: AppModel, limit: Int? = Self.limit, including current: String? = nil) {
         let now = nowMs()
         for chat in sortActive(model.overviewChats) {
             let indicator = model.indicator(for: chat)
-            guard indicator != .idle || now - chat.calledAt < Self.recentWindowMs else { continue }
+            guard chat.id == current || indicator != .idle
+                    || now - chat.calledAt < Self.recentWindowMs else { continue }
             chats.append(chat)
             indicators[chat.id] = indicator
-            if chats.count == Self.limit { break }
+            if let limit, chats.count >= limit { break }
         }
     }
 
