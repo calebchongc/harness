@@ -822,7 +822,7 @@ struct TraitPickerSheet: View {
                 .padding(.bottom, 12)
             }
             .background(SheetStyle.panel)
-            .navigationTitle("Traits")
+            .navigationTitle("Reasoning")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
