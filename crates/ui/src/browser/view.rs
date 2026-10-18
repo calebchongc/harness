@@ -371,7 +371,7 @@ impl BrowserSurface {
                             .text_color(theme.text)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if has_error {
-                                    this.reload(cx);
+                                    this.reload(window, cx);
                                 } else {
                                     this.focus_address(window, cx);
                                 }
@@ -436,7 +436,7 @@ impl Render for BrowserSurface {
             cx,
         )
         .when(has_page, |el| {
-            el.on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
+            el.on_click(cx.listener(|this, _, w, cx| this.reload(w, cx)))
         });
         let address = surface_chrome::input()
             .id("browser-address")
@@ -493,7 +493,11 @@ impl Render for BrowserSurface {
             });
         let open = button(
             "browser-external",
-            "Open in default browser",
+            if self.preview_request.is_some() {
+                "Open source file"
+            } else {
+                "Open in default browser"
+            },
             icons::ARROW_UP_RIGHT,
             has_page,
             &theme,
@@ -664,7 +668,7 @@ impl Render for BrowserSurface {
                 #[cfg(not(target_os = "linux"))]
                 let _=(this,event,w,cx);
             }))
-            .on_action(cx.listener(|this, _: &super::Reload, _, cx| this.reload(cx)))
+            .on_action(cx.listener(|this, _: &super::Reload, w, cx| this.reload(w, cx)))
             .on_action(cx.listener(|this, _: &super::FocusAddress, w, cx| this.focus_address(w, cx)))
             .on_action(cx.listener(|_, _: &super::NewTab, _, cx| cx.emit(BrowserEvent::NewTab(None))))
             .on_action(cx.listener(|_, _: &super::CloseTab, _, cx| cx.emit(BrowserEvent::Close)))

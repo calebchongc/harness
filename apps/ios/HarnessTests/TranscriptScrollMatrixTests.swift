@@ -267,32 +267,30 @@ final class TranscriptScrollMatrixTests: XCTestCase {
     }
 
     private func visibleLayout() -> String {
-        let rows = harness.store.transcriptCache.rows(revision: harness.store.revision,
-            entries: harness.store.entries, pendingSends: harness.store.pendingSends)
         let paths = (table.indexPathsForVisibleRows ?? []).sorted()
         let lines = paths.map { path -> String in
             let rect = table.rectForRow(at: path)
-            let id = path.row < rows.count ? rows[path.row].id : "?"
-            return "  \(path.row) \(id) y=\(rect.minY) h=\(rect.height)"
+            let cell = table.cellForRow(at: path)
+            let id = cell?.accessibilityIdentifier ?? "?"
+            return "  \(path.row) \(id) y=\(rect.minY) h=\(rect.height) cell=\(cell?.bounds ?? .zero) safeArea=\(cell?.safeAreaInsets ?? .zero)"
         }
-        return "offset=\(table.contentOffset.y) content=\(table.contentSize.height)\n" + lines.joined(separator: "\n")
+        return "offset=\(table.contentOffset.y) content=\(table.contentSize.height) inset=\(table.contentInset)\n" + lines.joined(separator: "\n")
     }
 
     private func anchorRowID() -> String? {
-        let rows = harness.store.transcriptCache.rows(revision: harness.store.revision,
-            entries: harness.store.entries, pendingSends: harness.store.pendingSends)
-        let top = table.contentOffset.y + table.contentInset.top
-        return (table.indexPathsForVisibleRows ?? []).sorted()
-            .first { table.rectForRow(at: $0).maxY > top && $0.row < rows.count }
-            .map { rows[$0.row].id }
+        let top = table.superview!.convert(table.superview!.bounds, to: window).minY
+        // The table contains only the retained tail window. Its row indices
+        // are not indices into the full transcript; measure the realized
+        // cell's identity so inserts cannot silently change the test anchor.
+        return table.visibleCells.sorted { $0.frame.minY < $1.frame.minY }
+            .first { table.convert($0.frame, to: window).maxY > top }?
+            .accessibilityIdentifier
     }
 
-    /// Window-space top of the row, or .nan when it no longer exists.
+    /// Window-space top of the realized row, or .nan if it disappeared.
     private func rowTop(_ id: String) -> CGFloat {
-        let rows = harness.store.transcriptCache.rows(revision: harness.store.revision,
-            entries: harness.store.entries, pendingSends: harness.store.pendingSends)
-        guard let row = rows.firstIndex(where: { $0.id == id }) else { return .nan }
-        return table.convert(table.rectForRow(at: IndexPath(row: row, section: 0)), to: window).minY
+        guard let cell = table.visibleCells.first(where: { $0.accessibilityIdentifier == id }) else { return .nan }
+        return presentedY(cell)
     }
 
     private func anchorCell() -> UITableViewCell? {
@@ -391,6 +389,109 @@ final class TranscriptScrollMatrixTests: XCTestCase {
         }
     }
 
+    func testReadingWindowRetainsItsLeadingIdentityAcrossMoreThanOneWindowOfAppends() {
+        let scroll = ScrollState()
+        func row(_ index: Int) -> TranscriptRow {
+            TranscriptRow(id: "row-\(index)", version: 1, turnStart: true,
+                          kind: .user(text: "Fixture \(index)"), entryId: "entry-\(index)",
+                          timestamp: nil, partKey: nil)
+        }
+        var rows = (0..<500).map(row)
+        let initial = scroll.tailWindow(rows)
+        XCTAssertEqual(initial.count, ScrollState.defaultRowLimit)
+        XCTAssertEqual(initial.first?.id, "row-300")
+        scroll.pinned = false
+        for index in 500..<750 {
+            rows.append(row(index))
+            let window = scroll.tailWindow(rows)
+            XCTAssertEqual(window.first?.id, initial.first?.id, "a live append cannot evict reading history")
+            XCTAssertEqual(Array(window.prefix(initial.count).map(\.id)), initial.map(\.id))
+            XCTAssertEqual(window.last?.id, "row-\(index)")
+        }
+        XCTAssertEqual(scroll.tailWindow(rows).count, 450)
+        scroll.growRowLimit(total: rows.count)
+        let expanded = scroll.tailWindow(rows)
+        XCTAssertEqual(expanded.count, 650, "top growth starts from the retained window, not its old limit")
+        XCTAssertEqual(expanded.first?.id, "row-100")
+        scroll.arm()
+        scroll.resetRowLimit()
+        let latest = scroll.tailWindow(rows)
+        XCTAssertEqual(latest.count, ScrollState.defaultRowLimit, "jumping restores the bounded tail")
+        XCTAssertEqual(latest.first?.id, "row-550")
+    }
+
+    func testReadingWindowCanGrowTowardEarlierHistoryWithoutSlidingOnHydration() {
+        let scroll = ScrollState()
+        func row(_ index: Int) -> TranscriptRow {
+            TranscriptRow(id: "row-\(index)", version: 1, turnStart: true,
+                          kind: .user(text: "Fixture \(index)"), entryId: "entry-\(index)",
+                          timestamp: nil, partKey: nil)
+        }
+        var rows = (0..<500).map(row)
+        _ = scroll.tailWindow(rows)
+        scroll.pinned = false
+        rows.append(row(500))
+        XCTAssertEqual(scroll.tailWindow(rows).first?.id, "row-300")
+        scroll.growRowLimit(total: rows.count)
+        let expanded = scroll.tailWindow(rows)
+        XCTAssertEqual(expanded.count, 401)
+        XCTAssertEqual(expanded.first?.id, "row-100")
+        rows.insert(row(-1), at: 0)
+        rows.append(row(501))
+        let hydrated = scroll.tailWindow(rows)
+        XCTAssertEqual(hydrated.first?.id, expanded.first?.id)
+        XCTAssertEqual(Array(hydrated.prefix(expanded.count).map(\.id)), expanded.map(\.id))
+        XCTAssertEqual(hydrated.count, expanded.count + 1)
+    }
+
+    /// Finishing a fence adds a trailing block to an already-full tail
+    /// window. Keep the reader's leading edge and unchanged realized rows'
+    /// measured heights and screen positions; do not slide the suffix window.
+    func testFinishingLongCodeWhileReadingPreservesRealizedRowMeasurements() async {
+        let corpus = Self.corpora.first { $0.name == "long-code" }!
+        await mount(corpus)
+        applyChunk(corpus, index: 0)
+        await settle(120)
+        await drag(by: -900)
+        await settle(120)
+        XCTAssertFalse(harness.scroll.pinned)
+        for chunk in 1..<(Self.chunkCount - 1) {
+            applyChunk(corpus, index: chunk)
+            await settle(80)
+        }
+        let viewportTop = table.superview!.convert(table.superview!.bounds, to: window).minY
+        let anchors = table.visibleCells.compactMap { cell -> (String, CGFloat, CGFloat)? in
+            guard let id = cell.accessibilityIdentifier else { return nil }
+            let y = presentedY(cell)
+            guard y > viewportTop, y < viewportTop + 300 else { return nil }
+            return (id, y, cell.bounds.height)
+        }
+        XCTAssertFalse(anchors.isEmpty, "history must have a fully visible anchor")
+        let beforeRows = harness.scroll.tailWindow(harness.store.transcriptCache.rows(
+            revision: harness.store.revision, entries: harness.store.entries, pendingSends: harness.store.pendingSends))
+        let beforeLayout = visibleLayout()
+        applyChunk(corpus, index: Self.chunkCount - 1)
+        for _ in 0..<4 {
+            try? await Task.sleep(for: .milliseconds(16))
+            for (id, y, height) in anchors {
+                guard let cell = table.visibleCells.first(where: { $0.accessibilityIdentifier == id }) else {
+                    XCTFail("unchanged history row \(id) disappeared\nbefore:\n\(beforeLayout)\nafter:\n\(visibleLayout())"); continue
+                }
+                XCTAssertEqual(cell.bounds.height, height, accuracy: 1,
+                               "a tail append changed the measured height of \(id)\nbefore:\n\(beforeLayout)\nafter:\n\(visibleLayout())")
+                XCTAssertLessThan(abs(presentedY(cell) - y), 4,
+                                  "a tail append moved unchanged history row \(id)\nbefore:\n\(beforeLayout)\nafter:\n\(visibleLayout())")
+            }
+        }
+        XCTAssertFalse(harness.scroll.pinned)
+        assertViewportRealized("long-code/final-tail-append")
+        let afterRows = harness.scroll.tailWindow(harness.store.transcriptCache.rows(
+            revision: harness.store.revision, entries: harness.store.entries, pendingSends: harness.store.pendingSends))
+        XCTAssertEqual(afterRows.count, beforeRows.count + 1, "the closing fence adds one trailing paragraph")
+        XCTAssertEqual(Array(afterRows.prefix(beforeRows.count).map(\.id)), beforeRows.map(\.id),
+                       "appending below a reader must not evict/reindex existing history rows")
+    }
+
     /// A structural (non-append) row change while reading history must not
     /// pass through an estimated-height content size. UITableView resets
     /// every height on `reloadData`; a 300-turn transcript collapsed toward
@@ -405,6 +506,7 @@ final class TranscriptScrollMatrixTests: XCTestCase {
         await settle(200)
         guard let anchorID = anchorRowID() else { XCTFail("no anchor row"); return }
         let start = rowTop(anchorID)
+        let beforeLayout = visibleLayout()
         let before = table.contentSize.height
         var minObserved = before
         let observation = table.observe(\.contentSize, options: [.new]) { _, change in
@@ -421,7 +523,7 @@ final class TranscriptScrollMatrixTests: XCTestCase {
             for _ in 0..<4 {
                 try? await Task.sleep(for: .milliseconds(16))
                 XCTAssertLessThan(abs(rowTop(anchorID) - start), 4,
-                    "anchor \(anchorID) moved on structural update \(step)\n\(visibleLayout())")
+                    "anchor \(anchorID) moved on structural update \(step)\nbefore:\n\(beforeLayout)\nafter:\n\(visibleLayout())")
             }
             XCTAssertFalse(harness.scroll.pinned, "structural update must not re-pin a reader")
         }

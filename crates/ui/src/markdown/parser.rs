@@ -29,6 +29,8 @@ pub struct InlineStyle {
     pub strikethrough: bool,
     /// Destination URL when inside a link.
     pub link: Option<String>,
+    /// A standalone content reference, never merged into adjacent references.
+    pub content_reference: bool,
     pub image: Option<InlineImage>,
     pub task: Option<TaskMarker>,
 }
@@ -125,7 +127,7 @@ impl BlockTree {
 // Full parse
 // ---------------------------------------------------------------------------
 
-fn options() -> Options {
+pub(super) fn options() -> Options {
     Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
 }
 
@@ -135,10 +137,22 @@ pub fn parse_full(source: &str) -> BlockTree {
 }
 
 fn parse_at(source: &str, offset: usize) -> BlockTree {
-    let events: Vec<(Event, Range<usize>)> = Parser::new_ext(source, options())
-        .into_offset_iter()
-        .map(|(event, range)| (event, range.start + offset..range.end + offset))
-        .collect();
+    let references = super::content_reference::rewrite(source);
+    let text = references.as_ref().map_or(source, |r| r.text.as_str());
+    let mut events = Vec::new();
+    for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+        let mut emit = |event, range: Range<usize>| {
+            let range = references
+                .as_ref()
+                .map_or(range.clone(), |r| r.original_range(range));
+            events.push((event, range.start + offset..range.end + offset));
+        };
+        if let Some(references) = &references {
+            references.expand(event, range, &mut emit);
+        } else {
+            emit(event, range);
+        }
+    }
     let mut cur = Cursor {
         events: &events,
         ix: 0,
@@ -429,7 +443,26 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
         }
         Event::SoftBreak => push(runs, " ".into(), style.clone()),
         Event::HardBreak => push(runs, "\n".into(), style.clone()),
-        Event::Html(t) | Event::InlineHtml(t) => push(runs, t.into_string(), style.clone()),
+        Event::Html(t) | Event::InlineHtml(t) => {
+            if let Some(reference) = super::content_reference::file_reference(&t) {
+                let mut style = style.clone();
+                style.content_reference = true;
+                style.link = Some(super::content_reference::file_destination(&reference.path));
+                push(runs, reference.label().to_owned(), style);
+            } else if let Some(reference) = super::content_reference::html_preview(&t) {
+                let mut style = style.clone();
+                style.content_reference = true;
+                style.link = Some(t.into_string());
+                let name = reference
+                    .path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(&reference.path);
+                push(runs, format!("Preview · {name}"), style);
+            } else {
+                push(runs, t.into_string(), style.clone());
+            }
+        }
         Event::TaskListMarker(done) => {
             let mut style = style.clone();
             style.task = Some(TaskMarker {
@@ -581,7 +614,11 @@ fn merge_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
     let mut out: Vec<InlineRun> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if last.style == run.style && run.style.image.is_none() => {
+            Some(last)
+                if last.style == run.style
+                    && run.style.image.is_none()
+                    && !run.style.content_reference =>
+            {
                 last.text.push_str(&run.text)
             }
             _ => out.push(run),

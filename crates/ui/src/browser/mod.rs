@@ -9,6 +9,7 @@ use linux as native;
 use macos as native;
 #[cfg(target_os = "macos")]
 pub use macos::clear_browsing_data;
+mod document;
 pub mod model;
 pub mod saved_view;
 mod view;
@@ -71,6 +72,7 @@ pub(crate) fn bind_keys(cx: &mut App, keymap: &crate::settings::KeymapConfig) {
 pub enum BrowserEvent {
     Changed,
     NewTab(Option<String>),
+    OpenSource(String),
     Close,
 }
 
@@ -93,6 +95,13 @@ pub struct BrowserSurface {
     remote: bool,
     /// Set when the tab shows a saved tool view instead of the web.
     view: Option<harness_proto::ToolView>,
+    document: Option<document::HtmlDocument>,
+    document_task: Option<gpui::Task<()>>,
+    preview_request: Option<(
+        crate::files::client::WorkspaceFilesClient,
+        crate::markdown::content_reference::HtmlPreview,
+        String,
+    )>,
     previews: harness_proto::PreviewSnapshot,
     previews_loading: bool,
     previews_task: Option<gpui::Task<()>>,
@@ -172,6 +181,9 @@ impl BrowserSurface {
             validation: None,
             remote,
             view: None,
+            document: None,
+            document_task: None,
+            preview_request: None,
             previews: harness_proto::PreviewSnapshot::default(),
             previews_loading: true,
             previews_task: None,
@@ -329,6 +341,9 @@ impl BrowserSurface {
     }
 
     pub fn navigate(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview_request.is_some() || self.view.is_some() {
+            return;
+        }
         let url = match model::normalize_address(input) {
             Ok(url) => url,
             Err(message) => {
@@ -420,15 +435,101 @@ impl BrowserSurface {
         cx.notify();
     }
 
+    /// Read only through the originating chat's workspace/device RPC. Every
+    /// reload destroys the old page and its state before asking for new bytes.
+    pub fn read_preview(
+        &mut self,
+        client: crate::files::client::WorkspaceFilesClient,
+        request: crate::markdown::content_reference::HtmlPreview,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document_task = None;
+        self.preview_request = Some((client.clone(), request.clone(), path.clone()));
+        self.document = None;
+        self.view = None;
+        self.previews_task = None;
+        self.clear_favicon(cx);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.native = None;
+            self.context = BrowserContext::default();
+        }
+        self.page = PageState {
+            url: Some(request.path.clone()),
+            title: request
+                .path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("HTML preview")
+                .into(),
+            loading: true,
+            ..Default::default()
+        };
+        self.address
+            .update(cx, |input, cx| input.set_text(request.path.clone(), cx));
+        self.address_edited = false;
+        self.validation = None;
+        let read = gpui_tokio::Tokio::spawn(cx, async move {
+            let file = client
+                .read_file(harness_proto::ReadWorkspaceFileRequest {
+                    target: client.target().clone(),
+                    path,
+                })
+                .await
+                .map_err(|_| "Could not read this HTML preview from its chat device.".to_owned())?;
+            if file.truncated {
+                return Err("This HTML preview is too large. Open the source file instead.".into());
+            }
+            let text = file
+                .text
+                .ok_or_else(|| "This file is not a UTF-8 HTML document.".to_owned())?;
+            document::HtmlDocument::new(&request, &text)
+        });
+        self.document_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = read.await.map_err(|error| error.to_string()).and_then(|result| result);
+            let _ = this.update_in(cx, |this, window, cx| {
+                let result: Result<(), String> = result.and_then(|document| {
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    {
+                        let mut native = native::NativePage::new_document(window, this.native_tx.clone())?;
+                        native.present(this.presentation);
+                        native.load_html(&document.html)?;
+                        this.document = Some(document);
+                        this.native = Some(native);
+                        Ok(())
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                    {
+                        let _ = (document, window);
+                        Err("HTML previews are not available on this platform. Open the source file instead.".to_owned())
+                    }
+                });
+                this.page.loading = result.is_ok();
+                this.page.error = result.err();
+                cx.emit(BrowserEvent::Changed);
+                cx.notify();
+            });
+        }));
+        cx.emit(BrowserEvent::Changed);
+        cx.notify();
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.view.is_some() {
+        if self.view.is_some() || self.preview_request.is_some() {
             return;
         }
         let url = self.address.read(cx).text().to_owned();
         self.navigate(&url, window, cx);
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((client, request, path)) = self.preview_request.clone() {
+            self.read_preview(client, request, path, window, cx);
+            return;
+        }
+        let _ = window;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(native) = &self.native {
             if self.page.error.is_some() {
@@ -446,6 +547,12 @@ impl BrowserSurface {
     }
 
     fn open_external(&self, cx: &mut Context<Self>) {
+        if let Some((_, request, _)) = &self.preview_request {
+            cx.emit(BrowserEvent::OpenSource(
+                crate::markdown::content_reference::file_destination(&request.path),
+            ));
+            return;
+        }
         if let Some(url) = self
             .page
             .url
@@ -457,6 +564,9 @@ impl BrowserSurface {
     }
 
     fn history(&mut self, forward: bool) {
+        if self.preview_request.is_some() {
+            return;
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(native) = &self.native {
             native.history(forward);
@@ -473,6 +583,9 @@ impl BrowserSurface {
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.document_task = None;
+        self.preview_request = None;
+        self.document = None;
         self.set_presentation(Presentation::Hidden, cx);
         self.clear_favicon(cx);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -509,6 +622,18 @@ impl BrowserSurface {
             native::NativeEvent::Changed | native::NativeEvent::Finished => {
                 let finished = matches!(event, native::NativeEvent::Finished);
                 let mut page = native.state();
+                if let Some(document) = &self.document {
+                    page.url = Some(document.path.clone());
+                    #[cfg(feature = "browser-fixture")]
+                    let fixture_status = page.title.starts_with("preview:");
+                    #[cfg(not(feature = "browser-fixture"))]
+                    let fixture_status = false;
+                    if !fixture_status {
+                        page.title = document.title.clone();
+                    }
+                    page.can_back = false;
+                    page.can_forward = false;
+                }
                 // A failed provisional request has no committed WebKit URL.
                 if page.url.is_none() {
                     page.url = self.page.url.clone();
@@ -534,7 +659,12 @@ impl BrowserSurface {
                 }
                 native.present(self.presentation);
                 // A saved view has no site to fetch an icon from.
-                if finished && self.view.is_none() && let Some(url) = &page.url {
+                if finished
+                    && self.view.is_none()
+                    && self.preview_request.is_none()
+                    && self.document.is_none()
+                    && let Some(url) = &page.url
+                {
                     native.discover_favicon(url.clone());
                 }
                 if page != self.page {
@@ -544,7 +674,7 @@ impl BrowserSurface {
                 cx.notify();
             }
             native::NativeEvent::NewTab(url) => {
-                if self.presentation == Presentation::Live {
+                if self.presentation == Presentation::Live && self.preview_request.is_none() {
                     cx.emit(BrowserEvent::NewTab(Some(url)));
                 }
             }
@@ -627,6 +757,40 @@ impl BrowserSurface {
 
 #[cfg(feature = "browser-fixture")]
 impl BrowserSurface {
+    /// Bypass only the file RPC for a synthetic fixture; document construction,
+    /// native contexts, navigation policy and sandbox are production paths.
+    pub fn fixture_document(
+        &mut self,
+        content: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let request = crate::markdown::content_reference::HtmlPreview {
+            path: "/workspace/fixture.html".into(),
+            wide: true,
+            compatibility: crate::markdown::content_reference::HtmlCompatibility::CodexVisualize,
+        };
+        let document = document::HtmlDocument::new(&request, content)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.native = None;
+            let mut native = native::NativePage::new_document(window, self.native_tx.clone())?;
+            native.present(self.presentation);
+            native.load_html(&document.html)?;
+            self.page.url = Some(document.path.clone());
+            self.page.title = document.title.clone();
+            self.page.loading = true;
+            self.document = Some(document);
+            self.native = Some(native);
+            cx.notify();
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (document, window, cx);
+            Err("Native HTML previews are unavailable on this platform".into())
+        }
+    }
     pub fn fixture_history(&mut self, forward: bool) {
         self.history(forward);
     }

@@ -38,6 +38,7 @@ struct TranscriptView: View {
         let runway = store.lastSubmittedMessageId
         let earlierErrors = Self.earlierReauthRows(rows)
         NativeTranscriptTable(rows: rows, hiddenRows: allRows.count - rows.count,
+            streaming: store.entries.last?.status == .streaming,
             scroll: scroll, runwayID: runway,
             expansionHeight: runway.flatMap { userExpansionHeights[$0] } ?? 0,
             bottomSpacing: verticalSizeClass == .compact ? 8 : 24,
@@ -208,9 +209,10 @@ struct TranscriptGeometry: Equatable {
 final class ScrollState {
     var pinned = true
     var showJump = false
-    /// Tail window: only the newest `rowLimit` rows reach the table, so a long
-    /// transcript never lays out its full history at once. Scrolling near the
-    /// top grows it by `rowLimitStep`; jumping back to the bottom resets it.
+    /// Tail window: initially only the newest `rowLimit` rows reach the table.
+    /// While reading, retain its leading identity as new rows arrive rather
+    /// than evicting history under the reader. Scrolling near the top grows
+    /// it by `rowLimitStep`; jumping back to the bottom resets it.
     static let defaultRowLimit = 200
     static let rowLimitStep = 200
     var rowLimit = defaultRowLimit
@@ -222,6 +224,8 @@ final class ScrollState {
     @ObservationIgnored var userDragging = false
     @ObservationIgnored var distanceFromBottom: CGFloat = 0
     @ObservationIgnored private var movedAway = false
+    @ObservationIgnored private var windowStartID: String?
+    @ObservationIgnored private var windowRowCount = 0
 
     func observe(old: TranscriptGeometry, new: TranscriptGeometry) {
         distanceFromBottom = new.bottom
@@ -253,16 +257,33 @@ final class ScrollState {
         movedAway = false
     }
 
-    /// The newest `rowLimit` rows — older ones stay unbuilt (no layout, no
-    /// cells) until the user scrolls into them.
+    /// Older rows stay unbuilt until requested. A released reader owns the
+    /// current window's leading edge: appending a block (for example, the
+    /// paragraph after a closing code fence) must not delete a row at its
+    /// head and reindex every realized history cell. Grow only at the tail
+    /// until follow resumes, or toward the head when rowLimit grows.
     func tailWindow(_ rows: [TranscriptRow]) -> [TranscriptRow] {
-        rows.count > rowLimit ? Array(rows.suffix(rowLimit)) : rows
+        var start = max(0, rows.count - rowLimit)
+        if !pinned, let windowStartID,
+           let retained = rows.firstIndex(where: { $0.id == windowStartID }) {
+            start = min(start, retained)
+        }
+        // This is rendering bookkeeping, not observable view state. Retain
+        // an identity rather than an index so hydration/prepends cannot
+        // silently slide the reader's window either.
+        windowStartID = rows.isEmpty ? nil : rows[start].id
+        windowRowCount = rows.count - start
+        return start == 0 ? rows : Array(rows[start...])
     }
 
     /// Grow the window toward `total` rows; never below the default, never
     /// above the transcript's actual row count.
     func growRowLimit(total: Int) {
-        rowLimit = max(Self.defaultRowLimit, min(total, rowLimit + Self.rowLimitStep))
+        // Appends may have grown a reader's window past rowLimit already.
+        // Grow from its actual size so reaching the top always reveals older
+        // history instead of spending a step catching up with the live tail.
+        let current = pinned ? rowLimit : max(rowLimit, windowRowCount)
+        rowLimit = max(Self.defaultRowLimit, min(total, current + Self.rowLimitStep))
     }
 
     /// Grow the window just enough that transcript row `index` is inside it.
@@ -273,6 +294,8 @@ final class ScrollState {
 
     func resetRowLimit() {
         rowLimit = Self.defaultRowLimit
+        windowStartID = nil
+        windowRowCount = 0
     }
 }
 
