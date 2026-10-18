@@ -122,4 +122,12 @@ final class PhoneSplitTests: XCTestCase {
             XCTAssertEqual(PhoneSplit.shownPane(resting: rest, composerFocused: false), rest)
         }
     }
+
+    /// Folded with nothing open, the screen was an empty placeholder with the list out of reach.
+    func testWithNothingOpenTheListTakesTheSessionsScreen() {
+        XCTAssertEqual(PhoneSplit.shownPane(resting: .session, composerFocused: false, hasDetail: false), .list)
+        XCTAssertEqual(PhoneSplit.shownPane(resting: .split, composerFocused: false, hasDetail: false), .split)
+        XCTAssertEqual(PhoneSplit.shownPane(resting: .list, composerFocused: false, hasDetail: false), .list)
+        XCTAssertEqual(PhoneSplit.shownPane(resting: .split, composerFocused: true, hasDetail: false), .split)
+    }
 }
