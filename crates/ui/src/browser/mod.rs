@@ -490,7 +490,7 @@ impl BrowserSurface {
         self.document_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = read.await.map_err(|error| error.to_string()).and_then(|result| result);
             let _ = this.update_in(cx, |this, window, cx| {
-                let result = result.and_then(|document| {
+                let result: Result<(), String> = result.and_then(|document| {
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
                     {
                         let mut native = native::NativePage::new_document(window, this.native_tx.clone())?;
