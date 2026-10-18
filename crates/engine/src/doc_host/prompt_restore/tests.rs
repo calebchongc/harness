@@ -33,6 +33,13 @@ fn archived(workspace: &WorkspaceHost) -> bool {
     workspace.chat(CHAT).unwrap().unwrap().archived
 }
 
+/// A send staged before the workspace attaches is stamped from the wall clock,
+/// so an archive in the same millisecond is a tie the clock's counters decide.
+/// Tests that order an archive and a send move past it first.
+fn after_this_millisecond() {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+}
+
 fn create_archived(workspace: &WorkspaceHost) {
     workspace
         .create_chat(CHAT, None, Some("restore-device"), None, None)
@@ -49,6 +56,7 @@ async fn accepted_queue_restore_survives_restart_before_workspace_arrives() {
         let workspace = workspace(store.clone());
         create_archived(&workspace);
         let host = host(store.clone());
+        after_this_millisecond();
         let id = host.queue_message(CHAT, "resume later", vec![]).unwrap();
         host.flush_all();
         assert!(store.sync_job_version(&id, RESTORE_JOB).unwrap().is_some());
@@ -139,6 +147,7 @@ async fn later_explicit_archive_supersedes_delayed_steer_restore() {
             },
         )
         .unwrap();
+    after_this_millisecond();
     workspace.set_chat_archived(CHAT, true).unwrap();
     host.set_workspace(workspace.clone());
     host.retry_prompt_restores(&mut String::new());
