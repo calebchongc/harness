@@ -55,6 +55,9 @@ What went wrong, in generic terms, with the app's own error text verbatim.
 ## Repro
 The smallest sequence of steps that shows it.
 
+## Screenshot
+Required when the bug is visual (see below). Leave it out otherwise.
+
 ## Root cause
 In code terms (`crate::module::function`), naming the tag or commit the
 line numbers come from. Leave this section out if the cause isn't known.
@@ -79,6 +82,30 @@ The expected behavior, or the proposed change.
   Comment on an existing issue only when you have a new repro or diagnostic.
 - **What the header must not contain:** account details, private repository
   names, local paths, session ids, or transcript excerpts.
+
+### Visual issues carry a screenshot
+
+If the bug is about how something looks (layout, clipping, overlap,
+truncation, spacing, colors, rendering, a stuck or wrong animation frame), the
+issue includes a screenshot that shows it. A pull request that changes how
+something looks shows it before and after, at the sizes it was checked at.
+A description of a picture can't be checked against the fix; a screenshot can.
+
+- **Capture from synthetic data, never the user's real app.** Run an isolated
+  build (`scripts/run-macos-dev.sh`, or any build with its own
+  `HARNESS_IPC_PORT` and `DATA_DIR`) or a fixture (for example
+  `harness-ui --example browser-fixture`), with made-up chat titles,
+  projects and prompts. On macOS, `screencapture -o -l <window id>` captures
+  one window; on the iOS simulator, `xcrun simctl io booted screenshot`.
+- **Crop to the part that's wrong**, and look at the image before posting.
+  The same rules as the text apply: no real chat titles, prompts, file names,
+  paths, account names, emails, device or host names, or other apps' windows.
+- **Post it with** `scripts/issue-screenshot.sh <issue-or-pr-number> <image>...`.
+  It uploads to the repository's `issue-media` branch and prints Markdown to
+  paste into the issue, PR or comment. An uploaded image stays in that
+  branch's history, so check it first.
+- **If it can only be seen with real data**, don't post that capture. Say in
+  the issue that no screenshot is attached and why, and describe what it shows.
 
 ## Heavy builds
 
