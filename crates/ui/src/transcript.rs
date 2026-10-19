@@ -1996,14 +1996,21 @@ pub fn rows_for_entry(
     if compact {
         // Collapsed: one work header. Expanded: the same rows compact-off
         // would emit for the work parts, tagged so the fold can hide them.
-        if !pending_group.is_empty() {
-            let tools = std::mem::take(&mut pending_group);
+        // A saved view is what the user asked to see: it stays a visible row
+        // after the fold, never inside it.
+        let (views, tools): (Vec<ToolItem>, Vec<ToolItem>) = std::mem::take(&mut pending_group)
+            .into_iter()
+            .partition(|t| t.view.is_some());
+        let pos = compact_group_pos.unwrap_or(rows.len());
+        let mut after_work = pos;
+        if !tools.is_empty() {
             let work_id: SharedString = format!("{}#work", entry.id).into();
             let work_parts: Vec<MessagePart> = entry
                 .parts
                 .iter()
                 .enumerate()
                 .filter(|(ix, part)| is_compact_work_part(*ix, part, reply_start))
+                .filter(|(_, part)| !matches!(part, MessagePart::Tool { view: Some(_), .. }))
                 .map(|(_, part)| part.clone())
                 .collect();
             let mut inner = if work_parts.is_empty() {
@@ -2046,11 +2053,32 @@ pub fn rows_for_entry(
                 copy_text: None,
                 compact_fold: None,
             };
-            let pos = compact_group_pos.unwrap_or(rows.len());
+            after_work = pos + 1 + inner.len();
             for (i, row) in inner.into_iter().enumerate() {
                 rows.insert(pos + i, row);
             }
             rows.insert(pos, header);
+        }
+        if !views.is_empty() {
+            rows.insert(
+                after_work,
+                Row {
+                    id: format!("{}#views", entry.id).into(),
+                    version: tool_fingerprint(&views, false),
+                    turn_start: false,
+                    kind: RowKind::ToolGroup {
+                        summary: tool_group_summary(&views).into(),
+                        tools: Arc::new(views),
+                        auto_open: false,
+                        worked_secs: None,
+                        compact_shell: false,
+                    },
+                    entry_id: entry.id.clone().into(),
+                    timestamp: None,
+                    copy_text: None,
+                    compact_fold: None,
+                },
+            );
         }
     } else {
         flush_group(
@@ -2616,6 +2644,15 @@ pub fn turn_wait_secs(
     }
     let waited = (started - entries[prompt].created_at) / 1000;
     (waited >= TURN_WAIT_SHOWN_SECS).then_some(waited)
+}
+
+/// The trailer under another device's prompt that hasn't started yet.
+pub fn remote_pending_label(waiting_for_attachments: bool) -> &'static str {
+    if waiting_for_attachments {
+        "Sent from another device · waiting for its attachments"
+    } else {
+        "Sent from another device · waiting to start"
+    }
 }
 
 /// Compact elapsed formatting, using at most two units up to days.
@@ -5170,6 +5207,10 @@ impl Transcript {
                 for echo in state.pending_echoes() {
                     new_rows.extend(self.rows_for(echo, true));
                 }
+                // Another device's prompt the host hasn't started (#415).
+                for prompt in state.remote_pending_prompts() {
+                    new_rows.extend(self.rows_for(&prompt.entry, true));
+                }
             }
             (
                 entries.is_empty(),
@@ -7200,6 +7241,32 @@ impl Transcript {
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
                         .child(SharedString::from("Not delivered — click to retry"))
+                        .into_any_element(),
+                );
+            }
+            // A prompt from another device that hasn't started: say what it
+            // waits on, without claiming the agent is working (#415).
+            let waiting = {
+                let state = self.state.read(cx);
+                (state.indicator_for(&chat_id, now) != crate::state::Indicator::Working)
+                    .then(|| {
+                        let mut prompts = state.remote_pending_prompts().peekable();
+                        prompts.peek()?;
+                        Some(remote_pending_label(
+                            prompts.any(|p| p.waiting_for_attachments),
+                        ))
+                    })
+                    .flatten()
+            };
+            if let Some(label) = waiting {
+                let theme = Theme::of(cx).clone();
+                return Some(
+                    div()
+                        .id("remote-pending")
+                        .pt(px(Theme::SPACE_LG))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(label))
                         .into_any_element(),
                 );
             }
@@ -13446,6 +13513,84 @@ mod tests {
         rows.iter()
             .filter(|row| row.compact_fold.is_none())
             .collect()
+    }
+
+    #[test]
+    fn compact_mode_keeps_a_saved_view_visible_after_the_fold() {
+        let view = harness_proto::ToolView::new(
+            harness_proto::ToolViewKind::Html,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let mut render = tool_part("v", "render_html");
+        if let MessagePart::Tool { view: slot, .. } = &mut render {
+            *slot = Some(view.clone());
+        }
+        let entry = assistant(
+            "a-view",
+            MessageStatus::Complete,
+            vec![
+                tool_part("t1", "ls"),
+                render,
+                text_part("r1", "Ready to open."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, true, &mut parse);
+        let visible = compact_visible(&rows);
+        assert_eq!(visible.len(), 3, "work header, the view, the reply");
+        let RowKind::ToolGroup {
+            tools,
+            compact_shell,
+            ..
+        } = &visible[0].kind
+        else {
+            panic!("expected the work group");
+        };
+        assert!(*compact_shell);
+        assert!(tools.iter().all(|t| t.view.is_none()));
+        let RowKind::ToolGroup {
+            tools,
+            compact_shell,
+            ..
+        } = &visible[1].kind
+        else {
+            panic!("expected the view row");
+        };
+        assert!(!*compact_shell);
+        assert!(!tool_group_collapses(tools));
+        assert_eq!(tools[0].view, Some(view));
+        // Expanding the fold doesn't show the view a second time.
+        let folded_views = rows
+            .iter()
+            .filter(|r| r.compact_fold.is_some())
+            .filter(|r| matches!(&r.kind, RowKind::ToolGroup { tools, .. } if tools.iter().any(|t| t.view.is_some())))
+            .count();
+        assert_eq!(folded_views, 0);
+        // A turn whose only tool saved a view has no work header at all.
+        let mut only = tool_part("v", "render_html");
+        if let MessagePart::Tool { view: slot, .. } = &mut only {
+            *slot = Some(
+                harness_proto::ToolView::new(
+                    harness_proto::ToolViewKind::Html,
+                    "0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            );
+        }
+        let entry = assistant(
+            "a-only",
+            MessageStatus::Complete,
+            vec![only, text_part("r1", "Ready.")],
+        );
+        let rows = rows_for_entry(&entry, false, true, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::ToolGroup {
+                compact_shell: false,
+                ..
+            }
+        ));
     }
 
     #[test]

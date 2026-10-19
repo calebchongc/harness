@@ -737,6 +737,10 @@ pub struct AppState {
     /// agent was busy, in the order it will be sent. Device-agnostic: the
     /// chat's doc holds them (every device sees the same queue).
     pub queue: Vec<harness_doc::QueuedMessage>,
+    /// The selected chat's prompts sent as Run commands that its host hasn't
+    /// turned into messages yet (sent from a phone, waiting for the host or
+    /// for attachments). Shown as pending user rows, never as delivered.
+    pub(crate) remote_pending: Vec<RemotePendingPrompt>,
     /// The selected chat's running tools' live output (graff subagent logs),
     /// straight from its host. Live-only: never in the transcript's doc.
     pub tool_progress: Vec<harness_proto::ToolProgressItem>,
@@ -845,6 +849,7 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             queue: Vec::new(),
+            remote_pending: Vec::new(),
             tool_progress: Vec::new(),
             context_usage: None,
             transcript_replayed: false,
@@ -1074,6 +1079,7 @@ impl AppState {
             self.transcript_replayed = false;
             self.transcript_task = None;
             self.queue.clear();
+            self.remote_pending.clear();
             self.queue_task = None;
             self.tool_progress.clear();
             self.tool_progress_task = None;
@@ -1769,6 +1775,16 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// Prompts the host hasn't started, not already shown as a message or as
+    /// this device's own echo (#415).
+    pub(crate) fn remote_pending_prompts(&self) -> impl Iterator<Item = &RemotePendingPrompt> {
+        let echoes = self.pending_echoes();
+        self.remote_pending.iter().filter(move |p| {
+            !self.transcript.iter().rev().any(|e| e.id == p.entry.id)
+                && !echoes.iter().any(|e| e.id == p.entry.id)
+        })
+    }
+
     // ---- queries ----
 
     /// Non-archived, top-level chats in sidebar order. Chats spawned by
@@ -2401,6 +2417,7 @@ impl AppState {
         }
         self.transcript_task = None;
         self.queue.clear();
+        self.remote_pending.clear();
         self.queue_task = None;
         self.tool_progress.clear();
         self.tool_progress_task = None;
@@ -2913,6 +2930,47 @@ fn spawn_transcript_watch(
     })
 }
 
+/// One `pendingPrompts` row of a queue frame (the engine's `PendingPrompt`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingPromptFrame {
+    message_id: String,
+    text: String,
+    issued_at: i64,
+    #[serde(default)]
+    issued_by: String,
+    #[serde(default)]
+    waiting_for_attachments: bool,
+}
+
+/// A prompt waiting to start, as the user row it will become.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RemotePendingPrompt {
+    pub entry: SessionMessageEntry,
+    pub waiting_for_attachments: bool,
+}
+
+impl From<PendingPromptFrame> for RemotePendingPrompt {
+    fn from(p: PendingPromptFrame) -> Self {
+        Self {
+            entry: SessionMessageEntry {
+                id: p.message_id,
+                role: harness_doc::MessageRole::User,
+                parts: vec![harness_doc::MessagePart::Text {
+                    id: "t0".into(),
+                    text: p.text,
+                }],
+                created_at: p.issued_at,
+                device_id: p.issued_by,
+                status: Some(harness_doc::MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            },
+            waiting_for_attachments: p.waiting_for_attachments,
+        }
+    }
+}
+
 /// The selected chat's pending-message queue, straight off its doc. Whole-list
 /// frames (the queue is a handful of rows at most), retried like the transcript
 /// watch — a queue that silently stopped updating would show messages the host
@@ -2923,9 +2981,12 @@ fn spawn_queue_watch(
     chat_id: String,
 ) -> Task<()> {
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct QueueFrame {
         #[serde(default)]
         items: Vec<harness_doc::QueuedMessage>,
+        #[serde(default)]
+        pending_prompts: Vec<PendingPromptFrame>,
     }
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2958,6 +3019,11 @@ fn spawn_queue_watch(
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
                         state.queue = frame.items;
+                        state.remote_pending = frame
+                            .pending_prompts
+                            .into_iter()
+                            .map(RemotePendingPrompt::from)
+                            .collect();
                         cx.notify();
                     }
                 });
@@ -3126,6 +3192,36 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `harness_proto::view`.
     use harness_proto::{SessionStatus, UserProfile};
+
+    #[test]
+    fn another_devices_pending_prompt_shows_until_its_message_lands() {
+        let frame: PendingPromptFrame = serde_json::from_value(serde_json::json!({
+            "messageId": "m1",
+            "text": "look at this",
+            "issuedAt": 1_000,
+            "issuedBy": "phone",
+            "waitingForAttachments": true,
+        }))
+        .unwrap();
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        state.remote_pending = vec![RemotePendingPrompt::from(frame)];
+        let shown = |state: &AppState| {
+            state
+                .remote_pending_prompts()
+                .map(|p| (p.entry.id.clone(), p.waiting_for_attachments))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&state), vec![("m1".to_string(), true)]);
+        assert_eq!(
+            state.remote_pending[0].entry.role,
+            harness_doc::MessageRole::User
+        );
+        // The host writes the message under the same id: the transcript has it.
+        let landed = state.remote_pending[0].entry.clone();
+        state.transcript.push(landed);
+        assert!(shown(&state).is_empty());
+    }
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
