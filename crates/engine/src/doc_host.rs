@@ -83,6 +83,11 @@ const SYNC_QUANTUM_MS: i64 = 30_000;
 const ACTIVE_SYNC_CAP: usize = 28;
 const SYNC_ADMISSION_BATCH: usize = 4;
 const SYNC_CATCH_UP_QUANTUM_MS: i64 = 300_000;
+/// A peer nudges as it pushes the row it announces, so the wake's catch-up
+/// can finish before that row lands; the client then went idle and the
+/// command waited for someone to open the chat (#412). A woken client stays
+/// connected this long while no other chat is waiting for a slot.
+const WAKE_LINGER_MS: i64 = 60_000;
 
 // All live-transport scenarios share the process budget, including tests in
 // sibling modules. Hold through shutdown so one fixture cannot rotate another.
@@ -583,6 +588,7 @@ pub struct ChatDocHandle {
     sync_service_until: AtomicI64,
     sync_wake_version: AtomicI64,
     sync_wake_ticket: AtomicU64,
+    sync_linger_until: AtomicI64,
     sync_cancel: Mutex<CancellationToken>,
     writers: Arc<AtomicUsize>,
     pub(crate) persistence: Option<Arc<crate::chat_persistence::ChatPersistence>>,
@@ -1487,6 +1493,7 @@ impl DocHost {
             sync_service_until: AtomicI64::new(0),
             sync_wake_version: AtomicI64::new(0),
             sync_wake_ticket: AtomicU64::new(0),
+            sync_linger_until: AtomicI64::new(0),
             sync_cancel: Mutex::new(CancellationToken::new()),
             writers: Arc::new(AtomicUsize::new(0)),
             persistence,
@@ -1840,6 +1847,7 @@ impl DocHost {
                             let ticket = client.request_catch_up();
                             handle.sync_wake_ticket.store(ticket, Ordering::Release);
                             handle.sync_wake_version.store(version, Ordering::Release);
+                            handle.sync_linger_until.store(now_ms() + WAKE_LINGER_MS, Ordering::Release);
                             captured = version;
                         }
                     }
@@ -1857,7 +1865,10 @@ impl DocHost {
                     // A quiet document can still be receiving its checkpoint
                     // or commands. Incomplete catch-up only yields via rotate's
                     // explicit service deadline, never the short reuse grace.
+                    let lingering = waiting.is_empty()
+                        && now_ms() < handle.sync_linger_until.load(Ordering::Acquire);
                     let idle = caught_up
+                        && !lingering
                         && !handle.sync_protected()
                         && (now_ms() - handle.last_access.load(Ordering::Relaxed) >= SYNC_IDLE_MS
                             || (handle.sync_background.load(Ordering::Acquire) && caught_up))
@@ -2016,6 +2027,10 @@ impl DocHost {
                     handle.sync_last_started.store(now_ms(), Ordering::Release);
                     handle.sync_wake_version.store(wake_version.unwrap_or(0), Ordering::Release);
                     handle.sync_wake_ticket.store(0, Ordering::Release);
+                    handle.sync_linger_until.store(
+                        if wake_version.is_some() { now_ms() + WAKE_LINGER_MS } else { 0 },
+                        Ordering::Release,
+                    );
                     match action {
                         SyncAdmission::Join => {
                             let cursor = handle.persistence.as_ref().map_or(0, |p| p.cursor());
@@ -3508,6 +3523,7 @@ impl DocHost {
         self.accept_prompt_restore(&id, receipt);
         handle.publish_queue();
         self.nudge_remote_host(chat_id);
+        self.nudge_remote_host_after_flush(chat_id);
         Ok(id)
     }
 
@@ -4200,6 +4216,30 @@ impl DocHost {
 
     /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
     /// another device as host. Best-effort: offline/edge-less engines skip silently.
+    /// The nudge sent with a write can be read before the write's rows reach
+    /// the edge, and the host then finds nothing to do (#412). Nudge again
+    /// once they have.
+    fn nudge_remote_host_after_flush(&self, chat_id: &str) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.remote_host_for(chat_id).is_none() {
+            return;
+        }
+        let host = self.clone();
+        let chat = chat_id.to_string();
+        self.spawn_worker_on(&runtime, async move {
+            let give_up = tokio::time::Instant::now() + RELAY_GIVE_UP;
+            while tokio::time::Instant::now() < give_up {
+                if host.rows_flushed(&chat) {
+                    host.nudge_remote_host(&chat);
+                    return;
+                }
+                tokio::time::sleep(ROWS_POLL).await;
+            }
+        });
+    }
+
     fn nudge_remote_host(&self, chat_id: &str) {
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
@@ -4305,13 +4345,17 @@ impl DocHost {
             let grace_end = tokio::time::Instant::now() + ROWS_GRACE;
             while tokio::time::Instant::now() < grace_end {
                 if host.rows_flushed(&chat) {
-                    return; // rows on the edge — the normal path has it
+                    // Rows on the edge — the normal path has it. The first
+                    // nudge may have been read before they landed.
+                    host.nudge_remote_host(&chat);
+                    return;
                 }
                 tokio::time::sleep(ROWS_POLL).await;
             }
             let mut backoff = RELAY_BACKOFF_BASE;
             loop {
                 if host.rows_flushed(&chat) {
+                    host.nudge_remote_host(&chat);
                     return; // the normal path won while we were retrying
                 }
                 match host.relay_command(&target, &chat, &entry).await {
