@@ -592,10 +592,18 @@ fn bind_agent_wait(spawns: &[AgentSpawn], item: &mut ToolItem) {
     }
 }
 
-/// Ordinary tool groups fold behind a summary header; agent/spawn chips
-/// render as their own always-open row.
+/// Chips that never fold into "Called N tools": agent chips, and a tool that
+/// saved a view. The view is the answer the user asked to see; folded away,
+/// the reply said "displayed above" over a bare "Called 1 tool" (#1677 in
+/// codegraff).
+fn stays_unfolded(item: &ToolItem) -> bool {
+    is_agent_tool(item) || item.view.is_some()
+}
+
+/// Ordinary tool groups fold behind a summary header; agent/spawn chips and
+/// saved views render as their own always-open row.
 fn tool_group_collapses(tools: &[ToolItem]) -> bool {
-    tools.iter().any(|t| !is_agent_tool(t))
+    tools.iter().any(|t| !stays_unfolded(t))
 }
 
 /// Column budget for soft-wrapping thought text into detail lines. The
@@ -1716,9 +1724,9 @@ pub fn rows_for_entry(
                     compact_group_pos.get_or_insert(rows.len());
                 } else if pending_group
                     .first()
-                    .is_some_and(|head| is_agent_tool(head) != is_agent_tool(&item))
+                    .is_some_and(|head| stays_unfolded(head) != stays_unfolded(&item))
                 {
-                    // Agent chips don't share a fold with ordinary tools:
+                    // Agent and view chips don't share a fold with ordinary tools:
                     // flush whenever the genus flips so each group is uniform.
                     flush_group(
                         &mut rows,
@@ -1747,7 +1755,7 @@ pub fn rows_for_entry(
                 let item = thought_item(part_id, &tree, live);
                 if compact {
                     compact_group_pos.get_or_insert(rows.len());
-                } else if pending_group.first().is_some_and(is_agent_tool) {
+                } else if pending_group.first().is_some_and(stays_unfolded) {
                     // Thoughts join ordinary tool groups; agent (spawn-link)
                     // groups stay pure, exactly like the tool genus rule.
                     flush_group(
@@ -14337,18 +14345,34 @@ mod tests {
             vec![tool_part("a", "ls"), render],
         );
         let rows = rows_for_entry(&entry, false, false, &mut parse);
-        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
-            panic!("tool group expected")
-        };
-        let chips: Vec<_> = tools.iter().map(|t| (is_link_chip(t), t.view.clone())).collect();
-        assert_eq!(chips, vec![(false, None), (true, Some(view))]);
-        // The row re-splices when the view lands after the result.
+        let groups: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                let RowKind::ToolGroup { tools, .. } = &row.kind else {
+                    panic!("tool group expected")
+                };
+                let chips: Vec<_> =
+                    tools.iter().map(|t| (is_link_chip(t), t.view.clone())).collect();
+                (tool_group_collapses(tools), chips)
+            })
+            .collect();
+        // The view is never folded into "Called N tools" with the ls.
+        assert_eq!(
+            groups,
+            vec![
+                (true, vec![(false, None)]),
+                (false, vec![(true, Some(view))]),
+            ]
+        );
+        // Before the view lands the render chip folds with the ls; the rows
+        // re-splice when it arrives after the result.
         let before = assistant(
             "m-view",
             MessageStatus::Complete,
             vec![tool_part("a", "ls"), tool_part("r", "render_html")],
         );
         let before = rows_for_entry(&before, false, false, &mut parse);
+        assert_eq!(before.len(), 1);
         assert_ne!(before[0].version, rows[0].version);
     }
 
