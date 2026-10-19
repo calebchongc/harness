@@ -838,16 +838,17 @@ struct TraitPickerSheet: View {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: selectionChanged ? "checkmark" : "xmark")
-                            .font(.system(size: selectionChanged ? 17 : 13, weight: .semibold))
-                            .foregroundStyle(selectionChanged ? Color.white : Color.primary)
-                            .frame(width: selectionChanged ? 44 : nil,
-                                   height: selectionChanged ? 44 : nil)
-                            .background {
-                                if selectionChanged {
-                                    Circle().fill(Color(white: 25.0 / 255.0))
-                                }
-                            }
+                        if selectionChanged {
+                            Image(systemName: "checkmark.circle.fill")
+                                .renderingMode(.original)
+                                .resizable()
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(Theme.bg, Theme.text)
+                                .frame(width: 44, height: 44)
+                        } else {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(selectionChanged ? "Done" : "Close")
