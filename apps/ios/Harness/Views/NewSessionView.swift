@@ -286,8 +286,7 @@ struct NewSessionView: View {
                 set: { optionSelections[option.id] = $0 }
             ))
         }
-        .photosPicker(isPresented: $showPhotoPicker, selection: $pickerItems,
-                      maxSelectionCount: 8, matching: .images)
+        .themedPhotosPicker(isPresented: $showPhotoPicker, selection: $pickerItems)
         .onChange(of: draft) { _, new in
             DraftStore.save(new, for: DraftStore.newSessionKey(destination))
         }

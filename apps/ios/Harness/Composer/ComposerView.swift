@@ -411,8 +411,7 @@ struct ComposerView: View {
                 }
             }
         }
-        .photosPicker(isPresented: $showPicker, selection: $pickerItems,
-                      maxSelectionCount: 8, matching: .images)
+        .themedPhotosPicker(isPresented: $showPicker, selection: $pickerItems)
         .onChange(of: pickerItems) { _, items in
             guard !items.isEmpty else { return }
             stage(items)
