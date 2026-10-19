@@ -591,6 +591,16 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
+/// A prompt from another device that hasn't started yet goes first: a
+/// follow-up typed meanwhile is queued behind it rather than sent as its own
+/// run (#415). Nothing is running, so there is no Stop.
+pub fn send_mode_behind_pending(mode: SendButtonMode, pending_prompt: bool) -> SendButtonMode {
+    match mode {
+        SendButtonMode::Send if pending_prompt => SendButtonMode::Queue,
+        mode => mode,
+    }
+}
+
 /// Queue rows are represented by the queue panel until the host promotes them
 /// into the transcript. They must never publish (or refresh) a local echo.
 fn should_publish_optimistic_echo(queue: bool) -> bool {
@@ -8087,7 +8097,17 @@ impl Composer {
             self.staged().len() + self.staged_appshots().len(),
             self.staged_comments(cx).len(),
         );
-        send_button_mode(self.run_live(cx), has_text)
+        let pending_prompt = has_text
+            && self
+                .state
+                .read(cx)
+                .remote_pending_prompts()
+                .next()
+                .is_some();
+        send_mode_behind_pending(
+            send_button_mode(self.run_live(cx), has_text),
+            pending_prompt,
+        )
     }
 
     fn execute_workspace_command(
@@ -15580,6 +15600,19 @@ mod tests {
         assert_eq!(send_button_mode(false, false), SendButtonMode::Send);
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Queue);
+        // Behind another device's prompt that hasn't started: queue, never Stop.
+        assert_eq!(
+            send_mode_behind_pending(send_button_mode(false, true), true),
+            SendButtonMode::Queue
+        );
+        assert_eq!(
+            send_mode_behind_pending(send_button_mode(false, true), false),
+            SendButtonMode::Send
+        );
+        assert_eq!(
+            send_mode_behind_pending(send_button_mode(true, false), true),
+            SendButtonMode::Stop
+        );
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
     }
 

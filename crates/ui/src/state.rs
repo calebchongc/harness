@@ -1775,6 +1775,22 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// The selected chat's name while it is untitled and another device's
+    /// prompt is waiting to start: that prompt's first words, as the host's
+    /// own title fallback would read, instead of "New session" (#415).
+    pub(crate) fn provisional_title(&self) -> Option<(String, String)> {
+        let chat_id = self.selected_chat.as_deref()?;
+        if self.chats.iter().find(|c| c.id == chat_id)?.title.is_some() {
+            return None;
+        }
+        let prompt = self.remote_pending_prompts().next()?;
+        let text = prompt.entry.parts.iter().find_map(|p| match p {
+            harness_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })?;
+        provisional_title_from(text).map(|title| (chat_id.to_string(), title))
+    }
+
     /// Prompts the host hasn't started, not already shown as a message or as
     /// this device's own echo (#415).
     pub(crate) fn remote_pending_prompts(&self) -> impl Iterator<Item = &RemotePendingPrompt> {
@@ -2930,6 +2946,39 @@ fn spawn_transcript_watch(
     })
 }
 
+/// The first line of a prompt, cut at a word near 48 characters.
+pub(crate) fn provisional_title_from(prompt: &str) -> Option<String> {
+    const MAX: usize = 48;
+    let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.chars().count() <= MAX {
+        return Some(line.to_string());
+    }
+    let cut: String = line.chars().take(MAX).collect();
+    let cut = match cut.rfind(' ') {
+        Some(space) if space > MAX / 2 => &cut[..space],
+        _ => cut.as_str(),
+    };
+    Some(format!("{}…", cut.trim_end()))
+}
+
+/// A chat's sidebar or tab label: its title, else the provisional one, else
+/// `fallback`.
+pub(crate) fn chat_label(
+    chat: &Chat,
+    provisional: &Option<(String, String)>,
+    fallback: &str,
+) -> String {
+    chat.title
+        .clone()
+        .or_else(|| {
+            provisional
+                .as_ref()
+                .filter(|(id, _)| *id == chat.id)
+                .map(|(_, title)| title.clone())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// One `pendingPrompts` row of a queue frame (the engine's `PendingPrompt`).
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3217,10 +3266,31 @@ mod tests {
             state.remote_pending[0].entry.role,
             harness_doc::MessageRole::User
         );
+        // Untitled, the chat reads as the prompt instead of "New session".
+        state.chats.push(chat("c", 0, None));
+        assert_eq!(
+            state.provisional_title(),
+            Some(("c".into(), "look at this".into()))
+        );
         // The host writes the message under the same id: the transcript has it.
         let landed = state.remote_pending[0].entry.clone();
         state.transcript.push(landed);
         assert!(shown(&state).is_empty());
+        assert_eq!(state.provisional_title(), None);
+    }
+
+    #[test]
+    fn provisional_titles_take_the_first_line_and_cut_at_a_word() {
+        assert_eq!(
+            provisional_title_from("\n  fix the login page \nmore"),
+            Some("fix the login page".into())
+        );
+        assert_eq!(provisional_title_from("   "), None);
+        let long = "compare three rollout plans and adjust the expected traffic for each region";
+        assert_eq!(
+            provisional_title_from(long),
+            Some("compare three rollout plans and adjust the…".into())
+        );
     }
 
     /// A localhost port that was just free (bind :0, read, drop).
