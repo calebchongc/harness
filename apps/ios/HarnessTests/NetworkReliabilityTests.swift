@@ -166,6 +166,32 @@ final class NetworkReliabilityTests: XCTestCase {
         XCTAssertEqual(store.outbox.map(\.batchId), ["stable-b"])
     }
 
+    /// #412: the nudge sent with a command can beat the command's row to the
+    /// room. A second nudge goes out once the outbox, that row included, is
+    /// acknowledged.
+    @MainActor
+    func testQueuedCommandNudgesAgainOnceTheOutboxDrains() async throws {
+        let id = "nudge-after-ack-\(UUID().uuidString)"
+        let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
+                               userId: "u", orgId: "o", deviceId: "phone",
+                               deviceName: "phone", tokens: nil, devBearer: "u@o")
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let store = SessionStore(chatId: id, config: config)
+        store.start(holdDial: true)
+        defer { store.stop() }
+        store.respondInput(requestId: "q1", answers: [])
+        for _ in 0..<20 where !store.nudgeWhenOutboxDrains { await Task.yield() }
+        XCTAssertTrue(store.nudgeWhenOutboxDrains)
+        let batches = store.outbox.map(\.batchId)
+        XCTAssertFalse(batches.isEmpty, "the command's batch is in the outbox before arming")
+        for batch in batches.dropLast() {
+            store.retirePush(batchId: batch)
+            XCTAssertTrue(store.nudgeWhenOutboxDrains, "still waiting on the command's batch")
+        }
+        store.retirePush(batchId: batches.last!)
+        XCTAssertFalse(store.nudgeWhenOutboxDrains, "nudged once the outbox drained")
+    }
+
     @MainActor
     func testHeldSessionReleasesPendingOutboxToTransport() throws {
         let id = "held-outbox-\(UUID().uuidString)"
