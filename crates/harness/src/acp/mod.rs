@@ -546,6 +546,22 @@ fn exo_bridge_programs() -> Vec<PathBuf> {
 /// it for now: graff trusts client-provided servers without a consent
 /// prompt and frames room deliveries as advisory peer mail; other ACP agents
 /// would ask the person before every room call.
+/// `session/cancel` params. With the engine's reason, `_meta` says whether the
+/// user asked (graff blames the user only then, codegraff#1611); without one
+/// the cancel stays bare, as before.
+fn cancel_params(session_id: &str, reason: Option<&str>) -> Value {
+    match reason {
+        Some(reason) => json!({
+            "sessionId": session_id,
+            "_meta": {
+                "graff/cancelSource": if crate::interrupt_reason::by_user(reason) { "user" } else { "client" },
+                "graff/cancelReason": reason,
+            },
+        }),
+        None => json!({ "sessionId": session_id }),
+    }
+}
+
 fn harness_mcp_servers(harness: HarnessId, origin: Option<&crate::RunOrigin>) -> Value {
     let (HarnessId::Graff, Some(origin), Some(program)) =
         (harness, origin, exo_bridge_programs().into_iter().next())
@@ -3444,6 +3460,7 @@ async fn run_session(session: Session) {
         interrupt,
         origin,
     } = controls;
+    let origin_chat = origin.as_ref().map(|o| o.chat_id.clone());
     let request_input = std::sync::Arc::new(request_input);
     let mut clarification = clarification_resume::State::default();
 
@@ -4768,7 +4785,8 @@ async fn run_session(session: Session) {
                 interrupt_sent = true;
                 interrupted = true;
                 if turn.is_some() {
-                    client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
+                    let reason = origin_chat.as_deref().and_then(crate::interrupt_reason::take);
+                    client.notify("session/cancel", Some(cancel_params(&session_id, reason.as_deref())));
                     // Escalate if the agent doesn't wind down (stopReason
                     // "cancelled") within the grace periods.
                     if let Some(pid) = crate::process::signal_target(&child) {
@@ -4896,6 +4914,20 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancel_says_whether_the_user_asked() {
+        let stop = cancel_params("s1", Some("stop"));
+        assert_eq!(stop["_meta"]["graff/cancelSource"], "user");
+        let replace = cancel_params("s1", Some("replace: run died around the send"));
+        assert_eq!(replace["_meta"]["graff/cancelSource"], "client");
+        assert_eq!(
+            replace["_meta"]["graff/cancelReason"],
+            "replace: run died around the send"
+        );
+        // No engine reason (title runs, tests): the bare cancel, as before.
+        assert_eq!(cancel_params("s1", None), json!({ "sessionId": "s1" }));
+    }
 
     #[test]
     fn graff_child_keeps_the_selected_acp_workspace() {

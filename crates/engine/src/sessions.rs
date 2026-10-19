@@ -859,6 +859,7 @@ impl SessionsEngine {
             let _ = tx.send(Vec::new());
         }
         // Harness-level interrupt (protocol + child teardown) …
+        harness_adapters::interrupt_reason::note(chat_id, reason);
         token.cancel();
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
         for _ in 0..500 {
