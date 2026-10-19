@@ -782,10 +782,10 @@ impl Shell {
                         })
                         .child(div().flex_1().min_w_0().truncate().child(title))
                         .into_any_element();
-                    // The strip owns its sidebar gutters. Cancel the tab list's
-                    // inset so grouping cards under a header does not narrow them.
+                    // Keep the strip inside the tab scroll viewport. Negative
+                    // gutters would put the cards' rounded edges under its clip.
                     let strip = if lit { pane_strip.take() } else { None }
-                        .map(|strip| div().flex_none().mx(px(-10.0)).child(strip).into_any_element());
+                        .map(|strip| div().flex_none().child(strip).into_any_element());
                     std::iter::once(row).chain(strip)
                 })).map(|rows| {
                     crate::edge_fade::edge_faded(SIDEBAR_GLASS_FADE_BAND, true, true, rows)
