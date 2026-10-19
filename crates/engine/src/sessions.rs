@@ -3040,6 +3040,12 @@ async fn drive_run(
             }
             continue;
         }
+        if let AgentEvent::ContextSavings { savings } = &event {
+            if let Err(err) = doc_ref.update_context_savings(*savings) {
+                tracing::warn!(%chat_id, error = %err, "context savings write failed");
+            }
+            continue;
+        }
         if let AgentEvent::ReasoningChanged { reasoning } = &event {
             let current_run = lock(&inner.runs)
                 .get(&chat_id)
