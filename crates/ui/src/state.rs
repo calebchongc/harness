@@ -2323,6 +2323,52 @@ impl AppState {
         self.deep_link_notice.take()
     }
 
+    /// Switch visible split panes without blanking either live transcript while
+    /// its replacement watch replays. The peer snapshot is newer than a warm
+    /// navigation-cache entry; keep both panes' prepared rows and baselines.
+    pub(crate) fn select_split_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+        let incoming = chat_id.as_ref().and_then(|id| {
+            self.sub_transcripts.remove(id).map(|entries| {
+                (
+                    entries,
+                    self.prepared_transcripts.get(id).cloned(),
+                    self.transcript_baselines.get(id).cloned(),
+                )
+            })
+        });
+        let outgoing = self
+            .selected_chat
+            .clone()
+            .filter(|_| self.transcript_replayed)
+            .map(|id| {
+                let entries = self.transcript.clone();
+                let prepared = self.prepared_transcripts.get(&id).cloned();
+                let baseline = self.transcript_baselines.get(&id).cloned();
+                (id, entries, prepared, baseline)
+            });
+        self.select_chat(chat_id.clone(), cx);
+        if let Some((entries, prepared, baseline)) = incoming {
+            let id = chat_id.as_ref().expect("peer snapshot has a chat");
+            self.transcript = entries;
+            self.transcript_replayed = true;
+            if let Some(prepared) = prepared {
+                self.prepared_transcripts.insert(id.clone(), prepared);
+            }
+            if let Some(baseline) = baseline {
+                self.transcript_baselines.insert(id.clone(), baseline);
+            }
+        }
+        if let Some((id, entries, prepared, baseline)) = outgoing {
+            self.sub_transcripts.insert(id.clone(), entries);
+            if let Some(prepared) = prepared {
+                self.prepared_transcripts.insert(id.clone(), prepared);
+            }
+            if let Some(baseline) = baseline {
+                self.transcript_baselines.insert(id, baseline);
+            }
+        }
+    }
+
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
     /// dropping the old task drops its stream receiver, which cancels the doc
     /// watch server-side. Selecting a chat also lands in its space and marks it
