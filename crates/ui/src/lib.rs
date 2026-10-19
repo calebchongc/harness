@@ -12,6 +12,7 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — harness pulse loader, gradient spinner, boot splash.
 
+mod agent_message;
 pub mod app_menus;
 pub mod appearance;
 pub mod appshots;
