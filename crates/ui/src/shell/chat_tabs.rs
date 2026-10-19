@@ -585,10 +585,17 @@ impl Shell {
     /// The lit tab's pane strip shows its panes, so rows carry titles only.
     fn chat_tab_labels(&self, cx: &App) -> Vec<SharedString> {
         let state = self.state.read(cx);
+        let provisional = state.provisional_title();
         let title = |selected: Option<&str>| -> SharedString {
             selected
                 .and_then(|id| state.chats.iter().find(|c| c.id == id))
-                .map(|c| transcript::single_line(c.title.as_deref().unwrap_or("Untitled session")))
+                .map(|c| {
+                    transcript::single_line(&crate::state::chat_label(
+                        c,
+                        &provisional,
+                        "Untitled session",
+                    ))
+                })
                 .unwrap_or_else(|| "New session".into())
                 .into()
         };

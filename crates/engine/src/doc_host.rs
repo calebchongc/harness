@@ -4167,6 +4167,13 @@ impl DocHost {
             if sessions.turn_in_flight(&handle.chat_id) {
                 return; // All queued messages wait, including rows from older clients.
             }
+            // A prompt sent as a command that hasn't run yet (its host just
+            // adopted it, or it waits for attachments) is an earlier turn:
+            // the queue follows it instead of jumping ahead (#415). Its turn
+            // starting or its command resolving re-drains.
+            if self.prompt_command_waiting(handle) {
+                return;
+            }
             let send = QueueSend::NextTurn;
             // Take it only once we know it is going out — a row that stays in
             // the queue on a failed send is recoverable; a vanished one is not.
@@ -4182,6 +4189,17 @@ impl DocHost {
                 return;
             }
         }
+    }
+
+    /// A Run still pending in the doc and not yet consumed by this host.
+    fn prompt_command_waiting(&self, handle: &ChatDocHandle) -> bool {
+        handle.doc.read_commands().is_ok_and(|commands| {
+            commands.iter().any(|c| {
+                c.status == SessionCommandStatus::Pending
+                    && matches!(c.payload, SessionCommandPayload::Run { .. })
+                    && !self.inner.store.is_processed(&c.id).unwrap_or(false)
+            })
+        })
     }
 
     /// Stop the active turn without treating the resulting Idle transition as

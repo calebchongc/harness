@@ -4447,6 +4447,7 @@ impl Shell {
         let mut slot = 0usize;
         let mut rendered = Vec::new();
         let mut moving_row = None;
+        let provisional = self.state.read(cx).provisional_title();
         for (group, rows) in sections {
             let pinned_group = slot < pinned_count;
             let drag_group = if pinned_group {
@@ -4524,9 +4525,11 @@ impl Shell {
                 let slot_height = height - removed;
                 let element = self.render_chat_row(
                     chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
+                    transcript::single_line(&crate::state::chat_label(
+                        &chat,
+                        &provisional,
+                        "New session",
+                    ))
                     .into(),
                     time_ago,
                     folder.into(),
@@ -4969,6 +4972,7 @@ impl Shell {
         let section = div().flex().flex_col().child(header);
         let body = {
             let selected = self.state.read(cx).selected_chat.clone();
+            let provisional = self.state.read(cx).provisional_title();
             let mut list = div()
                 .flex()
                 .flex_col()
@@ -4985,9 +4989,11 @@ impl Shell {
                 list = list.child(
                     self.render_chat_row(
                         chat.id.clone(),
-                        transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )
+                        transcript::single_line(&crate::state::chat_label(
+                            &chat,
+                            &provisional,
+                            "New session",
+                        ))
                         .into(),
                         format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
                             .into(),
