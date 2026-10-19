@@ -512,6 +512,46 @@ pub enum FinishQueueEditOutcome {
     Missing,
 }
 
+/// A prompt sent as a Run command that hasn't become a user message yet:
+/// the host hasn't adopted it, or is waiting for its attachments. A reader
+/// shows it as pending instead of an empty chat (#415). It isn't a message:
+/// delivery checks still read only the transcript.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPrompt {
+    pub message_id: String,
+    pub text: String,
+    pub issued_at: i64,
+    pub issued_by: String,
+    pub waiting_for_attachments: bool,
+}
+
+/// Run commands still pending, oldest first. One whose message already
+/// landed (it is executing) is the reader's to drop: this runs on every doc
+/// change, so it reads only the commands, never the transcript.
+pub(crate) fn pending_prompts(commands: &[SessionCommandEntry]) -> Vec<PendingPrompt> {
+    commands
+        .iter()
+        .filter(|c| c.status == SessionCommandStatus::Pending)
+        .filter_map(|c| match &c.payload {
+            SessionCommandPayload::Run {
+                request,
+                message_id,
+            } => Some(PendingPrompt {
+                message_id: message_id.clone(),
+                text: request.prompt.clone(),
+                issued_at: c.issued_at,
+                issued_by: c.issued_by.clone(),
+                waiting_for_attachments: request
+                    .attachments
+                    .iter()
+                    .any(|a| crate::uploads::is_pending_ref(a)),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Content and its historical presentation cutoff travel atomically, even
 /// when the watch coalesces several backfill and live commits.
 #[derive(Clone, Default)]
@@ -534,6 +574,8 @@ pub struct ChatDocHandle {
     /// of short rows — so unlike the transcript mirror it publishes on every
     /// change without a dirty flag.
     queue_tx: watch::Sender<Vec<QueuedMessage>>,
+    /// Published with the queue: Run commands not yet in the transcript.
+    pending_prompts_tx: watch::Sender<Vec<PendingPrompt>>,
     /// Serializes everything that TAKES from the queue. Both the doc-change
     /// task and the turn-end status watcher call `drain_queue`, and nothing
     /// keeps those two apart: without this they interleave across the
@@ -703,7 +745,30 @@ impl ChatDocHandle {
         rx
     }
 
+    pub fn watch_pending_prompts(&self) -> watch::Receiver<Vec<PendingPrompt>> {
+        let rx = self.pending_prompts_tx.subscribe();
+        self.publish_queue();
+        rx
+    }
+
     fn publish_queue(&self) {
+        if self.pending_prompts_tx.receiver_count() > 0 {
+            match self.doc.read_commands() {
+                Ok(commands) => {
+                    let prompts = pending_prompts(&commands);
+                    self.pending_prompts_tx.send_if_modified(|slot| {
+                        let changed = *slot != prompts;
+                        if changed {
+                            *slot = prompts;
+                        }
+                        changed
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %self.chat_id, error = %err, "command read failed");
+                }
+            }
+        }
         match self.doc.read_queue() {
             Ok(items) => {
                 self.queue_tx.send_if_modified(|slot| {
@@ -1465,6 +1530,7 @@ impl DocHost {
         // appended after the handle exists retain the normal automatic drain.
         let recovered_queue_pending = !initial_queue.is_empty();
         let (queue_tx, _) = watch::channel(initial_queue);
+        let (pending_prompts_tx, _) = watch::channel(Vec::new());
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
@@ -1474,6 +1540,7 @@ impl DocHost {
             transcript_import: Mutex::default(),
             transcript_history,
             queue_tx,
+            pending_prompts_tx,
             drain_lock: tokio::sync::Mutex::new(()),
             queue_paused: AtomicBool::new(recovered_queue_pending),
             mirror_dirty: AtomicBool::new(true),
@@ -6621,3 +6688,94 @@ mod publication_eviction_tests {
 #[cfg(test)]
 #[path = "doc_host_sync_tests.rs"]
 mod sync_lifecycle_tests;
+
+#[cfg(test)]
+mod pending_prompt_tests {
+    use super::*;
+
+    fn run(
+        id: &str,
+        prompt: &str,
+        attachments: Vec<String>,
+        status: SessionCommandStatus,
+    ) -> SessionCommandEntry {
+        SessionCommandEntry {
+            id: id.into(),
+            payload: SessionCommandPayload::Run {
+                request: harness_proto::RunRequest {
+                    prompt: prompt.into(),
+                    harness: None,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    cwd: String::new(),
+                    sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                    auto_approve: false,
+                    attachments,
+                    resume: None,
+                    worktree: None,
+                },
+                message_id: format!("m-{id}"),
+            },
+            issued_by: "phone".into(),
+            issued_at: 1_000,
+            based_on: None,
+            expires_at: None,
+            status,
+            resolution: None,
+        }
+    }
+
+    #[test]
+    fn only_pending_runs_become_pending_prompts() {
+        let commands = vec![
+            run(
+                "done",
+                "already ran",
+                Vec::new(),
+                SessionCommandStatus::Applied,
+            ),
+            run(
+                "rejected",
+                "never arrived",
+                Vec::new(),
+                SessionCommandStatus::Rejected,
+            ),
+            run(
+                "text",
+                "plain prompt",
+                Vec::new(),
+                SessionCommandStatus::Pending,
+            ),
+            run(
+                "image",
+                "look at this",
+                vec!["pending://0123456789abcdef/shot.png".into()],
+                SessionCommandStatus::Pending,
+            ),
+        ];
+        let prompts = pending_prompts(&commands);
+        assert_eq!(
+            prompts,
+            vec![
+                PendingPrompt {
+                    message_id: "m-text".into(),
+                    text: "plain prompt".into(),
+                    issued_at: 1_000,
+                    issued_by: "phone".into(),
+                    waiting_for_attachments: false,
+                },
+                PendingPrompt {
+                    message_id: "m-image".into(),
+                    text: "look at this".into(),
+                    issued_at: 1_000,
+                    issued_by: "phone".into(),
+                    waiting_for_attachments: true,
+                },
+            ]
+        );
+        let json = serde_json::to_value(&prompts[1]).unwrap();
+        assert_eq!(json["messageId"], "m-image");
+        assert_eq!(json["waitingForAttachments"], true);
+    }
+}
