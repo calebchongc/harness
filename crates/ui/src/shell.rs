@@ -12203,7 +12203,7 @@ impl Render for Shell {
                     .composer
                     .update(cx, |c, cx| c.open_model_menu(window, cx)),
                 WorkspaceCommand::New => self.open_new_session(cx),
-                WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
+                WorkspaceCommand::Resume => self.toggle_resume_palette(window, cx),
                 WorkspaceCommand::Settings => {
                     let section = self.remembered_settings_section();
                     self.open_settings(section, cx)
