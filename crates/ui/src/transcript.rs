@@ -2589,6 +2589,27 @@ pub fn sending_bridge(
     }
 }
 
+/// Shorter waits are the ordinary send round-trip.
+const TURN_WAIT_SHOWN_SECS: i64 = 60;
+
+/// How long the running turn's prompt waited before the turn began, when
+/// that is worth showing. The timer counts the run only; a send from another
+/// device can sit undelivered for minutes first, and without this the turn
+/// looked seconds old (#413). None unless the last user entry started this
+/// turn: every entry after it belongs to the turn.
+pub fn turn_wait_secs(
+    entries: &[SessionMessageEntry],
+    turn_started: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<i64> {
+    let started = turn_started?.timestamp_millis();
+    let prompt = entries.iter().rposition(|e| e.role == MessageRole::User)?;
+    if entries[prompt + 1..].iter().any(|e| e.created_at < started) {
+        return None;
+    }
+    let waited = (started - entries[prompt].created_at) / 1000;
+    (waited >= TURN_WAIT_SHOWN_SECS).then_some(waited)
+}
+
 /// Compact elapsed formatting, using at most two units up to days.
 pub fn format_elapsed(secs: i64) -> String {
     let secs = secs.max(0);
@@ -7220,6 +7241,14 @@ impl Transcript {
                 self.compact_last_elapsed.insert(entry_id, elapsed_secs);
             }
         }
+        let waited = match (&self.doc_override, &self.chat_id) {
+            (None, Some(chat_id)) => {
+                let state = self.state.read(cx);
+                let turn_started = state.session_for(chat_id).and_then(|s| s.started_at);
+                turn_wait_secs(&state.transcript, turn_started)
+            }
+            _ => None,
+        };
         let word = if queued {
             "Queued — will send automatically"
         } else if sending {
@@ -7283,6 +7312,18 @@ impl Transcript {
                             .text_color(theme.text_faint)
                             .child(SharedString::from(format_elapsed(elapsed_secs))),
                     )
+                    .when_some(waited, |el, waited| {
+                        el.child(
+                            div()
+                                .relative()
+                                .top(px(1.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!(
+                                    "· waited {} to start",
+                                    format_elapsed(waited)
+                                ))),
+                        )
+                    })
                 })
         };
         Some(
@@ -17114,6 +17155,43 @@ mod tests {
         assert_eq!(pane_working_since(None, Assistant, Some(MessageStatus::Streaming), 5), Some(5));
         assert_eq!(pane_working_since(None, User, Some(MessageStatus::Complete), 5), Some(5));
         assert_eq!(pane_working_since(None, Assistant, Some(MessageStatus::Complete), 5), None);
+    }
+
+    #[test]
+    fn a_turn_that_started_long_after_its_prompt_shows_the_wait() {
+        let sent = chrono::DateTime::parse_from_rfc3339("2026-10-18T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let at = |secs: i64| (sent + chrono::Duration::seconds(secs)).timestamp_millis();
+        let entry = |id: &str, role, created_at| SessionMessageEntry {
+            id: id.into(),
+            role,
+            parts: Vec::new(),
+            created_at,
+            device_id: "phone".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let started = Some(sent + chrono::Duration::seconds(597));
+        let prompt = vec![entry("u1", MessageRole::User, at(0))];
+        assert_eq!(turn_wait_secs(&prompt, started), Some(597));
+        let mut running = prompt.clone();
+        running.push(entry("a1", MessageRole::Assistant, at(598)));
+        assert_eq!(turn_wait_secs(&running, started), Some(597));
+        // An ordinary send round-trip, or no turn yet: nothing to show.
+        assert_eq!(
+            turn_wait_secs(&prompt, Some(sent + chrono::Duration::seconds(3))),
+            None
+        );
+        assert_eq!(turn_wait_secs(&prompt, None), None);
+        // A turn its last prompt didn't start (a resume after an earlier
+        // reply), or a steer sent after the turn began.
+        let mut resumed = prompt.clone();
+        resumed.push(entry("a0", MessageRole::Assistant, at(5)));
+        assert_eq!(turn_wait_secs(&resumed, started), None);
+        let steer = vec![entry("u2", MessageRole::User, at(900))];
+        assert_eq!(turn_wait_secs(&steer, started), None);
     }
 
     #[test]
