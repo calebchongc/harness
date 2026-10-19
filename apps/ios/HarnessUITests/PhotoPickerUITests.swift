@@ -115,7 +115,7 @@ final class PhotoPickerUITests: XCTestCase {
     }
 
     func testGitHubLight() throws { try exercise(mode: "light", theme: "github-light") }
-    func testSolarizedLight() throws { try exercise(mode: "light", theme: "solarized-light", newSession: true) }
+    func testHarnessLight() throws { try exercise(mode: "light", theme: "harnesser-light", newSession: true) }
     func testNord() throws { try exercise(mode: "dark", theme: "nord") }
     func testDracula() throws { try exercise(mode: "dark", theme: "dracula") }
     func testGruvboxDark() throws { try exercise(mode: "dark", theme: "gruvbox-dark", newSession: true) }
