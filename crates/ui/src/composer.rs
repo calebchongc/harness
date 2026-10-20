@@ -2349,13 +2349,26 @@ impl ComposerInput {
         self.content_height
     }
 
+    /// Height that can scroll and fade. A wrapped placeholder still sizes the
+    /// box, but it isn't a draft: it never scrolls or fades (#447).
+    fn scrollable_height(&self) -> f32 {
+        if self.display_is_placeholder {
+            0.0
+        } else {
+            self.content_height
+        }
+    }
+
     pub fn set_placeholder(
         &mut self,
         placeholder: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        self.placeholder = placeholder.into();
-        cx.notify();
+        let placeholder = placeholder.into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -3588,7 +3601,7 @@ impl ComposerInput {
         let next = (self.scroll_top + delta).clamp(
             0.0,
             input_max_scroll(
-                self.content_height,
+                self.scrollable_height(),
                 self.settled_viewport_height
                     .unwrap_or(f32::from(bounds.size.height)),
             ),
@@ -3622,7 +3635,7 @@ impl ComposerInput {
         let next = input_scroll_offset(
             self.scroll_top,
             delta_y,
-            self.content_height,
+            self.scrollable_height(),
             viewport_height,
         );
         if next == self.scroll_top {
@@ -3630,7 +3643,7 @@ impl ComposerInput {
             // taller than the viewport), swallow the wheel event even at the
             // scroll boundary so it never chains into the outer transcript
             // list (the native equivalent of `overscroll-behavior: contain`).
-            if delta_y != 0.0 && input_max_scroll(self.content_height, viewport_height) > 0.0 {
+            if delta_y != 0.0 && input_max_scroll(self.scrollable_height(), viewport_height) > 0.0 {
                 cx.stop_propagation();
             }
             return;
@@ -4007,7 +4020,7 @@ impl ComposerInput {
     fn paint_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
         let visible = f32::from(bounds.size.height);
         let top_overflow = input_overflow_edges(
-            self.content_height,
+            self.scrollable_height(),
             self.settled_viewport_height.unwrap_or(visible),
             visible,
             self.scroll_top,
@@ -4059,7 +4072,7 @@ impl ComposerInput {
         self.scroll_top = self.scroll_top.clamp(
             0.0,
             input_max_scroll(
-                self.content_height,
+                self.scrollable_height(),
                 self.settled_viewport_height.unwrap_or(element_height),
             ),
         );
@@ -4831,7 +4844,7 @@ impl Render for ComposerInput {
                         .last_bounds
                         .map_or(0.0, |bounds| f32::from(bounds.size.height));
                     input_overflow_edges(
-                        input.content_height,
+                        input.scrollable_height(),
                         input
                             .settled_viewport_height
                             .unwrap_or(TEXTAREA_MAX - TEXTAREA_PAD_V),
@@ -8029,8 +8042,15 @@ impl Composer {
             }
         }
         let input_context = message_input_context(self.wizard.is_some());
-        self.input
-            .update(cx, |input, cx| input.set_key_context(input_context, cx));
+        let question_open = self.wizard.is_some();
+        self.input.update(cx, |input, cx| {
+            input.set_key_context(input_context, cx);
+            // Every way out of a question (answer, resolution elsewhere,
+            // navigation) hands the ordinary hint back (#447).
+            if !question_open {
+                input.set_placeholder("Do anything…", cx);
+            }
+        });
         self.on_input_edited(cx);
         cx.notify();
     }
@@ -12846,6 +12866,70 @@ mod tests {
             input.delete(&Delete, window, cx);
             assert_eq!(input.text(), "next");
         });
+    }
+
+    #[gpui::test]
+    fn wrapped_placeholder_never_scrolls_or_fades(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.input.update(cx, |input, cx| {
+                    let hint =
+                        "Type your own answer, or leave this blank to use the selected option";
+                    let line = f32::from(input.line_height);
+                    input.set_text("", cx);
+                    input.set_placeholder(hint, cx);
+                    input.layout_text(px(140.0), &window.text_style(), window, cx);
+                    assert!(
+                        input.content_height > line,
+                        "the hint must wrap for this test"
+                    );
+                    input.settled_viewport_height = Some(line);
+                    input.scroll_top = line;
+                    input.clamp_scroll(line);
+                    assert_eq!(input.scroll_top, 0.0);
+                    assert_eq!(
+                        input_overflow_edges(input.scrollable_height(), line, line, 0.0),
+                        (false, false),
+                        "an empty composer is not a scrolled draft"
+                    );
+
+                    // A draft of the same length still scrolls and fades.
+                    input.set_text(hint, cx);
+                    input.layout_text(px(140.0), &window.text_style(), window, cx);
+                    assert_eq!(
+                        input_overflow_edges(input.scrollable_height(), line, line, 0.0),
+                        (false, true)
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn leaving_a_question_restores_the_ordinary_hint(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.selected_chat = Some("question-chat".into());
+                });
+                composer.on_state_changed(cx);
+                composer.wizard = Some(Wizard::new(
+                    "answer".into(),
+                    vec![question("answer", &[], false)],
+                ));
+                composer.input.update(cx, |input, cx| {
+                    input.set_placeholder("Type your own answer, or pick an option above", cx)
+                });
+                composer.state.update(cx, |state, _| {
+                    state.selected_chat = Some("ordinary-chat".into());
+                });
+                composer.on_state_changed(cx);
+                assert!(composer.wizard.is_none());
+                assert_eq!(composer.input.read(cx).placeholder.as_ref(), "Do anything…");
+            })
+            .unwrap();
     }
 
     #[gpui::test]
