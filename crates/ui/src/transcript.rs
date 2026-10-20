@@ -3814,7 +3814,7 @@ impl Transcript {
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        Self::build(state, None, true, cx)
+        Self::build(state, None, true, ListAlignment::Bottom, cx)
     }
 
     /// A read-only transcript over one SUBAGENT doc (right-pane tab). The
@@ -3829,13 +3829,37 @@ impl Transcript {
         follow: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(state, Some(doc_id), follow, cx)
+        Self::build(state, Some(doc_id), follow, ListAlignment::Top, cx)
+    }
+
+    /// Chat panes keep the same entity and list when becoming active. Unlike
+    /// subagent documents, both roles use the primary chat's list alignment.
+    pub(crate) fn for_peer_chat(
+        state: Entity<AppState>,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(state, Some(chat_id), true, ListAlignment::Bottom, cx)
+    }
+
+    /// Change only the feed/presentation role, not the chat or its interaction
+    /// state. In particular, keep folds, the viewport, and pending selection.
+    pub(crate) fn set_split_source(&mut self, peer: Option<String>) {
+        self.doc_live = peer.is_some();
+        self.retain_on_deselect = peer.is_none();
+        if peer.is_some() {
+            self.rail_enabled = false;
+            self.bottom_clearance = 0.0;
+        }
+        self.doc_override = peer;
+        self.last_source = None;
     }
 
     fn build(
         state: Entity<AppState>,
         doc_override: Option<String>,
         follow: bool,
+        alignment: ListAlignment,
         cx: &mut Context<Self>,
     ) -> Self {
         // A split pane drawn from a cached frame keeps its selectable text
@@ -3848,7 +3872,7 @@ impl Transcript {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
         // not the list's per-layout hard snap.
         //
-        // Override instances align TOP: a subagent transcript reads like a
+        // Subagent instances align TOP: a subagent transcript reads like a
         // fresh notes page — entries anchored at the top, streaming growing
         // into the empty space below, never rising from the pane's bottom.
         // Top alignment gets that structurally (a short list rests at the
@@ -3858,11 +3882,6 @@ impl Transcript {
         // materializes a Top list's past-end offset to a CONCRETE position
         // every frame (gpui list.rs: only `Bottom` re-glues to the `None`
         // sentinel), so a parked spring can't re-glue and hard-track growth.
-        let alignment = if doc_override.is_some() {
-            ListAlignment::Top
-        } else {
-            ListAlignment::Bottom
-        };
         let list = ListState::new(0, alignment, px(OVERDRAW_PX));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
@@ -4033,6 +4052,11 @@ impl Transcript {
 
     pub(crate) fn list_state(&self) -> &ListState {
         &self.list
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fold_open(&self, row_id: &str) -> Option<bool> {
+        self.folds.get(row_id).and_then(|fold| fold.open)
     }
 
     /// Snapshot the outgoing primary chat before its rows and ListState are
@@ -8468,6 +8492,8 @@ impl Transcript {
                         None => tool_group_title(summary.clone(), shimmer_phase, theme),
                     }),
             );
+        #[cfg(test)]
+        let header = header.debug_selector(|| "transcript-tool-group-header".into());
 
         if compact_shell {
             let view = cx.entity_id();

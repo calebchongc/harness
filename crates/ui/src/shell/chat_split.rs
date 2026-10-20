@@ -15,6 +15,8 @@ mod opening;
 
 #[cfg(test)]
 mod sidebar_tests;
+#[cfg(test)]
+mod interaction_tests;
 
 /// Every pane holds another engine doc watch; Ghostty-scale grids aren't
 /// the point of a chat column.
@@ -420,7 +422,7 @@ impl Shell {
             return false;
         };
         let from = split.focus;
-        let Some(target) = split.focus_pane(ix, selected) else {
+        let Some(target) = split.focus_pane(ix, selected.clone()) else {
             return false;
         };
         // Each pane keeps its own workspace and composer picks: park the
@@ -430,7 +432,38 @@ impl Shell {
         let project = split.projects[ix].clone();
         let target_draft = split.drafts[ix].take().filter(|_| target.is_none());
         self.chat_split_selected = target.clone();
-        self.state.update(cx, |s, cx| s.select_chat(target, cx));
+        // The clicked transcript must remain the visible entity: its click,
+        // selection, folds, and scroll animation belong to it, not a new view.
+        let incoming = target.as_ref().and_then(|id| self.peer_chat_views.remove(id));
+        if let Some(id) = selected.as_ref() {
+            self.transcript.update(cx, |transcript, _| {
+                transcript.set_split_source(Some(id.clone()));
+            });
+        }
+        self.state.update(cx, |s, cx| s.select_split_chat(target.clone(), cx));
+        let incoming = incoming.unwrap_or_else(|| {
+            let transcript = cx.new(|cx| Transcript::new(self.state.clone(), cx));
+            let links = Self::session_links(None, cx);
+            let views = Self::view_opener(cx);
+            transcript.update(cx, |transcript, _| {
+                transcript.set_workspace_link_handler(links);
+                transcript.set_view_opener(views);
+            });
+            let events = cx.subscribe(&transcript, Self::on_transcript_event);
+            PeerChatView { transcript, _events: events }
+        });
+        incoming.transcript.update(cx, |transcript, _| transcript.set_split_source(None));
+        let outgoing = PeerChatView {
+            transcript: std::mem::replace(&mut self.transcript, incoming.transcript),
+            _events: std::mem::replace(&mut self._transcript_events, incoming._events),
+        };
+        if let Some(id) = selected {
+            self.state.update(cx, |s, cx| s.watch_peer_chat(id.clone(), cx));
+            self.peer_chat_views.insert(id, outgoing);
+        }
+        if let Some(id) = target.as_deref() {
+            self.state.update(cx, |s, _| s.unwatch_peer_chat(id));
+        }
         // Filter first: on a canvas it re-aims the project, and the pane's
         // own parked project must have the last word.
         self.set_space_filter(project, cx);
@@ -439,18 +472,6 @@ impl Shell {
         self.focus_composer(cx);
         cx.notify();
         true
-    }
-
-    /// A press released on an unfocused pane: a plain click focuses it, but
-    /// a drag that selected text there keeps its selection (and the pane
-    /// stays unfocused) so the text can be copied.
-    pub(super) fn release_on_peer_pane(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // Dropping a dragged session over the pane isn't a click on it: it
-        // focused this pane's chat instead of opening the dropped one.
-        if crate::markdown::selection::selected_text().is_some() || cx.has_active_drag() {
-            return;
-        }
-        self.focus_chat_pane(ix, window, cx);
     }
 
     pub(super) fn cycle_chat_pane(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -632,7 +653,7 @@ impl Shell {
             if self.peer_chat_views.contains_key(&id) {
                 continue;
             }
-            let transcript = cx.new(|cx| Transcript::for_doc(self.state.clone(), id.clone(), true, cx));
+            let transcript = cx.new(|cx| Transcript::for_peer_chat(self.state.clone(), id.clone(), cx));
             let links = Self::session_links(Some(id.clone()), cx);
             let views = Self::view_opener(cx);
             transcript.update(cx, |transcript, _| {
@@ -927,13 +948,31 @@ impl Shell {
             )
             // Ghostty dims unfocused splits.
             .child(div().flex_1().min_h_0().flex().flex_col().opacity(0.8).child(body))
-            // Focus on release so text drags retain their transcript. Capture
-            // first so thought-process and other controls cannot swallow the
-            // activation; leave propagation intact for their own interactions.
-            .capture_any_mouse_up(cx.listener(move |this, event: &gpui::MouseUpEvent, window, cx| {
-                if event.button == gpui::MouseButton::Left {
-                    this.release_on_peer_pane(ix, window, cx);
+            // Finish the original click/selection before moving this entity
+            // into the active outlet. Capturing observes consumed child events;
+            // deferring lets their click handlers act on the still-mounted view.
+            // Every mouse button activates, and a text selection is no veto.
+            .capture_any_mouse_up(cx.listener(move |this, _, _, cx| {
+                if cx.has_active_drag() {
+                    return;
                 }
+                let tab = this.chat_tab;
+                let selected = this.state.read(cx).selected_chat.clone();
+                let pane = this.chat_split.as_ref().and_then(|split| split.panes.get(ix)).cloned();
+                let shell = cx.entity();
+                cx.defer(move |cx| {
+                    shell.update(cx, |this, cx| {
+                        // A link/control may itself navigate or close the pane.
+                        // Do not apply an old pane index to the resulting layout.
+                        if this.chat_tab == tab
+                            && matches!(this.route, Route::Chat)
+                            && this.state.read(cx).selected_chat == selected
+                            && this.chat_split.as_ref().and_then(|split| split.panes.get(ix)).cloned() == pane
+                        {
+                            this.select_chat_pane(ix, cx);
+                        }
+                    });
+                });
             }))
             .into_any_element()
     }
