@@ -10342,6 +10342,7 @@ mod tests {
     fn a_url_printed_in_tool_output_opens_through_the_transcript_link(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _selection = crate::markdown::selection::test_state_lock();
         struct Output {
             activated: Rc<RefCell<Vec<render::LinkActivation>>>,
         }
@@ -10389,7 +10390,11 @@ mod tests {
             bounds.left() + px(6.0),
             bounds.top() + px(6.0 + OUTPUT_LINE_HEIGHT / 2.0),
         );
+        // A settled selection can outlive the row that painted its listeners.
+        crate::markdown::selection::begin_with_span("unmounted-row", "selected", 0..8);
+        crate::markdown::selection::end_active_drag();
         cx.simulate_click(first_line, gpui::Modifiers::default());
+        crate::markdown::selection::clear_if_owner("unmounted-row");
         let seen = activated.borrow();
         assert_eq!(seen.len(), 1, "one activation");
         assert_eq!(seen[0].target.original, "https://example.com/review/123");

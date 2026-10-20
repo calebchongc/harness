@@ -172,6 +172,7 @@ pub fn autolinked_text(
             id,
             child: styled.into_any_element(),
             layout,
+            selection_key: None,
             links,
             ui,
         }
@@ -1167,6 +1168,7 @@ pub(super) fn flat_text_presented_element(
     // same paint pass re-registers the frame-scoped window mouse listeners
     // that drive text selection (round 18; see markdown/selection.rs).
     let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
+    let link_selection_key = sel_key.clone();
     let code_ranges = flat.code_ranges.clone();
     let flat_text = flat
         .original
@@ -1245,6 +1247,7 @@ pub(super) fn flat_text_presented_element(
         .into(),
         child,
         layout: link_layout,
+        selection_key: Some(link_selection_key),
         links: flat
             .links
             .iter()

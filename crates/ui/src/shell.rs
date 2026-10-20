@@ -16062,6 +16062,30 @@ mod exit_regressions {
                     LinkOutcome::Internal
                 );
                 assert_eq!(shell.browsers.len(), 4);
+                // The reported GitHub issue URL passes validation and reaches
+                // either destination; it is not diverted into file handling.
+                let issue_url = "https://github.com/justrach/harness/issues/447";
+                activation.target = LinkTarget::new("Issue", issue_url);
+                assert_eq!(activation.target.navigation, Ok(issue_url.into()));
+                assert!(crate::browser::model::allowed_navigation(issue_url));
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Internal
+                );
+                assert_eq!(shell.browsers.len(), 5);
+                assert_eq!(
+                    shell.browsers[&shell.browser_seq]
+                        .read(cx)
+                        .page
+                        .url
+                        .as_deref(),
+                    Some(issue_url)
+                );
+                activation.action = LinkAction::External;
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::External(issue_url.into())
+                );
                 let weak = shell.browsers[&first].downgrade();
                 shell.close_right_surface(RightSurface::Browser(first), window, cx);
                 weak
