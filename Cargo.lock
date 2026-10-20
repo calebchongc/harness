@@ -4172,6 +4172,7 @@ version = "0.2.129"
 dependencies = [
  "anyhow",
  "futures",
+ "plist",
  "reqwest",
  "serde",
  "serde_json",
