@@ -115,6 +115,7 @@ actions!(
         FocusComposer,
         // Chat tabs, each holding its own split (`shell/chat_tabs.rs`).
         NewChatTab,
+        ReopenClosedChatTab,
         NextChatTab,
         PrevChatTab,
         // Settings → Devices' update button: the sidebar strip's flow
@@ -535,6 +536,14 @@ pub fn apply_keymap(
                 ShortcutId::CloseTabWithoutArchiving.default_combo(),
             ),
             crate::app_menus::CloseTabWithoutArchiving,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.reopen_closed_tab,
+                ShortcutId::ReopenClosedTab.default_combo(),
+            ),
+            ReopenClosedChatTab,
             None,
         ),
         KeyBinding::new(
@@ -1849,6 +1858,8 @@ pub struct Shell {
     chat_tab_revealed: Option<usize>,
     /// Open tab indices from least to most recently visited.
     chat_tab_history: Vec<usize>,
+    /// Closed tabs, most recent last, for ⌘⇧T (#455).
+    closed_chat_tabs: Vec<chat_tabs::ClosedChatTab>,
     /// Live read-only transcripts for unfocused panes, keyed by chat id.
     peer_chat_views: std::collections::HashMap<String, chat_split::PeerChatView>,
     /// A split divider being dragged, and the split root's measured bounds.
@@ -2384,6 +2395,7 @@ impl Shell {
             chat_tab_scroll: gpui::ScrollHandle::new(),
             chat_tab_revealed: None,
             chat_tab_history: Vec::new(),
+            closed_chat_tabs: Vec::new(),
             peer_chat_views: std::collections::HashMap::new(),
             chat_split_drag: None,
             boot_restored: false,
@@ -12534,6 +12546,9 @@ impl Render for Shell {
                 this.toggle_chat_pane_zoom(cx)
             }))
             .on_action(cx.listener(|this, _: &NewChatTab, window, cx| this.new_chat_tab(None, window, cx)))
+            .on_action(cx.listener(|this, _: &ReopenClosedChatTab, window, cx| {
+                this.reopen_closed_chat_tab(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &StartAppUpdate, _, cx| {
                 if matches!(this.update_flow, UpdateFlow::Idle | UpdateFlow::Failed(_)) {
                     this.on_update_strip_click(cx);

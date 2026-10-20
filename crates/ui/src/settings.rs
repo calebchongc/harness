@@ -1029,11 +1029,12 @@ pub enum ShortcutId {
     PrevSession,
     ArchiveSession,
     CloseTabWithoutArchiving,
+    ReopenClosedTab,
     JumpSession(usize),
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 16 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 17 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -1050,6 +1051,7 @@ impl ShortcutId {
         ShortcutId::PrevSession,
         ShortcutId::ArchiveSession,
         ShortcutId::CloseTabWithoutArchiving,
+        ShortcutId::ReopenClosedTab,
         ShortcutId::JumpSession(0),
         ShortcutId::JumpSession(1),
         ShortcutId::JumpSession(2),
@@ -1084,6 +1086,7 @@ impl ShortcutId {
             ShortcutId::PrevSession => "Previous tab or session",
             ShortcutId::ArchiveSession => "Archive session",
             ShortcutId::CloseTabWithoutArchiving => "Close tab without archiving",
+            ShortcutId::ReopenClosedTab => "Reopen closed tab",
             ShortcutId::JumpSession(slot) => JUMP_LABELS.get(slot).copied().unwrap_or(""),
         }
     }
@@ -1134,6 +1137,9 @@ impl ShortcutId {
             // shifted combo.
             ShortcutId::ArchiveSession => "mod-shift-a",
             ShortcutId::CloseTabWithoutArchiving => "mod-alt-w",
+            // Off macOS Ctrl+Shift+T already opens a new tab.
+            ShortcutId::ReopenClosedTab if mac => "mod-shift-t",
+            ShortcutId::ReopenClosedTab => "mod-alt-shift-t",
             ShortcutId::JumpSession(slot) => JUMP_DEFAULTS.get(slot).copied().unwrap_or(""),
         }
     }
@@ -1169,6 +1175,7 @@ pub struct KeymapConfig {
     pub prev_session: String,
     pub archive_session: String,
     pub close_tab_without_archiving: String,
+    pub reopen_closed_tab: String,
     /// One combo per jump slot, in slot order. A list rather than nine fields:
     /// [`UiSettings::load`] discards the WHOLE file on a parse error, so a
     /// fixed-length array would let one malformed entry reset every unrelated
@@ -1236,6 +1243,7 @@ impl Default for KeymapConfig {
             prev_session: ShortcutId::PrevSession.default_combo().into(),
             archive_session: ShortcutId::ArchiveSession.default_combo().into(),
             close_tab_without_archiving: ShortcutId::CloseTabWithoutArchiving.default_combo().into(),
+            reopen_closed_tab: ShortcutId::ReopenClosedTab.default_combo().into(),
             jump_session: JUMP_DEFAULTS.iter().map(|c| (*c).to_string()).collect(),
         }
     }
@@ -1260,6 +1268,7 @@ impl KeymapConfig {
             ShortcutId::PrevSession => &self.prev_session,
             ShortcutId::ArchiveSession => &self.archive_session,
             ShortcutId::CloseTabWithoutArchiving => &self.close_tab_without_archiving,
+            ShortcutId::ReopenClosedTab => &self.reopen_closed_tab,
             ShortcutId::JumpSession(slot) => self
                 .jump_session
                 .get(slot)
@@ -1286,6 +1295,7 @@ impl KeymapConfig {
             ShortcutId::PrevSession => self.prev_session = combo,
             ShortcutId::ArchiveSession => self.archive_session = combo,
             ShortcutId::CloseTabWithoutArchiving => self.close_tab_without_archiving = combo,
+            ShortcutId::ReopenClosedTab => self.reopen_closed_tab = combo,
             ShortcutId::JumpSession(slot) => {
                 if slot < JUMP_SLOTS {
                     if self.jump_session.len() < JUMP_SLOTS {
@@ -3179,6 +3189,27 @@ mod tests {
         assert_eq!(restored.get(id), "mod-alt-x");
         keymap.reset(id);
         assert_eq!(keymap.get(id), "mod-alt-w");
+    }
+
+    #[test]
+    fn reopen_closed_tab_shortcut_avoids_the_new_tab_key_on_each_platform() {
+        let id = ShortcutId::ReopenClosedTab;
+        assert_eq!(
+            platform_combo_on(true, id.default_combo_on(true)),
+            "cmd-shift-t"
+        );
+        assert_eq!(
+            platform_combo_on(false, id.default_combo_on(false)),
+            "ctrl-alt-shift-t"
+        );
+        for mac in [true, false] {
+            assert_ne!(
+                id.default_combo_on(mac),
+                ShortcutId::NewSession.default_combo_on(mac)
+            );
+        }
+        let keymap: KeymapConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(keymap.get(id), id.default_combo());
     }
 
     #[test]
