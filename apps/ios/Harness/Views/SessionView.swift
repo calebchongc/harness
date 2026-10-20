@@ -49,8 +49,8 @@ struct SessionView: View {
     }
 
     private func headerControls(_ chat: Chat, chats: [Chat], maxVisible: Int) -> some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 8) {
+        HStack(spacing: 4) {
+            HStack(spacing: 3) {
                 Button {
                     renameChatId = chat.id
                     renameTitle = chat.displayTitle
@@ -249,7 +249,7 @@ struct SessionView: View {
             Image(systemName: previous ? "chevron.left" : "chevron.right")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Theme.textMuted)
-                .frame(width: 44, height: 44)
+                .frame(width: 28, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

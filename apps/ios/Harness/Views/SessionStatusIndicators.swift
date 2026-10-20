@@ -40,7 +40,7 @@ struct SessionStatusIndicators: View {
             let status = description(model.indicator(for: chat))
             return "\(chat.displayTitle): \(status)" + (chat.id == current ? ", current session" : "")
         }.joined(separator: "; "))
-        .accessibilityValue(window.overflowText ?? "All sessions shown")
+        .accessibilityValue(window.hiddenCount > 0 ? "\(window.hiddenCount) more" : "All sessions shown")
         .accessibilityIdentifier("session-status-indicators")
     }
 

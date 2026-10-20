@@ -38,10 +38,28 @@ final class SessionHeaderEdgeUITests: XCTestCase {
         let title = element("session-header")
         let marks = element("session-status-indicators")
         XCTAssertTrue(marks.exists)
-        XCTAssertGreaterThanOrEqual(title.frame.width, 80)
+        XCTAssertGreaterThanOrEqual(title.frame.width, 120)
         XCTAssertLessThanOrEqual(title.frame.maxX, marks.frame.minX)
         XCTAssertLessThanOrEqual(marks.frame.maxX, app.frame.maxX - 8)
         XCTAssertFalse(app.buttons["session-switcher"].exists)
+    }
+
+    func testCompactBControlsKeepIndependentHitTargets() {
+        launch(count: 7)
+        assertFits()
+        let title = element("session-header")
+        let previous = app.buttons["session-page-previous"]
+        let next = app.buttons["session-page-next"]
+        XCTAssertEqual(next.frame.width, 28, accuracy: 1)
+        XCTAssertGreaterThanOrEqual(next.frame.height, 44)
+        XCTAssertLessThanOrEqual(title.frame.maxX, previous.frame.minX)
+        next.tap()
+        XCTAssertEqual(element("session-page-position").label, "Session 2 of 7")
+        XCTAssertFalse(app.alerts["Rename session"].exists)
+        title.tap()
+        XCTAssertTrue(app.alerts["Rename session"].waitForExistence(timeout: 2))
+        app.alerts["Rename session"].buttons["Cancel"].tap()
+        capture("header-compact-B")
     }
 
     func testSingleSessionHidesNavigationAndOverflow() {
@@ -65,7 +83,7 @@ final class SessionHeaderEdgeUITests: XCTestCase {
         let hidden = Int(overflow.split(separator: " ").first ?? "") ?? 0
         XCTAssertGreaterThan(hidden, 0)
         XCTAssertTrue(overflow.hasSuffix(" more"))
-        XCTAssertFalse(overflow.contains("+"), "Overflow must not look like an Add button")
+        XCTAssertFalse(overflow.contains("+"), "Accessibility describes the hidden count in words")
         XCTAssertTrue(marks.label.contains("\(hidden) more sessions not shown"))
         XCTAssertTrue(marks.label.contains("Session 12 — A long planning conversation 📝: Idle, no unread reply, current session"))
         let point = marks.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.5))

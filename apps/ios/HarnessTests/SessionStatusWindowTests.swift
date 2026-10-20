@@ -13,10 +13,10 @@ final class SessionStatusWindowTests: XCTestCase {
         XCTAssertNil(single.overflowText)
     }
 
-    func testOneHiddenSessionUsesWordsNotAnAddAffordance() {
+    func testOneHiddenSessionUsesCompactOverflow() {
         let window = SessionStatusWindow(ids: ["a", "b", "c", "d"], current: "a", limit: 3)
         XCTAssertEqual(window.visibleIDs, ["a", "b", "c"])
-        XCTAssertEqual(window.overflowText, "1 more")
+        XCTAssertEqual(window.overflowText, "+1")
     }
 
     func testCurrentStaysVisibleAtEveryPositionAndCountsNeverLoseSessions() {
@@ -74,7 +74,7 @@ final class SessionStatusWindowTests: XCTestCase {
         XCTAssertEqual(SessionPaging.neighbors(of: "chat-11", in: entries).previous, "chat-10")
         let window = SessionStatusWindow(ids: set.map(\.id), current: "chat-11", limit: 3)
         XCTAssertTrue(window.visibleIDs.contains("chat-11"))
-        XCTAssertEqual(window.overflowText, "9 more")
+        XCTAssertEqual(window.overflowText, "+9")
     }
 
     func testOldIdleCurrentRemainsPageableAcrossRecentCutoff() {

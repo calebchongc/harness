@@ -14,18 +14,21 @@ struct SessionStatusWindow {
         hiddenCount = ids.count - count
     }
 
-    var overflowText: String? { hiddenCount > 0 ? "\(hiddenCount) more" : nil }
+    var overflowText: String? { hiddenCount > 0 ? "+\(hiddenCount)" : nil }
 
     /// Reserve title space and only the navigation that is actually rendered.
-    /// Overflow uses words rather than a plus sign so it cannot look like Add.
+    /// Compact overflow leaves room for more status marks and the session title.
     static func visibleLimit(availableWidth: CGFloat, total: Int, hasPager: Bool) -> Int {
         guard total > 0 else { return 0 }
         // Both the current index and total can grow to multiple digits.
         let counterWidth = CGFloat(String(total).count * 2 + 1) * 7
-        let navigationWidth: CGFloat = hasPager ? 88 + counterWidth + 16 : 8
-        let budget = availableWidth - 80 - navigationWidth
-        let maximum = min(6, total)
-        if CGFloat(maximum) * 19 <= budget, total <= 6 { return maximum }
-        return max(1, min(maximum, Int((budget - 40) / 19)))
+        let navigationWidth: CGFloat = hasPager ? 56 + counterWidth + 7 : 7
+        let budget = availableWidth - 120 - navigationWidth
+        for count in stride(from: min(6, total), through: 1, by: -1) {
+            let marksWidth = CGFloat(count * 16 + (count - 1) * 3)
+            let overflowWidth: CGFloat = total > count ? 3 + CGFloat(String(total - count).count + 1) * 7 : 0
+            if marksWidth + overflowWidth <= budget { return count }
+        }
+        return 1
     }
 }
