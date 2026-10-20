@@ -1347,7 +1347,12 @@ pub enum RowKind {
 /// The host path of a reply's Markdown image source: absolute, `file://`, or
 /// relative to the chat's workspace. Remote URLs and data URIs have none.
 fn reply_image_path(source: &str, workspace_root: Option<&str>) -> Option<String> {
-    let source = source.strip_prefix("file://").unwrap_or(source);
+    let source = match source.strip_prefix("file://") {
+        // `file:///C:/x.png` names `C:/x.png` on Windows.
+        Some(path) if cfg!(windows) && path.get(2..3) == Some(":") => &path[1..],
+        Some(path) => path,
+        None => source,
+    };
     if source.is_empty() || source.contains("://") || source.starts_with("data:") {
         return None;
     }
@@ -13306,23 +13311,32 @@ mod tests {
 
     #[test]
     fn reply_images_resolve_against_the_chat_workspace() {
-        let root = Some("/work/repo");
+        let (root, absolute, url) = if cfg!(windows) {
+            (
+                r"C:\work\repo",
+                "C:/tmp/before.png",
+                "file:///C:/tmp/before.png",
+            )
+        } else {
+            ("/work/repo", "/tmp/before.png", "file:///tmp/before.png")
+        };
+        let in_root = |relative: &str| {
+            std::path::Path::new(root)
+                .join(relative)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let root = Some(root);
         assert_eq!(
-            reply_image_path("shot.png", root).as_deref(),
-            Some("/work/repo/shot.png")
+            reply_image_path("shot.png", root),
+            Some(in_root("shot.png"))
         );
         assert_eq!(
-            reply_image_path("./docs/after.png", root).as_deref(),
-            Some("/work/repo/docs/after.png")
+            reply_image_path("./docs/after.png", root),
+            Some(in_root("docs/after.png"))
         );
-        assert_eq!(
-            reply_image_path("/tmp/before.png", None).as_deref(),
-            Some("/tmp/before.png")
-        );
-        assert_eq!(
-            reply_image_path("file:///tmp/before.png", root).as_deref(),
-            Some("/tmp/before.png")
-        );
+        assert_eq!(reply_image_path(absolute, None).as_deref(), Some(absolute));
+        assert_eq!(reply_image_path(url, root).as_deref(), Some(absolute));
         assert_eq!(reply_image_path("https://example.com/a.png", root), None);
         assert_eq!(reply_image_path("data:image/png;base64,AAAA", root), None);
         assert_eq!(reply_image_path("shot.png", None), None);
