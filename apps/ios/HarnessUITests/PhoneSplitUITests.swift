@@ -268,4 +268,42 @@ final class PhoneSplitUITests: XCTestCase {
         XCTAssertTrue(app.buttons["new-session"].waitForExistence(timeout: 10), "Home did not load")
         XCTAssertFalse(offer(app).waitForExistence(timeout: 2), "a portrait phone has no room, so nothing to offer")
     }
+
+    /// With nothing open, the list has the whole screen. A new session opened from "+" used to land in the
+    /// detail below it and stay folded away, so "+" looked like it did nothing.
+    func testNewSessionFromAFullScreenListOpensBelowIt() {
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        Thread.sleep(forTimeInterval: 1)
+        let app = XCUIApplication()
+        app.launchArguments = ["-demo", "-sethomefilter", "", "-phoneSplit", "stacked",
+                               "-rollout.stackedSplitDrag", "on", "-onboarding.stackedSplitDrag.seen", "YES"]
+        app.launch()
+        XCTAssertTrue(listButton(app).waitForExistence(timeout: 10), "the list is on screen")
+        listButton(app).tap()
+        let project = app.buttons["new-session-space-space-harness"]
+        XCTAssertTrue(project.waitForExistence(timeout: 5), "the project picker opened")
+        project.tap()
+        let context = app.descendants(matching: .any)["new-session-context"]
+        XCTAssertTrue(context.waitForExistence(timeout: 5), "the new session opened")
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-new-session-from-list")
+        XCTAssertTrue(context.isHittable, "the new session is on screen, not folded away below the list")
+    }
+
+    /// ⌘D on the phone: a session alone in the stacked split opens a new session for its project below it.
+    func testStackedSplitOpensANewSessionBelowTheOpenOne() {
+        let app = launchRollout("on", onboardingSeen: true)
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        let split = app.buttons["stacked-split-open"]
+        XCTAssertTrue(split.waitForExistence(timeout: 5), "the session offers a split")
+        split.tap()
+        let context = app.descendants(matching: .any)["new-session-context"]
+        XCTAssertTrue(context.waitForExistence(timeout: 5), "a new session opened below")
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-two-sessions")
+        XCTAssertTrue(header(app).isHittable, "the first session stays on screen")
+        XCTAssertLessThan(header(app).frame.maxY, context.frame.minY, "the new session sits below it")
+        XCTAssertFalse(app.buttons["stacked-split-open"].exists, "two panes at most")
+    }
 }

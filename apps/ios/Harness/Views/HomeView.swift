@@ -128,13 +128,70 @@ struct HomeView: View {
                                    toggleList: two ? nil : { toggleList() })
     }
 
+    // MARK: Stacked split (the phone split's stacked shape)
+
+    /// The pane below the open session in a stacked split, like the desktop's ⌘D: it starts as a new session in
+    /// the same project and becomes that session once it is sent. Nil while the list shares the screen instead.
+    @State private var stackedSecond: [Route]?
+    /// Which stacked pane's composer has the keyboard; that pane keeps the room above it.
+    @State private var stackedFocus: SplitPanes.Pane?
+
+    private var stackedSplitAvailable: Bool { phoneArrangement?.axis == .stacked }
+
+    /// ⌘D for the stacked split: a new session for the open session's project, below it.
+    private func openStackedSplit() {
+        guard case .chat(let id) = path.first, let chat = model.chat(id: id) else { return }
+        let destination: NewSessionDestination = if let space = chat.spaceId {
+            .project(spaceId: space)
+        } else {
+            .projectless(deviceId: chat.deviceId)
+        }
+        stackedSecond = [.newSession(destination)]
+    }
+
+    /// Offered on a session alone in the stacked split's detail; nil everywhere else.
+    private var stackedSplitAction: (() -> Void)? {
+        guard stackedSplitAvailable, stackedSecond == nil, case .chat = path.first else { return nil }
+        return { openStackedSplit() }
+    }
+
+    private var stackedSecondPath: Binding<[Route]> {
+        Binding(get: { stackedSecond ?? [] }, set: { next in
+            // Back out of the lower pane's last screen closes it.
+            stackedSecond = next.isEmpty ? nil : next
+        })
+    }
+
+    /// Two panes stacked, each its own navigation stack with its own bar. Backing out of a pane closes it; the
+    /// list comes back with one pane.
+    private var stackedPanes: some View {
+        VStack(spacing: 0) {
+            primaryStack
+                .frame(maxHeight: stackedFocus == .secondary ? Self.stackedPeek : .infinity)
+                .environment(\.stackedComposerFocus) { stackedFocus = $0 ? .primary : (stackedFocus == .primary ? nil : stackedFocus) }
+            Rectangle().fill(Theme.textFaint.opacity(0.25)).frame(height: 0.5)
+            NavigationStack(path: stackedSecondPath) {
+                SplitDetailPlaceholder()
+                    .navigationDestination(for: Route.self) { route in destination(route, in: stackedSecondPath) }
+            }
+            .frame(maxHeight: stackedFocus == .primary ? Self.stackedPeek : .infinity)
+            .environment(\.stackedComposerFocus) { stackedFocus = $0 ? .secondary : (stackedFocus == .secondary ? nil : stackedFocus) }
+        }
+        .animation(Motion.collapse, value: stackedFocus)
+    }
+
+    /// What the other stacked pane keeps while one is typing: its bar and the last rows.
+    private static let stackedPeek: CGFloat = 150
+
     private var primaryStack: some View {
         NavigationStack(path: $path) {
             SplitDetailPlaceholder()
                 // On each destination, not on the stack: a value set outside the stack did not reach the
                 // pushed session, so its header never saw the split controls.
                 .navigationDestination(for: Route.self) { route in
-                    destination(route).environment(\.splitScreen, controls(for: .primary))
+                    destination(route)
+                        .environment(\.splitScreen, controls(for: .primary))
+                        .environment(\.stackedSplit, stackedSplitAction)
                 }
         }
     }
@@ -165,9 +222,11 @@ struct HomeView: View {
                     primaryStack
                 }
                 .navigationSplitViewStyle(.balanced)
+            } else if stackedSplitAvailable, stackedSecond != nil, !path.isEmpty {
+                stackedPanes
             } else if let arrangement = phoneArrangement {
                 PhoneSplitContainer(arrangement: arrangement, selection: selectedChatId,
-                                    hasDetail: !path.isEmpty) {
+                                    detailRoute: path.first.map(AnyHashable.init), hasDetail: !path.isEmpty) {
                     NavigationStack { sidebar }
                 } detail: {
                     primaryStack
@@ -175,7 +234,7 @@ struct HomeView: View {
             } else {
                 NavigationStack(path: $path) {
                     sidebar
-                        .navigationDestination(for: Route.self, destination: destination)
+                        .navigationDestination(for: Route.self) { destination($0) }
                 }
             }
         }
@@ -187,6 +246,13 @@ struct HomeView: View {
         .onChange(of: phoneSplitRaw) { refreshSplitOffer() }
         .onAppear { refreshSplitOffer() }
         .environment(\.switchToSession, switchTo)
+        .onChange(of: path) { _, next in
+            // Backing out of the upper stacked pane promotes the lower one into its place.
+            if next.isEmpty, let second = stackedSecond {
+                stackedSecond = nil
+                path = second
+            }
+        }
         .onChange(of: splitLayout) { _, isSplit in
             // Opening or closing a foldable swaps the stack and the split. The
             // split's detail column shows one route, a phone stack can hold
@@ -205,16 +271,21 @@ struct HomeView: View {
         }
     }
 
-    @ViewBuilder
     private func destination(_ route: Route) -> some View {
+        destination(route, in: $path)
+    }
+
+    /// `stack`: the navigation path this screen lives in (the lower stacked pane has its own).
+    @ViewBuilder
+    private func destination(_ route: Route, in stack: Binding<[Route]>) -> some View {
         Group {
             switch route {
-            case .space(let id): SpaceView(spaceId: id, path: $path)
+            case .space(let id): SpaceView(spaceId: id, path: stack)
             // Compact: a pager host, so the open session swipes to its
             // neighbours. The split layout keeps its own sidebar selection.
             case .chat(let id):
                 if splitLayout { SessionView(chatId: id) } else { SessionPagerHost(chatId: id) }
-            case .newSession(let destination): NewSessionView(destination: destination, path: $path)
+            case .newSession(let destination): NewSessionView(destination: destination, path: stack)
             }
         }
         // Tap to the page it opened.

@@ -9,6 +9,8 @@ struct SessionView: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     /// Open another session beside this one, or close this pane: set only on a Max-class iPhone (SplitScreen).
     @Environment(\.splitScreen) private var splitScreen
+    /// Open a new session below this one, in the phone's stacked split (⌘D on the desktop).
+    @Environment(\.stackedSplit) private var stackedSplit
     let chatId: String
 
     /// Width the nav bar's own controls need around a LEADING title — the
@@ -174,12 +176,22 @@ struct SessionView: View {
                         // frame collapses to its minimum ("S…"). Claiming the
                         // remainder of the bar outright lays the texts out with
                         // real room and truncates them properly.
-                        .frame(width: max(140, viewWidth - Self.headerChromeInset), alignment: .leading)
+                        .frame(width: max(140, viewWidth - Self.headerChromeInset - (stackedSplit == nil ? 0 : 44)),
+                               alignment: .leading)
                         // Swipe the header to page to the neighbouring session.
                         .pagerSwipe()
                 }
                 // Bare text on the bar, not a glass capsule.
                 .sharedBackgroundVisibility(.hidden)
+            }
+            if let stackedSplit {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: stackedSplit) {
+                        Label("New session below", systemImage: "rectangle.split.1x2")
+                    }
+                    .accessibilityLabel("Open a new session below this one")
+                    .accessibilityIdentifier("stacked-split-open")
+                }
             }
         }
         .alert("Rename session", isPresented: $renamingSession) {
