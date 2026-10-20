@@ -69,4 +69,7 @@ struct SplitScreenControls {
 extension EnvironmentValues {
     /// Set per pane by Home; nil everywhere split screen is not available.
     @Entry var splitScreen: SplitScreenControls? = nil
+    /// The phone's stacked split, like the desktop's ⌘D: open a new session for this one's project below it.
+    /// Set on a session alone in the stacked split's detail; nil everywhere else.
+    @Entry var stackedSplit: (() -> Void)? = nil
 }
