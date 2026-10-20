@@ -11,6 +11,8 @@ struct SessionView: View {
     @Environment(\.splitScreen) private var splitScreen
     /// Open a new session below this one, in the phone's stacked split (⌘D on the desktop).
     @Environment(\.stackedSplit) private var stackedSplit
+    /// Close this pane of the stacked split, while two are shown.
+    @Environment(\.stackedClose) private var stackedClose
     let chatId: String
 
     /// Width the nav bar's own controls need around a LEADING title — the
@@ -176,7 +178,7 @@ struct SessionView: View {
                         // frame collapses to its minimum ("S…"). Claiming the
                         // remainder of the bar outright lays the texts out with
                         // real room and truncates them properly.
-                        .frame(width: max(140, viewWidth - Self.headerChromeInset - (stackedSplit == nil ? 0 : 44)),
+                        .frame(width: max(140, viewWidth - Self.headerChromeInset - (stackedSplit == nil && stackedClose == nil ? 0 : 44)),
                                alignment: .leading)
                         // Swipe the header to page to the neighbouring session.
                         .pagerSwipe()
@@ -187,10 +189,18 @@ struct SessionView: View {
             if let stackedSplit {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: stackedSplit) {
-                        Label("New session below", systemImage: "rectangle.split.1x2")
+                        Label("Open a session below", systemImage: "rectangle.split.1x2")
                     }
-                    .accessibilityLabel("Open a new session below this one")
+                    .accessibilityLabel("Open another session below this one")
                     .accessibilityIdentifier("stacked-split-open")
+                }
+            }
+            if let stackedClose {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: stackedClose) {
+                        Label("Close this pane", systemImage: "xmark")
+                    }
+                    .accessibilityIdentifier("stacked-pane-close")
                 }
             }
         }
