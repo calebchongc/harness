@@ -291,19 +291,46 @@ final class PhoneSplitUITests: XCTestCase {
         XCTAssertTrue(context.isHittable, "the new session is on screen, not folded away below the list")
     }
 
-    /// ⌘D on the phone: a session alone in the stacked split opens a new session for its project below it.
-    func testStackedSplitOpensANewSessionBelowTheOpenOne() {
+    /// ⌘D on the phone: a session alone in the stacked split opens the session list below it (Home's rows).
+    /// Picking one shows both sessions; × closes either pane.
+    func testStackedSplitPicksAnExistingSessionBelowAndEitherPaneCloses() {
         let app = launchRollout("on", onboardingSeen: true)
         XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
         let split = app.buttons["stacked-split-open"]
         XCTAssertTrue(split.waitForExistence(timeout: 5), "the session offers a split")
         split.tap()
-        let context = app.descendants(matching: .any)["new-session-context"]
-        XCTAssertTrue(context.waitForExistence(timeout: 5), "a new session opened below")
+
+        let picker = app.descendants(matching: .any)["stacked-session-picker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 5), "the session list opened below")
+        let other = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Streaming veil")).firstMatch
+        XCTAssertTrue(other.waitForExistence(timeout: 5), "the list shows the other sessions")
+        XCTAssertEqual(picker.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Tool group header")).count, 0,
+                       "the open session is not offered again")
+        attachScreenshot(named: "stacked-picker")
+        other.tap()
+
+        let headers = app.descendants(matching: .any).matching(identifier: "session-header")
+        XCTAssertTrue(headers.element(boundBy: 1).waitForExistence(timeout: 5), "two sessions are on screen")
         Thread.sleep(forTimeInterval: 0.8)
         attachScreenshot(named: "stacked-two-sessions")
-        XCTAssertTrue(header(app).isHittable, "the first session stays on screen")
-        XCTAssertLessThan(header(app).frame.maxY, context.frame.minY, "the new session sits below it")
         XCTAssertFalse(app.buttons["stacked-split-open"].exists, "two panes at most")
+        let closes = app.buttons.matching(identifier: "stacked-pane-close")
+        XCTAssertEqual(closes.count, 2, "each pane has its own ×")
+
+        // × on the lower pane: back to the first session with the list above.
+        closes.element(boundBy: 1).tap()
+        Thread.sleep(forTimeInterval: 0.8)
+        XCTAssertEqual(headers.count, 1, "one session left")
+        XCTAssertTrue(listButton(app).isHittable, "the list is back above it")
+
+        // Split again, pick, then × on the upper pane: the lower session takes its place.
+        app.buttons["stacked-split-open"].tap()
+        XCTAssertTrue(other.waitForExistence(timeout: 5))
+        other.tap()
+        XCTAssertTrue(headers.element(boundBy: 1).waitForExistence(timeout: 5))
+        closes.element(boundBy: 0).tap()
+        Thread.sleep(forTimeInterval: 0.8)
+        XCTAssertEqual(headers.count, 1, "one session left")
+        XCTAssertTrue(header(app).label.contains("Streaming veil"), "the lower session moved up: \(header(app).label)")
     }
 }
