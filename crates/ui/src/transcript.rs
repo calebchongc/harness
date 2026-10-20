@@ -54,6 +54,10 @@ use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
 use harness_syntax::LanguageId as Lang;
 
+#[cfg(test)]
+#[path = "transcript/selection_tests.rs"]
+mod selection_tests;
+
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
 // ---------------------------------------------------------------------------
@@ -4320,12 +4324,16 @@ impl Transcript {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Text listeners claim the drag before it bubbles here. Stop following
-        // immediately: a stream commit can otherwise virtualize the anchor
-        // before the first mouse move. Keep the user bubble's long-press timer.
-        if !crate::markdown::selection::is_dragging() {
+        // Text listeners claim direct hits before it bubbles here. Also allow
+        // a start in horizontal whitespace, but only inside this pane's viewport.
+        if !crate::markdown::selection::is_dragging()
+            && !(self.list.viewport_bounds().contains(&event.position)
+                && render::begin_drag_in_whitespace(cx.entity_id().as_u64(), event.position))
+        {
             return;
         }
+        // Stop following immediately: a stream commit can otherwise virtualize
+        // the anchor before the first move. Keep the bubble's long-press timer.
         self.selection_drag_position = Some(event.position);
         self.discard_pending_viewport();
         self.user_collapse_scroll = None;
