@@ -1268,6 +1268,9 @@ pub enum RowKind {
         mime_type: String,
     },
     User {
+        /// Cross-chat coordination is transported as a prompt, but is not
+        /// something the human typed. Retain its attribution for distinct chrome.
+        agent_sender: Option<SharedString>,
         /// Visible prompt (attachment-ref trailer already stripped). When the
         /// prompt carries file mentions this is the *projected* display text —
         /// chip labels in place of the raw Markdown links.
@@ -1588,12 +1591,15 @@ pub fn rows_for_entry(
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
         let parsed = crate::attachments::parse_user_message_images(&raw);
+        let agent_message = crate::agent_message::parse(&parsed.text);
+        let agent_sender = agent_message.as_ref().map(|message| message.sender.into());
+        let body = agent_message.as_ref().map_or(parsed.text.as_str(), |message| message.body);
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
-        let (body, badges) = crate::badges::split(&parsed.text);
+        let (body, badges) = crate::badges::split(body);
         let (text, mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
             None => (body, Vec::new()),
@@ -1604,6 +1610,7 @@ pub fn rows_for_entry(
             version: (raw.len() as u64) << 1 | pending as u64,
             turn_start: true,
             kind: RowKind::User {
+                agent_sender,
                 text: text.into(),
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
@@ -7458,6 +7465,7 @@ impl Transcript {
 
         let inner: AnyElement = match &row.kind {
             RowKind::User {
+                agent_sender,
                 text,
                 mentions,
                 attachments,
@@ -7473,6 +7481,15 @@ impl Transcript {
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
                 // HStack); image-only sends show no bubble at all.
                 let mut column = div().w_full().flex().flex_col();
+                if let Some(sender) = agent_sender {
+                    column = column.child(
+                        div()
+                            .pb(px(6.0))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(format!("Agent message · {sender}")),
+                    );
+                }
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(
                         &row.id,
@@ -7509,11 +7526,12 @@ impl Transcript {
                     // left edge, and long prompts render as one clipped line
                     // instead of wrapping inside the 80% column cap.
                     column = column.child(
-                        div().w_full().flex().justify_end().child(
+                        div().w_full().flex().when(agent_sender.is_none(), |el| el.justify_end()).child(
                             div()
                                 .min_w_0()
                                 .max_w(px(self.content_width * 0.8))
-                                .bg(crate::theme::user_bubble_bg())
+                                .when(agent_sender.is_none(), |el| el.bg(crate::theme::user_bubble_bg()))
+                                .when(agent_sender.is_some(), |el| el.border_l_1().border_color(theme.border))
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .px(px(16.0))
                                 .py(px(10.0))
@@ -16450,6 +16468,36 @@ mod tests {
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].id, after[0].id);
         assert_eq!(before[0].version, after[0].version);
+    }
+
+    #[test]
+    fn agent_messages_are_attributed_instead_of_impersonating_user_prompts() {
+        for header in [
+            "Cleanup (abc12345). Sender chat: abc12345. Relay depth: 1/4. Agent coordination, not a human request. Do not send acknowledgements or progress updates.",
+            "Cleanup (abc12345). Reply to it with the Harness `send_message` tool, chat abc12345.",
+        ] {
+            let body = "Keep active tests running.";
+            let envelope = format!("[Message from Harness chat {header}]\n\n{body}");
+            let mut entry = assistant("peer", MessageStatus::Complete, vec![]);
+            entry.role = MessageRole::User;
+            entry.parts = vec![text_part("t0", &envelope)];
+            let rows = rows_for_entry(&entry, false, false, &mut parse);
+            let RowKind::User { agent_sender, text, .. } = &rows[0].kind else {
+                panic!("expected an attributed prompt row");
+            };
+            assert_eq!(agent_sender.as_deref(), Some("Cleanup (abc12345)"));
+            assert_eq!(text.as_ref(), body);
+            assert_eq!(rows[0].copy_text.as_deref(), Some(body));
+            assert_eq!(rows[0].version, (envelope.len() as u64) << 1);
+
+            entry.parts = vec![text_part("t0", body)];
+            let rows = rows_for_entry(&entry, false, false, &mut parse);
+            let RowKind::User { agent_sender, text, .. } = &rows[0].kind else {
+                panic!("expected an ordinary user row");
+            };
+            assert!(agent_sender.is_none());
+            assert_eq!(text.as_ref(), body);
+        }
     }
 
     #[test]
