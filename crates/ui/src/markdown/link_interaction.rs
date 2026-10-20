@@ -115,6 +115,9 @@ impl Element for LinkRanges {
                 state.dismissed.set(false);
             }
             state.focused = focused;
+            // Pointer focus must not mount a second disclosure between mouse
+            // down and up: window-edge snapping can put it over the hit target.
+            let disclosure_focus = focused.filter(|_| window.last_input_was_keyboard());
             state.bounds = bounds;
             state.tooltip_bounds.set(None);
             #[cfg(all(test, any(target_os = "linux", windows)))]
@@ -151,15 +154,19 @@ impl Element for LinkRanges {
                     let hit = div()
                         .id(format!("link-{index}-{part}-{}", state.epoch.get()))
                         // Removing the builder cancels both visible tooltips
-                        // and GPUI's delayed show task while the menu owns input.
-                        .when(state.menu.borrow().is_none(), |hit| {
-                            hit.hoverable_tooltip(move |_, cx| {
-                                let url = destination.clone();
-                                let bounds = tooltip_bounds.clone();
-                                cx.new(|_| super::link_destination::Destination(url, bounds))
-                                    .into()
-                            })
-                        })
+                        // and GPUI's delayed show task while the menu or the
+                        // keyboard disclosure owns input.
+                        .when(
+                            state.menu.borrow().is_none() && disclosure_focus != Some(index),
+                            |hit| {
+                                hit.hoverable_tooltip(move |_, cx| {
+                                    let url = destination.clone();
+                                    let bounds = tooltip_bounds.clone();
+                                    cx.new(|_| super::link_destination::Destination(url, bounds))
+                                        .into()
+                                })
+                            },
+                        )
                         .w(rect.size.width)
                         .h(rect.size.height)
                         .cursor_pointer()
@@ -227,7 +234,7 @@ impl Element for LinkRanges {
                 }
             }
             if state.menu.borrow().is_none() && !state.dismissed.get() {
-                if let Some(index) = focused {
+                if let Some(index) = disclosure_focus {
                     if let Some(rect) =
                         range_rects(&self.layout, &self.links[index].0, 0., 0.).first()
                     {
@@ -498,6 +505,84 @@ mod tests {
         event.down.click_count = 2;
         assert!(!click_is_activation(&ClickEvent::Mouse(event)));
     }
+    struct BottomLink {
+        layout: TextLayout,
+        activations: Rc<Cell<usize>>,
+    }
+    impl gpui::Render for BottomLink {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            let text = gpui::StyledText::new("Docs");
+            self.layout = text.layout().clone();
+            let activations = self.activations.clone();
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .justify_end()
+                .child(LinkRanges {
+                    id: "bottom-link".into(),
+                    child: text.into_any_element(),
+                    layout: self.layout.clone(),
+                    links: vec![(0..4, LinkTarget::new("Docs", "https://example.com/docs"))],
+                    ui: Some(LinkUi {
+                        source_session: None,
+                        handler: Rc::new(move |_, _, _| {
+                            activations.set(activations.get() + 1);
+                            LinkOutcome::Rejected
+                        }),
+                    }),
+                })
+        }
+    }
+    #[gpui::test]
+    fn pointer_focus_at_window_bottom_does_not_block_link_click(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let activations = Rc::new(Cell::new(0));
+        let window = cx.open_window(gpui::size(px(400.), px(240.)), |_, _| BottomLink {
+            layout: TextLayout::default(),
+            activations: activations.clone(),
+        });
+        let view = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+            let position = range_rects(&view.read(cx).layout, &(0..4), 0., 0.)[0].center();
+            for expected in 1..=2 {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                // A frame between down and up used to mount a focused
+                // disclosure, snapped over the link at the window edge.
+                window.refresh();
+                let _ = window.draw(cx);
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                assert_eq!(activations.get(), expected);
+                window.refresh();
+                let _ = window.draw(cx);
+            }
+        })
+        .unwrap();
+    }
     #[gpui::test]
     fn all_actions_keep_the_destination(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| gpui::Empty);
@@ -621,6 +706,7 @@ mod rendered_tests {
                 .unwrap();
             cx.update_window(window.into(), |_, window, cx| {
                 draw_has_tooltip(window, cx);
+                key(window, "tab", cx);
                 window.focus_next(cx);
                 assert!(
                     draw_has_tooltip(window, cx),
@@ -711,6 +797,11 @@ mod rendered_tests {
                     }),
                     cx,
                 );
+                assert!(
+                    !draw_has_tooltip(window, cx),
+                    "pointer focus must not mount a keyboard disclosure"
+                );
+                key(window, "tab", cx);
                 assert!(draw_has_tooltip(window, cx));
                 let position = gpui::point(px(425.), px(125.));
                 window.dispatch_event(
@@ -814,6 +905,7 @@ mod rendered_tests {
                         }
                         cx.update_window(window.into(), |_, window, cx| {
                             if keyboard {
+                                key(window, "tab", cx);
                                 window.focus_next(cx);
                                 draw_has_tooltip(window, cx);
                                 key(window, "shift-f10", cx);
@@ -897,6 +989,7 @@ mod rendered_tests {
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh();
                 let _ = window.draw(cx);
+                key(window, "tab", cx);
                 window.focus_next(cx);
                 window.refresh();
                 let _ = window.draw(cx);
