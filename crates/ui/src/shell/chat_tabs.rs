@@ -679,8 +679,19 @@ impl Shell {
 
     /// Sidebar navigation preserves the current tab: reveal an open chat in
     /// its tab/pane, or give a previously unopened chat its own new tab.
-    pub(super) fn open_chat_in_tab(&mut self, chat_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_chat_in_tab(
+        &mut self,
+        chat_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let already_selected =
+            self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str());
         self.open_chat_preserving_tabs(chat_id, cx);
+        if already_selected {
+            self.composer
+                .update(cx, |composer, cx| composer.reveal_pending_question(cx));
+        }
         window.focus(&self.composer.focus_handle(cx), cx);
     }
 
@@ -832,7 +843,15 @@ impl Shell {
                         .on_hover(motion::hover_listener(key))
                         .text_size(crate::typography::ui_rems(12.5))
                         .text_color(if lit { theme.text } else { theme.text_muted })
-                        .on_click(cx.listener(move |this, _, window, cx| this.switch_chat_tab(ix, window, cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if ix == this.chat_tab {
+                                this.composer
+                                    .update(cx, |composer, cx| composer.reveal_pending_question(cx));
+                                window.focus(&this.composer.focus_handle(cx), cx);
+                            } else {
+                                this.switch_chat_tab(ix, window, cx);
+                            }
+                        }))
                         .when(multiple && crate::click_activation_drag_enabled(), |row| {
                             row.on_drag(
                                 ChatTabDrag {

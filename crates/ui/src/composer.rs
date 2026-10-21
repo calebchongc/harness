@@ -5589,6 +5589,9 @@ pub struct Composer {
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
+    /// Failed submissions can complete after navigation. Restore only when
+    /// this chat/request is pending again, never into another chat's editor.
+    wizard_retries: HashMap<(String, String), (Wizard, String)>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     /// The queued message being edited in the composer (see
@@ -5857,6 +5860,7 @@ impl Composer {
             wizard_scroll: gpui::ScrollHandle::new(),
             available_height: None,
             answered_requests: HashSet::new(),
+            wizard_retries: HashMap::new(),
             failure_key: None,
             action_task: None,
             advance_task: None,
@@ -5960,6 +5964,16 @@ impl Composer {
 
     fn wizard_active(&self) -> bool {
         self.wizard.is_some() && self.editing_queued.is_none()
+    }
+
+    /// Explicit navigation should reveal the selected session's pending ask,
+    /// even when the selection itself did not change. Never steal a queue edit.
+    pub(crate) fn reveal_pending_question(&mut self, cx: &mut Context<Self>) {
+        self.on_state_changed(cx);
+        if self.wizard_active() {
+            self.wizard_expanded = true;
+            cx.notify();
+        }
     }
 
     pub(crate) fn prepare_queue_edit_input(&mut self, cx: &mut Context<Self>) {
@@ -6244,6 +6258,7 @@ impl Composer {
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
         self.appshots.remove(chat_id);
+        self.wizard_retries.retain(|(chat, _), _| chat != chat_id);
         self.state.update(cx, |state, _| {
             state.purge_review_comments(chat_id);
         });
@@ -7844,7 +7859,7 @@ impl Composer {
         }
     }
 
-    fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         {
             let state = self.state.read(cx);
             let now = chrono::Utc::now();
@@ -7994,13 +8009,18 @@ impl Composer {
                         );
                     }
                     self.reset_mention(None, cx);
-                    let prefill = questions
-                        .first()
-                        .and_then(|q| q.prefill.clone())
-                        .unwrap_or_default();
-                    self.wizard = Some(Wizard::new(request_id, questions));
-                    self.input
-                        .update(cx, |input, cx| input.set_text(prefill, cx));
+                    let (wizard, text) = self
+                        .wizard_retries
+                        .remove(&(self.current_key.clone(), request_id.clone()))
+                        .unwrap_or_else(|| {
+                            let prefill = questions
+                                .first()
+                                .and_then(|q| q.prefill.clone())
+                                .unwrap_or_default();
+                            (Wizard::new(request_id, questions), prefill)
+                        });
+                    self.wizard = Some(wizard);
+                    self.input.update(cx, |input, cx| input.set_text(text, cx));
                     // The active session's question opens immediately, even
                     // when a narrow pane needs the anchored popover. Only a
                     // deliberate dismissal keeps this request collapsed.
@@ -9259,14 +9279,48 @@ impl Composer {
         cx.notify();
     }
 
+    fn restore_failed_answer(
+        &mut self,
+        chat_id: String,
+        wizard: Wizard,
+        text: String,
+        staged: Vec<StagedAttachment>,
+        cx: &mut Context<Self>,
+    ) {
+        self.answered_requests.remove(&wizard.request_id);
+        self.attachments
+            .entry(chat_id.clone())
+            .or_default()
+            .extend(staged);
+        self.wizard_retries
+            .insert((chat_id.clone(), wizard.request_id.clone()), (wizard, text));
+        // A Composer notify only redraws; it does not run the AppState
+        // observer that mounts a wizard. Reconcile explicitly, even offline.
+        if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
+            self.on_state_changed(cx);
+        }
+        cx.notify();
+    }
+
     /// Submit RespondInput and retire the panel.
     fn wizard_finish(&mut self, answers: Vec<UserInputAnswer>, cx: &mut Context<Self>) {
         if self.question_cancellation_pending(cx) {
             return;
         }
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected — your answer is still here".into());
+            self.failure_key = Some(chat_id);
+            self.wizard_expanded = true;
+            cx.notify();
+            return;
+        };
         let Some(wizard) = self.wizard.take() else {
             return;
         };
+        let answer_text = self.input.read(cx).text().to_string();
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
         let draft = self
@@ -9280,12 +9334,6 @@ impl Composer {
             input.set_placeholder("Do anything…", cx);
             input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
         });
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
-            return;
-        };
         let request_id = wizard.request_id.clone();
         // Files staged while the question was up belong to the answer, not
         // to the next message: upload them to the chat's host like a send.
@@ -9293,15 +9341,15 @@ impl Composer {
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
-        let staged_key = self.current_key.clone();
         let host_device_id = self
             .state
             .read(cx)
             .selected_chat_row()
             .map(|chat| chat.device_id.clone());
         let failure_chat = chat_id.clone();
-        // `action_task`, NOT `send_task` — see `interrupt`.
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        // Delivery and recovery must survive navigation and another chat's
+        // composer action; replacing action_task used to cancel this work.
+        cx.spawn(async move |this, cx| {
             let mut paths = Vec::with_capacity(staged.len());
             for attachment in &staged {
                 let upload_id = uuid::Uuid::new_v4().to_string();
@@ -9319,17 +9367,13 @@ impl Composer {
                     Err(err) => {
                         tracing::warn!(name = %attachment.name, error = %err, "answer attachment upload failed");
                         this.update(cx, |composer, cx| {
-                            composer
-                                .attachments
-                                .entry(staged_key)
-                                .or_default()
-                                .extend(staged.iter().cloned());
                             composer.failure = Some(
                                 "Couldn't upload the attachment — the device may be offline.".into(),
                             );
-                            composer.failure_key = Some(failure_chat);
-                            composer.answered_requests.remove(&request_id);
-                            cx.notify();
+                            composer.failure_key = Some(failure_chat.clone());
+                            composer.restore_failed_answer(
+                                failure_chat, wizard, answer_text, staged, cx,
+                            );
                         })
                         .ok();
                         return;
@@ -9340,18 +9384,22 @@ impl Composer {
                 request_id: request_id.clone(),
                 answers: answers_with_attachments(answers, &paths),
             };
-            let Ok(command) = serde_json::to_value(&command) else {
-                return;
-            };
             let params = serde_json::json!({ "chatId": chat_id, "command": command });
-            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            let result = attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                methods::QUEUE_COMMAND,
+                params,
+                Duration::from_secs(30),
+            )
+            .await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
                     composer.failure = Some(format!("Answer failed: {err}").into());
-                    composer.failure_key = Some(failure_chat);
-                    // The answer never left this device — put the panel back.
-                    composer.answered_requests.remove(&request_id);
-                    cx.notify();
+                    composer.failure_key = Some(failure_chat.clone());
+                    composer.restore_failed_answer(
+                        failure_chat, wizard, answer_text, staged, cx,
+                    );
                 })
                 .ok();
                 return;
@@ -9364,15 +9412,18 @@ impl Composer {
             // un-hide the panel instead of leaving the question unanswerable.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
-                let transcript = composer.state.read(cx).transcript.clone();
-                let still_pending = pending_input_request(&transcript)
-                    .is_some_and(|(pending_id, _)| pending_id == request_id);
-                if still_pending && composer.answered_requests.remove(&request_id) {
-                    cx.notify();
+                let state = composer.state.read(cx);
+                let selected = state.selected_chat.as_deref() == Some(chat_id.as_str());
+                let still_pending = !selected
+                    || pending_input_request(&state.transcript)
+                        .is_some_and(|(pending_id, _)| pending_id == request_id);
+                if still_pending && composer.answered_requests.contains(&request_id) {
+                    composer.restore_failed_answer(chat_id, wizard, answer_text, staged, cx);
                 }
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
     }
 
@@ -10175,7 +10226,11 @@ impl Render for Composer {
                 div().min_h_0().flex().flex_col().child(wizard),
             ));
         }
-        self.wizard_expanded = false;
+        // A queue edit only borrows the composer; hiding the wizard must not
+        // discard its expanded/collapsed state before the edit finishes.
+        if self.wizard.is_none() {
+            self.wizard_expanded = false;
+        }
 
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
@@ -11095,6 +11150,10 @@ fn dictation_unavailable_message(
         E::Protocol => "Codex's voice helper stopped responding.".into(),
     }
 }
+
+#[cfg(test)]
+#[path = "composer/question_recovery_tests.rs"]
+mod question_recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -16078,7 +16137,19 @@ mod tests {
     fn wizard_restores_displaced_draft_after_submit_navigation_and_timeout(
         cx: &mut gpui::TestAppContext,
     ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, _requests) = tokio::sync::mpsc::channel(16);
+        let (_replies, inbound) = tokio::sync::mpsc::channel(16);
         let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                harness_rpc::RpcClient::new(out, inbound),
+            ));
+        });
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let transcript = |id: &str, resolved: bool| {
             let mut q = question("editor", &[], false);
