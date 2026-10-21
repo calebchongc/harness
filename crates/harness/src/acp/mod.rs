@@ -2180,6 +2180,9 @@ impl Harness for AcpHarness {
             .filter(|name| harness_proto::graff_worktree::valid_name(name));
         if let Some(name) = &graff_worktree {
             launch_args.extend(["-w".to_owned(), name.clone()]);
+            // "Send now" and other follow-ups rebuild the request from the
+            // chat row, already re-homed into the tree (codegraff#1693).
+            request.cwd = harness_proto::graff_worktree::launch_root(&request.cwd).to_owned();
         }
         let (scratch, mut child, stderr_tail) = self
             .spawn_agent(Some(&request.cwd), true, &launch_args)
