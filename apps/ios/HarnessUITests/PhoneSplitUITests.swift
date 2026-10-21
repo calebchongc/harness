@@ -263,11 +263,40 @@ final class PhoneSplitUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Pick a session, or start one with +"].exists, "the split stays off")
     }
 
-    func testNoOfferWithoutRoomEvenWhileJuggling() {
+    /// Upright, the offer is the stacked split: trying it keeps the list above the next session opened.
+    func testPortraitOffersTheStackedSplit() {
         let app = launchJuggling(orientation: .portrait)
-        XCTAssertTrue(app.buttons["new-session"].waitForExistence(timeout: 10), "Home did not load")
-        XCTAssertFalse(offer(app).waitForExistence(timeout: 2), "a portrait phone has no room, so nothing to offer")
+        XCTAssertTrue(offer(app).waitForExistence(timeout: 10), "juggling in portrait should offer the stacked split")
+        attachScreenshot(named: "split-offer-portrait")
+        app.buttons["split-offer-try"].tap()
+        XCTAssertFalse(offer(app).waitForExistence(timeout: 2), "the offer goes away once answered")
+        app.staticTexts["Tool group header colors"].firstMatch.tap()
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        XCTAssertTrue(listButton(app).isHittable, "the list stays on screen above the session")
+        XCTAssertLessThan(listButton(app).frame.maxY, header(app).frame.minY, "the list sits above the session")
     }
+
+    /// With the stacked split on and nothing open, the list has the whole screen: no empty placeholder below it,
+    /// at launch and after Back from a session.
+    private func nothingOpenGivesTheListTheScreen(_ half: String) {
+        let app = launchRollout(half, onboardingSeen: true)
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        let headerY = header(app).frame.midY
+        let back = app.navigationBars.buttons.allElementsBoundByIndex.first {
+            $0.isHittable && abs($0.frame.midY - headerY) < 30 && $0.frame.maxX < header(app).frame.minX
+        }
+        XCTAssertNotNil(back, "no Back button beside the session header")
+        back?.tap()
+        Thread.sleep(forTimeInterval: 0.8)
+        attachScreenshot(named: "stacked-nothing-open-\(half)")
+        XCTAssertTrue(listButton(app).isHittable, "Back returns to the list")
+        XCTAssertFalse(app.staticTexts["Pick a session, or start one with +"].isHittable,
+                       "no empty placeholder below the list")
+        XCTAssertFalse(app.buttons["stacked-split-handle"].exists, "no handle with nothing below it")
+    }
+
+    func testWithNothingOpenTheListHasTheScreen() { nothingOpenGivesTheListTheScreen("on") }
+    func testWithNothingOpenTheListHasTheScreenWithoutTheHandle() { nothingOpenGivesTheListTheScreen("off") }
 
     /// With nothing open, the list has the whole screen. A new session opened from "+" used to land in the
     /// detail below it and stay folded away, so "+" looked like it did nothing.
