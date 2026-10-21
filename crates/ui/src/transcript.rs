@@ -1344,6 +1344,32 @@ pub enum RowKind {
     },
 }
 
+/// The host path of a reply's Markdown image source: absolute, `file://`, or
+/// relative to the chat's workspace. Remote URLs and data URIs have none.
+fn reply_image_path(source: &str, workspace_root: Option<&str>) -> Option<String> {
+    let source = match source.strip_prefix("file://") {
+        // `file:///C:/x.png` names `C:/x.png` on Windows.
+        Some(path) if cfg!(windows) && path.get(2..3) == Some(":") => &path[1..],
+        Some(path) => path,
+        None => source,
+    };
+    if source.is_empty() || source.contains("://") || source.starts_with("data:") {
+        return None;
+    }
+    let path = std::path::Path::new(source);
+    if path.is_absolute() {
+        return Some(source.to_owned());
+    }
+    let root = workspace_root?;
+    let relative = source.strip_prefix("./").unwrap_or(source);
+    Some(
+        std::path::Path::new(root)
+            .join(relative)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
     let mut devices = Vec::new();
     for device in std::iter::once(owner).chain(fallback.iter().map(String::as_str)) {
@@ -6820,6 +6846,118 @@ impl Transcript {
         }
     }
 
+    /// Images a reply's Markdown block references (`![caption](shot.png)`),
+    /// loaded like generated images through the engine's read-back, which
+    /// serves files under a chat's folder (#400). Relative sources resolve
+    /// against the chat's workspace. `None` for a block without images, and
+    /// a remote URL or an unreadable file shows its caption.
+    fn reply_media_ui(
+        &mut self,
+        block: &Block,
+        workspace_root: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Option<render::MediaUi> {
+        use crate::attachments::AttachmentSnapshot;
+        let sources = crate::files::markdown_media::block_image_sources(block);
+        if sources.is_empty() {
+            return None;
+        }
+        let devices = {
+            let state = self.state.read(cx);
+            let owner = self
+                .chat_id
+                .as_deref()
+                .and_then(|chat_id| state.chats.iter().find(|chat| chat.id == chat_id))
+                .map(|chat| chat.device_id.clone())
+                .unwrap_or_default();
+            generated_image_devices(&owner, &self.attachment_device_ids(cx))
+        };
+        let mut images = HashMap::new();
+        for source in sources {
+            if let Some(path) = reply_image_path(&source, workspace_root) {
+                let state = self.attachment_state(&devices, &path, None, cx);
+                images.insert(source, state);
+            }
+        }
+        let images = Rc::new(images);
+        let transcript = cx.entity().downgrade();
+        Some(render::MediaUi {
+            diagram: None,
+            image: Rc::new(move |image, id, theme| {
+                let frame = div()
+                    .id(id.clone())
+                    .w(px(512.0))
+                    .max_w_full()
+                    .h(px(320.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.0))
+                    .overflow_hidden()
+                    .bg(crate::theme::ink(0.045))
+                    .text_color(theme.text_muted);
+                match images.get(&image.source) {
+                    Some(AttachmentSnapshot::Loaded(loaded)) => {
+                        let (width, height) = crate::appshots::png_dimensions(&loaded.image.bytes)
+                            .unwrap_or((512, 320));
+                        let scale = (512.0 / width as f32).min(420.0 / height as f32).min(1.0);
+                        let name = if image.alt.is_empty() {
+                            loaded.name.to_string()
+                        } else {
+                            image.alt.clone()
+                        };
+                        let preview = crate::attachments::PreviewImage::new(
+                            name.clone(),
+                            loaded.image.clone(),
+                        );
+                        let transcript = transcript.clone();
+                        let accent = theme.accent;
+                        frame
+                            .w(px(width as f32 * scale))
+                            .h(px(height as f32 * scale))
+                            .role(gpui::Role::Button)
+                            .aria_label(SharedString::from(name))
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .focus_visible(move |style| style.border_2().border_color(accent))
+                            .on_click(move |_, window, cx| {
+                                transcript
+                                    .update(cx, |this, cx| {
+                                        this.attachment_preview_return_focus = window.focused(cx);
+                                        preview.viewer.reset();
+                                        this.attachment_preview = Some(preview.clone());
+                                        window.focus(&this.attachment_preview_focus, cx);
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            })
+                            .child(
+                                gpui::img(loaded.image.clone())
+                                    .size_full()
+                                    .rounded(px(12.0))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            )
+                            .into_any_element()
+                    }
+                    Some(AttachmentSnapshot::Loading) => {
+                        frame.child("Loading image…").into_any_element()
+                    }
+                    // Not a workspace file, or it could not be read: the
+                    // caption, as before.
+                    _ => div()
+                        .id(id)
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(if image.alt.is_empty() {
+                            image.source.clone()
+                        } else {
+                            image.alt.clone()
+                        }))
+                        .into_any_element(),
+                }
+            }),
+        })
+    }
+
     /// A sent non-image attachment: the thumbnail's footprint (so row heights
     /// don't shift) with a document glyph, the file name, and upload status.
     fn render_file_attachment(
@@ -7584,9 +7722,10 @@ impl Transcript {
                     return gpui::Empty.into_any_element();
                 };
                 let code = self.code_uis_for(&row.id, &top.block, *block_ix, cx);
+                let media = self.reply_media_ui(&top.block, workspace_root.as_deref(), cx);
                 let opts = RenderOptions {
                     tasks: None,
-                    media: None,
+                    media,
                     row_key: row.id.clone(),
                     veil: None,
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -7643,9 +7782,10 @@ impl Transcript {
                         })
                         .clone()
                 });
+                let media = self.reply_media_ui(&top.block, workspace_root.as_deref(), cx);
                 let opts = RenderOptions {
                     tasks: None,
-                    media: None,
+                    media,
                     row_key: row.id.clone(),
                     veil: veil.clone(),
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -13167,6 +13307,88 @@ mod tests {
             id: id.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn reply_images_resolve_against_the_chat_workspace() {
+        let (root, absolute, url) = if cfg!(windows) {
+            (
+                r"C:\work\repo",
+                "C:/tmp/before.png",
+                "file:///C:/tmp/before.png",
+            )
+        } else {
+            ("/work/repo", "/tmp/before.png", "file:///tmp/before.png")
+        };
+        let in_root = |relative: &str| {
+            std::path::Path::new(root)
+                .join(relative)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let root = Some(root);
+        assert_eq!(
+            reply_image_path("shot.png", root),
+            Some(in_root("shot.png"))
+        );
+        assert_eq!(
+            reply_image_path("./docs/after.png", root),
+            Some(in_root("docs/after.png"))
+        );
+        assert_eq!(reply_image_path(absolute, None).as_deref(), Some(absolute));
+        assert_eq!(reply_image_path(url, root).as_deref(), Some(absolute));
+        assert_eq!(reply_image_path("https://example.com/a.png", root), None);
+        assert_eq!(reply_image_path("data:image/png;base64,AAAA", root), None);
+        assert_eq!(reply_image_path("shot.png", None), None);
+    }
+
+    #[gpui::test]
+    fn reply_markdown_images_load_through_the_attachment_cache(cx: &mut gpui::TestAppContext) {
+        use crate::attachments::*;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.local_device_id = Some("reply-owner".into());
+                state
+            });
+            let transcript = cx.new(|cx| Transcript::new(state, cx));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(64, 48)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            store_loaded_for(
+                &AttachmentKey::new("reply-owner", "/fixture/ws/shot.png", None),
+                "shot.png".into(),
+                Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    bytes.into_inner(),
+                )),
+            );
+            transcript.update(cx, |this, cx| {
+                let block = |source: &str| parse_full(source).blocks[0].block.clone();
+                let root = Some("/fixture/ws");
+                assert!(
+                    this.reply_media_ui(&block("plain reply"), root, cx)
+                        .is_none()
+                );
+                assert!(
+                    this.reply_media_ui(&block("![Before and after](shot.png)"), root, cx)
+                        .is_some()
+                );
+                assert!(
+                    this.reply_media_ui(&block("![Remote](https://example.com/a.png)"), root, cx)
+                        .is_some()
+                );
+                assert!(
+                    this.attachment_loads.is_empty(),
+                    "a cached image repaints without a fetch, and a remote URL is never fetched"
+                );
+            });
+        });
     }
 
     #[test]
