@@ -5724,7 +5724,7 @@ impl DocHost {
     ) -> Result<Option<String>, EngineError> {
         let context = self.capture_source_context(&request.cwd).await;
         if let Some(context) = &context
-            && let Some(drift) = self.drift_since_last_turn(sessions, chat_id, context)
+            && let Some(drift) = self.drift_since_last_turn(sessions, chat_id, context).await
         {
             self.hold_for_branch_drift(chat_id, &drift, harness, request, message_id)
                 .await?;

@@ -282,6 +282,34 @@ impl Repos {
         }
     }
 
+    /// This checkout's `HEAD` reflog, oldest first, as `(unix seconds,
+    /// subject)`. Each linked worktree keeps its own, so it records exactly
+    /// the renames and checkouts that happened in this folder.
+    pub(crate) async fn head_reflog(&self, path: &Path) -> Result<Vec<(i64, String)>, EngineError> {
+        let log = self
+            .git(
+                &[
+                    "reflog",
+                    "show",
+                    "--date=unix",
+                    "--format=%gd%x09%gs",
+                    "HEAD",
+                ],
+                Some(path),
+            )
+            .await?;
+        let mut entries: Vec<(i64, String)> = log
+            .lines()
+            .filter_map(|line| {
+                let (selector, subject) = line.split_once('\t')?;
+                let at = selector.strip_prefix("HEAD@{")?.strip_suffix('}')?;
+                Some((at.parse().ok()?, subject.to_string()))
+            })
+            .collect();
+        entries.reverse();
+        Ok(entries)
+    }
+
     /// Capture the complete source identity after dispatch or an owned checkout change.
     pub(crate) async fn capture_source_context(
         &self,
