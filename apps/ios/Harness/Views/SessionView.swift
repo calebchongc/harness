@@ -23,6 +23,12 @@ struct SessionView: View {
     private static let headerChromeInset: CGFloat = 170
     private static let topFadeHeight: CGFloat = 28
 
+    /// Room the stacked split's trailing buttons take from the title: the titled Split button, or the ×.
+    private var stackedButtonsWidth: CGFloat {
+        if stackedSplit != nil { return 92 }
+        return stackedClose == nil ? 0 : 44
+    }
+
     /// The view's own width, the only reliable basis for capping the principal
     /// toolbar item (its container proposes an unbounded width).
     @State private var viewWidth: CGFloat = 0
@@ -178,7 +184,7 @@ struct SessionView: View {
                         // frame collapses to its minimum ("S…"). Claiming the
                         // remainder of the bar outright lays the texts out with
                         // real room and truncates them properly.
-                        .frame(width: max(140, viewWidth - Self.headerChromeInset - (stackedSplit == nil && stackedClose == nil ? 0 : 44)),
+                        .frame(width: max(140, viewWidth - Self.headerChromeInset - stackedButtonsWidth),
                                alignment: .leading)
                         // Swipe the header to page to the neighbouring session.
                         .pagerSwipe()
@@ -188,8 +194,16 @@ struct SessionView: View {
             }
             if let stackedSplit {
                 ToolbarItem(placement: .topBarTrailing) {
+                    // Titled: the icon alone read as a plain box. A Label in the bar drops its title, so the
+                    // icon and the word are laid out here.
                     Button(action: stackedSplit) {
-                        Label("Open a session below", systemImage: "rectangle.split.1x2")
+                        HStack(spacing: 6) {
+                            Image(systemName: "rectangle.split.1x2")
+                            Text("Split")
+                                .font(Theme.sans(15, weight: .medium))
+                        }
+                        .padding(.horizontal, 4)
+                        .fixedSize()
                     }
                     .accessibilityLabel("Open another session below this one")
                     .accessibilityIdentifier("stacked-split-open")

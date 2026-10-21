@@ -320,6 +320,27 @@ final class PhoneSplitUITests: XCTestCase {
         XCTAssertTrue(context.isHittable, "the new session is on screen, not folded away below the list")
     }
 
+    /// The lower pane's list has Home's archived shelf too, and an archived session opens there.
+    func testTheLowerPaneOffersArchivedSessions() {
+        let app = launchRollout("on", onboardingSeen: true)
+        XCTAssertTrue(header(app).waitForExistence(timeout: 10), "the session did not open")
+        let split = app.buttons["stacked-split-open"]
+        XCTAssertTrue(split.waitForExistence(timeout: 5), "the session offers a split")
+        XCTAssertTrue(split.label.contains("below"), "the split button says what it does")
+        split.tap()
+
+        let picker = app.descendants(matching: .any)["stacked-session-picker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 5), "the session list opened below")
+        let archived = picker.buttons.matching(NSPredicate(format: "label CONTAINS %@", "OKLCH conversion drift")).firstMatch
+        for _ in 0..<3 where !archived.isHittable { picker.swipeUp() }
+        XCTAssertTrue(archived.isHittable, "the archived shelf is in the list")
+        attachScreenshot(named: "stacked-picker-archived")
+        archived.tap()
+
+        let headers = app.descendants(matching: .any).matching(identifier: "session-header")
+        XCTAssertTrue(headers.element(boundBy: 1).waitForExistence(timeout: 5), "the archived session opened below")
+    }
+
     /// ⌘D on the phone: a session alone in the stacked split opens the session list below it (Home's rows).
     /// Picking one shows both sessions; × closes either pane.
     func testStackedSplitPicksAnExistingSessionBelowAndEitherPaneCloses() {
