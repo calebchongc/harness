@@ -153,6 +153,7 @@ fn fixed_shortcuts() -> Vec<crate::settings::shortcuts::FixedShortcut> {
         row("Make all panes the same size", Box::new(EqualizeChatPanes)),
         row("Zoom the pane (and back)", Box::new(ToggleChatPaneZoom)),
         row("New chat tab", Box::new(NewChatTab)),
+        row("Reopen closed chat tab", Box::new(ReopenClosedChatTab)),
         row("Next chat tab", Box::new(NextChatTab)),
         row("Previous chat tab", Box::new(PrevChatTab)),
         row(
@@ -1852,14 +1853,20 @@ pub struct Shell {
     /// at `chat_tab` is stale; the active tab lives in the fields above.
     chat_tabs: Vec<chat_tabs::ChatTab>,
     chat_tab: usize,
+    /// The implicit single tab keeps its identity when the tab list collapses.
+    chat_tab_id: uuid::Uuid,
     /// The sidebar tab list scrolls once it hits its height cap; the tab it
     /// last scrolled into view, so a switch reveals the new one exactly once.
     chat_tab_scroll: gpui::ScrollHandle,
     chat_tab_revealed: Option<usize>,
     /// Open tab indices from least to most recently visited.
     chat_tab_history: Vec<usize>,
-    /// Closed tabs, most recent last, for ⌘⇧T (#455).
+    /// Recently closed tabs, oldest first; kept only for this window's lifetime.
     closed_chat_tabs: Vec<chat_tabs::ClosedChatTab>,
+    /// Serialize archive-on-close and its undo so a quick reopen wins.
+    chat_close_archive_tasks: std::collections::HashMap<String, Task<()>>,
+    /// Keep restored split panes visible until their archive undo completes.
+    chat_tab_unarchiving: std::collections::HashMap<String, usize>,
     /// Live read-only transcripts for unfocused panes, keyed by chat id.
     peer_chat_views: std::collections::HashMap<String, chat_split::PeerChatView>,
     /// A split divider being dragged, and the split root's measured bounds.
@@ -2392,10 +2399,13 @@ impl Shell {
             chat_split_selected: None,
             chat_tabs: Vec::new(),
             chat_tab: 0,
+            chat_tab_id: uuid::Uuid::new_v4(),
             chat_tab_scroll: gpui::ScrollHandle::new(),
             chat_tab_revealed: None,
             chat_tab_history: Vec::new(),
             closed_chat_tabs: Vec::new(),
+            chat_close_archive_tasks: std::collections::HashMap::new(),
+            chat_tab_unarchiving: std::collections::HashMap::new(),
             peer_chat_views: std::collections::HashMap::new(),
             chat_split_drag: None,
             boot_restored: false,
