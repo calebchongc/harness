@@ -8001,7 +8001,10 @@ impl Composer {
                     self.wizard = Some(Wizard::new(request_id, questions));
                     self.input
                         .update(cx, |input, cx| input.set_text(prefill, cx));
-                    self.wizard_expanded = false;
+                    // The active session's question opens immediately, even
+                    // when a narrow pane needs the anchored popover. Only a
+                    // deliberate dismissal keeps this request collapsed.
+                    self.wizard_expanded = true;
                     self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
@@ -9373,6 +9376,14 @@ impl Composer {
         cx.notify();
     }
 
+    fn question_needs_popover(&self, window: &Window) -> bool {
+        self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH) < QUESTION_INLINE_MIN_WIDTH
+            || self
+                .available_height
+                .unwrap_or(f32::from(window.viewport_size().height))
+                < QUESTION_INLINE_MIN_HEIGHT
+    }
+
     fn on_wizard_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Keys bubbling out of the free-text input must not double-handle:
         // digits select options only while the input is empty, and Enter is the
@@ -9399,7 +9410,7 @@ impl Composer {
                 cx.stop_propagation();
             }
         } else if key == "escape" {
-            if self.wizard_expanded {
+            if self.wizard_expanded && self.question_needs_popover(window) {
                 self.wizard_expanded = false;
                 window.focus(&self.wizard_focus, cx);
                 cx.notify();
@@ -10039,9 +10050,7 @@ impl Render for Composer {
             // compact launcher opens it in a popover anchored to this pane:
             // wide enough to read, without dimming or blocking other panes.
             let pane_width = self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH);
-            let narrow =
-                pane_width < QUESTION_INLINE_MIN_WIDTH || available < QUESTION_INLINE_MIN_HEIGHT;
-            if narrow {
+            if self.question_needs_popover(window) {
                 if !self.wizard_expanded && self.input.focus_handle(cx).is_focused(window) {
                     window.focus(&self.wizard_focus, cx);
                 }
@@ -10153,7 +10162,9 @@ impl Render for Composer {
                     .priority(3),
                 );
             }
-            self.wizard_expanded = false;
+            // Inline questions are visible too. Preserve that visibility if
+            // resizing later moves the same question into a popover.
+            self.wizard_expanded = true;
             let cap = (available * QUESTION_INLINE_SHARE)
                 .max(QUESTION_INLINE_FLOOR)
                 .min(available - Theme::SPACE_LG)
@@ -11547,6 +11558,126 @@ mod tests {
             handle
                 .read_with(cx, |composer, _| assert!(!composer.wizard_expanded))
                 .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn agent_question_opens_on_session_activation(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let mut visual = gpui::VisualTestContext::from_window(handle.into(), cx);
+        visual.simulate_resize(size(px(1000.0), px(600.0)));
+        let state = handle
+            .read_with(cx, |composer, _| composer.state.clone())
+            .unwrap();
+        let transcript = vec![SessionMessageEntry {
+            id: "assistant".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Input {
+                id: "input".into(),
+                request_id: "pending-question".into(),
+                questions: vec![
+                    question("branch", &["Yes", "No"], true),
+                    question("confirm", &["Yes", "No"], true),
+                ],
+                resolved: false,
+            }],
+            created_at: 0,
+            device_id: "device".into(),
+            status: Some(harness_doc::MessageStatus::Streaming),
+            continuation_of: None,
+            duration_ms: None,
+        }];
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.set_available_width(200.0, cx)
+            })
+            .unwrap();
+
+        // Both a warm snapshot and a question arriving after watch replay
+        // must open without a second click on the collapsed launcher.
+        for delayed in [false, true] {
+            state.update(cx, |state, cx| {
+                state.select_chat(Some("other".into()), cx);
+                state.transcript.clear();
+                cx.notify();
+            });
+            visual.run_until_parked();
+            state.update(cx, |state, cx| {
+                state.select_chat(Some("question-chat".into()), cx);
+                if !delayed {
+                    state.transcript = transcript.clone();
+                }
+                cx.notify();
+            });
+            visual.run_until_parked();
+            if delayed {
+                assert!(visual.debug_bounds("question-popover").is_none());
+                state.update(cx, |state, cx| {
+                    state.transcript = transcript.clone();
+                    cx.notify();
+                });
+            }
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert!(visual.debug_bounds("question-popover").is_some());
+            assert!(visual.debug_bounds("wizard-submit").is_some());
+
+            // Switching between inline and popover layouts must not silently
+            // dismiss the active question, whether width or height changes.
+            for (width, height, popover) in [
+                (260.0, 600.0, false),
+                (200.0, 600.0, true),
+                (260.0, 600.0, false),
+                (260.0, 140.0, true),
+                (200.0, 600.0, true),
+            ] {
+                handle
+                    .update(cx, |composer, _, cx| {
+                        composer.set_available_width(width, cx);
+                        composer.set_available_height(height, cx);
+                    })
+                    .unwrap();
+                visual.update(|window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear();
+                });
+                assert_eq!(
+                    visual.debug_bounds("question-popover").is_some(),
+                    popover,
+                    "{width}x{height}"
+                );
+                assert!(visual.debug_bounds("wizard-submit").is_some());
+                if !popover {
+                    // Escape still goes back a page inline; it must not
+                    // consume the key as though a popover were showing.
+                    handle
+                        .update(cx, |composer, window, cx| {
+                            composer.wizard.as_mut().unwrap().page = 1;
+                            window.focus(&composer.wizard_focus, cx);
+                        })
+                        .unwrap();
+                    cx.simulate_keystrokes(handle.into(), "escape");
+                    handle
+                        .read_with(cx, |composer, _| {
+                            assert_eq!(composer.wizard.as_ref().unwrap().page, 0);
+                        })
+                        .unwrap();
+                }
+            }
+
+            // Explicit collapse remains respected across unrelated updates,
+            // but leaving and returning to the session opens it again.
+            let close = visual.debug_bounds("question-close").unwrap();
+            visual.simulate_click(close.center(), Default::default());
+            state.update(cx, |_, cx| cx.notify());
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert!(visual.debug_bounds("question-popover").is_none());
+            assert!(visual.debug_bounds("question-expand").is_some());
         }
     }
 
