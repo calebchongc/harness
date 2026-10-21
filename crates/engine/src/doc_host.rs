@@ -3594,6 +3594,30 @@ impl DocHost {
         Ok(id)
     }
 
+    /// Recover accepted steers whose run failed, before publishing its terminal
+    /// status. They precede later queued work and keep their transcript IDs so
+    /// explicit retry cannot create a second user bubble.
+    pub(crate) fn hold_failed_steers(
+        &self,
+        chat_id: &str,
+        messages: &[QueuedMessage],
+    ) -> Result<(), EngineError> {
+        let handle = self.open(chat_id)?;
+        // Set the barrier before the first commit can wake a document drain.
+        // Do not await drain_lock here: an explicit send may own it while
+        // waiting for this run to settle.
+        handle.queue_paused.store(true, Ordering::Release);
+        let mut existing: HashSet<_> = handle.doc.read_queue()?.into_iter().map(|m| m.id).collect();
+        for message in messages.iter().rev() {
+            if existing.insert(message.id.clone()) {
+                handle.doc.insert_queued(0, message)?;
+            }
+        }
+        handle.publish_queue();
+        self.save_snapshot(&handle);
+        Ok(())
+    }
+
     /// Retype a queued message. Empty text deletes the row — emptying the box
     /// is how you say "drop it". `false` when the row is already gone.
     pub fn update_queued_message(
@@ -4120,10 +4144,12 @@ impl DocHost {
         // lock next re-reads the queue and the status, so a drain that became
         // unnecessary while it waited simply finds nothing to do.
         let _drain = handle.drain_lock.lock().await;
-        if handle.queue_paused.load(Ordering::Acquire) {
-            return;
-        }
         loop {
+            // A dispatched run can fail and pause delivery while this drain
+            // awaits dispatch. Recheck before taking every subsequent row.
+            if handle.queue_paused.load(Ordering::Acquire) {
+                return;
+            }
             let Ok(Some(head)) = handle.doc.read_queue().map(|q| q.into_iter().next()) else {
                 return;
             };
