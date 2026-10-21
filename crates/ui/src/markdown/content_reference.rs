@@ -295,13 +295,13 @@ impl Rewritten<'_> {
 
 pub(crate) fn rewrite(source: &str) -> Option<Rewritten<'_>> {
     let references = source.contains(CITATION) || source.contains(VISUALIZE);
-    let math = source.contains("\\(") || source.contains("\\[") || source.contains("$$");
+    let math = source.contains("\\(") || source.contains("\\[") || source.contains('$');
     if !references && !math {
         return None;
     }
     // Ask the same CommonMark parser which regions are literal. In particular,
     // an unclosed code fence must stay literal throughout streaming.
-    let protected: Vec<_> = Parser::new_ext(source, super::parser::options())
+    let mut protected: Vec<_> = Parser::new_ext(source, super::parser::options())
         .into_offset_iter()
         .filter_map(|(event, range)| match event {
             Event::Code(_)
@@ -385,6 +385,9 @@ pub(crate) fn rewrite(source: &str) -> Option<Rewritten<'_>> {
         at = end;
     }
     if math {
+        // A dollar in a directive payload must not consume an adjacent math
+        // opener before overlap resolution drops the directive's inner span.
+        protected.extend(spans.iter().map(|(range, _)| range.clone()));
         for span in super::math::spans(source, &protected) {
             spans.push((
                 span.range,
