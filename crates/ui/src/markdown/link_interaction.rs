@@ -370,6 +370,7 @@ impl Element for LinkRanges {
                             format!("{}-link-{index}-action-{action_ix}", self.id),
                         )
                         .id(label)
+                        .when(cfg!(test), |row| row.debug_selector(move || label.into()))
                         .child(icons::icon(icon).size(px(16.)).text_color(theme.text_muted))
                         .child(label)
                         .track_focus(&state.menu_focus[action_ix])
@@ -912,6 +913,119 @@ mod tests {
             );
         })
         .unwrap();
+    }
+    #[gpui::test]
+    fn pointer_context_menu_actions_reach_the_activation_handler(cx: &mut TestAppContext) {
+        struct MenuLink {
+            seen: Rc<RefCell<Vec<LinkActivation>>>,
+            top: f32,
+        }
+        impl gpui::Render for MenuLink {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                let seen = self.seen.clone();
+                div().size_full().child(
+                    div()
+                        .absolute()
+                        .top(px(self.top))
+                        .left(px(20.))
+                        .w(px(350.))
+                        .debug_selector(|| "context-menu-source".into())
+                        .child(
+                            super::super::render::autolinked_text(
+                                "menu-source".into(),
+                                "https://github.com/justrach/harness/issues/447".into(),
+                                Some(LinkUi {
+                                    source_session: Some("owner".into()),
+                                    handler: Rc::new(move |activation, _, _| {
+                                        seen.borrow_mut().push(activation.clone());
+                                        LinkOutcome::Rejected
+                                    }),
+                                }),
+                                &Theme::dark(),
+                            )
+                            .expect("fixture URL is linked"),
+                        ),
+                )
+            }
+        }
+        let _selection = super::super::selection::test_state_lock();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (view, cx) = cx.add_window_view(|_, _| MenuLink {
+            seen: seen.clone(),
+            top: 20.,
+        });
+        cx.simulate_resize(gpui::size(px(400.), px(300.)));
+        for top in [20., 240.] {
+            view.update(cx, |view, cx| {
+                view.top = top;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("context-menu-source").unwrap();
+            let source = bounds.origin + point(px(6.), px(13.));
+            for (label, action) in [
+                ("Open in Harness", LinkAction::Internal),
+                ("Open in external browser", LinkAction::External),
+                ("Copy link address", LinkAction::Copy),
+            ] {
+                cx.simulate_event(gpui::MouseMoveEvent {
+                    position: source,
+                    ..Default::default()
+                });
+                cx.run_until_parked();
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(650));
+                cx.run_until_parked();
+                cx.simulate_event(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position: source,
+                    click_count: 1,
+                    ..Default::default()
+                });
+                cx.simulate_event(MouseUpEvent {
+                    button: MouseButton::Right,
+                    position: source,
+                    click_count: 1,
+                    ..Default::default()
+                });
+                cx.run_until_parked();
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(200));
+                cx.run_until_parked();
+                let row = cx
+                    .debug_bounds(label)
+                    .expect("context-menu action is rendered");
+                let before = seen.borrow().len();
+                cx.simulate_click(row.center(), gpui::Modifiers::default());
+                cx.run_until_parked();
+                if action == LinkAction::Copy {
+                    cx.update(|_, cx| {
+                        assert_eq!(
+                            cx.read_from_clipboard().unwrap().text().as_deref(),
+                            Some("https://github.com/justrach/harness/issues/447")
+                        )
+                    });
+                } else {
+                    let seen = seen.borrow();
+                    assert_eq!(
+                        seen.len(),
+                        before + 1,
+                        "pointer click on {label} at y={top} must deliver an activation"
+                    );
+                    assert_eq!(seen.last().unwrap().action, action);
+                    assert_eq!(
+                        seen.last().unwrap().source_session.as_deref(),
+                        Some("owner")
+                    );
+                }
+            }
+        }
     }
     #[gpui::test]
     fn all_actions_keep_the_destination(cx: &mut TestAppContext) {

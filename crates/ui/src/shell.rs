@@ -3499,10 +3499,26 @@ impl Shell {
     ) -> crate::markdown::render::LinkOutcome {
         use crate::markdown::render::{LinkAction, LinkOutcome};
         if self.active_chat.is_empty()
-            || activation.source_session.as_deref() != Some(self.active_chat.as_str())
             || self.state.read(cx).selected_chat.as_deref() != Some(self.active_chat.as_str())
         {
             return LinkOutcome::Rejected;
+        }
+        let Some(source) = activation.source_session.as_deref() else {
+            return LinkOutcome::Rejected;
+        };
+        if source != self.active_chat {
+            // A peer's context menu does not focus its pane. Authorize web
+            // navigation from a currently rendered peer, not a cached/hidden
+            // transcript. Workspace resources still require their owner to be
+            // focused so they cannot resolve in another chat's workspace.
+            let visible_peer = matches!(self.route, Route::Chat)
+                && self.chat_split.as_ref().is_some_and(|split| {
+                    !split.zoomed && split.peer_chats().any(|id| id == source)
+                })
+                && self.peer_chat_views.contains_key(source);
+            if !visible_peer || activation.target.navigation.is_err() {
+                return LinkOutcome::Rejected;
+            }
         }
         if let Some(request) =
             crate::markdown::content_reference::html_preview(&activation.target.original)
@@ -16101,6 +16117,83 @@ mod exit_regressions {
                     shell.activate_session_link(&activation, window, cx),
                     LinkOutcome::External(issue_url.into())
                 );
+                // Peer transcripts retain their own source even when another
+                // pane owns the composer. Both explicit menu actions must work.
+                shell.route = Route::Chat;
+                shell.chat_split = chat_split::ChatSplit::split(
+                    None,
+                    SplitAxis::Horizontal,
+                    Some("visible-peer".into()),
+                    None,
+                );
+                shell.sync_chat_panes(cx);
+                activation.source_session = shell.peer_chat_views["visible-peer"]
+                    .transcript
+                    .read(cx)
+                    .link_ui()
+                    .unwrap()
+                    .source_session;
+                let before = shell.browsers.len();
+                for action in [
+                    LinkAction::Primary,
+                    LinkAction::External,
+                    LinkAction::Internal,
+                ] {
+                    activation.action = action;
+                    let expected = if action == LinkAction::Internal {
+                        LinkOutcome::Internal
+                    } else {
+                        LinkOutcome::External(issue_url.into())
+                    };
+                    assert_eq!(
+                        shell.activate_session_link(&activation, window, cx),
+                        expected
+                    );
+                }
+                assert_eq!(shell.browsers.len(), before + 1);
+                assert_eq!(shell.active_chat, "first-session");
+
+                shell.chat_split.as_mut().unwrap().zoomed = true;
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+                shell.chat_split.as_mut().unwrap().zoomed = false;
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("switch-in-progress".into())
+                });
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("first-session".into())
+                });
+                let split = shell.chat_split.take();
+                assert!(shell.peer_chat_views.contains_key("visible-peer"));
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+                shell.chat_split = split;
+                shell.route = Route::Settings(SettingsSection::Devices);
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+                shell.route = Route::Chat;
+                for destination in [
+                    "README.md",
+                    "\u{e200}visualize\u{e202}{\"path\":\"/workspace/design.html\"}\u{e201}",
+                ] {
+                    activation.target = LinkTarget::new("Peer resource", destination);
+                    assert_eq!(
+                        shell.activate_session_link(&activation, window, cx),
+                        LinkOutcome::Rejected,
+                        "peer resources must not resolve in the focused chat's workspace"
+                    );
+                }
+                assert_eq!(shell.browsers.len(), before + 1);
                 let weak = shell.browsers[&first].downgrade();
                 shell.close_right_surface(RightSurface::Browser(first), window, cx);
                 weak
