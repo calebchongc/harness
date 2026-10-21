@@ -118,6 +118,7 @@ fn inline_dollar_end(source: &str, start: usize, protected: &[Range<usize>]) -> 
         let body = &source[body_start..close];
         let end = close + 1;
         return (!body.is_empty()
+            && !price_before_parenthesis(body)
             && !body.ends_with(char::is_whitespace)
             && !source[end..].starts_with(|c: char| c == '$' || c.is_numeric())
             && !source[end..]
@@ -127,6 +128,24 @@ fn inline_dollar_end(source: &str, start: usize, protected: &[Range<usize>]) -> 
         .then_some(end);
     }
     None
+}
+
+/// Prefer a price in `pay $5 ($x^2$)`: otherwise the amount and opening
+/// parentheses steal the equation's opening dollar. A bare `$5$` and complete
+/// mathematical expressions such as `$5 (x)$` remain valid inline math.
+fn price_before_parenthesis(body: &str) -> bool {
+    if !body.starts_with(char::is_numeric)
+        && !body
+            .strip_prefix('.')
+            .is_some_and(|tail| tail.starts_with(char::is_numeric))
+    {
+        return false;
+    }
+    let rest = body.trim_start_matches(|c: char| c.is_numeric() || matches!(c, '.' | ','));
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, '(' | '[' | '{'))
 }
 
 /// CommonMark also treats CR and whitespace-only lines as paragraph breaks.

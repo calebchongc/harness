@@ -336,6 +336,90 @@ fn generated_delimiter_sequences_keep_ranges_and_incremental_parsing_sound() {
 }
 
 #[test]
+fn parenthesized_formulas_after_prices_keep_their_own_opener() {
+    for source in [
+        "Pay $5 ($x^2$).",
+        "Pay $.50 ($x^2$).",
+        "Pay $1,000 [ $x^2$ ].",
+        "Pay $５ (($x^2$)).",
+        "Pay $٥ {$x^2$}.",
+    ] {
+        assert_eq!(formulas(source), [("x^2".into(), false)], "{source}");
+        let expected = source.replace("$x^2$", "x²");
+        assert_eq!(tree_text(&parse_full(source)), expected, "{source}");
+        let mut parser = IncrementalParser::new();
+        for (at, c) in source.char_indices() {
+            let end = at + c.len_utf8();
+            parser.set_text(&source[..end]);
+            assert_eq!(
+                parser.tree(),
+                &parse_full(&source[..end]),
+                "{end}: {source}"
+            );
+        }
+        assert_eq!(tree_text(parser.tree()), expected);
+    }
+    for latex in ["5", "5 (x)", "5 [x]", "5 {x}", "5 + x", "0.5", "2 x"] {
+        assert_eq!(formulas(&format!("${latex}$")), [(latex.into(), false)]);
+    }
+}
+
+#[test]
+fn reference_definition_destinations_and_titles_remain_literal() {
+    use crate::markdown::content_reference::rewrite;
+    for (definition, destination) in [
+        (
+            "[ref]: https://example.test/$x$",
+            "https://example.test/$x$",
+        ),
+        (
+            "[ref]: https://example.test \"Formula $x$\"",
+            "https://example.test",
+        ),
+        (
+            "[ref]: <https://example.test/$x$>\n  'Title $y$'",
+            "https://example.test/$x$",
+        ),
+        (
+            "[ref]:\n  https://example.test/$x$",
+            "https://example.test/$x$",
+        ),
+    ] {
+        let literal = format!("Read [docs][ref].\n\n{definition}\n");
+        assert!(rewrite(&literal).is_none(), "{literal}");
+        let source = format!("{literal}\nNow $z^2$.\n");
+        let rewritten = rewrite(&source).unwrap();
+        assert!(rewritten.text.contains(definition), "{source}");
+        let tree = parse_full(&source);
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("paragraph missing")
+        };
+        let link = runs.iter().find(|run| run.text == "docs").unwrap();
+        assert_eq!(link.style.link.as_deref(), Some(destination), "{source}");
+        assert!(tree_text(&tree).ends_with("Now z²."));
+        let mut parser = IncrementalParser::new();
+        for (at, c) in source.char_indices() {
+            let end = at + c.len_utf8();
+            parser.set_text(&source[..end]);
+            assert_eq!(
+                parser.tree(),
+                &parse_full(&source[..end]),
+                "{end}: {source}"
+            );
+        }
+        assert_eq!(parser.tree(), &tree);
+    }
+}
+
+#[test]
+fn escaped_dollars_can_touch_math_closers() {
+    assert_eq!(formulas(r"$x\$$"), [(r"x\$".into(), false)]);
+    assert_eq!(formulas(r"$$x\$$$"), [(r"x\$".into(), true)]);
+    assert_eq!(tree_text(&parse_full(r"$x\$$")), "x$");
+    assert_eq!(tree_text(&parse_full(r"$$x\$$$")), "x$");
+}
+
+#[test]
 fn every_streaming_prefix_matches_a_full_parse_including_unicode() {
     for source in [
         "Price $5 or $10; α uses $x_i$ and $\\sigma/\\sqrt m$.\n\nNext $y$.",
