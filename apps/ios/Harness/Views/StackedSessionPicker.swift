@@ -1,5 +1,5 @@
 // The lower pane of the phone's stacked split before it shows a session: the same session rows as Home's list,
-// searchable, without the session already open above. Picking one opens it in this pane; + starts a new session
+// archived shelf included, searchable, without the session already open above. Picking one opens it in this pane; + starts a new session
 // for the project above; × closes the pane.
 
 import SwiftUI
@@ -24,7 +24,7 @@ struct StackedSessionPicker: View {
 
     var body: some View {
         List {
-            if chats.isEmpty {
+            if chats.isEmpty, model.archivedMatches(in: nil, query: query).allSatisfy({ $0.id == excluding }) {
                 Text(query.isEmpty ? "No other sessions" : "No matching sessions")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
@@ -37,6 +37,10 @@ struct StackedSessionPicker: View {
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
             }
+            // An archived session opens here too, as it does from Home's shelf.
+            ArchivedSection(query: query, excluding: excluding, path: Binding(get: { [] }, set: { routes in
+                if case .chat(let id)? = routes.last { pick(id) }
+            }))
         }
         .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search sessions")
         .listStyle(.plain)

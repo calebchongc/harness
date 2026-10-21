@@ -60,8 +60,11 @@ struct HomeView: View {
         showSplitOffer = splitSuggestion.shouldOffer(context, now: Date().timeIntervalSince1970)
     }
 
+    /// The split the offer would turn on for this window: Auto when it is wide, Stacked on a phone in portrait.
+    private var offeredSplit: PhoneSplit { SplitSuggestion.offeredMode(for: containerSize) ?? .auto }
+
     private func answerSplitOffer(tryIt: Bool) {
-        if tryIt { phoneSplitRaw = PhoneSplit.auto.rawValue }
+        if tryIt { phoneSplitRaw = offeredSplit.rawValue }
         splitSuggestion.markShown(at: Date().timeIntervalSince1970)
         splitSuggestion.save()
         showSplitOffer = false
@@ -363,13 +366,22 @@ struct HomeView: View {
     }
 
     private var sidebar: some View {
-        List {
-            sessionsSection
-            // The desktop's archived shelf sits under the active list,
-            // scoped by the same space filter and search. Archived sessions
-            // are never running or waiting, so a status filter hides it.
-            if statusFilter == .all {
-                ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
+        ScrollViewReader { proxy in
+            List {
+                sessionsSection
+                // The desktop's archived shelf sits under the active list,
+                // scoped by the same space filter and search. Archived sessions
+                // are never running or waiting, so a status filter hides it.
+                if statusFilter == .all {
+                    ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
+                }
+            }
+            // In a split the list shrinks as the session opens below it, and the opened row was left cut in
+            // half at the divider. Once the panes settle, bring the whole row into view.
+            .task(id: selectedChatId) {
+                guard let id = selectedChatId else { return }
+                try? await Task.sleep(for: .milliseconds(400))
+                withAnimation(Motion.collapse) { proxy.scrollTo(id) }
             }
         }
         // In the phone split the field sits in the pane's own bar: the floating one overlaps the rows of a
@@ -675,7 +687,7 @@ struct HomeView: View {
         let grouping = HomeGroupBy(rawValue: groupByRaw) ?? .none
         if showSplitOffer {
             Section {
-                SplitOfferBanner(tryIt: { answerSplitOffer(tryIt: true) },
+                SplitOfferBanner(mode: offeredSplit, tryIt: { answerSplitOffer(tryIt: true) },
                                  notNow: { answerSplitOffer(tryIt: false) })
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
