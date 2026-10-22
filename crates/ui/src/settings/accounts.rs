@@ -25,8 +25,8 @@ use harness_rpc::methods;
 
 use crate::codegraff_jobs::{CodegraffJob, job_active, job_summary};
 use crate::codegraff_sandboxes::{
-    TURN_OFF, TURN_OFF_HINT, can_keep_running, can_start, can_stop, sandbox_detail, sandbox_title,
-    start_labels,
+    CREATE_COPY, TURN_OFF, TURN_OFF_HINT, can_keep_running, can_start, can_stop, sandbox_detail,
+    sandbox_title, selected_size, size_detail, size_title, start_labels,
 };
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
@@ -357,6 +357,8 @@ pub struct AccountsPage {
     /// Delete asks for a second click.
     sandbox_confirm_delete: Option<String>,
     creating_sandbox: bool,
+    /// The size picked for the next cloud sandbox (`None`: the default one).
+    sandbox_size: Option<String>,
     /// Sign out of Codegraff is in flight.
     codegraff_signing_out: bool,
     /// Account id with an in-flight Switch/Forget.
@@ -408,6 +410,7 @@ impl AccountsPage {
             sandbox_busy: None,
             sandbox_confirm_delete: None,
             creating_sandbox: false,
+            sandbox_size: None,
             codegraff_signing_out: false,
             busy_account: None,
             graff_logins: Loadable::Idle,
@@ -804,12 +807,20 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        // The size picked, as the list offers it (none on gateways without sizes).
+        let size = self.state.read(cx).cloud_sandboxes().and_then(|list| {
+            selected_size(&list.sizes, self.sandbox_size.as_deref()).map(|s| s.id.clone())
+        });
+        let params = match size {
+            Some(size) => serde_json::json!({ "size": size }),
+            None => serde_json::json!({}),
+        };
         self.creating_sandbox = true;
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::CODEGRAFF_CREATE_SANDBOX, serde_json::json!({}))
+                .call(methods::CODEGRAFF_CREATE_SANDBOX, params)
                 .await;
             this.update(cx, |page, cx| {
                 page.creating_sandbox = false;
@@ -1011,6 +1022,69 @@ impl AccountsPage {
                 .child(delete)
         });
         let creating = self.creating_sandbox;
+        let picked = selected_size(&list.sizes, self.sandbox_size.as_deref()).map(|s| s.id.clone());
+        // Standard / Large with what each is and costs; the default one preselected.
+        let size_choice = (!list.sizes.is_empty()).then(|| {
+            div()
+                .mt(px(8.0))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .children(list.sizes.iter().enumerate().map(|(ix, size)| {
+                    let selected = picked.as_deref() == Some(size.id.as_str());
+                    let id = size.id.clone();
+                    div()
+                        .id(("codegraff-sandbox-size", ix))
+                        .debug_selector(move || format!("codegraff-sandbox-size-{ix}"))
+                        .flex_none()
+                        .min_w(px(180.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(if selected {
+                            theme.accent.opacity(0.6)
+                        } else {
+                            theme.border
+                        })
+                        .bg(if selected {
+                            theme.accent_wash
+                        } else {
+                            crate::theme::ink(0.02)
+                        })
+                        .role(gpui::Role::RadioButton)
+                        .aria_label(SharedString::from(format!(
+                            "{} {}",
+                            size_title(size),
+                            size_detail(size)
+                        )))
+                        .when(!creating, |el| {
+                            el.cursor_pointer()
+                                .hover(|s| s.bg(crate::theme::ink(0.05)))
+                                .on_click(cx.listener(move |page, _, _, cx| {
+                                    page.sandbox_size = Some(id.clone());
+                                    cx.notify();
+                                }))
+                        })
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(size_title(size))),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(size_detail(size))),
+                        )
+                }))
+        });
         let create = div()
             .id("codegraff-sandbox-create-row")
             .px(px(20.0))
@@ -1034,10 +1108,11 @@ impl AccountsPage {
                             .mt(px(2.0))
                             .text_size(crate::typography::ui_rems(11.5))
                             .text_color(theme.text_muted)
-                            .child(
-                                "A machine that runs Harness for you and shows up in your devices. It keeps running, billed per second from your Codegraff credit, until you turn it off.",
-                            ),
-                    ),
+                            .child(format!(
+                                "A machine that runs Harness for you and shows up in your devices. {CREATE_COPY}"
+                            )),
+                    )
+                    .children(size_choice),
             )
             .child(
                 widgets::ghost_action(theme)

@@ -4,6 +4,10 @@
 //! can be started, a running one turned off (or, if Harness was never set up in it, set up), and
 //! any of them deleted. A running sandbox costs credit until it is turned off, so
 //! [`running_summary`] also drives the always-visible "Cloud sandbox running" strip.
+//!
+//! Gateways that know sizes say what each sandbox is (vCPU, memory) and what it costs per hour;
+//! every view shows that rate ("$0.10/h", summed over running sandboxes) and a create offers the
+//! sizes. Older gateways say neither, and every text reads as it did before.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -28,6 +32,29 @@ pub struct CodegraffSandbox {
     pub keep_running: Option<bool>,
     /// Why the last renewal failed; it pauses when its current window ends.
     pub renew_error: Option<String>,
+    /// Its machine, when the gateway says.
+    pub cpu: Option<f64>,
+    #[serde(rename = "memoryGiB")]
+    pub memory_gib: Option<f64>,
+    #[serde(rename = "diskGiB")]
+    pub disk_gib: Option<f64>,
+    /// What it costs per hour while running, in micro-USD.
+    pub price_per_hour_micro_usd: Option<i64>,
+}
+
+/// One size a new sandbox can be.
+#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PersonalSize {
+    /// `standard`, `large`, …
+    pub id: String,
+    pub cpu: u32,
+    #[serde(rename = "memoryGiB")]
+    pub memory_gib: u32,
+    #[serde(rename = "diskGiB")]
+    pub disk_gib: u32,
+    pub price_per_hour_micro_usd: Option<i64>,
+    pub default: bool,
 }
 
 /// `enabled: false` means this build doesn't offer cloud sandboxes.
@@ -36,6 +63,92 @@ pub struct CodegraffSandbox {
 pub struct CodegraffSandboxes {
     pub enabled: bool,
     pub sandboxes: Vec<CodegraffSandbox>,
+    /// The sizes a new sandbox can be; empty on gateways without sizes (no size choice shown).
+    pub sizes: Vec<PersonalSize>,
+}
+
+/// What a create says it costs, under the size choice.
+pub const CREATE_COPY: &str =
+    "Keeps running until you turn it off. Billed per second from your Codegraff credit.";
+
+/// An hourly price: "$0.10/h", "$0.125/h", "$1.50/h". Pure.
+pub fn format_rate(micro_usd: i64) -> String {
+    let dollars = micro_usd.max(0) as f64 / 1_000_000.0;
+    let mut text = format!("{dollars:.3}");
+    // Cents always show; a third decimal only when it says something.
+    if text.ends_with('0') {
+        text.pop();
+    }
+    format!("${text}/h")
+}
+
+/// "4 GB", "0.5 GB".
+fn format_gb(gib: f64) -> String {
+    if gib.fract() == 0.0 {
+        format!("{gib:.0} GB")
+    } else {
+        format!("{} GB", (gib * 10.0).round() / 10.0)
+    }
+}
+
+/// "2 vCPU · 4 GB" when both are known. Pure.
+pub fn machine_spec(cpu: Option<f64>, memory_gib: Option<f64>) -> Option<String> {
+    let (cpu, memory) = (cpu.filter(|c| *c > 0.0)?, memory_gib.filter(|m| *m > 0.0)?);
+    let cpu = if cpu.fract() == 0.0 {
+        format!("{cpu:.0}")
+    } else {
+        cpu.to_string()
+    };
+    Some(format!("{cpu} vCPU · {}", format_gb(memory)))
+}
+
+/// "Standard", "Large", or the id capitalised. Pure.
+pub fn size_title(size: &PersonalSize) -> String {
+    capitalize(size.id.trim())
+}
+
+/// "2 vCPU · 4 GB · 40 GB · $0.10/h". Pure.
+pub fn size_detail(size: &PersonalSize) -> String {
+    let mut parts = vec![
+        machine_spec(Some(f64::from(size.cpu)), Some(f64::from(size.memory_gib)))
+            .unwrap_or_default(),
+    ];
+    if size.disk_gib > 0 {
+        parts.push(format_gb(f64::from(size.disk_gib)));
+    }
+    if let Some(price) = size.price_per_hour_micro_usd {
+        parts.push(format_rate(price));
+    }
+    parts.retain(|part| !part.is_empty());
+    parts.join(" · ")
+}
+
+/// The size a create uses: the one picked, else the default (else the first). `None` when the
+/// gateway offers no sizes. Pure.
+pub fn selected_size<'a>(
+    sizes: &'a [PersonalSize],
+    picked: Option<&str>,
+) -> Option<&'a PersonalSize> {
+    picked
+        .and_then(|id| sizes.iter().find(|s| s.id == id))
+        .or_else(|| sizes.iter().find(|s| s.default))
+        .or_else(|| sizes.first())
+}
+
+/// What the running (and starting) sandboxes cost together per hour, when every one of them
+/// says. Pure.
+pub fn running_rate(list: &CodegraffSandboxes) -> Option<i64> {
+    let live: Vec<&CodegraffSandbox> = list
+        .sandboxes
+        .iter()
+        .filter(|s| matches!(s.state.as_str(), "running" | "starting"))
+        .collect();
+    if live.is_empty() {
+        return None;
+    }
+    live.iter()
+        .map(|s| s.price_per_hour_micro_usd)
+        .sum::<Option<i64>>()
 }
 
 pub fn sandbox_title(sandbox: &CodegraffSandbox) -> String {
@@ -123,11 +236,16 @@ pub fn sandbox_detail(sandbox: &CodegraffSandbox, now: DateTime<Utc>) -> String 
         other => other.to_string(),
     }];
     if sandbox.state == "running" {
-        if sandbox.harness {
-            parts.push("Harness ready".into());
-        } else {
+        let spec = machine_spec(sandbox.cpu, sandbox.memory_gib);
+        let rate = sandbox.price_per_hour_micro_usd.map(format_rate);
+        // With its machine and rate to say, a ready sandbox goes without "Harness ready".
+        if !sandbox.harness {
             parts.push("Harness not set up".into());
+        } else if spec.is_none() && rate.is_none() {
+            parts.push("Harness ready".into());
         }
+        parts.extend(spec);
+        parts.extend(rate);
         if let Some(outlook) = running_outlook(sandbox, now) {
             parts.push(outlook);
         }
@@ -140,7 +258,8 @@ const BILLED: &str = "Billed per second until you turn it off";
 /// What the always-visible strip says while sandboxes cost credit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunningSummary {
-    /// "Cloud sandbox running" / "2 cloud sandboxes running".
+    /// "Cloud sandbox running · $0.10/h" / "2 cloud sandboxes running · $0.20/h" (the rate when
+    /// every running sandbox says what it costs).
     pub label: String,
     /// "Billed per second until you turn it off", "Pauses in 24 min", or a failed renewal.
     pub detail: String,
@@ -164,11 +283,14 @@ pub fn running_summary(list: &CodegraffSandboxes, now: DateTime<Utc>) -> Option<
     if live.is_empty() {
         return None;
     }
-    let label = match live.len() {
+    let mut label = match live.len() {
         1 if live[0].state == "starting" => "Cloud sandbox starting".to_string(),
         1 => "Cloud sandbox running".to_string(),
         n => format!("{n} cloud sandboxes running"),
     };
+    if let Some(rate) = running_rate(list) {
+        label = format!("{label} · {}", format_rate(rate));
+    }
     let running: Vec<&CodegraffSandbox> = live.iter().copied().filter(|s| can_stop(s)).collect();
     // The most pressing word wins: a failed renewal, then a window about to end, then billing.
     let problem = running
@@ -258,6 +380,7 @@ mod tests {
             device_name: None,
             keep_running: None,
             renew_error: None,
+            ..Default::default()
         }
     }
 
@@ -330,6 +453,7 @@ mod tests {
         CodegraffSandboxes {
             enabled: true,
             sandboxes,
+            sizes: Vec::new(),
         }
     }
 
@@ -512,6 +636,162 @@ mod tests {
         let off: Option<CodegraffSandboxes> =
             serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(!off.unwrap().enabled);
+    }
+
+    fn priced(id: &str, state: &str, price: Option<i64>) -> CodegraffSandbox {
+        CodegraffSandbox {
+            id: id.into(),
+            keep_running: Some(true),
+            price_per_hour_micro_usd: price,
+            cpu: Some(2.0),
+            memory_gib: Some(4.0),
+            ..sandbox(state, true, None)
+        }
+    }
+
+    #[test]
+    fn rates_read_as_dollars_per_hour() {
+        assert_eq!(format_rate(100_000), "$0.10/h");
+        assert_eq!(format_rate(125_000), "$0.125/h");
+        assert_eq!(format_rate(2_000_000), "$2.00/h");
+        assert_eq!(format_rate(-5), "$0.00/h");
+        assert_eq!(
+            machine_spec(Some(2.0), Some(4.0)).as_deref(),
+            Some("2 vCPU · 4 GB")
+        );
+        assert_eq!(
+            machine_spec(Some(0.5), Some(0.5)).as_deref(),
+            Some("0.5 vCPU · 0.5 GB")
+        );
+        assert_eq!(machine_spec(Some(2.0), None), None);
+        assert_eq!(machine_spec(None, Some(4.0)), None);
+    }
+
+    #[test]
+    fn running_rows_show_the_machine_and_rate_instead_of_harness_ready() {
+        let row = priced("cnd_1", "running", Some(100_000));
+        assert_eq!(
+            sandbox_detail(&row, at(12, 0)),
+            "Running · 2 vCPU · 4 GB · $0.10/h · keeps running until you turn it off"
+        );
+        let mut unready = row.clone();
+        unready.harness = false;
+        assert!(
+            sandbox_detail(&unready, at(12, 0))
+                .starts_with("Running · Harness not set up · 2 vCPU · 4 GB · $0.10/h")
+        );
+        let mut unpriced = row.clone();
+        unpriced.price_per_hour_micro_usd = None;
+        assert_eq!(
+            sandbox_detail(&unpriced, at(12, 0)),
+            "Running · 2 vCPU · 4 GB · keeps running until you turn it off"
+        );
+    }
+
+    #[test]
+    fn the_strip_adds_the_summed_rate_only_when_every_running_one_has_a_price() {
+        let now = at(12, 0);
+        let one = running_summary(&list(vec![priced("a", "running", Some(100_000))]), now).unwrap();
+        assert_eq!(one.label, "Cloud sandbox running · $0.10/h");
+        assert_eq!(
+            compact_tooltip(&one),
+            "Cloud sandbox running · $0.10/h — billed per second"
+        );
+        let two = running_summary(
+            &list(vec![
+                priced("a", "running", Some(100_000)),
+                priced("b", "running", Some(200_000)),
+                priced("c", "paused", Some(900_000)),
+            ]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(two.label, "2 cloud sandboxes running · $0.30/h");
+        let partly = list(vec![
+            priced("a", "running", Some(100_000)),
+            priced("b", "running", None),
+        ]);
+        assert_eq!(running_rate(&partly), None);
+        assert_eq!(
+            running_summary(&partly, now).unwrap().label,
+            "2 cloud sandboxes running"
+        );
+        let starting =
+            running_summary(&list(vec![priced("a", "starting", Some(100_000))]), now).unwrap();
+        assert_eq!(starting.label, "Cloud sandbox starting · $0.10/h");
+        assert_eq!(running_rate(&list(vec![])), None);
+    }
+
+    #[test]
+    fn a_create_offers_the_sizes_with_the_default_preselected() {
+        let sizes: Vec<PersonalSize> = serde_json::from_value(serde_json::json!([
+            {"id": "standard", "cpu": 2, "memoryGiB": 4, "diskGiB": 40,
+             "pricePerHourMicroUsd": 100000, "default": true},
+            {"id": "large", "cpu": 4, "memoryGiB": 8, "diskGiB": 40,
+             "pricePerHourMicroUsd": 200000}
+        ]))
+        .unwrap();
+        assert_eq!(selected_size(&sizes, None).unwrap().id, "standard");
+        assert_eq!(selected_size(&sizes, Some("large")).unwrap().id, "large");
+        assert_eq!(selected_size(&sizes, Some("gone")).unwrap().id, "standard");
+        assert_eq!(selected_size(&[], None), None);
+        assert_eq!(size_title(&sizes[1]), "Large");
+        assert_eq!(size_detail(&sizes[0]), "2 vCPU · 4 GB · 40 GB · $0.10/h");
+        let bare = PersonalSize {
+            id: "x".into(),
+            cpu: 1,
+            memory_gib: 2,
+            ..Default::default()
+        };
+        assert_eq!(size_detail(&bare), "1 vCPU · 2 GB");
+        let parsed: CodegraffSandboxes = serde_json::from_value(serde_json::json!({
+            "enabled": true, "sandboxes": [], "sizes": sizes_json()
+        }))
+        .unwrap();
+        assert_eq!(parsed.sizes.len(), 2);
+    }
+
+    fn sizes_json() -> Value {
+        vector()["personalSizes"]["sizes"].clone()
+    }
+
+    fn vector() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../apps/parity/vectors/cloud-sandbox.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_shared_vector_rates_sizes_and_summaries() {
+        let vector = vector();
+        for case in vector["rates"].as_array().unwrap() {
+            assert_eq!(
+                format_rate(case["microUsd"].as_i64().unwrap()),
+                case["text"].as_str().unwrap()
+            );
+        }
+        for case in vector["sizeChoices"].as_array().unwrap() {
+            let size: PersonalSize = serde_json::from_value(case["size"].clone()).unwrap();
+            assert_eq!(size_title(&size), case["title"].as_str().unwrap());
+            assert_eq!(size_detail(&size), case["detail"].as_str().unwrap());
+        }
+        let now = DateTime::from_timestamp(vector["now"].as_i64().unwrap(), 0).unwrap();
+        for case in vector["summaries"].as_array().unwrap() {
+            let list = CodegraffSandboxes {
+                enabled: true,
+                sandboxes: serde_json::from_value(case["sandboxes"].clone()).unwrap(),
+                sizes: Vec::new(),
+            };
+            let summary = running_summary(&list, now).unwrap();
+            assert_eq!(summary.label, case["label"].as_str().unwrap(), "{case}");
+            assert_eq!(summary.detail, case["detail"].as_str().unwrap(), "{case}");
+            assert_eq!(
+                compact_tooltip(&summary),
+                case["tooltip"].as_str().unwrap(),
+                "{case}"
+            );
+        }
     }
 
     #[test]

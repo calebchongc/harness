@@ -274,6 +274,7 @@ mod tests {
                 keep_running: Some(true),
                 ..Default::default()
             }],
+            ..Default::default()
         })
     }
 
