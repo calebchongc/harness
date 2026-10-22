@@ -294,6 +294,74 @@ fn selecting_in_an_inactive_pane_activates_and_preserves_selection(cx: &mut gpui
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui::test]
+fn peer_link_menu_actions_open_the_requested_destination(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    let url = "https://example.com/split-link";
+    for canvas in [false, true] {
+        for label in ["Open in Harness", "Open in external browser"] {
+            with_panes(
+                cx,
+                vec![reply(&format!("[Documentation]({url})"))],
+                |shell, peer, _, cx| {
+                    // This fixture renders the panes directly, not Shell's
+                    // normal render path that synchronizes its active chat.
+                    shell.update(cx, |shell, cx| {
+                        shell.on_state_changed(&shell.state.clone(), cx);
+                    });
+                    if canvas {
+                        shell.update(cx, |shell, cx| {
+                            shell
+                                .state
+                                .update(cx, |state, cx| state.select_chat(None, cx));
+                            shell.on_state_changed(&shell.state.clone(), cx);
+                        });
+                        draw(cx);
+                    }
+                    let source = text_point(&peer, "reply#text.0:0");
+                    cx.simulate_mouse_move(source, None, Default::default());
+                    cx.background_executor
+                        .advance_clock(std::time::Duration::from_millis(650));
+                    draw(cx);
+                    cx.simulate_mouse_down(source, MouseButton::Right, Default::default());
+                    cx.simulate_mouse_up(source, MouseButton::Right, Default::default());
+                    draw(cx);
+                    cx.background_executor
+                        .advance_clock(std::time::Duration::from_millis(200));
+                    draw(cx);
+                    let row = cx.debug_bounds(label).expect("painted link menu action");
+                    cx.simulate_click(row.center(), Default::default());
+                    draw(cx);
+                    if label == "Open in external browser" {
+                        assert_eq!(cx.opened_url().as_deref(), Some(url));
+                    } else {
+                        shell.read_with(cx, |shell, cx| {
+                            assert!(
+                                shell.right_pane_open(cx),
+                                "{label}, canvas={canvas}: active={}, selected={:?}, focus={}, browsers={}, chat_route={}",
+                                shell.active_chat,
+                                shell.state.read(cx).selected_chat,
+                                shell.chat_split.as_ref().unwrap().focus,
+                                shell.browsers.len(),
+                                matches!(shell.route, Route::Chat)
+                            );
+                            assert_eq!(
+                                shell.browsers[&shell.browser_seq]
+                                    .read(cx)
+                                    .page
+                                    .url
+                                    .as_deref(),
+                                Some(url)
+                            );
+                        });
+                    }
+                },
+            );
+        }
+    }
+}
+
 #[gpui::test]
 fn every_mouse_button_activates_an_inactive_pane_on_release(cx: &mut gpui::TestAppContext) {
     let _selection = selection::test_state_lock();
