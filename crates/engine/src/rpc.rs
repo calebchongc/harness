@@ -1113,7 +1113,13 @@ impl EngineRpc {
                 match archive_requested_at.filter(|_| archived) {
                     Some(at) => self.workspace.archive_chat_at(&chat_id, at),
                     None => self.workspace.set_chat_archived(&chat_id, archived),
-                }.map_err(failed).map(drop)
+                }
+                .map_err(failed)?;
+                // A person's restore lets peer mail held while archived out (#498).
+                if !archived {
+                    self.doc_host.kick_queue(&chat_id);
+                }
+                Ok(())
             }
             MutateParams::ChangeSidebarPin { change } => {
                 self.workspace.change_sidebar_pin(&change).map_err(failed)

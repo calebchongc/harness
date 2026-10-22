@@ -2784,13 +2784,13 @@ impl Shell {
                     .sessions
                     .iter()
                     .map(|s| {
-                        let status = crate::sound::SessionNotificationState::new(s, now);
+                        let chat = state.chats.iter().find(|c| c.id == s.chat_id);
+                        // Archived chats and peer-only turns consume their
+                        // completion silently (#499).
+                        let archived = chat.is_some_and(|c| c.archived);
+                        let status = crate::sound::SessionNotificationState::new(s, archived, now);
                         let send_pending = state.send_pending(&s.chat_id, now);
-                        let title = state
-                            .chats
-                            .iter()
-                            .find(|c| c.id == s.chat_id)
-                            .and_then(|c| c.title.clone());
+                        let title = chat.and_then(|c| c.title.clone());
                         (s.chat_id.clone(), status, send_pending, title)
                     })
                     .collect();
