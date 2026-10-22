@@ -77,6 +77,7 @@ mod reauth;
 mod sidebar_pins;
 mod sidebar_sections;
 mod spaces;
+mod stale_input;
 mod tabs;
 #[cfg(test)]
 mod titlebar_tests;
@@ -12575,6 +12576,7 @@ impl Render for Shell {
                 }),
             )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
+            .map(stale_input::coalesce_late_layout_commands)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
