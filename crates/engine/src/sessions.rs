@@ -1830,7 +1830,7 @@ impl Inner {
     }
 
     fn resume_candidates(&self, chat_id: &str, cwd: &str) -> Option<String> {
-        let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || session_cwd == cwd;
+        let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || same_dir(session_cwd, cwd);
         if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
             return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
                 .then_some(known.session_id);
@@ -1945,6 +1945,18 @@ fn is_active(session: &Session) -> bool {
         session.status,
         SessionStatus::Working | SessionStatus::AwaitingInput
     )
+}
+
+/// Whether two cwds name the same folder. Agents report their session cwd with
+/// symlinks resolved (Claude Code records `/private/tmp/x` for a chat in
+/// `/tmp/x`), so a plain string compare would refuse to resume a session in a
+/// folder opened through a symlink. Paths that don't exist compare as strings.
+fn same_dir(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 // ── subagent docs ───────────────────────────────────────────────────────────
@@ -4039,6 +4051,26 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn same_dir_matches_a_symlink_to_its_real_path_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let other = tmp.path().join("other");
+        let link = tmp.path().join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let real_resolved = s(&std::fs::canonicalize(&real).unwrap());
+
+        assert!(super::same_dir(&real_resolved, &s(&link)));
+        assert!(super::same_dir(&s(&link), &s(&real)));
+        assert!(!super::same_dir(&real_resolved, &s(&other)));
+        assert!(super::same_dir("/no/such/dir", "/no/such/dir"));
+        assert!(!super::same_dir("/no/such/dir", "/no/such/other"));
+    }
+
     #[tokio::test]
     async fn acp_effort_update_persists_and_refreshes_chat_picker_without_cross_harness_clobber() {
         use super::*;
