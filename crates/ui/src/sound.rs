@@ -7,6 +7,8 @@
 //!   background thread: `afplay` (macOS), PowerShell `Media.SoundPlayer`
 //!   (Windows), first of `paplay`/`pw-play`/`aplay`/`ffplay`/`mpv` (Linux —
 //!   WAV, so even bare ALSA `aplay` decodes it);
+//! - on macOS a session chime for a background banner is attached to that
+//!   notification instead of played here, so Focus applies ([`plan_alert`]);
 //! - `HARNESS_DISABLE_SOUND` env kill-switch + the `soundEnabled` ui-setting;
 //! - failures are logged and swallowed — a missing player must never bother
 //!   the session flow.
@@ -35,6 +37,76 @@ pub enum Sound {
     Request,
     /// A run failed or the durable connection state degraded.
     Attention,
+}
+
+impl Sound {
+    /// The chime's file name inside the macOS app bundle's `Resources`
+    /// (copied there by `scripts/package-macos.sh`), the name a system
+    /// notification plays it by.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn bundle_file_name(self) -> &'static str {
+        match self {
+            Sound::Done => "harness-done.wav",
+            Sound::Request => "harness-request.wav",
+            Sound::Attention => "harness-attention.wav",
+        }
+    }
+}
+
+/// Whether the `HARNESS_DISABLE_SOUND` kill-switch is set. Applies to chimes
+/// attached to notifications as well as local playback.
+pub(crate) fn disabled_by_env() -> bool {
+    std::env::var_os(DISABLE_ENV).is_some()
+}
+
+/// Where one alert's chime is played.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chime {
+    Silent,
+    /// Harness plays it itself ([`play`]). macOS Focus can't silence this.
+    Local,
+    /// Attached to the alert's system notification, so the system applies
+    /// Focus / Do Not Disturb and the per-app notification settings to it.
+    WithNotification,
+}
+
+/// How one session or connectivity alert is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AlertDelivery {
+    pub banner: bool,
+    pub chime: Chime,
+}
+
+/// Route one alert. Each alert rings at most once: a chime that rides on the
+/// notification is never also played locally.
+///
+/// - `sound`: the chime is wanted (session-sound settings, attention gate);
+/// - `banner`: the banner is wanted (desktop setting, background-only check);
+/// - `app_focused`: a Harness window is key;
+/// - `notification_sound`: this platform's notification path can carry the
+///   chime (native macOS center).
+///
+/// In the background, a chime travels with the banner when there is one, so
+/// Focus and the app's notification settings decide whether it is heard.
+/// While Harness is focused the chime stays in-app feedback and plays
+/// locally; a banner shown then is silent. With banners off (sound-only
+/// alerts) nothing exists for the system to filter, so the chime plays
+/// locally as before rather than being dropped or forcing a banner the user
+/// turned off.
+pub(crate) fn plan_alert(
+    sound: bool,
+    banner: bool,
+    app_focused: bool,
+    notification_sound: bool,
+) -> AlertDelivery {
+    let chime = if !sound {
+        Chime::Silent
+    } else if banner && !app_focused && notification_sound {
+        Chime::WithNotification
+    } else {
+        Chime::Local
+    };
+    AlertDelivery { banner, chime }
 }
 
 /// Play a chime on a background thread. Silently a no-op when disabled or no
@@ -516,6 +588,98 @@ mod tests {
         assert_eq!(stale.sound_since(&before, false), None);
         let refreshed = baseline(Indicator::Working, Some("old"));
         assert_eq!(refreshed.sound_since(&stale, false), None);
+    }
+
+    #[test]
+    fn background_chimes_ride_on_the_notification_so_focus_applies() {
+        // Background with a banner: the system notification carries the
+        // chime, so Focus / Do Not Disturb can silence it. Never also local.
+        assert_eq!(
+            plan_alert(true, true, false, true),
+            AlertDelivery {
+                banner: true,
+                chime: Chime::WithNotification
+            }
+        );
+        // Sound off: the banner is silent and nothing plays locally.
+        assert_eq!(
+            plan_alert(false, true, false, true),
+            AlertDelivery {
+                banner: true,
+                chime: Chime::Silent
+            }
+        );
+        assert_eq!(
+            plan_alert(false, false, false, true),
+            AlertDelivery {
+                banner: false,
+                chime: Chime::Silent
+            }
+        );
+    }
+
+    #[test]
+    fn foreground_and_sound_only_chimes_are_kept_and_never_doubled() {
+        // Focused, banner skipped by background-only: in-app chime.
+        assert_eq!(
+            plan_alert(true, false, true, true),
+            AlertDelivery {
+                banner: false,
+                chime: Chime::Local
+            }
+        );
+        // Focused with a banner anyway: one local chime, silent banner.
+        assert_eq!(
+            plan_alert(true, true, true, true),
+            AlertDelivery {
+                banner: true,
+                chime: Chime::Local
+            }
+        );
+        // Sound-only alerts in the background still ring, without a banner.
+        assert_eq!(
+            plan_alert(true, false, false, true),
+            AlertDelivery {
+                banner: false,
+                chime: Chime::Local
+            }
+        );
+        // No notification sound on this platform: the chime plays locally
+        // and the banner stays as configured.
+        assert_eq!(
+            plan_alert(true, true, false, false),
+            AlertDelivery {
+                banner: true,
+                chime: Chime::Local
+            }
+        );
+        // Exhaustively: a wanted chime is never dropped, and an unwanted one
+        // never plays.
+        for sound in [false, true] {
+            for banner in [false, true] {
+                for focused in [false, true] {
+                    for carried in [false, true] {
+                        let plan = plan_alert(sound, banner, focused, carried);
+                        assert_eq!(plan.banner, banner);
+                        assert_eq!(plan.chime != Chime::Silent, sound);
+                        if plan.chime == Chime::WithNotification {
+                            assert!(banner && !focused && carried);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_chime_names_are_distinct_wavs() {
+        let names = [Sound::Done, Sound::Request, Sound::Attention].map(Sound::bundle_file_name);
+        for name in names {
+            assert!(name.starts_with("harness-") && name.ends_with(".wav"));
+        }
+        assert_ne!(names[0], names[1]);
+        assert_ne!(names[1], names[2]);
+        assert_ne!(names[0], names[2]);
     }
 
     #[test]

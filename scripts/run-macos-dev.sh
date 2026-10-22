@@ -39,6 +39,9 @@ if [[ -n "$GRAFF_SRC" ]]; then
   mkdir -p "$CONTENTS/Resources/bin"
   install -m 755 "$GRAFF_SRC" "$CONTENTS/Resources/bin/graff"
 fi
+for chime in done request attention; do
+  cp "$ROOT/crates/ui/assets/sounds/$chime.wav" "$CONTENTS/Resources/harness-$chime.wav"
+done
 sed "s/__VERSION__/$VERSION/g" "$ROOT/dist/macos/Info-dev.plist" >"$CONTENTS/Info.plist"
 plutil -replace LSEnvironment.HARNESS_DATA_DIR -string "$DATA_DIR" "$CONTENTS/Info.plist"
 plutil -replace LSEnvironment.HARNESS_IPC_PORT -string "$IPC_PORT" "$CONTENTS/Info.plist"
