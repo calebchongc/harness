@@ -680,6 +680,26 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
+/// Identity and geometry of a mounted attachment target. Native drops may
+/// arrive after navigation but before the next frame replaces its listeners.
+#[derive(PartialEq)]
+struct AttachmentDropTarget {
+    tab: usize,
+    tab_id: uuid::Uuid,
+    pane: Option<usize>,
+    chat: Option<String>,
+    canvas: Option<AttachmentCanvasTarget>,
+    layout: Option<(SplitAxis, usize, bool, Vec<f32>)>,
+}
+
+#[derive(PartialEq)]
+struct AttachmentCanvasTarget {
+    project: Option<String>,
+    parked: Option<crate::pickers::CanvasTarget>,
+    resolved: crate::pickers::CanvasTarget,
+    project_exists: Option<bool>,
+}
+
 /// Maximum width the right pane may occupy while retaining the conversation
 /// floor. On unusually small windows this deliberately falls below the right
 /// pane's preferred minimum: the chat remains usable and the side surface
@@ -10108,6 +10128,89 @@ impl Shell {
             )
     }
 
+    fn attachment_drop_target(&self, pane: Option<usize>, cx: &App) -> AttachmentDropTarget {
+        let state = self.state.read(cx);
+        let split = self.chat_split.as_ref();
+        let pane = pane.or_else(|| split.map(|split| split.focus));
+        let chat = match (split, pane) {
+            (Some(split), Some(ix)) if ix != split.focus => {
+                split.panes.get(ix).cloned().flatten()
+            }
+            _ => state.selected_chat.clone(),
+        };
+        // A blank canvas has no chat id: its workspace/device identifies the
+        // destination. Model/reasoning changes alone do not retarget a drop.
+        let canvas = chat.is_none().then(|| {
+            let (project, parked) = match (split, pane) {
+                (Some(split), Some(ix)) if ix != split.focus => (
+                    split.projects.get(ix).cloned().flatten(),
+                    split.drafts.get(ix).and_then(|draft| draft.as_ref())
+                        .and_then(|draft| draft.target.clone()),
+                ),
+                _ => (None, None),
+            };
+            let mut resolved = crate::pickers::CanvasTarget {
+                space: state.selected_space.clone(),
+                no_project: state.no_project,
+                device: state.selected_device.clone(),
+            };
+            let effective_device = |target: &crate::pickers::CanvasTarget| {
+                target.space.as_deref().filter(|_| !target.no_project)
+                    .and_then(|id| state.space_row(id)).map(|space| space.device_id.clone())
+                    .or_else(|| target.device.clone())
+                    .or_else(|| state.local_device_id.clone())
+            };
+            // Match focus restoration: the pane's filter applies first, then
+            // its parked target. Missing/invalid picks inherit the live target.
+            if let Some(project) = &project {
+                resolved.space = Some(project.clone());
+                resolved.no_project = false;
+                if let Some(space) = state.space_row(project) {
+                    resolved.device = Some(space.device_id.clone());
+                }
+            }
+            if let Some(target) = &parked {
+                if target.no_project {
+                    resolved.device = target.device.clone().or_else(|| effective_device(&resolved));
+                    resolved.space = None;
+                    resolved.no_project = true;
+                } else if let Some(space) = target.space.as_deref().and_then(|id| state.space_row(id)) {
+                    resolved.space = Some(space.id.clone());
+                    resolved.no_project = false;
+                    resolved.device = Some(space.device_id.clone());
+                }
+            }
+            resolved.device = effective_device(&resolved);
+            // Losing a project must invalidate the mounted target even when
+            // its fallback device happens to be the project's former host.
+            let project_exists = resolved.space.as_deref().filter(|_| !resolved.no_project)
+                .map(|id| state.space_row(id).is_some());
+            AttachmentCanvasTarget { project, parked, resolved, project_exists }
+        });
+        AttachmentDropTarget {
+            tab: self.chat_tab,
+            tab_id: self.chat_tab_id,
+            pane,
+            chat,
+            canvas,
+            layout: split.map(|split| {
+                (split.axis, split.focus, split.zoomed, split.shares.clone())
+            }),
+        }
+    }
+
+    fn attachment_drop_is_current(&self, target: &AttachmentDropTarget, cx: &App) -> bool {
+        if !matches!(self.route, Route::Chat)
+            || self.attachment_drop_target(target.pane, cx) != *target
+        {
+            return false;
+        }
+        let state = self.state.read(cx);
+        target.chat.as_deref().is_none_or(|id| {
+            !state.chats_synced || state.chats.iter().any(|chat| chat.id == id)
+        })
+    }
+
     fn render_main(
         &mut self,
         window: &mut Window,
@@ -10333,6 +10436,7 @@ impl Shell {
         };
 
         let status = self.render_status_strip(composer_width, cx);
+        let drop_target = self.attachment_drop_target(None, cx);
         // Attachment dropzone over the ENTIRE conversation column (transcript
         // + composer, not just the pill). OS images keep using the upload
         // pipeline; workspace files/directories and file tabs become the same
@@ -10350,7 +10454,10 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
-            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+            .on_drop(cx.listener(move |this, paths: &gpui::ExternalPaths, _, cx| {
+                if !this.attachment_drop_is_current(&drop_target, cx) {
+                    return;
+                }
                 let paths = paths.paths().to_vec();
                 this.composer
                     .update(cx, |composer, cx| composer.add_paths(paths, cx));
