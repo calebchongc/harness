@@ -194,6 +194,10 @@ const TURN_INTERRUPT_WAIT_TICKS: usize = 800;
 /// no filesystem internals.
 const SHOW_IMAGE_ATTACH_ERROR: &str = "show_image could not attach the file; use a supported raster image inside the active workspace (maximum 24 MiB)";
 
+/// Sent to an agent whose background work a Harness restart (quit, update)
+/// stopped: the conversation resumes, but those processes are gone.
+const RESTART_BACKGROUND_NOTE: &str = "Harness restarted (quit or update) while background work you started was still running, and the restart stopped it. Check what was in progress, then start again whatever still needs to finish.";
+
 struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
@@ -207,6 +211,10 @@ struct Inner {
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
+    /// chat_id → background tasks its agent has open (a background shell
+    /// command, monitor, agent or workflow). Read at shutdown: that work dies
+    /// with the agent, so the next boot tells the agent to restart it.
+    background_open: Mutex<HashMap<String, usize>>,
     /// chat_id → when the current wait on the user began. Leaving the wait
     /// moves `started_at` forward by its length, so the elapsed timer bills
     /// only the agent's work, never the user's think-time.
@@ -278,6 +286,7 @@ impl SessionsEngine {
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
+                background_open: Mutex::new(HashMap::new()),
                 awaiting_since: Mutex::new(HashMap::new()),
                 tool_progress: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -1148,68 +1157,171 @@ impl SessionsEngine {
             }
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
-            let sessions = self.clone();
-            tokio::spawn(async move {
-                let Some(host) = sessions.inner.doc_host() else {
-                    return;
-                };
-                let request = sessions
-                    .last_request(&chat_id)
-                    .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
-                    // Last resort: the journal's own cwd (harness's draft config)
-                    // — a crash can predate the debounced workspace-row write.
-                    .or_else(|| {
-                        let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
-                        Some(RunRequest {
-                            prompt: String::new(),
-                            harness: None,
-                            model: None,
-                            reasoning: None,
-                            model_options: Default::default(),
-                            cwd,
-                            sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
-                            attachments: Vec::new(),
-                            resume: None,
-                            worktree: None,
-                        })
-                    });
-                let Some(mut request) = request else {
-                    tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
-                    return;
-                };
-                request.prompt = prompt_text;
-                request.resume = None; // dispatch re-injects the remembered session
-                request.attachments = Vec::new();
-                let harness_id = host.harness_for_request(&chat_id, &request);
-                match host
-                    .dispatch_with_source_context(
-                        &sessions,
-                        &chat_id,
-                        harness_id,
-                        request,
-                        Some(user_id),
-                    )
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        tracing::info!(chat = %chat_id, attempt, "auto-resumed crashed run")
-                    }
-                    Ok(None) => {
-                        tracing::info!(chat = %chat_id, "auto-resume held: the checkout changed branch")
-                    }
-                    Err(err) => {
-                        tracing::warn!(chat = %chat_id, error = %err, "auto-resume dispatch failed")
-                    }
-                }
-            });
+            self.spawn_resume(
+                chat_id,
+                user_id,
+                prompt_text,
+                attempt,
+                "auto-resumed crashed run",
+            );
         }
         Ok(recovered)
     }
 
+    /// Re-dispatch `prompt_text` as `user_id` on the chat's remembered harness
+    /// session: crash recovery and restart recovery pick runs back up the
+    /// same way.
+    fn spawn_resume(
+        &self,
+        chat_id: String,
+        user_id: String,
+        prompt_text: String,
+        attempt: u32,
+        what: &'static str,
+    ) {
+        let sessions = self.clone();
+        tokio::spawn(async move {
+            let Some(host) = sessions.inner.doc_host() else {
+                return;
+            };
+            let request = sessions
+                .last_request(&chat_id)
+                .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
+                // Last resort: the journal's own cwd (harness's draft config)
+                // — a crash can predate the debounced workspace-row write.
+                .or_else(|| {
+                    let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
+                    Some(RunRequest {
+                        prompt: String::new(),
+                        harness: None,
+                        model: None,
+                        reasoning: None,
+                        model_options: Default::default(),
+                        cwd,
+                        sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                        auto_approve: false,
+                        attachments: Vec::new(),
+                        resume: None,
+                        worktree: None,
+                    })
+                });
+            let Some(mut request) = request else {
+                tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
+                return;
+            };
+            request.prompt = prompt_text;
+            request.resume = None; // dispatch re-injects the remembered session
+            request.attachments = Vec::new();
+            let harness_id = host.harness_for_request(&chat_id, &request);
+            match host
+                .dispatch_with_source_context(
+                    &sessions,
+                    &chat_id,
+                    harness_id,
+                    request,
+                    Some(user_id),
+                )
+                .await
+            {
+                Ok(Some(_)) => {
+                    tracing::info!(chat = %chat_id, attempt, "{what}")
+                }
+                Ok(None) => {
+                    tracing::info!(chat = %chat_id, "auto-resume held: the checkout changed branch")
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "auto-resume dispatch failed")
+                }
+            }
+        });
+    }
+
+    /// Boot: pick back up what the last graceful shutdown cut short. A turn
+    /// re-sends its prompt on the same harness session, like crash recovery.
+    /// A session whose background work stopped gets a note asking the agent
+    /// to check it and start again what still needs to finish. Same budget as
+    /// crash recovery: fresh (< 12 h) and at most 3 revivals in a row.
+    pub fn resume_after_restart(&self) -> usize {
+        const MAX_AUTO_RESUME: u32 = 3;
+        const RESUME_FRESH: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+        let mut resumed = 0;
+        for (chat_id, kind, at) in self.inner.journal.take_restart_resumes() {
+            if lock(&self.inner.runs).contains_key(&chat_id) {
+                continue;
+            }
+            let fresh = at.elapsed().is_ok_and(|age| age < RESUME_FRESH);
+            if !fresh || self.inner.journal.resume_attempts(&chat_id) >= MAX_AUTO_RESUME {
+                tracing::info!(chat = %chat_id, ?kind, fresh, "restart resume skipped");
+                continue;
+            }
+            let Ok(handle) = self.doc_handle(&chat_id) else {
+                continue;
+            };
+            if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
+                self.inner
+                    .remember_harness_session(&chat_id, &session_id, &cwd);
+            }
+            let (user_id, prompt_text) = match kind {
+                crate::run_journal::RestartResume::Turn => {
+                    let last = handle.doc().read_entries().ok().and_then(|entries| {
+                        entries
+                            .iter()
+                            .rev()
+                            .find(|e| e.role == MessageRole::User)
+                            .and_then(|e| {
+                                e.parts.iter().find_map(|p| match p {
+                                    MessagePart::Text { text, .. } => {
+                                        Some((e.id.clone(), text.clone()))
+                                    }
+                                    _ => None,
+                                })
+                            })
+                    });
+                    let Some(last) = last else { continue };
+                    last
+                }
+                crate::run_journal::RestartResume::Background => {
+                    (new_id(), RESTART_BACKGROUND_NOTE.to_owned())
+                }
+            };
+            let attempt = self.inner.journal.note_resume_attempt(&chat_id);
+            let what = match kind {
+                crate::run_journal::RestartResume::Turn => "resumed a turn cut short by a restart",
+                crate::run_journal::RestartResume::Background => {
+                    "resumed a session whose background work a restart stopped"
+                }
+            };
+            self.spawn_resume(chat_id, user_id, prompt_text, attempt, what);
+            resumed += 1;
+        }
+        resumed
+    }
+
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
+    /// Work the shutdown cuts short is recorded first, so the next boot picks
+    /// it back up ([`Self::resume_after_restart`]): a running turn, or a
+    /// parked session whose agent still had background work going. A chat
+    /// waiting on the user's answer stays waiting (#482, #517).
     pub async fn shutdown(&self) {
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
+        for chat_id in &chats {
+            let working = self
+                .session_status(chat_id)
+                .is_some_and(|s| s.status == SessionStatus::Working);
+            let background = lock(&self.inner.background_open)
+                .get(chat_id)
+                .is_some_and(|open| *open > 0);
+            let kind = if working {
+                Some(crate::run_journal::RestartResume::Turn)
+            } else if background {
+                Some(crate::run_journal::RestartResume::Background)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.inner.journal.note_restart_resume(chat_id, kind);
+            }
+        }
         for chat_id in chats {
             if let Err(err) = self.interrupt_for(&chat_id, "engine shutdown").await {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
@@ -1229,6 +1341,15 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    fn note_background(&self, chat_id: &str, open: usize) {
+        let mut background = lock(&self.background_open);
+        if open == 0 {
+            background.remove(chat_id);
+        } else {
+            background.insert(chat_id.to_owned(), open);
+        }
+    }
+
     /// Import one explicitly requested workspace image through the same file
     /// jail, pinned-directory walk, signature check, and size cap as the
     /// Codex-source importer — resolved against the run's CURRENT cwd, not
@@ -2638,6 +2759,7 @@ async fn drive_run(
                 _ = live_heartbeat.tick() => {
                     inner.touch_session(&chat_id);
                     live_background.retain(|_, started| started.elapsed() < background_hold_max);
+                    inner.note_background(&chat_id, live_background.len());
                     continue;
                 }
                 // Idle reaper (harness SESSION_IDLE_MS): a parked persistent session
@@ -2970,6 +3092,7 @@ async fn drive_run(
                     task_wake = true;
                 }
             }
+            inner.note_background(&chat_id, live_background.len());
             continue;
         }
 
@@ -3815,6 +3938,8 @@ async fn drive_run(
 
     // Nothing the run held back may outlive it.
     deltas.flush(&inner, &chat_id);
+    // The agent process is gone, and its background work with it.
+    inner.note_background(&chat_id, 0);
 
     // Any subagent still streaming when the run ends freezes as-is: the
     // parent process is gone, so nothing more can arrive on this stream.
