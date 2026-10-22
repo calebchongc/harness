@@ -16,6 +16,8 @@ mod opening;
 #[cfg(test)]
 mod archived_tests;
 #[cfg(test)]
+mod archived_session_tests;
+#[cfg(test)]
 mod sidebar_tests;
 #[cfg(test)]
 mod interaction_tests;
@@ -314,19 +316,32 @@ impl ChatSplit {
         {
             return None;
         }
-        let total: f32 = saved.shares.iter().sum();
+        // Finite f32 weights can still overflow when summed. Normalize in
+        // f64, then reject ratios that cannot represent visible f32 panes.
+        let total: f64 = saved.shares.iter().map(|share| f64::from(*share)).sum();
+        let shares: Vec<f32> = saved
+            .shares
+            .iter()
+            .map(|share| (f64::from(*share) / total) as f32)
+            .collect();
+        if shares.iter().any(|share| *share <= 0.0) {
+            return None;
+        }
         let mut projects = saved.projects.clone();
         projects.resize(len, None);
+        let mut seen = std::collections::HashSet::new();
         Some(Self {
             axis: if saved.vertical { SplitAxis::Vertical } else { SplitAxis::Horizontal },
             panes: saved
                 .panes
                 .iter()
                 .enumerate()
-                .map(|(ix, pane)| pane.clone().filter(|id| ix != saved.focus && live(id)))
+                .map(|(ix, pane)| {
+                    pane.clone().filter(|id| ix != saved.focus && live(id) && seen.insert(id.clone()))
+                })
                 .collect(),
             focus: saved.focus,
-            shares: saved.shares.iter().map(|s| s / total).collect(),
+            shares,
             projects,
             drafts: vec![None; len],
             vanished: vec![None; len],
@@ -397,6 +412,12 @@ pub(super) struct PeerChatView {
     _events: Subscription,
 }
 
+/// Validate a reference from an existing view, not a newly created session.
+/// Archived rows are valid; an incomplete initial list is not deletion proof.
+pub(super) fn existing_chat_selection(selected: Option<String>, state: &AppState) -> Option<String> {
+    selected.filter(|id| !state.chats_synced || state.chats.iter().any(|chat| chat.id == *id))
+}
+
 impl Shell {
     fn chat_split_active(&self) -> bool {
         matches!(self.route, Route::Chat) && self.chat_split.is_some()
@@ -429,6 +450,7 @@ impl Shell {
         let Some(target) = split.focus_pane(ix, selected.clone()) else {
             return false;
         };
+        let target = existing_chat_selection(target, self.state.read(cx));
         // Each pane keeps its own workspace and composer picks: park the
         // live ones in the pane being left and bring the target pane's back.
         split.projects[from] = self.settings.space_filter.clone();
@@ -635,6 +657,7 @@ impl Shell {
             self.chat_split = None;
             return false;
         };
+        let target = existing_chat_selection(target, self.state.read(cx));
         let project = split.projects[split.focus].clone();
         let draft = split.drafts[split.focus].take().filter(|_| target.is_none());
         if split.panes.len() == 1 {

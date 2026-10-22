@@ -2380,6 +2380,8 @@ impl AppState {
             self.focus_chat_sync(id, cx);
         }
         if self.selected_chat == chat_id {
+            // An explicit pick of the already-blank boot canvas is intent too.
+            self.auto_selected = true;
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
                 self.mark_chat_seen(&id, cx);
