@@ -568,6 +568,127 @@ fn deleting_a_chat_releases_its_browser_tabs_and_queued_callbacks(cx: &mut TestA
 }
 
 #[gpui::test]
+fn hidden_transcript_callbacks_cannot_navigate_from_settings(cx: &mut TestAppContext) {
+    for source in ["owner", "peer-a"] {
+        for action in [
+            LinkAction::Primary,
+            LinkAction::Internal,
+            LinkAction::External,
+        ] {
+            for target in [URL, "/workspace/link-tests/hidden.rs"] {
+                with_link_panes(cx, Some("owner"), |shell, window, cx| {
+                    let mut link = activation(Some(source), action);
+                    link.target = LinkTarget::new("Synthetic hidden destination", target);
+                    let transcript = shell.transcript.entity_id();
+                    shell.route = Route::Settings(SettingsSection::Appearance);
+                    // A menu/pointer callback may already be queued when the
+                    // route hides all transcripts, without changing selection.
+                    assert_rejected_unchanged(shell, &link, window, cx);
+                    assert_eq!(shell.transcript.entity_id(), transcript);
+                    shell.route = Route::Chat;
+                    assert_eq!(
+                        shell.activate_session_link(
+                            &activation(Some(source), LinkAction::External),
+                            window,
+                            cx
+                        ),
+                        LinkOutcome::External(URL.into()),
+                    );
+                });
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn revoked_browser_owners_still_close_without_taking_keyboard_focus(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for (archived, synced) in [(true, false), (true, true), (false, true)] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            shell.activate_session_link(
+                &activation(Some("peer-a"), LinkAction::Internal),
+                window,
+                cx,
+            );
+            setup = Some((
+                cx.entity(),
+                window.window_handle(),
+                shell.browsers[&shell.browser_seq].clone(),
+            ));
+        });
+        let (shell, window, browser) = setup.unwrap();
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.chats_synced = synced;
+                if archived {
+                    state
+                        .chats
+                        .iter_mut()
+                        .find(|chat| chat.id == "peer-a")
+                        .unwrap()
+                        .archived = true;
+                } else {
+                    state.chats.retain(|chat| chat.id != "peer-a");
+                }
+                // Hold reconciliation so the revoked browser still has a
+                // subscription and a selected, open host when events arrive.
+            });
+        });
+        let focus = window
+            .update(cx, |_, window, cx| {
+                let composer = shell.read(cx).composer.clone();
+                let focus = cx.focus_handle();
+                window.replace_root(cx, |_, _| BrowserFocusFixture {
+                    composer,
+                    other: focus.clone(),
+                });
+                let _ = window.draw(cx);
+                window.focus(&focus, cx);
+                focus
+            })
+            .unwrap();
+        let mut expected = shell.read_with(cx, link_state);
+        expected.browsers.clear();
+        expected.tabs.get_mut("peer-a").unwrap().clear();
+        let panel = expected.panels.get_mut("peer-a").unwrap();
+        panel.right_active = RightSurface::Picker;
+        panel.changes_open = false;
+        browser.update(cx, |_, cx| {
+            cx.emit(BrowserEvent::Changed);
+            cx.emit(BrowserEvent::NewTab(None));
+            cx.emit(BrowserEvent::OpenSource(
+                "/workspace/link-tests/revoked.rs".into(),
+            ));
+            cx.emit(BrowserEvent::Close);
+        });
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(
+                link_state(shell, cx),
+                expected,
+                "archived={archived}, synced={synced}"
+            );
+            assert!(shell.browser_subs.is_empty());
+        });
+        window
+            .update(cx, |_, window, _| {
+                assert!(
+                    focus.is_focused(window),
+                    "revoked-owner cleanup stole focus"
+                );
+            })
+            .unwrap();
+        // A repeated close from the retained entity is harmless, including
+        // while the revoked owner is still selected in AppState.
+        browser.update(cx, |_, cx| cx.emit(BrowserEvent::Close));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| assert_eq!(link_state(shell, cx), expected));
+    }
+}
+
+#[gpui::test]
 fn cached_navigation_survives_an_incomplete_chat_snapshot(cx: &mut TestAppContext) {
     use crate::browser::BrowserEvent;
 

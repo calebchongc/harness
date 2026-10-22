@@ -3517,6 +3517,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> crate::markdown::render::LinkOutcome {
         use crate::markdown::render::{LinkAction, LinkOutcome};
+        if !matches!(self.route, Route::Chat) {
+            return LinkOutcome::Rejected;
+        }
         if self
             .state
             .read(cx)
