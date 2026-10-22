@@ -191,7 +191,19 @@ impl Shell {
         if !matches!(self.route, Route::Chat) || self.state.read(cx).selected_chat.is_none() {
             return false;
         }
+        self.remember_closed_chat_tab(
+            self.chat_tab,
+            chat_tabs::ChatTab {
+                id: self.chat_tab_id,
+                split: self.chat_split.clone(),
+                selected: self.state.read(cx).selected_chat.clone(),
+                project: self.settings.space_filter.clone(),
+                draft: Some(self.current_canvas_draft(cx)),
+            },
+        );
+        self.chat_tab_id = uuid::Uuid::new_v4();
         self.open_new_session(cx);
+        self.remember_last_tab_canvas(cx);
         true
     }
 

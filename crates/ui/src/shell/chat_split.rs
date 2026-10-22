@@ -552,6 +552,26 @@ impl Shell {
         self.close_focused_chat_view(window, cx)
     }
 
+    /// The two explicit close shortcuts share view/history handling, not their
+    /// archive policy. Include the final session-to-canvas close in both.
+    pub(crate) fn close_chat_view_with_archive(
+        &mut self,
+        archive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let closing = self.state.read(cx).selected_chat.clone();
+        let closed = self.close_focused_chat_pane_without_archiving(window, cx)
+            || self.close_chat_to_new_session(cx);
+        if closed
+            && archive
+            && let Some(chat_id) = closing
+        {
+            self.archive_closed_session_explicitly(chat_id, window, cx);
+        }
+        closed
+    }
+
     /// [`Self::close_focused_chat_pane`], plus what it did to the session.
     pub(super) fn close_focused_chat_pane_archiving(
         &mut self,
@@ -570,6 +590,13 @@ impl Shell {
         if !self.chat_split_active() {
             // One pane left: close its tab while others remain.
             return self.close_chat_tab(window, cx);
+        }
+        if self
+            .chat_split
+            .as_ref()
+            .is_some_and(|split| split.panes.len() > 1)
+        {
+            self.remember_closed_chat_pane(cx);
         }
         let Some(split) = self.chat_split.as_mut() else {
             return false;
@@ -612,8 +639,11 @@ impl Shell {
         }
         if state.chats_synced {
             let chat = |id: &str| state.chats.iter().find(|c| c.id == id);
-            split.prune(|id| chat(id).map(|c| c.archived));
-            split.restore_returned(|id| chat(id).is_some_and(|c| !c.archived));
+            let unarchiving = &self.chat_tab_unarchiving;
+            split.prune(|id| chat(id).map(|c| c.archived && !unarchiving.contains_key(id)));
+            split.restore_returned(|id| {
+                chat(id).is_some_and(|c| !c.archived || unarchiving.contains_key(id))
+            });
         }
         self.sync_chat_panes(cx);
     }
