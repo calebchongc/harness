@@ -130,9 +130,7 @@ fn sidebar_session_drop_pins(
 ) -> Vec<String> {
     let mut next = saved.to_vec();
     match target {
-        SidebarSessionDrop::Regular | SidebarSessionDrop::Section(_) => {
-            next.retain(|id| id != chat_id)
-        }
+        SidebarSessionDrop::Regular => next.retain(|id| id != chat_id),
         SidebarSessionDrop::Pinned(index) => {
             if let Some(from) = visible.iter().position(|id| id == chat_id) {
                 return reorder_visible_pins(saved, visible, from, index.min(visible.len() - 1));
@@ -283,7 +281,6 @@ mod pinned_session_tests {
 
     fn pin_snapshot(revision: u64, pins: &[&str]) -> harness_proto::SidebarPreferencesState {
         harness_proto::SidebarPreferencesState {
-            sections: vec![],
             revision,
             synced: true,
             initialized: true,
@@ -2625,16 +2622,6 @@ impl Shell {
             self.cancel_sidebar_session_transfer(cx);
             return;
         }
-        if let SidebarSessionDrop::Section(id) = &target {
-            if !self
-                .active_sidebar_sections(cx)
-                .iter()
-                .any(|section| &section.id == id)
-            {
-                self.cancel_sidebar_session_transfer(cx);
-                return;
-            }
-        }
         let saved = self.raw_sidebar_pins(cx);
         let next = sidebar_session_drop_pins(
             &saved,
@@ -2642,16 +2629,7 @@ impl Shell {
             &payload.chat_id,
             target.clone(),
         );
-        let sections = self.active_sidebar_sections(cx);
-        let source_section = sections
-            .iter()
-            .find(|section| section.session_ids.contains(&payload.chat_id))
-            .map(|section| section.id.as_str());
-        let target_section = match &target {
-            SidebarSessionDrop::Section(id) => Some(id.as_str()),
-            _ => None,
-        };
-        if saved == next && source_section == target_section {
+        if saved == next {
             // A no-op drop still animates home; ordinary groups retain recency order.
             self.cancel_sidebar_session_transfer(cx);
             return;
@@ -2679,39 +2657,9 @@ impl Shell {
                 session_id: payload.chat_id.clone(),
             }
         };
-        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Local)
-            && !matches!(target, SidebarSessionDrop::Pinned(_))
-        {
-            if !self.change_sidebar_section(
-                harness_proto::SidebarSectionChange::Assign {
-                    session_id: payload.chat_id.clone(),
-                    section_id: target_section.map(str::to_owned),
-                },
-                cx,
-            ) {
-                self.cancel_sidebar_session_transfer(cx);
-                return;
-            }
-        } else {
-            if saved != next
-                && !self.apply_sidebar_pin_change(payload.profile_key.clone(), change, cx)
-            {
-                self.cancel_sidebar_session_transfer(cx);
-                return;
-            }
-            if !matches!(target, SidebarSessionDrop::Pinned(_))
-                || self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local)
-                || saved == next
-            {
-                self.assign_sidebar_section(
-                    &payload.chat_id,
-                    match &target {
-                        SidebarSessionDrop::Section(id) => Some(id.as_str()),
-                        _ => None,
-                    },
-                    cx,
-                );
-            }
+        if !self.apply_sidebar_pin_change(payload.profile_key.clone(), change, cx) {
+            self.cancel_sidebar_session_transfer(cx);
+            return;
         }
         self.sidebar_session_transfer = None;
         self.cancel_pinned_session_drag(cx);
@@ -3262,7 +3210,7 @@ impl Shell {
                     );
                 } else {
                     menu.active =
-                        popover::menu_step(menu.active, SIDEBAR_VIEW_GROUPS.len() + 2, delta);
+                        popover::menu_step(menu.active, SIDEBAR_VIEW_GROUPS.len() + 1, delta);
                 }
                 cx.notify();
             }
@@ -3277,11 +3225,7 @@ impl Shell {
                     }
                 } else {
                     let group = menu.active.unwrap_or(0);
-                    if group == SIDEBAR_VIEW_GROUPS.len() + 1 {
-                        if key != "right" && !event.is_held {
-                            self.open_section_dialog(None, cx);
-                        }
-                    } else if group == SIDEBAR_VIEW_GROUPS.len() {
+                    if group == SIDEBAR_VIEW_GROUPS.len() {
                         if key != "right" && !event.is_held {
                             self.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
                         }
@@ -3568,47 +3512,6 @@ impl Shell {
                         theme,
                         self.settings.sidebar_compact,
                     )),
-                )
-                .into_any_element(),
-        );
-        groups.push(popover::menu_separator().into_any_element());
-        groups.push(
-            div()
-                .id("sidebar-create-section-hover")
-                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                    let target = SIDEBAR_VIEW_GROUPS.len() + 1;
-                    if *hovered {
-                        this.hover_sidebar_view_group(target, window.mouse_position(), false, cx);
-                    } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
-                        menu.hover_intent.leave(&target);
-                    }
-                }))
-                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    this.hover_sidebar_view_group(
-                        SIDEBAR_VIEW_GROUPS.len() + 1,
-                        event.position,
-                        true,
-                        cx,
-                    );
-                }))
-                .child(
-                    popover::menu_row_nav(
-                        theme,
-                        false,
-                        active == Some(SIDEBAR_VIEW_GROUPS.len() + 1),
-                        "sidebar-create-section",
-                    )
-                    .id("sidebar-create-section")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_section_dialog(None, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        icon(icons::PLUS)
-                            .size(px(14.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child("Create Section"),
                 )
                 .into_any_element(),
         );
@@ -4102,26 +4005,6 @@ impl Shell {
         let (pinned_chats, chats): (Vec<_>, Vec<_>) = chats
             .into_iter()
             .partition(|chat| pinned_order.contains(&chat.id));
-        let custom_sections = self.active_sidebar_sections(cx);
-        let mut custom_order = Vec::new();
-        for section in &custom_sections {
-            if !section.collapsed {
-                custom_order.extend(
-                    chats
-                        .iter()
-                        .filter(|chat| section.session_ids.contains(&chat.id))
-                        .map(|chat| chat.id.clone()),
-                );
-            }
-        }
-        let chats: Vec<_> = chats
-            .into_iter()
-            .filter(|chat| {
-                !custom_sections
-                    .iter()
-                    .any(|section| section.session_ids.contains(&chat.id))
-            })
-            .collect();
         let ordered = if self.settings.sidebar_organization != SidebarOrganization::InOneList {
             let mut groups: Vec<(Option<(String, String)>, Vec<harness_proto::Chat>)> = Vec::new();
             for chat in chats {
@@ -4155,14 +4038,13 @@ impl Shell {
         let ordered = pinned_chats
             .into_iter()
             .map(|chat| chat.id)
-            .chain(custom_order.iter().cloned())
             .chain(ordered)
             .collect::<Vec<_>>();
         let mut visible = project_pinned_first(&ordered, pinned_order);
         if !self.sessions_open
             && self.settings.sidebar_organization == SidebarOrganization::InOneList
         {
-            visible.retain(|id| pinned_order.contains(id) || custom_order.contains(id));
+            visible.retain(|id| pinned_order.contains(id));
         }
         if !self.pinned_open {
             let pins: HashSet<&str> = pinned_order.iter().map(String::as_str).collect();
@@ -4293,26 +4175,8 @@ impl Shell {
                 .collect::<Vec<_>>(),
         );
 
-        let custom_sections = self.active_sidebar_sections(cx);
-        let custom_count = custom_sections.len();
-        let mut custom_groups: Vec<_> = custom_sections
-            .iter()
-            .map(|section| {
-                (
-                    Some((format!("section:{}", section.id), section.name.clone())),
-                    Vec::new(),
-                )
-            })
-            .collect();
         let mut regular_groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
         for row in regular_rows {
-            if let Some(index) = custom_sections
-                .iter()
-                .position(|section| section.session_ids.contains(&row.chat.id))
-            {
-                custom_groups[index].1.push(row);
-                continue;
-            }
             if let Some((_, existing)) = regular_groups
                 .iter_mut()
                 .find(|(group, _)| group == &row.group)
@@ -4330,11 +4194,6 @@ impl Shell {
         if !pinned_rows.is_empty() {
             sections.push((None, pinned_rows));
         }
-        let custom_sessions = custom_groups
-            .iter()
-            .map(|(_, rows)| rows.len())
-            .sum::<usize>();
-        sections.extend(custom_groups);
         sections.extend(regular_groups);
 
         let returning = self.sidebar_session_transfer.is_none();
@@ -4629,18 +4488,6 @@ impl Shell {
                 }
                 continue;
             };
-            if let Some(id) = key.strip_prefix("section:") {
-                if let Some(section) = custom_sections.iter().find(|section| section.id == id) {
-                    rendered.push(self.render_custom_sidebar_section(
-                        section.clone(),
-                        rendered_rows,
-                        drag_group,
-                        theme,
-                        cx,
-                    ));
-                    continue;
-                }
-            }
             let organization = match self.settings.sidebar_organization {
                 SidebarOrganization::ByDevice => "device",
                 SidebarOrganization::ByProject => "project",
@@ -4716,10 +4563,7 @@ impl Shell {
             rendered.push((format!("g:{collapse_key}"), height, element));
         }
         SidebarSessionRows {
-            custom_count,
-            regular_count: base_ids
-                .len()
-                .saturating_sub(pinned_count + custom_sessions),
+            regular_count: base_ids.len().saturating_sub(pinned_count),
             rows: rendered,
             pinned_count,
             moving_row,

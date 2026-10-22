@@ -32,20 +32,6 @@ pub fn validate_sidebar_pin_update(
 pub struct SidebarPreferences {
     #[serde(default)]
     pub pinned_session_ids: Vec<String>,
-    #[serde(default)]
-    pub sections: Vec<SidebarSection>,
-}
-
-/// A user-named sidebar section. Archived sessions retain membership so restoring
-/// them restores their section; deleting the section never deletes sessions.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SidebarSection {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub session_ids: Vec<String>,
-    #[serde(default)]
-    pub collapsed: bool,
 }
 
 /// Watch payload for pins. `initialized` records known cached state, including
@@ -61,8 +47,6 @@ pub struct SidebarPreferencesState {
     pub initialized: bool,
     #[serde(default)]
     pub pinned_session_ids: Vec<String>,
-    #[serde(default)]
-    pub sections: Vec<SidebarSection>,
 }
 
 impl SidebarPreferencesState {
@@ -1232,6 +1216,26 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn sidebar_preferences_ignore_legacy_section_data() {
+        let legacy = serde_json::json!({
+            "pinnedSessionIds": ["pin"],
+            "sections": [{ "id": "old", "name": "Old", "session_ids": ["session"] }]
+        });
+        let preferences: SidebarPreferences = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(preferences.pinned_session_ids, ["pin"]);
+        assert_eq!(
+            serde_json::to_value(preferences).unwrap(),
+            serde_json::json!({ "pinnedSessionIds": ["pin"] })
+        );
+        let mut state = legacy;
+        state["initialized"] = serde_json::json!(true);
+        state["synced"] = serde_json::json!(false);
+        let state: SidebarPreferencesState = serde_json::from_value(state).unwrap();
+        assert_eq!(state.pinned_session_ids, ["pin"]);
+        assert!(serde_json::to_value(state).unwrap().get("sections").is_none());
+    }
 
     #[test]
     fn checkout_change_request_status_round_trips_all_states_as_camel_case() {
