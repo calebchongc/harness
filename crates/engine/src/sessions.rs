@@ -2465,6 +2465,14 @@ async fn drive_run(
         .filter(|ms| *ms > 0)
         .map(std::time::Duration::from_millis)
         .unwrap_or(std::time::Duration::from_secs(30 * 60));
+    // How long a background task that never reports back keeps the session
+    // from the reaper (`HARNESS_BACKGROUND_HOLD_MAX_MS`).
+    let background_hold_max = std::env::var("HARNESS_BACKGROUND_HOLD_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(3 * 60 * 60));
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
     // TURN-QUIESCE WATCHDOG (2026-08-12 stuck-Working incident): a harness
@@ -2590,6 +2598,19 @@ async fn drive_run(
     // idle window once they all settle.
     let mut live_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_subagent_activity: Option<tokio::time::Instant> = None;
+    // Work the agent left running past its turn (a background shell command,
+    // monitor, agent or workflow), by task id → when it started. Stopping the
+    // agent process kills it, so the idle reaper holds off while any is open
+    // (#517). One that never reports back stops holding after
+    // `background_hold_max`.
+    let mut live_background: std::collections::HashMap<String, tokio::time::Instant> =
+        std::collections::HashMap::new();
+    // A background task settled while parked: the output that follows is the
+    // agent answering it, not a runaway loop, so it starts a fresh chain.
+    let mut task_wake = false;
+    // The current self-continued turn answers a settled background task, so a
+    // long stretch of work is expected and the chain's streaming cap is off.
+    let mut task_woken_turn = false;
 
     let mut final_completed_turn = None;
     let final_status = loop {
@@ -2616,6 +2637,7 @@ async fn drive_run(
                 },
                 _ = live_heartbeat.tick() => {
                     inner.touch_session(&chat_id);
+                    live_background.retain(|_, started| started.elapsed() < background_hold_max);
                     continue;
                 }
                 // Idle reaper (harness SESSION_IDLE_MS): a parked persistent session
@@ -2627,7 +2649,7 @@ async fn drive_run(
                     idle_since
                         .map(|at| last_subagent_activity.map_or(at, |a| a.max(at)) + session_idle)
                         .unwrap_or_else(tokio::time::Instant::now)
-                ), if idle_since.is_some() && live_subagents.is_empty() => {
+                ), if idle_since.is_some() && live_subagents.is_empty() && live_background.is_empty() => {
                     tracing::info!(chat = %chat_id, "reaping idle persistent session");
                     if let Some(token) = lock(&inner.runs)
                         .get(&chat_id)
@@ -2930,6 +2952,24 @@ async fn drive_run(
             let _ = pending.reply.send(Err(EngineError::Other(
                 "Run was interrupted; no visual can be published".into(),
             )));
+            continue;
+        }
+
+        // ── background tasks ───────────────────────────────────────────
+        // Bookkeeping only: never journaled or folded, and handled before the
+        // parked gate so a settle while parked doesn't un-park the chat.
+        if let AgentEvent::BackgroundTask { id, running } = &event {
+            if *running {
+                live_background.insert(id.clone(), tokio::time::Instant::now());
+            } else {
+                live_background.remove(id);
+                // The idle window restarts once the work settles, and the
+                // agent's reply to it is a task wake, not a runaway chain.
+                last_subagent_activity = Some(tokio::time::Instant::now());
+                if idle_since.is_some() {
+                    task_wake = true;
+                }
+            }
             continue;
         }
 
@@ -3275,6 +3315,15 @@ async fn drive_run(
                         if id == harness_proto::LIVE_PLAN_TOOL_ID || !seen_tools.contains(id)
                 ));
             if self_continued {
+                // Answering a background task that just settled starts a
+                // fresh chain: a session driven by its own background work
+                // wakes many times on purpose, and only a loop that resumes
+                // with nothing settling is runaway (#517, #341).
+                task_woken_turn = std::mem::take(&mut task_wake);
+                if task_woken_turn {
+                    self_resumes = 0;
+                    self_chain_started = None;
+                }
                 let chain_started =
                     *self_chain_started.get_or_insert_with(tokio::time::Instant::now);
                 if self_resume_cap.is_some_and(|cap| self_resumes >= cap)
@@ -3328,6 +3377,7 @@ async fn drive_run(
         // A resumed turn that keeps streaming never parks, so it never meets
         // the resume check above: its chain's wall-clock cap holds here too.
         if self_continued_turn
+            && !task_woken_turn
             && idle_since.is_none()
             && !matches!(&event, AgentEvent::Done { .. })
             && self_chain_cap
