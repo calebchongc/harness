@@ -324,6 +324,11 @@ fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
 ///
 /// Prefix-matched: the CLI ships at least two spellings of the marker
 /// (`…by user]` and `…by user for tool use]`).
+fn is_synthetic_user_text(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("<system-reminder>") || text.starts_with("[Request interrupted")
+}
+
 /// Work the CLI runs past the turn: every `task_started` (a background shell
 /// command, monitor, agent or workflow) and every terminal
 /// `task_notification`. The engine keeps a parked session alive while any is
@@ -355,11 +360,6 @@ fn task_settled(status: &str) -> Option<DoneStatus> {
         }
         _ => None,
     }
-}
-
-fn is_synthetic_user_text(text: &str) -> bool {
-    let text = text.trim_start();
-    text.starts_with("<system-reminder>") || text.starts_with("[Request interrupted")
 }
 
 /// Per-run normalization state.
