@@ -1270,6 +1270,10 @@ pub enum RowKind {
         path: String,
         name: String,
         mime_type: String,
+        /// An image the agent opened with a read tool rather than made. One
+        /// outside the engine's read-back jail just isn't shown: the Read
+        /// chip above already names the file.
+        viewed: bool,
     },
     User {
         /// Cross-chat coordination is transported as a prompt, but is not
@@ -1914,6 +1918,7 @@ pub fn rows_for_entry(
                                 path: path.clone(),
                                 name: name.clone(),
                                 mime_type: mime_type.clone(),
+                                viewed: false,
                             },
                         });
                     }
@@ -2061,6 +2066,8 @@ pub fn rows_for_entry(
                 };
                 rows_for_entry(&work_entry, pending, false, parse)
             };
+            // Viewed images follow the whole entry, outside the fold.
+            inner.retain(|row| !matches!(row.kind, RowKind::GeneratedImage { viewed: true, .. }));
             for row in &mut inner {
                 row.turn_start = false;
                 row.timestamp = None;
@@ -2126,6 +2133,8 @@ pub fn rows_for_entry(
         );
     }
 
+    rows.extend(viewed_image_rows(entry));
+
     if let Some(first) = rows.first_mut() {
         first.turn_start = true;
     }
@@ -2139,6 +2148,65 @@ pub fn rows_for_entry(
         last.version ^= 1 << 62;
     }
     rows
+}
+
+/// Images the agent opened with a read tool, shown under its reply so the
+/// person sees what it looked at (a screenshot it is checking, say). Only a
+/// successful read of an absolute path to a raster type the engine's
+/// read-back serves; the read-back's jail decides whether it can load.
+fn viewed_image_rows(entry: &SessionMessageEntry) -> Vec<Row> {
+    let mut seen = HashSet::new();
+    entry
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Tool {
+                call: ToolCall::ReadFile { path },
+                is_error: false,
+                resolved: true,
+                ..
+            } => Some((part.id(), path)),
+            _ => None,
+        })
+        .filter_map(|(part_id, path)| {
+            let mime_type = viewed_image_mime(path)?;
+            if !std::path::Path::new(path).is_absolute() || !seen.insert(path.as_str()) {
+                return None;
+            }
+            let name = std::path::Path::new(path)
+                .file_name()?
+                .to_string_lossy()
+                .into_owned();
+            Some(Row {
+                id: format!("{}#{}#viewed", entry.id, part_id).into(),
+                version: fnv1a(format!("{}\0{path}", entry.device_id).as_bytes()),
+                turn_start: false,
+                entry_id: entry.id.clone().into(),
+                timestamp: None,
+                copy_text: None,
+                compact_fold: None,
+                kind: RowKind::GeneratedImage {
+                    owner: entry.device_id.clone(),
+                    path: path.clone(),
+                    name,
+                    mime_type: mime_type.into(),
+                    viewed: true,
+                },
+            })
+        })
+        .collect()
+}
+
+/// The raster types both gpui and the engine's read-back support.
+fn viewed_image_mime(path: &str) -> Option<&'static str> {
+    use gpui::ImageFormat;
+    match crate::attachments::format_by_extension(std::path::Path::new(path))? {
+        ImageFormat::Png => Some("image/png"),
+        ImageFormat::Jpeg => Some("image/jpeg"),
+        ImageFormat::Gif => Some("image/gif"),
+        ImageFormat::Webp => Some("image/webp"),
+        _ => None,
+    }
 }
 
 fn is_compact_work_part(ix: usize, part: &MessagePart, reply_start: Option<usize>) -> bool {
@@ -6784,6 +6852,7 @@ impl Transcript {
         path: &str,
         name: &str,
         mime_type: &str,
+        viewed: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
@@ -6815,7 +6884,11 @@ impl Transcript {
                     .w(px(dimensions.0 as f32 * scale))
                     .h(px(dimensions.1 as f32 * scale))
                     .role(gpui::Role::Button)
-                    .aria_label("Preview generated image")
+                    .aria_label(if viewed {
+                        "Preview image"
+                    } else {
+                        "Preview generated image"
+                    })
                     .tab_index(0)
                     .cursor_pointer()
                     .focus_visible(move |style| style.border_2().border_color(theme.accent))
@@ -6837,8 +6910,13 @@ impl Transcript {
             }
             AttachmentSnapshot::Loading => frame
                 .text_color(theme.text_muted)
-                .child("Loading generated image…")
+                .child(if viewed {
+                    "Loading image…"
+                } else {
+                    "Loading generated image…"
+                })
                 .into_any_element(),
+            AttachmentSnapshot::Error { .. } if viewed => div().into_any_element(),
             AttachmentSnapshot::Error { .. } => frame
                 .text_color(theme.text_muted)
                 .child("Generated image unavailable")
@@ -7890,7 +7968,8 @@ impl Transcript {
                 path,
                 name,
                 mime_type,
-            } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
+                viewed,
+            } => self.render_generated_image(&row.id, owner, path, name, mime_type, *viewed, cx),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ReauthRequired { message, provider } => {
                 self.render_reauth(ix, &row.id, message, *provider, &theme, cx)
@@ -13482,6 +13561,7 @@ mod tests {
                             "/fixture/preview.png",
                             "generated.png",
                             "image/png",
+                            false,
                             cx,
                         )
                     })
@@ -14570,6 +14650,95 @@ mod tests {
             subagent_status: None,
             subagent_tail: None,
             view: None,
+        }
+    }
+
+    fn read_part(id: &str, path: &str, is_error: bool, resolved: bool) -> MessagePart {
+        let MessagePart::Tool {
+            output,
+            diff,
+            output_ref,
+            output_bytes,
+            diff_ref,
+            diff_stats,
+            subagent_ref,
+            subagent_status,
+            subagent_tail,
+            view,
+            ..
+        } = tool_part(id, "")
+        else {
+            unreachable!()
+        };
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::ReadFile { path: path.into() },
+            is_error,
+            resolved,
+            output,
+            diff,
+            output_ref,
+            output_bytes,
+            diff_ref,
+            diff_stats,
+            subagent_ref,
+            subagent_status,
+            subagent_tail,
+            view,
+        }
+    }
+
+    #[test]
+    fn images_the_agent_read_follow_its_reply() {
+        let viewed = |rows: &[Row]| -> Vec<String> {
+            rows.iter()
+                .filter_map(|row| match &row.kind {
+                    RowKind::GeneratedImage {
+                        path,
+                        viewed: true,
+                        mime_type,
+                        ..
+                    } => Some(format!("{path} {mime_type}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                read_part("r1", "/work/shots/home.png", false, true),
+                read_part("r2", "/work/src/main.rs", false, true),
+                read_part("r3", "shots/relative.png", false, true),
+                read_part("r4", "/work/shots/missing.png", true, true),
+                read_part("r5", "/work/shots/pending.jpg", false, false),
+                read_part("r6", "/work/shots/home.png", false, true),
+                read_part("r7", "/work/shots/photo.JPEG", false, true),
+                read_part("r8", "/work/shots/diagram.svg", false, true),
+                text_part("t1", "Here is what I saw."),
+            ],
+        );
+        for compact in [false, true] {
+            let rows = rows_for_entry(&entry, false, compact, &mut parse);
+            // Successful reads of absolute raster paths, once each, in order.
+            assert_eq!(
+                viewed(&rows),
+                [
+                    "/work/shots/home.png image/png",
+                    "/work/shots/photo.JPEG image/jpeg"
+                ],
+                "compact={compact}"
+            );
+            // Below the reply, carrying the settled entry's timestamp.
+            let last = rows.last().unwrap();
+            assert!(matches!(
+                last.kind,
+                RowKind::GeneratedImage { viewed: true, .. }
+            ));
+            assert_eq!(last.timestamp, Some(0));
+            assert!(last.compact_fold.is_none(), "outside the work fold");
+            let ids: HashSet<_> = rows.iter().map(|row| row.id.clone()).collect();
+            assert_eq!(ids.len(), rows.len(), "row ids stay unique");
         }
     }
 
