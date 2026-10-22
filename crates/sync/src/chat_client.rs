@@ -379,6 +379,14 @@ fn apply_cursor_amnesty(
     }
 }
 
+/// The contiguity rule for a ROW at `seq`: the cursor claims every row up to
+/// it is in the doc, so it only walks. `None` is a gap: the bytes are still
+/// imported, but the cursor holds and a backfill repair is due. Pinned for
+/// every client by `protocol/chat2-vectors.json`.
+pub fn next_row_cursor(cursor: u64, seq: u64) -> Option<u64> {
+    (seq <= cursor.saturating_add(1)).then(|| cursor.max(seq))
+}
+
 fn apply_remote_row(
     shared: &Mutex<Shared>,
     sink: &dyn ChatDocSink,
@@ -388,12 +396,13 @@ fn apply_remote_row(
 ) {
     let cursor = {
         let mut shared = lock(shared);
-        if seq > shared.cursor.saturating_add(1) {
-            shared.gap_repair = true;
-            shared.row_gap_generation = shared.row_gap_generation.wrapping_add(1);
-            shared.cursor
-        } else {
-            shared.cursor.max(seq)
+        match next_row_cursor(shared.cursor, seq) {
+            Some(next) => next,
+            None => {
+                shared.gap_repair = true;
+                shared.row_gap_generation = shared.row_gap_generation.wrapping_add(1);
+                shared.cursor
+            }
         }
     };
     // Import may fire document subscriptions, so never hold the client lock

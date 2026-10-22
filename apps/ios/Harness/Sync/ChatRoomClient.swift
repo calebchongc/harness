@@ -719,7 +719,7 @@ actor ChatRoomClient {
             // proves rows up to seq exist SERVER-side, not that we have the
             // interleaved ones from other devices.
             let cursor = await delegate.cursor()
-            if seq > cursor + 1 {
+            if chatNextRowCursor(cursor: cursor, seq: seq) == nil {
                 gapRepair = true
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): ack gap (seq=\(seq), cursor=\(cursor)); holding cursor and requesting backfill")
             } else {
@@ -869,7 +869,7 @@ actor ChatRoomClient {
     }
 
     /// Frames in order, with each run of rows that keeps to the contiguity
-    /// rule (`seq <= cursor + 1`) imported in one call. A gap row and
+    /// rule (`chatNextRowCursor`) imported in one call. A gap row and
     /// ROWS_DONE go through `applyRowFrame` exactly as before.
     private func applyRowFrames(_ frames: [ChatWireFrame]) async {
         var i = 0
@@ -878,9 +878,9 @@ actor ChatRoomClient {
             var bytes: [Data] = []
             while i < frames.count, frames[i].kind == ChatFrameType.row,
                   let seq = (frames[i].header["seq"] as? NSNumber)?.uint64Value,
-                  seq <= cursor + 1 {
+                  let next = chatNextRowCursor(cursor: cursor, seq: seq) {
                 bytes.append(frames[i].payload)
-                cursor = max(cursor, seq)
+                cursor = next
                 i += 1
             }
             if bytes.isEmpty {
@@ -911,7 +911,7 @@ actor ChatRoomClient {
             // repair. Skipping the hole was the random new-session
             // forever-hang: an empty doc under an advanced cursor.
             let cursor = await delegate.cursor()
-            if seq > cursor + 1 {
+            if chatNextRowCursor(cursor: cursor, seq: seq) == nil {
                 gapRepair = true
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): row gap (seq=\(seq), cursor=\(cursor)); holding cursor and requesting backfill")
                 await delegate.applyRow(frame.payload, cursor)
