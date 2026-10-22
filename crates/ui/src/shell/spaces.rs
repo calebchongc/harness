@@ -3879,6 +3879,7 @@ impl Shell {
             .pt(px(8.0))
             .pb(px(4.0))
             .child(trigger)
+            .child(self.render_sidebar_search_trigger(theme, cx))
             .child(view_trigger)
             .into_any_element()
     }
@@ -4113,6 +4114,9 @@ impl Shell {
     /// and local-device promotion. Jump shortcuts and session cycling read
     /// this projection so keyboard order never drifts from the screen.
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
+        if self.sidebar_search_is_filtering(cx) {
+            return self.sidebar_search_ids(cx);
+        }
         let filter = self.settings.space_filter.clone();
         let profile_key = self.active_sidebar_pin_profile_key(cx);
         let saved_pins = self.active_sidebar_pins(cx);

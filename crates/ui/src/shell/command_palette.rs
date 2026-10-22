@@ -174,6 +174,7 @@ impl Shell {
             return;
         }
         self.add_space = None;
+        self.sidebar_search = None;
         let placeholder = if self.chat_split.as_ref().is_some_and(|split| split.panes.len() > 1) {
             "Search open panes, commands and chats…"
         } else {

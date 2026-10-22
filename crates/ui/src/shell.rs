@@ -75,6 +75,7 @@ mod link_tests;
 mod project_icon;
 mod reauth;
 mod sidebar_pins;
+mod sidebar_search;
 mod sidebar_sections;
 mod spaces;
 mod stale_input;
@@ -1762,6 +1763,7 @@ impl Render for SidebarPane {
         };
         let inner = shell.update(cx, |shell, cx| {
             let theme = Theme::of(cx).clone();
+            shell.focus_sidebar_search(window, cx);
             match shell.route {
                 Route::Settings(section) => shell.render_settings_nav(section, &theme, window, cx),
                 Route::Chat => shell.render_chat_sidebar(&theme, cx),
@@ -1946,6 +1948,8 @@ pub struct Shell {
     /// while open.
     add_space: Option<AddSpaceFlow>,
     command_palette: Option<command_palette::CommandPalette>,
+    sidebar_search: Option<sidebar_search::SidebarSearch>,
+    sidebar_search_trigger_focus: gpui::FocusHandle,
     /// Conversations from other tools on this device (Claude Code, Codex, graff) that
     /// `/resume` can import; listed again when the palette opens and the last
     /// list is over a minute old.
@@ -2465,6 +2469,8 @@ impl Shell {
             delete_space_confirm: None,
             add_space: None,
             command_palette: None,
+            sidebar_search: None,
+            sidebar_search_trigger_focus: cx.focus_handle().tab_stop(true),
             external_sessions: Vec::new(),
             external_task: None,
             external_loaded_at: None,
@@ -3043,6 +3049,9 @@ impl Shell {
         self.pane_resize_active = None;
         self.pane_resize_dragging = None;
         self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
+        if self.settings.sidebar_collapsed && self.sidebar_search.take().is_some() {
+            self.focus_composer(cx);
+        }
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
         cx.notify();
@@ -8282,6 +8291,10 @@ impl Shell {
             ),
         )
         .fade_overflow_y(&self.sidebar_scroll);
+        let sidebar_lists = self
+            .render_sidebar_search_results(theme, cx)
+            .unwrap_or_else(|| sidebar_lists.into_any_element());
+        let search_controls = self.render_sidebar_search_controls(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -8293,6 +8306,7 @@ impl Shell {
             .children(chat_tabs)
             .children(pane_strip)
             .child(filter_row)
+            .children(search_controls)
             .child(sidebar_lists)
             // Global connection pill (durable-by-design UI truth): appears
             // whenever the edge posture is degraded; hidden while healthy —
@@ -9550,6 +9564,10 @@ impl Shell {
         if event.keystroke.key == "escape" && self.command_palette.is_some() {
             self.close_command_palette(window, cx);
             cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.key == "escape" && self.sidebar_search_has_focus(window, cx) {
+            self.sidebar_search_key(event, window, cx);
             return;
         }
         if event.keystroke.key == "escape" && self.capture_escape_surface(cx) {
