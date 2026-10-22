@@ -7070,7 +7070,8 @@ impl Shell {
         // composer-strip spinner, Done wears a check; Idle rows show the
         // relative time instead. Hovering the ROW swaps the corner for the
         // ARCHIVE button. Compact rows keep status first and elapsed time last;
-        // their archive control occupies the remote-icon slot on hover.
+        // their archive control occupies the remote-icon slot on hover, while
+        // an overflow-menu button replaces the timestamp in the same state.
         // A chat can appear on both surfaces at once. Namespace every hover
         // key and child id so the palette never animates the sidebar copy.
         let row_id = if search_query.is_some() {
@@ -7312,6 +7313,10 @@ impl Shell {
             let archive_id = id.clone();
             div()
                 .id(SharedString::from(format!("{row_id}-corner")))
+                .debug_selector({
+                    let row_id = row_id.clone();
+                    move || format!("{row_id}-corner")
+                })
                 .aria_label(if corner_hovered {
                     if archived { "Unarchive" } else { "Archive" }
                 } else {
@@ -7537,6 +7542,43 @@ impl Shell {
                         },
                     )
                     .when(compact, |el| {
+                        if corner_hovered {
+                            return el.child(
+                                div()
+                                    .id(SharedString::from(format!("{row_id}-menu")))
+                                    .debug_selector({
+                                        let row_id = row_id.clone();
+                                        move || format!("{row_id}-menu")
+                                    })
+                                    .aria_label("Session menu")
+                                    .ml(px(6.0))
+                                    .size(px(18.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .text_color(theme.text_muted)
+                                    .hover(|s| s.bg(crate::theme::wash(0.10)))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.chat_menu.open(ChatMenuState {
+                                            chat_id: id.clone(),
+                                            position: window.mouse_position(),
+                                            page: ChatMenuPage::Root,
+                                        });
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        icon(icons::MORE_HORIZONTAL)
+                                            .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                            .text_color(theme.text_muted),
+                                    ),
+                            );
+                        }
                         el.child(
                             div()
                                 .debug_selector({

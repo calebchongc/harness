@@ -1205,6 +1205,11 @@ mod pinned_session_tests {
             assert!(cx.debug_bounds("chat-status-archived").is_some());
             let time = cx.debug_bounds("chat-time-archived").unwrap();
             cx.simulate_mouse_move(archived.center(), None, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("chat-time-archived").is_none());
+            assert!(cx.debug_bounds("chat-archived-menu").is_some());
+            assert!(cx.debug_bounds("chat-archived-corner").is_some());
+            cx.simulate_mouse_move(gpui::point(px(500.0), px(500.0)), None, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("chat-archived-menu").is_none());
             assert_eq!(cx.debug_bounds("chat-time-archived").unwrap(), time);
         }
 
@@ -1236,6 +1241,35 @@ mod pinned_session_tests {
             cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
             assert!(cx.debug_bounds("chat-title-older").unwrap().size.width < title.size.width);
             assert_eq!(cx.debug_bounds("chat-status-older").unwrap(), status);
+            assert!(cx.debug_bounds("chat-time-older").is_none());
+            assert!(cx.debug_bounds("chat-older-corner").is_some());
+            let menu = cx.debug_bounds("chat-older-menu").unwrap().center();
+            let selected = shell.read_with(cx, |shell, cx| shell.state.read(cx).selected_chat.clone());
+            cx.simulate_mouse_move(menu, None, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("chat-older-menu").is_some());
+            cx.simulate_mouse_down(menu, MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_up(menu, MouseButton::Left, gpui::Modifiers::default());
+            shell.update(cx, |shell, cx| {
+                let menu = shell.chat_menu.get().unwrap();
+                assert_eq!(menu.chat_id, "older");
+                assert!(matches!(menu.page, ChatMenuPage::Root));
+                assert_eq!(shell.state.read(cx).selected_chat, selected);
+                assert!(shell.sidebar_session_transfer.is_none());
+                shell.chat_menu = Default::default();
+                cx.notify();
+            });
+            // Right click still opens the identical session/root menu.
+            cx.simulate_mouse_down(row.center(), MouseButton::Right, gpui::Modifiers::default());
+            cx.simulate_mouse_up(row.center(), MouseButton::Right, gpui::Modifiers::default());
+            shell.update(cx, |shell, cx| {
+                let menu = shell.chat_menu.get().unwrap();
+                assert_eq!(menu.chat_id, "older");
+                assert!(matches!(menu.page, ChatMenuPage::Root));
+                shell.chat_menu = Default::default();
+                cx.notify();
+            });
+            cx.simulate_mouse_move(gpui::point(px(500.0), px(500.0)), None, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("chat-older-menu").is_none());
             assert_eq!(cx.debug_bounds("chat-time-older").unwrap(), time);
         }
 
