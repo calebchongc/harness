@@ -50,7 +50,10 @@ static CHECK: std::sync::LazyLock<Check> = std::sync::LazyLock::new(Check::defau
 
 /// Before the first Codex run: repair a global npm Codex that can't start
 /// because its native binary is missing. Never fails the run itself: a
-/// Codex that still can't start reports its own error when spawned.
+/// Codex that still can't start reports its own error when spawned. The
+/// reinstall runs as the user only, never with escalated privileges: a
+/// global prefix the user can't write to (a root-owned /usr/local) fails,
+/// is logged, and leaves Codex's own error to surface.
 pub(crate) async fn ensure_starts(codex: &Path) {
     if cfg!(windows) {
         return;
@@ -60,13 +63,7 @@ pub(crate) async fn ensure_starts(codex: &Path) {
             let Some(npm) = crate::adapter_install::find_npm() else {
                 return Ok(Repair::NotNeeded);
             };
-            // A root-owned global prefix (/usr/local on a machine image) needs
-            // sudo; only ever without a password prompt.
-            let sudo = match crate::executable::find_on_paths("sudo", Vec::new()) {
-                Some(sudo) if succeeds(&sudo, &["-n", "true"]).await => Some(sudo),
-                _ => None,
-            };
-            repair_with(codex, &npm, sudo.as_deref()).await
+            repair_with(codex, &npm).await
         })
         .await;
 }
@@ -104,11 +101,7 @@ impl Check {
 
 /// Reinstall `codex`'s npm package when its binary is missing. `Err` when the
 /// reinstall ran and Codex still can't start.
-pub(crate) async fn repair_with(
-    codex: &Path,
-    npm: &Path,
-    sudo: Option<&Path>,
-) -> Result<Repair, String> {
+pub(crate) async fn repair_with(codex: &Path, npm: &Path) -> Result<Repair, String> {
     match probe(codex).await {
         Probe::Starts | Probe::Fails(_) => return Ok(Repair::NotNeeded),
         Probe::MissingBinary => {}
@@ -123,13 +116,7 @@ pub(crate) async fn repair_with(
         "--no-fund",
         spec.as_str(),
     ];
-    let mut output = run(npm, None, &args).await?;
-    if !output.status.success()
-        && let Some(sudo) = sudo
-        && permission_denied(&output)
-    {
-        output = run(npm, Some(sudo), &args).await?;
-    }
+    let output = run(npm, &args).await?;
     if !output.status.success() {
         return Err(format!(
             "reinstalling {spec} failed: {}",
@@ -183,35 +170,14 @@ fn installed_version(codex: &Path) -> Option<String> {
         .then(|| version.to_string())
 }
 
-fn permission_denied(output: &std::process::Output) -> bool {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    stderr.contains("EACCES") || stderr.contains("EPERM") || stderr.contains("permission denied")
-}
-
-/// `npm args…`, or `sudo -n <npm> args…` when `sudo` is given.
-async fn run(
-    npm: &Path,
-    sudo: Option<&Path>,
-    args: &[&str],
-) -> Result<std::process::Output, String> {
-    let program = sudo.unwrap_or(npm);
-    let mut cmd = command(program);
-    if sudo.is_some() {
-        cmd.arg("-n").arg(npm);
-    }
+/// `npm args…`, as the user.
+async fn run(npm: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    let mut cmd = command(npm);
     cmd.args(args);
     tokio::time::timeout(INSTALL_TIMEOUT, cmd.output())
         .await
-        .map_err(|_| format!("{} timed out", program.display()))?
-        .map_err(|err| format!("{}: {err}", program.display()))
-}
-
-async fn succeeds(program: &Path, args: &[&str]) -> bool {
-    let mut cmd = command(program);
-    cmd.args(args);
-    tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
-        .await
-        .is_ok_and(|out| out.is_ok_and(|out| out.status.success()))
+        .map_err(|_| format!("{} timed out", npm.display()))?
+        .map_err(|err| format!("{}: {err}", npm.display()))
 }
 
 /// The same PATH a Codex run gets (npm launchers are `env node` scripts).
@@ -287,7 +253,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let codex = install(dir.path());
         let (npm, calls) = fixing_npm(dir.path());
-        let outcome = repair_with(&codex, &npm, None).await;
+        let outcome = repair_with(&codex, &npm).await;
         assert_eq!(
             outcome,
             Ok(Repair::Repaired {
@@ -300,34 +266,29 @@ mod tests {
             "install -g --include=optional --no-audit --no-fund @openai/codex@0.163.0"
         );
         // Healthy now: nothing more to do.
-        assert_eq!(repair_with(&codex, &npm, None).await, Ok(Repair::NotNeeded));
+        assert_eq!(repair_with(&codex, &npm).await, Ok(Repair::NotNeeded));
     }
 
+    /// A global prefix the user can't write to fails as the user: one plain
+    /// npm attempt, its error reported, no privileged retry.
     #[tokio::test]
-    async fn a_root_owned_prefix_retries_through_sudo() {
+    async fn a_refused_global_prefix_fails_without_escalating() {
         let dir = tempfile::tempdir().unwrap();
         let codex = install(dir.path());
         let npm = dir.path().join("npm");
-        let fixed = dir.path().join("fixed");
-        // Plain npm is refused; through "sudo" (which marks itself) it works.
+        let calls = dir.path().join("calls");
         script(
             &npm,
             &format!(
-                "if [ -n \"$AS_ROOT\" ]; then touch '{}'; exit 0; fi\n\
-                 echo 'npm error code EACCES' >&2; exit 243",
-                fixed.display()
+                "echo \"$@\" >> '{}'; echo 'npm error code EACCES' >&2; exit 243",
+                calls.display()
             ),
         );
-        let sudo = dir.path().join("sudo");
-        script(
-            &sudo,
-            "[ \"$1\" = -n ] || exit 9; shift; AS_ROOT=1 exec \"$@\"",
-        );
-        let outcome = repair_with(&codex, &npm, Some(&sudo)).await;
-        assert!(
-            matches!(outcome, Ok(Repair::Repaired { .. })),
-            "{outcome:?}"
-        );
+        let outcome = repair_with(&codex, &npm).await;
+        let error = outcome.expect_err("a refused install is an error");
+        assert!(error.contains("EACCES"), "{error}");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        assert!(!dir.path().join("fixed").exists());
     }
 
     #[tokio::test]
@@ -341,7 +302,7 @@ mod tests {
             &npm,
             &format!("echo called >> '{}'; exit 1", calls.display()),
         );
-        assert_eq!(repair_with(&codex, &npm, None).await, Ok(Repair::NotNeeded));
+        assert_eq!(repair_with(&codex, &npm).await, Ok(Repair::NotNeeded));
         assert!(!calls.exists(), "npm ran for an unrelated failure");
     }
 
@@ -354,9 +315,7 @@ mod tests {
         let (npm, calls) = fixing_npm(dir.path());
         let check = Check::default();
         for _ in 0..2 {
-            check
-                .ensure(&codex, || repair_with(&codex, &npm, None))
-                .await;
+            check.ensure(&codex, || repair_with(&codex, &npm)).await;
         }
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
 
@@ -385,9 +344,7 @@ mod tests {
         );
         let check = Check::default();
         for _ in 0..3 {
-            check
-                .ensure(&codex, || repair_with(&codex, &npm, None))
-                .await;
+            check.ensure(&codex, || repair_with(&codex, &npm)).await;
         }
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
     }
