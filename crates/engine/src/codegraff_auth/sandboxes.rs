@@ -130,7 +130,14 @@ fn parse_sandbox(value: &Value) -> CodegraffSandbox {
         provider: text("/provider").unwrap_or_default(),
         name: text("/name"),
         state: normalise_state(text("/state").as_deref()),
-        tier: text("/tier"),
+        // Daytona has no tier in its list response; retain the temporary intent via its labels.
+        tier: text("/tier").or_else(|| {
+            (value
+                .pointer("/labels/harness-purpose")
+                .and_then(Value::as_str)
+                == Some("temporary"))
+            .then(|| "ephemeral".to_string())
+        }),
         expires_at: value
             .get("expiresAt")
             .or_else(|| value.get("expires_at"))
@@ -144,8 +151,12 @@ fn parse_sandbox(value: &Value) -> CodegraffSandbox {
         keep_running: value.get("keepRunning").and_then(Value::as_bool),
         renew_error: text("/renewError").filter(|e| !e.trim().is_empty()),
         cpu: number(value, "cpu").filter(|n| *n > 0.0),
-        memory_gib: number(value, "memoryGiB").filter(|n| *n > 0.0),
-        disk_gib: number(value, "diskGiB").filter(|n| *n > 0.0),
+        memory_gib: number(value, "memoryGiB")
+            .or_else(|| number(value, "memory"))
+            .filter(|n| *n > 0.0),
+        disk_gib: number(value, "diskGiB")
+            .or_else(|| number(value, "disk"))
+            .filter(|n| *n > 0.0),
         price_per_hour_micro_usd: number(value, "pricePerHourMicroUsd")
             .filter(|n| *n >= 0.0)
             .map(|n| n.round() as i64),
@@ -204,7 +215,10 @@ fn chosen_size<'a>(sizes: &'a [PersonalSize], wanted: Option<&str>) -> Option<&'
 
 /// A view without a price borrows the price of the size with the same vCPU and memory.
 fn fill_price(sandbox: &mut CodegraffSandbox, sizes: &[PersonalSize]) {
-    if sandbox.price_per_hour_micro_usd.is_some() {
+    if sandbox.price_per_hour_micro_usd.is_some()
+        || sandbox.provider == "daytona"
+        || sandbox.tier.as_deref() == Some("ephemeral")
+    {
         return;
     }
     let (Some(cpu), Some(memory)) = (sandbox.cpu, sandbox.memory_gib) else {
@@ -467,6 +481,30 @@ impl CodegraffAuth {
                 .map(drop),
             other => other.map(drop),
         }
+    }
+
+    /// A short-lived API/tool sandbox. Let the gateway choose the fleet or Daytona fallback;
+    /// unlike a personal cloud machine, this must not attach Harness or renew its lease.
+    pub async fn create_temporary_sandbox(&self) -> Result<CodegraffSandbox, String> {
+        if !cloud_sandboxes_enabled() {
+            return Err("Cloud sandboxes are not available in this build.".into());
+        }
+        let body = json!({
+            "provider": "auto",
+            "ephemeral": true,
+            "name": "Temporary sandbox",
+            "autoStopMinutes": AUTO_STOP_MINUTES,
+            "labels": { "harness-purpose": "temporary" },
+        });
+        let created = self
+            .sandbox_call(Method::POST, "/v1/sandboxes", Some(body), BOOT)
+            .await
+            .map_err(|f| f.sentence("CodeGraff couldn't create the temporary sandbox"))?;
+        let sandbox = parse_sandbox(&created);
+        if sandbox.id.is_empty() {
+            return Err("CodeGraff created a sandbox but didn't say which one.".into());
+        }
+        Ok(sandbox)
     }
 
     /// Create the account's Harness cloud sandbox, `size` (a personal size id) or the default
@@ -779,6 +817,50 @@ pub(super) mod tests {
     fn enable() {
         // SAFETY: every test that needs the flag sets the same value.
         unsafe { std::env::set_var("HARNESS_CLOUD_SANDBOXES", "1") };
+    }
+
+    #[tokio::test]
+    async fn temporary_create_allows_fallback_without_sizes_or_harness_setup() {
+        for (provider, reply) in [
+            (
+                "fleet",
+                r#"{"id":"temp_1","provider":"fleet","state":"started","tier":"ephemeral","cpu":2,"memoryGiB":4}"#,
+            ),
+            (
+                "daytona",
+                r#"{"id":"temp_1","provider":"daytona","state":"started","cpu":2,"memory":4,"disk":10,"labels":{"harness-purpose":"temporary"}}"#,
+            ),
+        ] {
+            let (gateway, seen) = fake(vec![("POST /v1/sandboxes ", 201, reply)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let auth = signed_in(dir.path(), gateway);
+            enable();
+            let sandbox = auth.create_temporary_sandbox().await.unwrap();
+            assert_eq!(sandbox.provider, provider);
+            assert_eq!(sandbox.tier.as_deref(), Some("ephemeral"));
+            assert_eq!(sandbox.memory_gib, Some(4.0));
+            assert!(!sandbox.harness);
+            assert!(auth.device_names().is_empty());
+            assert_eq!(
+                recorded(&seen),
+                expand(&vector()["plans"]["createTemporary"], "", "")
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_lists_keep_the_provider_and_never_borrow_personal_prices() {
+        let list = parse_list(&json!([
+            {"id":"f","provider":"fleet","state":"started","tier":"ephemeral","cpu":2,"memoryGiB":4},
+            {"id":"d","provider":"daytona","state":"started","cpu":2,"memory":4,
+             "labels":{"harness-purpose":"temporary"}}
+        ]));
+        let sizes = parse_sizes(&serde_json::from_str(SIZES).unwrap());
+        for mut sandbox in list {
+            assert_eq!(sandbox.tier.as_deref(), Some("ephemeral"));
+            fill_price(&mut sandbox, &sizes);
+            assert_eq!(sandbox.price_per_hour_micro_usd, None);
+        }
     }
 
     #[tokio::test]

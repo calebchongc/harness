@@ -1712,6 +1712,13 @@ impl RpcService for EngineRpc {
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&sandbox)
             }
+            methods::CODEGRAFF_CREATE_TEMPORARY_SANDBOX => {
+                let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .create_temporary_sandbox()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&sandbox)
+            }
             methods::CODEGRAFF_SANDBOX_ACTION => {
                 let id = params
                     .get("id")

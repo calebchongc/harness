@@ -25,8 +25,9 @@ use harness_rpc::methods;
 
 use crate::codegraff_jobs::{CodegraffJob, job_active, job_summary};
 use crate::codegraff_sandboxes::{
-    CREATE_COPY, TURN_OFF, TURN_OFF_HINT, can_keep_running, can_start, can_stop, sandbox_detail,
-    sandbox_title, selected_size, size_detail, size_title, start_labels,
+    CREATE_COPY, TEMPORARY_COPY, TURN_OFF, TURN_OFF_HINT, can_keep_running, can_start, can_stop,
+    is_temporary, sandbox_detail, sandbox_title, selected_size, size_detail, size_title,
+    start_labels,
 };
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
@@ -803,25 +804,30 @@ impl AccountsPage {
             .update(cx, |state, cx| state.refresh_cloud_sandboxes(cx));
     }
 
-    fn create_codegraff_sandbox(&mut self, cx: &mut Context<Self>) {
+    fn create_codegraff_sandbox(&mut self, temporary: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        // The size picked, as the list offers it (none on gateways without sizes).
-        let size = self.state.read(cx).cloud_sandboxes().and_then(|list| {
-            selected_size(&list.sizes, self.sandbox_size.as_deref()).map(|s| s.id.clone())
-        });
-        let params = match size {
-            Some(size) => serde_json::json!({ "size": size }),
-            None => serde_json::json!({}),
+        let (method, params) = if temporary {
+            (
+                methods::CODEGRAFF_CREATE_TEMPORARY_SANDBOX,
+                serde_json::json!({}),
+            )
+        } else {
+            // Personal sizing belongs only to persistent Harness devices.
+            let size = self.state.read(cx).cloud_sandboxes().and_then(|list| {
+                selected_size(&list.sizes, self.sandbox_size.as_deref()).map(|s| s.id.clone())
+            });
+            let params = match size {
+                Some(size) => serde_json::json!({ "size": size }),
+                None => serde_json::json!({}),
+            };
+            (methods::CODEGRAFF_CREATE_SANDBOX, params)
         };
         self.creating_sandbox = true;
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CODEGRAFF_CREATE_SANDBOX, params)
-                .await;
+            let result = engine.client().call(method, params).await;
             this.update(cx, |page, cx| {
                 page.creating_sandbox = false;
                 if let Err(err) = result {
@@ -913,6 +919,17 @@ impl AccountsPage {
                 .as_ref()
                 .filter(|(id, _)| *id == sandbox.id)
                 .map(|(_, action)| *action);
+            let copy_id = is_temporary(sandbox).then(|| {
+                let id = sandbox.id.clone();
+                widgets::ghost_action(theme)
+                    .id(("codegraff-sandbox-copy-id", ix))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip("Use this ID with sandbox API/tools."))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                    }))
+                    .child("Copy ID")
+            });
             let start = can_start(sandbox).then(|| {
                 let id = sandbox.id.clone();
                 widgets::ghost_action(theme)
@@ -1016,6 +1033,7 @@ impl AccountsPage {
                                 .child(sandbox_detail(sandbox, now)),
                         ),
                 )
+                .children(copy_id)
                 .children(start)
                 .children(keep_running)
                 .children(stop)
@@ -1120,7 +1138,7 @@ impl AccountsPage {
                     .hover(|s| widgets::ghost_hover(theme, s))
                     .when(creating, |el| el.opacity(0.5))
                     .when(!creating, |el| {
-                        el.on_click(cx.listener(|page, _, _, cx| page.create_codegraff_sandbox(cx)))
+                        el.on_click(cx.listener(|page, _, _, cx| page.create_codegraff_sandbox(false, cx)))
                     })
                     .child(if creating { "Creating…" } else { "Create" }),
             );
@@ -1140,7 +1158,49 @@ impl AccountsPage {
                     widgets::section_card(theme)
                         .mt(px(8.0))
                         .children(rows)
-                        .child(create),
+                        .child(create)
+                        .child(
+                            div()
+                                .id("codegraff-temporary-sandbox-create-row")
+                                .px(px(20.0))
+                                .py(px(12.0))
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(widgets::row_title(theme, "Temporary sandbox"))
+                                        .child(
+                                            div()
+                                                .mt(px(2.0))
+                                                .text_size(crate::typography::ui_rems(11.5))
+                                                .text_color(theme.text_muted)
+                                                .child(TEMPORARY_COPY),
+                                        ),
+                                )
+                                .child(
+                                    widgets::ghost_action(theme)
+                                        .id("codegraff-temporary-sandbox-create")
+                                        .hover(|s| widgets::ghost_hover(theme, s))
+                                        .when(creating, |el| el.opacity(0.5))
+                                        .when(!creating, |el| {
+                                            el.on_click(cx.listener(|page, _, _, cx| {
+                                                page.create_codegraff_sandbox(true, cx)
+                                            }))
+                                        })
+                                        .child(if creating {
+                                            "Creating…"
+                                        } else {
+                                            "Create temporary"
+                                        }),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
