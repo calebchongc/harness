@@ -26,8 +26,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use harness_adapters::{CancellationToken, Harness, RunControls, SteerMessage};
 use harness_doc::{
-    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
-    SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
+    DocError, MessagePart, MessageRole, MessageStatus, QueuedMessage, STREAM_COMMIT_MS,
+    SegmentWriter, SessionDoc, SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
 use harness_proto::{
     AgentEvent, ChatConfig, DoneStatus, HarnessId, ReasoningLevel, RunRequest, Session,
@@ -128,9 +128,9 @@ struct RunHandle {
     /// event — the at-least-once ledger. A run can die with accepted steers
     /// still in its mailbox (idle reaper vs. a routed send; a mid-turn error
     /// discarding queued boundary steers): the run task drains this at exit
-    /// and re-dispatches each entry as a fresh turn, so an accepted message
-    /// can never silently evaporate from a transcript that shows it as sent.
-    routed_steers: Arc<Mutex<std::collections::VecDeque<RoutedSteer>>>,
+    /// and re-dispatches on clean exits, or holds for explicit retry on error.
+    /// None seals the ledger at exit so late senders cannot escape recovery.
+    routed_steers: Arc<Mutex<Option<std::collections::VecDeque<RoutedSteer>>>>,
     /// Bounded explicit-intake lane: `show_image` requests join the run's
     /// sequential event pipeline instead of bypassing it.
     image_tx: mpsc::Sender<ShowImageRequest>,
@@ -150,6 +150,8 @@ struct RunHandle {
 struct RoutedSteer {
     prompt: String,
     message_id: String,
+    attachments: Vec<String>,
+    issued_at: i64,
 }
 
 /// One explicit image-publication request (MCP `show_image` → engine RPC →
@@ -520,7 +522,7 @@ impl SessionsEngine {
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
                 // Register acceptance before a fast boundary can retire it.
-                let mut pending = lock(&ledger);
+                let mut ledger = lock(&ledger);
                 let message = SteerMessage {
                     // OpenCode must see the canonical selection before it
                     // decodes the provider command: a project-scoped command
@@ -535,10 +537,14 @@ impl SessionsEngine {
                     // can inline them on this follow-up turn.
                     attachments: request.attachments.clone(),
                 };
-                if steer_tx.try_send(message).is_ok() {
+                if let Some(pending) = ledger.as_mut()
+                    && steer_tx.try_send(message).is_ok()
+                {
                     pending.push_back(RoutedSteer {
                         prompt: request.prompt.clone(),
                         message_id: user_id.clone(),
+                        attachments: request.attachments.clone(),
+                        issued_at: now_ms(),
                     });
                     true
                 } else {
@@ -564,10 +570,11 @@ impl SessionsEngine {
                 // claimed the entry, that re-dispatch owns the message —
                 // otherwise reclaim it and fall through to a fresh run.
                 let reclaimed = {
-                    let mut ledger = lock(&ledger);
-                    let before = ledger.len();
-                    ledger.retain(|s| s.message_id != user_id);
-                    ledger.len() != before
+                    lock(&ledger).as_mut().is_some_and(|pending| {
+                        let before = pending.len();
+                        pending.retain(|s| s.message_id != user_id);
+                        pending.len() != before
+                    })
                 };
                 if !reclaimed {
                     self.inner.note_prompt(chat_id, &request.prompt);
@@ -683,7 +690,7 @@ impl SessionsEngine {
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
-                routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                routed_steers: Arc::new(Mutex::new(Some(std::collections::VecDeque::new()))),
                 image_tx,
                 visual_tx,
                 harness: harness.clone(),
@@ -770,18 +777,23 @@ impl SessionsEngine {
                 harness_proto::invocation::harness_prompt(prompt, harness_id)
             },
             message_id: Some(user_id.clone()),
-            attachments,
+            attachments: attachments.clone(),
         };
         {
             // Serialize mailbox acceptance with confirmation and Done-time
             // inspection: a fast consumer must never outrun its ledger entry.
-            let mut pending = lock(&ledger);
+            let mut ledger = lock(&ledger);
+            let Some(pending) = ledger.as_mut() else {
+                return Ok(SteerOutcome::NotSteerable);
+            };
             if steer_tx.try_send(message).is_err() {
                 return Ok(SteerOutcome::NotSteerable);
             }
             pending.push_back(RoutedSteer {
                 prompt: prompt.to_string(),
                 message_id: user_id.clone(),
+                attachments,
+                issued_at: now_ms(),
             });
         }
         let handle = self.doc_handle(chat_id)?;
@@ -801,10 +813,11 @@ impl SessionsEngine {
         // NotSteerable so the executor falls back to a fresh dispatch
         // (same message id — the doc entry dedupes).
         let reclaimed = {
-            let mut ledger = lock(&ledger);
-            let before = ledger.len();
-            ledger.retain(|s| s.message_id != user_id);
-            ledger.len() != before
+            lock(&ledger).as_mut().is_some_and(|pending| {
+                let before = pending.len();
+                pending.retain(|s| s.message_id != user_id);
+                pending.len() != before
+            })
         };
         if reclaimed {
             return Ok(SteerOutcome::NotSteerable);
@@ -1405,7 +1418,51 @@ impl Inner {
         lock(&self.runs)
             .get(chat_id)
             .filter(|h| h.run_id == run_id)
-            .is_some_and(|h| !lock(&h.routed_steers).is_empty())
+            .is_some_and(|h| {
+                lock(&h.routed_steers)
+                    .as_ref()
+                    .is_some_and(|pending| !pending.is_empty())
+            })
+    }
+
+    /// Seal acceptance before releasing a run. Error exits preserve unconfirmed
+    /// messages in the paused durable queue, not in an automatic fresh turn.
+    fn recover_orphaned_steers(
+        &self,
+        chat_id: &str,
+        run_id: &str,
+        status: SessionStatus,
+    ) -> Vec<RoutedSteer> {
+        let orphans: Vec<RoutedSteer> = lock(&self.runs)
+            .get(chat_id)
+            .filter(|h| h.run_id == run_id)
+            .and_then(|h| lock(&h.routed_steers).take())
+            .unwrap_or_default()
+            .into();
+        if status != SessionStatus::Errored || orphans.is_empty() {
+            return orphans;
+        }
+        let held: Vec<_> = orphans
+            .into_iter()
+            .map(|steer| QueuedMessage {
+                id: steer.message_id,
+                text: steer.prompt,
+                attachments: steer.attachments,
+                issued_by: self.device_id.clone(),
+                issued_at: steer.issued_at,
+                hold_for_turn_end: true,
+                edited_at: None,
+                delivery_gate: None,
+            })
+            .collect();
+        if let Some(host) = self.doc_host() {
+            if let Err(error) = host.hold_failed_steers(chat_id, &held) {
+                tracing::error!(chat = %chat_id, %error, "failed to preserve orphaned steers; transcript retains their messages");
+            }
+        } else {
+            tracing::error!(chat = %chat_id, "cannot preserve orphaned steers without doc host; transcript retains their messages");
+        }
+        Vec::new()
     }
 
     /// Publish the completion marker atomically with the settled status. Keep
@@ -2223,6 +2280,7 @@ async fn drive_run(
                     session_id: None,
                 },
             );
+            inner.recover_orphaned_steers(&chat_id, &run_id, SessionStatus::Errored);
             inner.remove_run(&chat_id, &run_id);
             inner.set_status(&chat_id, SessionStatus::Errored, false);
             return;
@@ -2595,10 +2653,11 @@ async fn drive_run(
                 Some(event) = engine_rx.recv() => event,
                 next = stream.next() => match next {
                     Some(Ok(event)) => event,
-                    // A stream error while PARKED is a post-turn child death —
-                    // the turn was already finalized, so the run ends clean
-                    // instead of stamping a completed session Errored.
-                    Some(Err(err)) if idle_since.is_some() => {
+                    // A parked child can die cleanly only when no accepted
+                    // prompt is waiting for its boundary. An unconfirmed steer
+                    // owns new work even before its first output arrives.
+                    Some(Err(err)) if idle_since.is_some()
+                        && !inner.has_pending_steers(&chat_id, &run_id) => {
                         tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
                         break SessionStatus::Idle;
                     }
@@ -3238,6 +3297,9 @@ async fn drive_run(
                 chat = %chat_id,
                 "run died before session start; retrying once (resume kept)"
             );
+            // The retry owns only the original prompt. Preserve anything this
+            // failed runtime accepted while starting, without replaying it.
+            inner.recover_orphaned_steers(&chat_id, &run_id, SessionStatus::Errored);
             inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
                 inner: inner.clone(),
@@ -3301,7 +3363,9 @@ async fn drive_run(
                 .get(&chat_id)
                 .filter(|h| h.run_id == run_id)
             {
-                lock(&h.routed_steers).pop_front();
+                if let Some(pending) = lock(&h.routed_steers).as_mut() {
+                    pending.pop_front();
+                }
             }
             continue;
         }
@@ -3595,17 +3659,13 @@ async fn drive_run(
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own
     // it — re-dispatched below) or reclaims it and starts a fresh run itself.
-    let orphans: Vec<RoutedSteer> = lock(&inner.runs)
-        .get(&chat_id)
-        .filter(|h| h.run_id == run_id)
-        .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
-        .unwrap_or_default();
+    let orphans = inner.recover_orphaned_steers(&chat_id, &run_id, final_status);
     inner.remove_run(&chat_id, &run_id);
     inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
     if !interrupted && !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
-        // Steered boundary (idle-reaper race, a mid-turn error discarding
-        // queued boundary steers, a parked child death). Their user entries
+        // Steered boundary (idle-reaper race or a parked child death). Error
+        // exits were held for explicit retry above. Their user entries
         // are already in the transcript — a message that shows as sent must
         // never silently not run. Re-dispatch each as a fresh turn
         // (write_user_message dedupes by id; resume is engine-injected).
@@ -3621,7 +3681,7 @@ async fn drive_run(
                 };
                 request.prompt = steer.prompt.clone();
                 request.resume = None;
-                request.attachments = Vec::new();
+                request.attachments = steer.attachments;
                 tracing::info!(chat = %chat, "re-dispatching steer orphaned by a dying run");
                 let Some(host) = engine.inner.doc_host() else {
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
