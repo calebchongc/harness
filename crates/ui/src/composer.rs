@@ -5103,8 +5103,9 @@ fn invocation_token(text: &str, cursor: usize, prefix: char) -> Option<MentionTo
     })
 }
 
-/// Pasted prose is eligible only at completion boundaries, never inside
-/// Markdown code/links. Catalog matching below decides whether it is a reference.
+/// Pasted file/skill references are eligible only at completion boundaries,
+/// never inside Markdown code/links. Slash commands require explicit completion
+/// acceptance, not a catalog match in pasted prose.
 fn pasted_reference_tokens(text: &str, pasted: Range<usize>) -> Vec<(char, MentionToken)> {
     if text.len() > 256 * 1024 || text.get(pasted.clone()).is_none() {
         return Vec::new();
@@ -5112,7 +5113,7 @@ fn pasted_reference_tokens(text: &str, pasted: Range<usize>) -> Vec<(char, Menti
     let mut tokens = Vec::new();
     let mut attempts = 0;
     for (relative, prefix) in text[pasted.clone()].char_indices() {
-        if !matches!(prefix, '@' | '$' | '/') {
+        if !matches!(prefix, '@' | '$') {
             continue;
         }
         let start = pasted.start + relative;
@@ -5278,6 +5279,9 @@ fn workspace_command_for_text(
     text: &str,
     rows: &[InvocationCandidate],
 ) -> Option<WorkspaceCommand> {
+    // Match native-command whitespace rules: non-ASCII indentation and code
+    // must stay literal, even when the workspace-command cache is warm.
+    harness_proto::invocation::leading_command(text)?;
     let end = text.trim_end().len();
     let token = slash_token(text, end)?;
     if !text[..token.range.start].trim().is_empty() {
@@ -12629,6 +12633,10 @@ mod tests {
         );
         for literal in [
             "    /model",
+            "\t/model",
+            "\u{a0}/model",
+            "\u{2003}/model",
+            "\n\u{a0}/model",
             "`/model`",
             "```\n/model\n```",
             "please /model",
@@ -13482,6 +13490,256 @@ mod tests {
         assert_eq!(shown[0], shown[2]);
     }
 
+    #[gpui::test]
+    fn explicit_command_completion_preserves_supported_and_legacy_behavior(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        for supported in [false, true] {
+            handle.update(cx, |composer, window, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.selected_device = Some("peer".into());
+                    state.devices = vec![serde_json::from_value(serde_json::json!({
+                        "id": "peer", "name": "Peer", "platform": "linux",
+                        "capabilities": if supported { vec![capabilities::COMPOSER_REFERENCES_V1] } else { vec![] }
+                    })).unwrap()];
+                });
+                let draft = "Mention /res later";
+                composer.input.update(cx, |input, cx| input.set_text(draft, cx));
+                composer.update_slash(draft, "Mention /res".len(), cx);
+                let invocation = harness_proto::invocation::Invocation::Command { name: "resume".into() };
+                composer.slash_cache.insert(composer.slash.context.clone(), vec![InvocationCandidate {
+                    workspace_command: None,
+                    name: "resume".into(),
+                    description: String::new(),
+                    input_hint: None,
+                    invocation: invocation.clone(),
+                }]);
+                composer.refilter_slash(cx);
+                composer.accept_slash(cx);
+                let expected = if supported { invocation.link() } else { "/resume".into() };
+                assert_eq!(composer.input.read(cx).text(), format!("Mention {expected} later"));
+                assert_eq!(composer.input.read(cx).projection.mentions.len(), usize::from(supported));
+                composer.input.update(cx, |input, cx| {
+                    input.undo(&Undo, window, cx);
+                    assert_eq!(input.text(), draft);
+                });
+            }).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn pasted_literal_slash_mentions_reach_send_and_queue_edit_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        for supported in [false, true] {
+            for editing_queue in [false, true] {
+                for raw in LITERAL_SLASH_PASTES
+                    .iter()
+                    .copied()
+                    .filter(|raw| harness_proto::invocation::leading_command(raw).is_none())
+                {
+                    let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+                    let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+                    let state = cx.new(|_| AppState::new());
+                    state.update(cx, |state, _| {
+                        state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                            harness_rpc::RpcClient::new(out, inbound),
+                        ));
+                        state.selected_chat = Some("literal-draft".into());
+                        state.selected_device = Some("peer".into());
+                        state.devices = vec![serde_json::from_value(serde_json::json!({
+                            "id": "peer", "name": "Peer", "platform": "linux",
+                            "capabilities": if supported { vec![capabilities::COMPOSER_REFERENCES_V1] } else { vec![] }
+                        })).unwrap()];
+                    });
+                    let composer = cx.new(|cx| Composer::new(state, cx));
+                    composer.update(cx, |composer, cx| {
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_text(raw, cx));
+                        let revision = composer.input.read(cx).edit_revision;
+                        composer.resolve_pasted_references(0..raw.len(), revision, cx);
+                        assert_eq!(composer.input.read(cx).text(), raw);
+                        assert!(composer.input.read(cx).projection.mentions.is_empty());
+                        // Even a warm workspace-command cache must not turn a
+                        // literal mention into navigation when submitting.
+                        composer.slash_cache.insert(
+                            composer.slash.context.clone(),
+                            with_workspace_commands(vec![], true),
+                        );
+                        if editing_queue {
+                            composer.editing_queued = Some("queued-row".into());
+                            composer.queue_edit_lease_id = Some("lease".into());
+                            composer.queue_edit_chat_id = Some("literal-draft".into());
+                            composer.queue_edit_host_device_id = Some("peer".into());
+                        }
+                        composer.on_submit(cx);
+                    });
+                    cx.run_until_parked();
+                    let mut submitted = Vec::new();
+                    while let Ok(frame) = requests.try_recv() {
+                        let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                        match frame.method.as_deref() {
+                            Some(methods::FINISH_QUEUED_MESSAGE_EDIT) => {
+                                submitted.push(frame.params["text"].as_str().unwrap().to_owned())
+                            }
+                            Some(methods::QUEUE_COMMAND) => submitted.push(
+                                frame.params["command"]["request"]["prompt"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned(),
+                            ),
+                            method => panic!("literal paste must not need discovery: {method:?}"),
+                        }
+                    }
+                    assert_eq!(
+                        submitted,
+                        vec![raw],
+                        "supported={supported}, editing_queue={editing_queue}, raw={raw:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    const LITERAL_SLASH_PASTES: &[&str] = &[
+        "/resume",
+        "/harness:resume",
+        "/compact arguments",
+        "Would /resume work?",
+        "Will\r\n/resume\r\nor /compact work?",
+        "Please compare /resume and /harness:resume",
+        "Mention /resume",
+        "(/resume), [/compact]; {/harness:resume}.",
+        "café 🦀 /resume 日本語",
+        "    /resume",
+        "\t/resume",
+        "\u{a0}/resume",
+        "`/resume` and ``/compact``",
+        "```text\n/resume\n/compact\n```",
+        "~~~text\n/resume\n~~~",
+        "[/resume](https://example.com/resume)",
+        "![a /resume example](example.png)",
+        "<!-- /resume -->",
+        r"\/resume and /usr/bin/resume",
+        "https://example.com/resume?q=/compact#resume",
+        "//resume /resume/path /resume?arg=yes",
+    ];
+
+    #[test]
+    fn pasted_slash_mentions_stay_literal_across_boundaries_and_work_limits() {
+        for text in LITERAL_SLASH_PASTES {
+            assert!(
+                pasted_reference_tokens(text, 0..text.len()).is_empty(),
+                "{text:?}"
+            );
+            // A paste may replace any UTF-8-aligned part of an existing draft.
+            let boundaries: Vec<_> = text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(text.len()))
+                .collect();
+            for &start in &boundaries {
+                for &end in boundaries.iter().filter(|&&end| end >= start) {
+                    assert!(
+                        pasted_reference_tokens(text, start..end).is_empty(),
+                        "{text:?}: {start}..{end}"
+                    );
+                }
+            }
+        }
+        let text = "/resume ".repeat(64) + "$review @README.md";
+        let tokens = pasted_reference_tokens(&text, 0..text.len());
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|(prefix, token)| (*prefix, token.query.as_str()))
+                .collect::<Vec<_>>(),
+            vec![('$', "review"), ('@', "README.md")],
+            "slash mentions must not consume the reference-discovery budget"
+        );
+        let text = "🦀 /resume $review";
+        for range in [1..text.len(), 0..1, text.len()..text.len() + 1] {
+            assert!(pasted_reference_tokens(text, range).is_empty());
+        }
+        let text = "x".repeat(256 * 1024) + " /resume $review";
+        assert!(pasted_reference_tokens(&text, 0..text.len()).is_empty());
+    }
+
+    #[gpui::test]
+    fn pasted_slash_clipboard_replacement_and_undo_never_create_chips(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_composer_input(cx, |input, window, cx| {
+            let prefix = "Préface 🦀 ";
+            let suffix = " 日本語 after";
+            let original = format!("{prefix}replace{suffix}");
+            for pasted in LITERAL_SLASH_PASTES {
+                input.set_text(&original, cx);
+                input.selected_range = prefix.len()..prefix.len() + "replace".len();
+                cx.write_to_clipboard(ClipboardItem::new_string((*pasted).into()));
+                input.paste(&Paste, window, cx);
+                let expected = format!("{prefix}{pasted}{suffix}");
+                assert_eq!(input.text(), expected, "{pasted:?}");
+                assert!(input.projection.mentions.is_empty(), "{pasted:?}");
+                assert_eq!(input.cursor_offset(), prefix.len() + pasted.len());
+                input.undo(&Undo, window, cx);
+                assert_eq!(input.text(), original);
+                input.redo(&Redo, window, cx);
+                assert_eq!(input.text(), expected);
+                assert!(input.projection.mentions.is_empty());
+                input.select_all(&SelectAll, window, cx);
+                input.copy(&Copy, window, cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), expected);
+                input.set_text("", cx);
+                input.paste(&Paste, window, cx);
+                assert_eq!(input.text(), expected);
+                assert!(input.projection.mentions.is_empty());
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn selected_command_clipboard_metadata_is_preserved_but_stale_metadata_is_ignored(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_composer_input(cx, |input, window, cx| {
+            let invocation = harness_proto::invocation::Invocation::Command {
+                name: "resume".into(),
+            };
+            let raw = format!("Please {} later", invocation.link());
+            input.set_text(&raw, cx);
+            input.select_all(&SelectAll, window, cx);
+            input.copy(&Copy, window, cx);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "Please /resume later"
+            );
+            input.set_text("", cx);
+            input.paste(&Paste, window, cx);
+            assert_eq!(input.text(), raw);
+            assert_eq!(
+                input.projection.mentions.len(),
+                1,
+                "an explicitly selected command survives internal copy/paste"
+            );
+            input.set_text("", cx);
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                "Would /resume work?".into(),
+                serde_json::json!({"harnessComposerV1": raw, "text": "Please /resume later"}),
+            ));
+            input.paste(&Paste, window, cx);
+            assert_eq!(input.text(), "Would /resume work?");
+            assert!(input.projection.mentions.is_empty());
+        });
+    }
+
     #[test]
     fn pasted_references_only_recognize_complete_prose_tokens() {
         let text = "Use @README.md, ($framer) and /review. café@example.com $12.50 /usr/bin x/review `@code.rs` \\@escaped.rs [@label](url) https://host/@remote";
@@ -13491,7 +13749,7 @@ mod tests {
                 .iter()
                 .map(|(prefix, token)| (*prefix, token.query.as_str()))
                 .collect::<Vec<_>>(),
-            vec![('@', "README.md"), ('$', "framer"), ('/', "review")]
+            vec![('@', "README.md"), ('$', "framer")]
         );
         for text in [
             "```\n@README.md\n```",
@@ -13499,6 +13757,9 @@ mod tests {
             "<user@example.com>",
             "$HOME/bin",
             "[x](https://host/@file)",
+            "Would /resume work?",
+            "Will\n/resume\nor /compact work?",
+            "/resume",
         ] {
             assert!(
                 pasted_reference_tokens(text, 0..text.len()).is_empty(),
@@ -13554,7 +13815,7 @@ mod tests {
                 ));
             });
             let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-            let raw = "$review /compact @README.md";
+            let raw = "$review: would /resume\nor /compact work? @README.md";
             composer.update(cx, |composer, cx| {
                 assert!(composer.file_search_params("", cx).is_none());
                 composer
@@ -13574,7 +13835,10 @@ mod tests {
                 assert!(frame.params.get("cwd").is_none());
                 let value = match frame.method.as_deref() {
                     Some(methods::LIST_COMMANDS) => {
-                        serde_json::json!([{"name":"compact", "description":"Compact"}])
+                        serde_json::json!([
+                            {"name":"compact", "description":"Compact"},
+                            {"name":"resume", "description":"Resume"}
+                        ])
                     }
                     Some(methods::LIST_SKILLS) => {
                         serde_json::json!([{"name":"review", "path":"/skills/SKILL.md", "description":"Review", "enabled":true}])
@@ -13604,8 +13868,8 @@ mod tests {
                 if change_target {
                     assert_eq!(text, raw);
                 } else {
-                    assert_eq!(harness_proto::invocation::invocation_links(text).len(), 2);
-                    assert!(text.ends_with(" @README.md"));
+                    assert_eq!(harness_proto::invocation::invocation_links(text).len(), 1);
+                    assert!(text.ends_with(": would /resume\nor /compact work? @README.md"));
                 }
             });
         }
