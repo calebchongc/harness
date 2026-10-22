@@ -793,7 +793,7 @@ final class WorkspaceStore {
                 .call(method: "SwitchRef", params: ["repoPath": repoPath, "refName": refName])
             return nil
         } catch {
-            return describeTransportError(error)
+            return describeUserFacingError(error)
         }
     }
 

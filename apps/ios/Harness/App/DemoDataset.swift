@@ -160,7 +160,7 @@ final class DemoDataset {
 
     func listRefs(spacePath: String) -> [RepoRef] {
         if let cached = refsByPath[spacePath] { return cached }
-        let seeded: [RepoRef]
+        var seeded: [RepoRef]
         if spacePath.contains("harness") {
             seeded = [
                 RepoRef(name: "main", current: true, worktreePath: nil),
@@ -169,6 +169,12 @@ final class DemoDataset {
                 RepoRef(name: "feature/diff-pane", current: false, worktreePath: nil),
                 RepoRef(name: "fix/tool-colors", current: false, worktreePath: nil),
             ]
+            // UI-test fixture: more refs than the medium detent shows.
+            if ProcessInfo.processInfo.arguments.contains("-many-refs") {
+                seeded += (1...30).map {
+                    RepoRef(name: "chore/batch-\($0)", current: false, worktreePath: nil)
+                }
+            }
         } else {
             seeded = [
                 RepoRef(name: "main", current: true, worktreePath: nil),

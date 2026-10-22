@@ -790,6 +790,10 @@ final class AppModel {
     func switchSpaceRef(space: Space, refName: String) async -> String? {
         if let demo {
             try? await Task.sleep(nanoseconds: 200_000_000)
+            // UI-test fixture: a host that refuses every checkout (#424).
+            if ProcessInfo.processInfo.arguments.contains("-checkout-refused") {
+                return describeUserFacingError(RelayError.rpc("git: synthetic checkout refused"))
+            }
             demo.switchRef(path: space.path, refName: refName)
             return nil
         }
