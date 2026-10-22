@@ -329,6 +329,39 @@ fn is_synthetic_user_text(text: &str) -> bool {
     text.starts_with("<system-reminder>") || text.starts_with("[Request interrupted")
 }
 
+/// Work the CLI runs past the turn: every `task_started` (a background shell
+/// command, monitor, agent or workflow) and every terminal
+/// `task_notification`. The engine keeps a parked session alive while any is
+/// open, since stopping the CLI kills it (#517).
+fn background_task(f: &super::wire::SystemFrame) -> Option<AgentEvent> {
+    let id = f
+        .task_id
+        .as_deref()
+        .or(f.tool_use_id.as_deref())
+        .filter(|id| !id.is_empty())?;
+    let running = match f.subtype.as_str() {
+        "task_started" => true,
+        "task_notification" if task_settled(f.status.as_deref().unwrap_or("")).is_some() => false,
+        _ => return None,
+    };
+    Some(AgentEvent::BackgroundTask {
+        id: id.to_owned(),
+        running,
+    })
+}
+
+/// A `task_notification` status that ends the task, as the run's Done status.
+fn task_settled(status: &str) -> Option<DoneStatus> {
+    match status {
+        "completed" | "complete" | "succeeded" | "success" => Some(DoneStatus::Completed),
+        "failed" | "errored" | "error" => Some(DoneStatus::Errored),
+        "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
+            Some(DoneStatus::Interrupted)
+        }
+        _ => None,
+    }
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -540,96 +573,95 @@ impl Normalizer {
         out
     }
 
+    /// One `system` frame: init, workflow progress, and agent tasks settling.
+    fn normalize_system(&mut self, f: super::wire::SystemFrame) -> Vec<AgentEvent> {
+        // A background subagent's completion arrives as an UNTAGGED
+        // `task_notification` carrying the spawning tool's id — the
+        // wire's only terminal signal for it (live-verified 2.1.228:
+        // no tagged frame follows; the subagent's stream just stops).
+        // Surface it as the subagent's tagged Done so the chip flips
+        // done/failed and the transcript freezes.
+        if f.subtype == "task_notification" {
+            let Some(parent) = f.tool_use_id.as_deref().filter(|t| !t.is_empty()) else {
+                return Vec::new();
+            };
+            // Only a KNOWN spawn settles as a subagent. Background
+            // SHELL tasks (`Bash` with `run_in_background`) settle
+            // through this same subtype carrying the Bash call's id —
+            // tagging that Done would bind a subagent ref onto an
+            // ordinary Run chip. A real spawn's tool_use frame always
+            // precedes its notification on the wire, so the set is
+            // populated by the time a genuine one arrives.
+            if !self.agent_spawn_tools.contains(parent) {
+                return Vec::new();
+            }
+            // Non-terminal notification shapes: nothing to close.
+            let Some(status) = task_settled(f.status.as_deref().unwrap_or("")) else {
+                return Vec::new();
+            };
+            // A workflow's notification carries its final totals:
+            // summarize them onto the chip before it settles.
+            let summary = self.workflow_counts.get(parent).map(|&(_, total)| {
+                tag(
+                    parent,
+                    AgentEvent::SubagentProgress {
+                        summary: workflow_summary(total, total, f.usage.as_ref(), true),
+                    },
+                )
+            });
+            return summary
+                .into_iter()
+                .chain(std::iter::once(tag(
+                    parent,
+                    AgentEvent::Done {
+                        status,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                )))
+                .collect();
+        }
+        // An AGENT task starting (subagent_type present — subagent-
+        // owned shell tasks carry the same subtype without it):
+        // record agentId → spawn id for SendMessage steer re-keying.
+        if f.subtype == "task_progress" && !f.workflow_progress.is_empty() {
+            return self.workflow_progress(&f);
+        }
+        if f.subtype == "task_started"
+            && (f.subagent_type.is_some() || f.task_type.as_deref() == Some("local_workflow"))
+            && let (Some(task), Some(tool)) = (
+                f.task_id.as_deref().filter(|t| !t.is_empty()),
+                f.tool_use_id.as_deref().filter(|t| !t.is_empty()),
+            )
+        {
+            self.agent_tasks.insert(task.to_owned(), tool.to_owned());
+            self.agent_spawn_tools.insert(tool.to_owned());
+            return Vec::new();
+        }
+        if f.subtype != "init" || self.saw_init {
+            return Vec::new();
+        }
+        self.saw_init = true;
+        self.session_id = Some(f.session_id.clone());
+        vec![AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: f.model,
+            tools: f.tools,
+            cwd: f.cwd,
+            session_id: f.session_id,
+            assistant_message_id: self.assistant_message_id.clone(),
+        }]
+    }
+
     /// Normalize one stdout frame into 0+ unified events. `interrupted` folds
     /// a post-interrupt `result` into `Done { status: Interrupted }`.
     pub fn normalize(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
         match frame {
             Frame::System(f) => {
-                // A background subagent's completion arrives as an UNTAGGED
-                // `task_notification` carrying the spawning tool's id — the
-                // wire's only terminal signal for it (live-verified 2.1.228:
-                // no tagged frame follows; the subagent's stream just stops).
-                // Surface it as the subagent's tagged Done so the chip flips
-                // done/failed and the transcript freezes.
-                if f.subtype == "task_notification" {
-                    let Some(parent) = f.tool_use_id.as_deref().filter(|t| !t.is_empty()) else {
-                        return Vec::new();
-                    };
-                    // Only a KNOWN spawn settles as a subagent. Background
-                    // SHELL tasks (`Bash` with `run_in_background`) settle
-                    // through this same subtype carrying the Bash call's id —
-                    // tagging that Done would bind a subagent ref onto an
-                    // ordinary Run chip. A real spawn's tool_use frame always
-                    // precedes its notification on the wire, so the set is
-                    // populated by the time a genuine one arrives.
-                    if !self.agent_spawn_tools.contains(parent) {
-                        return Vec::new();
-                    }
-                    let status = match f.status.as_deref().unwrap_or("") {
-                        "completed" | "complete" | "succeeded" | "success" => {
-                            DoneStatus::Completed
-                        }
-                        "failed" | "errored" | "error" => DoneStatus::Errored,
-                        "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
-                            DoneStatus::Interrupted
-                        }
-                        // Non-terminal notification shapes: nothing to close.
-                        _ => return Vec::new(),
-                    };
-                    // A workflow's notification carries its final totals:
-                    // summarize them onto the chip before it settles.
-                    let summary = self.workflow_counts.get(parent).map(|&(_, total)| {
-                        tag(
-                            parent,
-                            AgentEvent::SubagentProgress {
-                                summary: workflow_summary(total, total, f.usage.as_ref(), true),
-                            },
-                        )
-                    });
-                    return summary
-                        .into_iter()
-                        .chain(std::iter::once(tag(
-                            parent,
-                            AgentEvent::Done {
-                                status,
-                                result: None,
-                                error: None,
-                                session_id: None,
-                            },
-                        )))
-                        .collect();
-                }
-                // An AGENT task starting (subagent_type present — subagent-
-                // owned shell tasks carry the same subtype without it):
-                // record agentId → spawn id for SendMessage steer re-keying.
-                if f.subtype == "task_progress" && !f.workflow_progress.is_empty() {
-                    return self.workflow_progress(&f);
-                }
-                if f.subtype == "task_started"
-                    && (f.subagent_type.is_some()
-                        || f.task_type.as_deref() == Some("local_workflow"))
-                    && let (Some(task), Some(tool)) = (
-                        f.task_id.as_deref().filter(|t| !t.is_empty()),
-                        f.tool_use_id.as_deref().filter(|t| !t.is_empty()),
-                    )
-                {
-                    self.agent_tasks.insert(task.to_owned(), tool.to_owned());
-                    self.agent_spawn_tools.insert(tool.to_owned());
-                    return Vec::new();
-                }
-                if f.subtype != "init" || self.saw_init {
-                    return Vec::new();
-                }
-                self.saw_init = true;
-                self.session_id = Some(f.session_id.clone());
-                vec![AgentEvent::SessionStarted {
-                    harness: HarnessId::ClaudeCode,
-                    model: f.model,
-                    tools: f.tools,
-                    cwd: f.cwd,
-                    session_id: f.session_id,
-                    assistant_message_id: self.assistant_message_id.clone(),
-                }]
+                let mut out: Vec<AgentEvent> = background_task(&f).into_iter().collect();
+                out.extend(self.normalize_system(f));
+                out
             }
 
             // Frames with `parent_tool_use_id` set belong to a SUBAGENT's
@@ -1057,6 +1089,15 @@ mod tests {
         ));
     }
 
+    /// Events other than the engine's background-task bookkeeping (#517),
+    /// for tests about what a frame means to the transcript.
+    fn without_background(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        events
+            .into_iter()
+            .filter(|e| !matches!(e, AgentEvent::BackgroundTask { .. }))
+            .collect()
+    }
+
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
         Normalizer::new().normalize(frame, false)
@@ -1247,7 +1288,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_started","task_id":"a20b2336","tool_use_id":"toolu_spawn","subagent_type":"general-purpose","prompt":"p","description":"d"}"#,
         )
         .expect("parses");
-        assert!(norm.normalize(started, false).is_empty());
+        assert!(without_background(norm.normalize(started, false)).is_empty());
         let send = crate::claude::wire::parse_frame(
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_send","name":"SendMessage","input":{"to":"a20b2336","message":"Also read the rebuild.","summary":"s"}}]}}"#,
         )
@@ -1269,7 +1310,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
         )
         .expect("parses");
-        assert!(norm.normalize(shell_task, false).is_empty());
+        assert!(without_background(norm.normalize(shell_task, false)).is_empty());
         let send = crate::claude::wire::parse_frame(
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"SendMessage","input":{"to":"bg1","message":"x"}}]}}"#,
         )
@@ -1339,7 +1380,7 @@ mod tests {
         };
         let notify = |norm: &mut Normalizer, raw: &str| {
             let frame = crate::claude::wire::parse_frame(raw).expect("parses");
-            norm.normalize(frame, false)
+            without_background(norm.normalize(frame, false))
         };
         let mut norm = Normalizer::new();
         spawn(&mut norm);
@@ -1379,6 +1420,54 @@ mod tests {
     }
 
     #[test]
+    fn background_tasks_start_and_settle_for_the_reaper() {
+        // #517: every task the CLI runs past the turn is reported, shell
+        // commands included, so the engine can keep the session alive.
+        let mut norm = Normalizer::new();
+        let mut frame = |line: &str| {
+            norm.normalize(
+                crate::claude::wire::parse_frame(line).expect("parses"),
+                false,
+            )
+        };
+        let task = |events: &[AgentEvent]| {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::BackgroundTask { id, running } => Some((id.clone(), *running)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let started = frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
+        );
+        assert_eq!(task(&started), [("bg1".to_owned(), true)]);
+        let progress = frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"running"}"#,
+        );
+        assert!(
+            task(&progress).is_empty(),
+            "a non-terminal status settles nothing"
+        );
+        for status in ["completed", "failed", "killed", "stopped"] {
+            let settled = frame(&format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"{status}"}}"#
+            ));
+            assert_eq!(task(&settled), [("bg1".to_owned(), false)], "{status}");
+            assert!(
+                !settled.iter().any(|e| matches!(e, AgentEvent::Subagent { .. })),
+                "a shell task never settles as a subagent"
+            );
+        }
+        // An agent task is reported too, keyed by its task id.
+        let agent = frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_agent","subagent_type":"general-purpose","task_type":"local_agent"}"#,
+        );
+        assert_eq!(task(&agent), [("a1".to_owned(), true)]);
+    }
+
+    #[test]
     fn shell_task_notification_never_settles_a_subagent() {
         // `Bash` with `run_in_background` settles through the SAME
         // `task_notification` subtype, carrying the Bash call's own id.
@@ -1399,7 +1488,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"completed"}"#,
         )
         .expect("parses");
-        assert!(norm.normalize(done, false).is_empty());
+        assert!(without_background(norm.normalize(done, false)).is_empty());
     }
 
     #[test]
@@ -1514,10 +1603,10 @@ mod tests {
         // through untagged task_progress, then one task_notification.
         let mut norm = Normalizer::new();
         let mut feed = |raw: &str| {
-            norm.normalize(
+            without_background(norm.normalize(
                 crate::claude::wire::parse_frame(raw).expect("parses"),
                 false,
-            )
+            ))
         };
         let ev = feed(
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_wf","name":"Workflow","input":{"script":"export const meta = {\n  name: 'apple-banana',\n  description: 'Two agents in parallel',\n}\nawait parallel([])"}}]}}"#,

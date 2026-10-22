@@ -628,6 +628,16 @@ pub enum AgentEvent {
     SubagentProgress {
         summary: String,
     },
+    /// Work the agent left running past its turn: a background shell command,
+    /// monitor, agent or workflow. `running: true` when it starts, `false`
+    /// when it settles. Not part of the transcript; the engine keeps a parked
+    /// session alive while any is open, since stopping the agent process kills
+    /// that work (#517).
+    #[serde(rename_all = "camelCase")]
+    BackgroundTask {
+        id: String,
+        running: bool,
+    },
     /// An event belonging to a SUBAGENT's nested transcript, attributed to
     /// the spawning tool call (`parent_tool_use_id` = the parent-feed
     /// `ToolCall::id` that launched it). Never folded into the parent chat

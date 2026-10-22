@@ -317,3 +317,65 @@ async fn a_self_continued_chain_ends_visibly_at_its_cap() {
 
     rig.core.sessions.shutdown().await;
 }
+
+fn background(id: &str, running: bool) -> AgentEvent {
+    AgentEvent::BackgroundTask {
+        id: id.into(),
+        running,
+    }
+}
+
+/// #517: an agent driven by its own background work wakes once per settled
+/// task. Those wakes are not a runaway chain and never trip the cap; waking
+/// with nothing settled still does.
+#[tokio::test]
+async fn wakes_that_answer_settled_background_tasks_are_not_a_runaway_chain() {
+    let rig = assemble("merge the stack");
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("merge the stack"), None)
+        .await
+        .expect("dispatch");
+    rig.feed.send(session_started()).unwrap();
+    rig.feed.send(background("ci-0", true)).unwrap();
+    rig.feed.send(text("Waiting on CI.")).unwrap();
+    rig.feed.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || status(&rig.core) == Some(SessionStatus::Idle),
+        "park after Done",
+    )
+    .await;
+
+    // Three times the cap's worth of wakes, each answering a settled task.
+    for round in 0..SELF_RESUME_MAX * 3 {
+        rig.feed
+            .send(background(&format!("ci-{round}"), false))
+            .unwrap();
+        rig.feed
+            .send(background(&format!("ci-{}", round + 1), true))
+            .unwrap();
+        assert!(
+            self_continue(&rig, &format!("CI {round} settled; watching the next.")).await,
+            "a wake answering a settled task is never capped (round {round})"
+        );
+    }
+
+    // With nothing settling, the chain counts from the last task wake: the
+    // cap still ends a real runaway.
+    for round in 1..SELF_RESUME_MAX {
+        assert!(
+            self_continue(&rig, &format!("Thinking more ({round}).")).await,
+            "within the cap after the last task wake"
+        );
+    }
+    assert!(
+        !self_continue(&rig, "Still going with nothing settled.").await,
+        "past the cap without a settle the session does not resume"
+    );
+    wait_for(
+        || status(&rig.core) == Some(SessionStatus::Errored),
+        "the runaway chain ends the run",
+    )
+    .await;
+    rig.core.sessions.shutdown().await;
+}
