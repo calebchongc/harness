@@ -17,6 +17,8 @@ mod opening;
 mod sidebar_tests;
 #[cfg(test)]
 mod interaction_tests;
+#[cfg(test)]
+mod drop_tests;
 
 /// Every pane holds another engine doc watch; Ghostty-scale grids aren't
 /// the point of a chat column.
@@ -472,6 +474,32 @@ impl Shell {
         self.focus_composer(cx);
         cx.notify();
         true
+    }
+
+    /// Files dropped on unfocused pane `ix`: focus it, then attach them to
+    /// its session (or canvas) exactly as a drop on the focused column does.
+    fn drop_paths_on_pane(
+        &mut self,
+        ix: usize,
+        paths: Vec<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.select_chat_pane(ix, cx) {
+            return;
+        }
+        // The composer swaps to the pane's draft only once the selection
+        // change reaches it, so name the destination.
+        let key = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .unwrap_or_default();
+        self.composer
+            .update(cx, |composer, cx| composer.add_paths_for(key, paths, cx));
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
     }
 
     pub(super) fn cycle_chat_pane(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -978,6 +1006,14 @@ impl Shell {
             )
             // Ghostty dims unfocused splits.
             .child(div().flex_1().min_h_0().flex().flex_col().opacity(0.8).child(body))
+            // Every visible pane takes dropped files, not just the focused
+            // one; the drop focuses the pane it lands on (#488).
+            .child(attachment_drop_veil(("chat-peer-pane-drop", ix), theme))
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.drop_paths_on_pane(ix, paths.paths().to_vec(), window, cx);
+                }),
+            )
             // Finish the original click/selection before moving this entity
             // into the active outlet. Capturing observes consumed child events;
             // deferring lets their click handlers act on the still-mounted view.
@@ -1006,6 +1042,31 @@ impl Shell {
             }))
             .into_any_element()
     }
+}
+
+/// The "Drop to attach" veil over a conversation column, focused or not. It
+/// shows while OS files are dragged over it; the focused column also adds
+/// its workspace file drags.
+pub(super) fn attachment_drop_veil(
+    id: impl Into<gpui::ElementId>,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .opacity(0.0)
+        .bg(theme.scrim().opacity(0.4 / 0.6))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(crate::typography::ui_rems(13.0))
+        .text_color(theme.text)
+        // GPUI matches these styles against the active payload's concrete
+        // TypeId. Resize markers therefore cannot reveal this overlay, even
+        // after an external drag exits without another move event.
+        .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.opacity(1.0))
+        .child("Drop to attach")
 }
 
 /// Pane glyph: which part of the split a card or row badge stands for.
