@@ -7430,7 +7430,7 @@ impl Composer {
     /// The new-session canvas heading. The destination chips alone read as
     /// settings, so a fresh canvas (first launch, ⌘D) never said where the
     /// session would run; this names the project up front. Clicking it opens
-    /// the project picker, which also offers "New project…".
+    /// the project picker, which also offers "New project".
     fn render_new_thread_heading(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let project = self
             .state

@@ -2956,7 +2956,7 @@ impl Pickers {
     }
 
     /// The project popover: search + one row per project on the picked device
-    /// (check on the current pick), then "New project…" and the opt-out rows. Rows
+    /// (check on the current pick), then "New project" and the opt-out rows. Rows
     /// are device-scoped, so no per-row `@ device` tag — the device chip next
     /// door names the host.
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3053,7 +3053,7 @@ impl Pickers {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(SharedString::from("New project…")),
+                    .child(SharedString::from("New project")),
             );
         div()
             .flex()
