@@ -3913,6 +3913,7 @@ mod tests {
     ) -> Session {
         Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
@@ -4193,6 +4194,7 @@ mod tests {
         let now = Utc::now();
         let mut row = Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,
@@ -4224,6 +4226,7 @@ mod tests {
         let now = Utc::now();
         state.sessions = vec![Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,

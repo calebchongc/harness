@@ -385,6 +385,15 @@ use harness_proto::{
     view::{Indicator, effective_indicator},
 };
 
+/// Whether a completed turn earns a completion sound and "Run finished"
+/// banner. An archived chat is out of the person's working set, and a turn
+/// that answered only peer mail is agent coordination, not a result anyone
+/// asked to hear about (#499). Input requests and failures keep their own
+/// alerts; only completion is withheld.
+pub(crate) fn completion_alert_allowed(chat_archived: bool, peer_only_turn: bool) -> bool {
+    !chat_archived && !peer_only_turn
+}
+
 /// Notification baseline is separate from the visual activity indicator:
 /// going idle can mean cancellation, expiry, or an internal handoff.
 #[derive(Debug, Clone)]
@@ -392,10 +401,15 @@ pub(crate) struct SessionNotificationState {
     indicator: Indicator,
     last_completed_turn: Option<String>,
     fresh: bool,
+    completion_alert: bool,
 }
 
 impl SessionNotificationState {
-    pub(crate) fn new(session: &Session, now: chrono::DateTime<chrono::Utc>) -> Self {
+    pub(crate) fn new(
+        session: &Session,
+        chat_archived: bool,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
         Self {
             indicator: effective_indicator(Some(session), now),
             last_completed_turn: session.last_completed_turn.clone(),
@@ -403,11 +417,17 @@ impl SessionNotificationState {
                 .signed_duration_since(session.updated_at)
                 .num_milliseconds()
                 <= harness_proto::view::SESSION_STALE_MS,
+            completion_alert: completion_alert_allowed(
+                chat_archived,
+                session.last_completed_peer_only,
+            ),
         }
     }
 
     /// Call after saving the new baseline, including when delivery is pending
-    /// or outputs are disabled. Suppressed pings must never be replayed later.
+    /// or outputs are disabled. Suppressed pings must never be replayed later:
+    /// a withheld completion (archived chat, peer-only turn) still advances the
+    /// baseline, so a restore or heartbeat cannot replay it.
     pub(crate) fn sound_since(&self, prev: &Self, send_pending: bool) -> Option<Sound> {
         if self.indicator == Indicator::Errored && prev.indicator != Indicator::Errored {
             return Some(Sound::Attention);
@@ -417,6 +437,7 @@ impl SessionNotificationState {
             return Some(Sound::Request);
         }
         if !send_pending
+            && self.completion_alert
             && self.fresh
             && self.last_completed_turn.is_some()
             && self.last_completed_turn != prev.last_completed_turn
@@ -509,7 +530,76 @@ mod tests {
             indicator,
             last_completed_turn: turn.map(str::to_owned),
             fresh: true,
+            completion_alert: true,
         }
+    }
+
+    fn session(
+        status: harness_proto::SessionStatus,
+        turn: Option<&str>,
+        peer_only: bool,
+    ) -> Session {
+        Session {
+            last_completed_turn: turn.map(str::to_owned),
+            last_completed_peer_only: peer_only,
+            chat_id: "chat".into(),
+            device_id: "device".into(),
+            status,
+            started_at: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn archived_chats_never_alert_completion_and_never_replay_it() {
+        use harness_proto::SessionStatus::{Idle, Working};
+        let now = chrono::Utc::now();
+        let working =
+            SessionNotificationState::new(&session(Working, Some("t1"), false), false, now);
+        // Archived after the run started: the late completion is consumed.
+        let late = SessionNotificationState::new(&session(Idle, Some("t2"), false), true, now);
+        assert_eq!(late.sound_since(&working, false), None);
+        // Restoring the chat (or a heartbeat) re-reads the same marker: silent.
+        let restored = SessionNotificationState::new(&session(Idle, Some("t2"), false), false, now);
+        assert_eq!(restored.sound_since(&late, false), None);
+        let heartbeat =
+            SessionNotificationState::new(&session(Working, Some("t2"), false), false, now);
+        assert_eq!(heartbeat.sound_since(&restored, false), None);
+        // A failure or a question in an archived chat still alerts.
+        let failed = SessionNotificationState::new(
+            &session(harness_proto::SessionStatus::Errored, Some("t2"), false),
+            true,
+            now,
+        );
+        assert_eq!(failed.sound_since(&late, false), Some(Sound::Attention));
+        let asking = SessionNotificationState::new(
+            &session(
+                harness_proto::SessionStatus::AwaitingInput,
+                Some("t2"),
+                false,
+            ),
+            true,
+            now,
+        );
+        assert_eq!(asking.sound_since(&late, false), Some(Sound::Request));
+    }
+
+    #[test]
+    fn peer_only_turns_complete_silently_and_human_turns_still_chime() {
+        use harness_proto::SessionStatus::{Idle, Working};
+        let now = chrono::Utc::now();
+        let before =
+            SessionNotificationState::new(&session(Working, Some("t1"), false), false, now);
+        let peer = SessionNotificationState::new(&session(Idle, Some("t2"), true), false, now);
+        assert_eq!(peer.sound_since(&before, false), None);
+        assert_eq!(peer.sound_since(&peer, false), None);
+        // A person's next request (which may consult peers) chimes as usual.
+        let human = SessionNotificationState::new(&session(Idle, Some("t3"), false), false, now);
+        assert_eq!(human.sound_since(&peer, false), Some(Sound::Done));
+        assert!(completion_alert_allowed(false, false));
+        assert!(!completion_alert_allowed(true, false));
+        assert!(!completion_alert_allowed(false, true));
+        assert!(!completion_alert_allowed(true, true));
     }
 
     #[test]

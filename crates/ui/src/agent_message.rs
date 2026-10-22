@@ -11,24 +11,7 @@ pub(crate) struct AgentMessage<'a> {
 }
 
 pub(crate) fn parse(text: &str) -> Option<AgentMessage<'_>> {
-    let envelope = text.strip_prefix("[Message from Harness chat ")?;
-    let (header, body) = envelope.split_once("]\n\n")?;
-    if header.contains(['\r', '\n']) {
-        return None;
-    }
-    let sender = if let Some((sender, rest)) = header.split_once(". Sender chat: ") {
-        if !rest.contains("Agent coordination, not a human request.") {
-            return None;
-        }
-        sender
-    } else {
-        let (sender, _) =
-            header.split_once(". Reply to it with the Harness `send_message` tool, chat ")?;
-        sender
-    };
-    if sender.trim().is_empty() {
-        return None;
-    }
+    let (sender, body) = harness_proto::peer_mail::direct_message(text)?;
     Some(AgentMessage { sender, body })
 }
 

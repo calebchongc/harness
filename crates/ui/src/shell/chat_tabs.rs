@@ -1404,6 +1404,7 @@ mod tests {
                                 started_at: None,
                                 updated_at: chrono::Utc::now() - chrono::Duration::hours(1),
                                 last_completed_turn: None,
+                                last_completed_peer_only: false,
                             });
                         }
                         state.set_test_engine(engine.clone());

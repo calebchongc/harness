@@ -211,6 +211,12 @@ struct Inner {
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
+    /// chat_id → who asked for the current (or last) turn's work: a person's
+    /// prompt or only peer mail. A prompt that opens a new turn resets it; a
+    /// steer into a running turn adds to it; a turn the agent continues on
+    /// its own keeps the last one. Read when a completion is published
+    /// (`Session::last_completed_peer_only`).
+    turn_origins: Mutex<HashMap<String, harness_proto::peer_mail::TurnOrigin>>,
     /// chat_id → background tasks its agent has open (a background shell
     /// command, monitor, agent or workflow). Read at shutdown: that work dies
     /// with the agent, so the next boot tells the agent to restart it.
@@ -286,6 +292,7 @@ impl SessionsEngine {
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
+                turn_origins: Mutex::new(HashMap::new()),
                 background_open: Mutex::new(HashMap::new()),
                 awaiting_since: Mutex::new(HashMap::new()),
                 tool_progress: Mutex::new(HashMap::new()),
@@ -340,6 +347,23 @@ impl SessionsEngine {
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
         }
+    }
+
+    /// Record who asked for the turn `prompt` feeds. A prompt reaching a
+    /// settled chat opens a new turn; one reaching a working turn joins it.
+    fn note_prompt_origin(&self, chat_id: &str, prompt: &str) {
+        let in_turn = lock(&self.inner.statuses).get(chat_id).is_some_and(|s| {
+            matches!(
+                s.status,
+                SessionStatus::Working | SessionStatus::AwaitingInput
+            )
+        });
+        let mut origins = lock(&self.inner.turn_origins);
+        let origin = origins.entry(chat_id.to_string()).or_default();
+        if !in_turn {
+            *origin = Default::default();
+        }
+        origin.note_prompt(prompt);
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -516,6 +540,7 @@ impl SessionsEngine {
             .map_err(EngineError::Other)?;
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
+        self.note_prompt_origin(chat_id, &request.prompt);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -805,6 +830,7 @@ impl SessionsEngine {
                 issued_at: now_ms(),
             });
         }
+        self.note_prompt_origin(chat_id, prompt);
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, prompt, now_ms())?;
         // A routed steer is a turn too. Fired here (not only on the confirmed
@@ -1602,6 +1628,7 @@ impl Inner {
                 .entry(chat_id.to_string())
                 .or_insert_with(|| Session {
                     last_completed_turn: None,
+                    last_completed_peer_only: false,
                     chat_id: chat_id.to_string(),
                     device_id: self.device_id.clone(),
                     status,
@@ -1620,6 +1647,9 @@ impl Inner {
             );
             if let Some(turn) = completed_turn {
                 entry.last_completed_turn = Some(turn);
+                entry.last_completed_peer_only = lock(&self.turn_origins)
+                    .get(chat_id)
+                    .is_some_and(|origin| origin.peer_only());
             }
             entry.status = status;
             entry.updated_at = now;
