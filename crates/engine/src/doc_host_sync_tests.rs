@@ -236,6 +236,45 @@ async fn new_wake_during_stalled_backfill_does_not_block_other_admissions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn woken_client_keeps_listening_for_the_row_its_wake_announced() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Checkpoint).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    for id in ["early", "expired"] {
+        store.initialize_chat_outbox(id, &[]).unwrap();
+        store.schedule_sync_job(id, "wake").unwrap();
+    }
+    let host = host(store.clone(), &relay);
+    // The wake's read completes before the sender's row has landed.
+    until(|| store.sync_work_counts().unwrap() == (0, 0)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let woken = |id: &str| lock(&host.inner.handles).get(id).cloned().unwrap();
+    for id in ["early", "expired"] {
+        assert!(
+            lock(&woken(id).chat2)
+                .as_ref()
+                .is_some_and(|c| c.caught_up())
+        );
+        assert!(
+            woken(id).sync_started.load(Ordering::Acquire),
+            "{id} went idle on catch-up"
+        );
+    }
+    woken("expired")
+        .sync_linger_until
+        .store(now_ms() - 1, Ordering::Release);
+    until(|| !woken("expired").sync_started.load(Ordering::Acquire)).await;
+    assert!(woken("early").sync_started.load(Ordering::Acquire));
+    // A chat waiting for a slot ends the linger.
+    let _viewer = host.open("viewer").unwrap();
+    until(|| !woken("early").sync_started.load(Ordering::Acquire)).await;
+    assert_eq!(lock(&relay.joins_by_chat).get("early"), Some(&1));
+    host.shutdown_workers().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_connection_closes_while_caller_keeps_document() {
     let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Checkpoint).await;
@@ -893,6 +932,10 @@ async fn interactive_handoff_prefers_an_unprotected_slot_over_a_view() {
         host.enqueue_wakeup(&format!("phase-{n}")).unwrap();
     }
     until(|| relay.joins.load(Ordering::SeqCst) == 3).await;
+    // No row follows these wakes: don't wait out their linger.
+    for h in lock(&host.inner.handles).values() {
+        h.sync_linger_until.store(0, Ordering::Release);
+    }
     until(|| host.sync_resources()["retainedBy"]["connections"] == 0).await;
     let mut handles = Vec::new();
     let mut views = Vec::new();

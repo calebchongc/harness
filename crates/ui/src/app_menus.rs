@@ -325,6 +325,7 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::action("Zoom", Zoom),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Reopen Closed Tab", shell::ReopenClosedChatTab),
             MenuItem::action("Close Window", CloseWindow),
         ]));
     }

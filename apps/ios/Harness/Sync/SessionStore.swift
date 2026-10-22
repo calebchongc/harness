@@ -74,6 +74,9 @@ final class SessionStore {
     @ObservationIgnored private var firstContactQueued = false
     @ObservationIgnored private(set) var outbox: [(batchId: String, bytes: Data)] = []
     @ObservationIgnored private var admitted: Set<String> = []
+    /// A command was queued since the outbox last drained: nudge the host
+    /// again once it does (see `queueCommand`).
+    @ObservationIgnored private(set) var nudgeWhenOutboxDrains = false
     private(set) var snapshotBytes = 0
     private(set) var viewAttached = false
     var keepsParseCacheWarm = false
@@ -383,6 +386,10 @@ final class SessionStore {
         admitted.remove(batchId)
         if outbox.count != oldCount {
             saver?.poke()
+        }
+        if nudgeWhenOutboxDrains && outbox.isEmpty {
+            nudgeWhenOutboxDrains = false
+            nudgeHost()
         }
     }
 
@@ -917,6 +924,11 @@ final class SessionStore {
             doc.commit()
         } catch {}
         nudgeHost()
+        // That nudge can reach the host before this row reaches the room; the
+        // host then catches up, finds nothing to run and goes idle (#412).
+        // The commit's batch joins the outbox on the next main-actor turn, so
+        // arm after it and nudge again once the room has acknowledged it.
+        Task { @MainActor [weak self] in self?.nudgeWhenOutboxDrains = true }
     }
 
     /// Durable-nudge the host device so a cold host opens the doc and drains

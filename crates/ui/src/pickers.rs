@@ -6648,7 +6648,7 @@ mod tests {
             })).unwrap());
             state.selected_chat = Some("session".into());
             state.context_usage = Some(harness_proto::ContextUsage {
-                tokens: Some(12_000), window: Some(200_000),
+                tokens: Some(12_000), window: Some(200_000), ..Default::default()
             });
             state.fixture_sidebar_change_request(harness_proto::CheckoutChangeRequestStatus {
                 checkout_id: "checkout".into(), device_id: "local".into(), cwd: "/project".into(),

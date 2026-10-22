@@ -859,6 +859,7 @@ impl SessionsEngine {
             let _ = tx.send(Vec::new());
         }
         // Harness-level interrupt (protocol + child teardown) …
+        harness_adapters::interrupt_reason::note(chat_id, reason);
         token.cancel();
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
         for _ in 0..500 {
@@ -3037,6 +3038,12 @@ async fn drive_run(
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
+            }
+            continue;
+        }
+        if let AgentEvent::ContextSavings { savings } = &event {
+            if let Err(err) = doc_ref.update_context_savings(*savings) {
+                tracing::warn!(%chat_id, error = %err, "context savings write failed");
             }
             continue;
         }

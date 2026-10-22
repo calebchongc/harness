@@ -54,6 +54,10 @@ use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
 use harness_syntax::LanguageId as Lang;
 
+#[cfg(test)]
+#[path = "transcript/selection_tests.rs"]
+mod selection_tests;
+
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
 // ---------------------------------------------------------------------------
@@ -592,10 +596,18 @@ fn bind_agent_wait(spawns: &[AgentSpawn], item: &mut ToolItem) {
     }
 }
 
-/// Ordinary tool groups fold behind a summary header; agent/spawn chips
-/// render as their own always-open row.
+/// Chips that never fold into "Called N tools": agent chips, and a tool that
+/// saved a view. The view is the answer the user asked to see; folded away,
+/// the reply said "displayed above" over a bare "Called 1 tool" (#1677 in
+/// codegraff).
+fn stays_unfolded(item: &ToolItem) -> bool {
+    is_agent_tool(item) || item.view.is_some()
+}
+
+/// Ordinary tool groups fold behind a summary header; agent/spawn chips and
+/// saved views render as their own always-open row.
 fn tool_group_collapses(tools: &[ToolItem]) -> bool {
-    tools.iter().any(|t| !is_agent_tool(t))
+    tools.iter().any(|t| !stays_unfolded(t))
 }
 
 /// Column budget for soft-wrapping thought text into detail lines. The
@@ -1260,6 +1272,9 @@ pub enum RowKind {
         mime_type: String,
     },
     User {
+        /// Cross-chat coordination is transported as a prompt, but is not
+        /// something the human typed. Retain its attribution for distinct chrome.
+        agent_sender: Option<SharedString>,
         /// Visible prompt (attachment-ref trailer already stripped). When the
         /// prompt carries file mentions this is the *projected* display text —
         /// chip labels in place of the raw Markdown links.
@@ -1327,6 +1342,32 @@ pub enum RowKind {
         requested: SharedString,
         restored: Option<SharedString>,
     },
+}
+
+/// The host path of a reply's Markdown image source: absolute, `file://`, or
+/// relative to the chat's workspace. Remote URLs and data URIs have none.
+fn reply_image_path(source: &str, workspace_root: Option<&str>) -> Option<String> {
+    let source = match source.strip_prefix("file://") {
+        // `file:///C:/x.png` names `C:/x.png` on Windows.
+        Some(path) if cfg!(windows) && path.get(2..3) == Some(":") => &path[1..],
+        Some(path) => path,
+        None => source,
+    };
+    if source.is_empty() || source.contains("://") || source.starts_with("data:") {
+        return None;
+    }
+    let path = std::path::Path::new(source);
+    if path.is_absolute() {
+        return Some(source.to_owned());
+    }
+    let root = workspace_root?;
+    let relative = source.strip_prefix("./").unwrap_or(source);
+    Some(
+        std::path::Path::new(root)
+            .join(relative)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1580,12 +1621,15 @@ pub fn rows_for_entry(
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
         let parsed = crate::attachments::parse_user_message_images(&raw);
+        let agent_message = crate::agent_message::parse(&parsed.text);
+        let agent_sender = agent_message.as_ref().map(|message| message.sender.into());
+        let body = agent_message.as_ref().map_or(parsed.text.as_str(), |message| message.body);
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
-        let (body, badges) = crate::badges::split(&parsed.text);
+        let (body, badges) = crate::badges::split(body);
         let (text, mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
             None => (body, Vec::new()),
@@ -1596,6 +1640,7 @@ pub fn rows_for_entry(
             version: (raw.len() as u64) << 1 | pending as u64,
             turn_start: true,
             kind: RowKind::User {
+                agent_sender,
                 text: text.into(),
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
@@ -1716,9 +1761,9 @@ pub fn rows_for_entry(
                     compact_group_pos.get_or_insert(rows.len());
                 } else if pending_group
                     .first()
-                    .is_some_and(|head| is_agent_tool(head) != is_agent_tool(&item))
+                    .is_some_and(|head| stays_unfolded(head) != stays_unfolded(&item))
                 {
-                    // Agent chips don't share a fold with ordinary tools:
+                    // Agent and view chips don't share a fold with ordinary tools:
                     // flush whenever the genus flips so each group is uniform.
                     flush_group(
                         &mut rows,
@@ -1747,7 +1792,7 @@ pub fn rows_for_entry(
                 let item = thought_item(part_id, &tree, live);
                 if compact {
                     compact_group_pos.get_or_insert(rows.len());
-                } else if pending_group.first().is_some_and(is_agent_tool) {
+                } else if pending_group.first().is_some_and(stays_unfolded) {
                     // Thoughts join ordinary tool groups; agent (spawn-link)
                     // groups stay pure, exactly like the tool genus rule.
                     flush_group(
@@ -1988,14 +2033,21 @@ pub fn rows_for_entry(
     if compact {
         // Collapsed: one work header. Expanded: the same rows compact-off
         // would emit for the work parts, tagged so the fold can hide them.
-        if !pending_group.is_empty() {
-            let tools = std::mem::take(&mut pending_group);
+        // A saved view is what the user asked to see: it stays a visible row
+        // after the fold, never inside it.
+        let (views, tools): (Vec<ToolItem>, Vec<ToolItem>) = std::mem::take(&mut pending_group)
+            .into_iter()
+            .partition(|t| t.view.is_some());
+        let pos = compact_group_pos.unwrap_or(rows.len());
+        let mut after_work = pos;
+        if !tools.is_empty() {
             let work_id: SharedString = format!("{}#work", entry.id).into();
             let work_parts: Vec<MessagePart> = entry
                 .parts
                 .iter()
                 .enumerate()
                 .filter(|(ix, part)| is_compact_work_part(*ix, part, reply_start))
+                .filter(|(_, part)| !matches!(part, MessagePart::Tool { view: Some(_), .. }))
                 .map(|(_, part)| part.clone())
                 .collect();
             let mut inner = if work_parts.is_empty() {
@@ -2038,11 +2090,32 @@ pub fn rows_for_entry(
                 copy_text: None,
                 compact_fold: None,
             };
-            let pos = compact_group_pos.unwrap_or(rows.len());
+            after_work = pos + 1 + inner.len();
             for (i, row) in inner.into_iter().enumerate() {
                 rows.insert(pos + i, row);
             }
             rows.insert(pos, header);
+        }
+        if !views.is_empty() {
+            rows.insert(
+                after_work,
+                Row {
+                    id: format!("{}#views", entry.id).into(),
+                    version: tool_fingerprint(&views, false),
+                    turn_start: false,
+                    kind: RowKind::ToolGroup {
+                        summary: tool_group_summary(&views).into(),
+                        tools: Arc::new(views),
+                        auto_open: false,
+                        worked_secs: None,
+                        compact_shell: false,
+                    },
+                    entry_id: entry.id.clone().into(),
+                    timestamp: None,
+                    copy_text: None,
+                    compact_fold: None,
+                },
+            );
         }
     } else {
         flush_group(
@@ -2586,6 +2659,36 @@ pub fn sending_bridge(
         (Some(send), Some(turn)) => turn <= send,
         (Some(_), None) => true,
         (None, _) => false,
+    }
+}
+
+/// Shorter waits are the ordinary send round-trip.
+const TURN_WAIT_SHOWN_SECS: i64 = 60;
+
+/// How long the running turn's prompt waited before the turn began, when
+/// that is worth showing. The timer counts the run only; a send from another
+/// device can sit undelivered for minutes first, and without this the turn
+/// looked seconds old (#413). None unless the last user entry started this
+/// turn: every entry after it belongs to the turn.
+pub fn turn_wait_secs(
+    entries: &[SessionMessageEntry],
+    turn_started: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<i64> {
+    let started = turn_started?.timestamp_millis();
+    let prompt = entries.iter().rposition(|e| e.role == MessageRole::User)?;
+    if entries[prompt + 1..].iter().any(|e| e.created_at < started) {
+        return None;
+    }
+    let waited = (started - entries[prompt].created_at) / 1000;
+    (waited >= TURN_WAIT_SHOWN_SECS).then_some(waited)
+}
+
+/// The trailer under another device's prompt that hasn't started yet.
+pub fn remote_pending_label(waiting_for_attachments: bool) -> &'static str {
+    if waiting_for_attachments {
+        "Sent from another device · waiting for its attachments"
+    } else {
+        "Sent from another device · waiting to start"
     }
 }
 
@@ -3741,7 +3844,7 @@ impl Transcript {
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        Self::build(state, None, true, cx)
+        Self::build(state, None, true, ListAlignment::Bottom, cx)
     }
 
     /// A read-only transcript over one SUBAGENT doc (right-pane tab). The
@@ -3756,13 +3859,37 @@ impl Transcript {
         follow: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(state, Some(doc_id), follow, cx)
+        Self::build(state, Some(doc_id), follow, ListAlignment::Top, cx)
+    }
+
+    /// Chat panes keep the same entity and list when becoming active. Unlike
+    /// subagent documents, both roles use the primary chat's list alignment.
+    pub(crate) fn for_peer_chat(
+        state: Entity<AppState>,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(state, Some(chat_id), true, ListAlignment::Bottom, cx)
+    }
+
+    /// Change only the feed/presentation role, not the chat or its interaction
+    /// state. In particular, keep folds, the viewport, and pending selection.
+    pub(crate) fn set_split_source(&mut self, peer: Option<String>) {
+        self.doc_live = peer.is_some();
+        self.retain_on_deselect = peer.is_none();
+        if peer.is_some() {
+            self.rail_enabled = false;
+            self.bottom_clearance = 0.0;
+        }
+        self.doc_override = peer;
+        self.last_source = None;
     }
 
     fn build(
         state: Entity<AppState>,
         doc_override: Option<String>,
         follow: bool,
+        alignment: ListAlignment,
         cx: &mut Context<Self>,
     ) -> Self {
         // A split pane drawn from a cached frame keeps its selectable text
@@ -3775,7 +3902,7 @@ impl Transcript {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
         // not the list's per-layout hard snap.
         //
-        // Override instances align TOP: a subagent transcript reads like a
+        // Subagent instances align TOP: a subagent transcript reads like a
         // fresh notes page — entries anchored at the top, streaming growing
         // into the empty space below, never rising from the pane's bottom.
         // Top alignment gets that structurally (a short list rests at the
@@ -3785,11 +3912,6 @@ impl Transcript {
         // materializes a Top list's past-end offset to a CONCRETE position
         // every frame (gpui list.rs: only `Bottom` re-glues to the `None`
         // sentinel), so a parked spring can't re-glue and hard-track growth.
-        let alignment = if doc_override.is_some() {
-            ListAlignment::Top
-        } else {
-            ListAlignment::Bottom
-        };
         let list = ListState::new(0, alignment, px(OVERDRAW_PX));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
@@ -3960,6 +4082,11 @@ impl Transcript {
 
     pub(crate) fn list_state(&self) -> &ListState {
         &self.list
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fold_open(&self, row_id: &str) -> Option<bool> {
+        self.folds.get(row_id).and_then(|fold| fold.open)
     }
 
     /// Snapshot the outgoing primary chat before its rows and ListState are
@@ -4223,12 +4350,16 @@ impl Transcript {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Text listeners claim the drag before it bubbles here. Stop following
-        // immediately: a stream commit can otherwise virtualize the anchor
-        // before the first mouse move. Keep the user bubble's long-press timer.
-        if !crate::markdown::selection::is_dragging() {
+        // Text listeners claim direct hits before it bubbles here. Also allow
+        // a start in horizontal whitespace, but only inside this pane's viewport.
+        if !crate::markdown::selection::is_dragging()
+            && !(self.list.viewport_bounds().contains(&event.position)
+                && render::begin_drag_in_whitespace(cx.entity_id().as_u64(), event.position))
+        {
             return;
         }
+        // Stop following immediately: a stream commit can otherwise virtualize
+        // the anchor before the first move. Keep the bubble's long-press timer.
         self.selection_drag_position = Some(event.position);
         self.discard_pending_viewport();
         self.user_collapse_scroll = None;
@@ -5140,6 +5271,10 @@ impl Transcript {
             if self.doc_override.is_none() {
                 for echo in state.pending_echoes() {
                     new_rows.extend(self.rows_for(echo, true));
+                }
+                // Another device's prompt the host hasn't started (#415).
+                for prompt in state.remote_pending_prompts() {
+                    new_rows.extend(self.rows_for(&prompt.entry, true));
                 }
             }
             (
@@ -6711,6 +6846,118 @@ impl Transcript {
         }
     }
 
+    /// Images a reply's Markdown block references (`![caption](shot.png)`),
+    /// loaded like generated images through the engine's read-back, which
+    /// serves files under a chat's folder (#400). Relative sources resolve
+    /// against the chat's workspace. `None` for a block without images, and
+    /// a remote URL or an unreadable file shows its caption.
+    fn reply_media_ui(
+        &mut self,
+        block: &Block,
+        workspace_root: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Option<render::MediaUi> {
+        use crate::attachments::AttachmentSnapshot;
+        let sources = crate::files::markdown_media::block_image_sources(block);
+        if sources.is_empty() {
+            return None;
+        }
+        let devices = {
+            let state = self.state.read(cx);
+            let owner = self
+                .chat_id
+                .as_deref()
+                .and_then(|chat_id| state.chats.iter().find(|chat| chat.id == chat_id))
+                .map(|chat| chat.device_id.clone())
+                .unwrap_or_default();
+            generated_image_devices(&owner, &self.attachment_device_ids(cx))
+        };
+        let mut images = HashMap::new();
+        for source in sources {
+            if let Some(path) = reply_image_path(&source, workspace_root) {
+                let state = self.attachment_state(&devices, &path, None, cx);
+                images.insert(source, state);
+            }
+        }
+        let images = Rc::new(images);
+        let transcript = cx.entity().downgrade();
+        Some(render::MediaUi {
+            diagram: None,
+            image: Rc::new(move |image, id, theme| {
+                let frame = div()
+                    .id(id.clone())
+                    .w(px(512.0))
+                    .max_w_full()
+                    .h(px(320.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.0))
+                    .overflow_hidden()
+                    .bg(crate::theme::ink(0.045))
+                    .text_color(theme.text_muted);
+                match images.get(&image.source) {
+                    Some(AttachmentSnapshot::Loaded(loaded)) => {
+                        let (width, height) = crate::appshots::png_dimensions(&loaded.image.bytes)
+                            .unwrap_or((512, 320));
+                        let scale = (512.0 / width as f32).min(420.0 / height as f32).min(1.0);
+                        let name = if image.alt.is_empty() {
+                            loaded.name.to_string()
+                        } else {
+                            image.alt.clone()
+                        };
+                        let preview = crate::attachments::PreviewImage::new(
+                            name.clone(),
+                            loaded.image.clone(),
+                        );
+                        let transcript = transcript.clone();
+                        let accent = theme.accent;
+                        frame
+                            .w(px(width as f32 * scale))
+                            .h(px(height as f32 * scale))
+                            .role(gpui::Role::Button)
+                            .aria_label(SharedString::from(name))
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .focus_visible(move |style| style.border_2().border_color(accent))
+                            .on_click(move |_, window, cx| {
+                                transcript
+                                    .update(cx, |this, cx| {
+                                        this.attachment_preview_return_focus = window.focused(cx);
+                                        preview.viewer.reset();
+                                        this.attachment_preview = Some(preview.clone());
+                                        window.focus(&this.attachment_preview_focus, cx);
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            })
+                            .child(
+                                gpui::img(loaded.image.clone())
+                                    .size_full()
+                                    .rounded(px(12.0))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            )
+                            .into_any_element()
+                    }
+                    Some(AttachmentSnapshot::Loading) => {
+                        frame.child("Loading image…").into_any_element()
+                    }
+                    // Not a workspace file, or it could not be read: the
+                    // caption, as before.
+                    _ => div()
+                        .id(id)
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(if image.alt.is_empty() {
+                            image.source.clone()
+                        } else {
+                            image.alt.clone()
+                        }))
+                        .into_any_element(),
+                }
+            }),
+        })
+    }
+
     /// A sent non-image attachment: the thumbnail's footprint (so row heights
     /// don't shift) with a document glyph, the file name, and upload status.
     fn render_file_attachment(
@@ -7174,6 +7421,32 @@ impl Transcript {
                         .into_any_element(),
                 );
             }
+            // A prompt from another device that hasn't started: say what it
+            // waits on, without claiming the agent is working (#415).
+            let waiting = {
+                let state = self.state.read(cx);
+                (state.indicator_for(&chat_id, now) != crate::state::Indicator::Working)
+                    .then(|| {
+                        let mut prompts = state.remote_pending_prompts().peekable();
+                        prompts.peek()?;
+                        Some(remote_pending_label(
+                            prompts.any(|p| p.waiting_for_attachments),
+                        ))
+                    })
+                    .flatten()
+            };
+            if let Some(label) = waiting {
+                let theme = Theme::of(cx).clone();
+                return Some(
+                    div()
+                        .id("remote-pending")
+                        .pt(px(Theme::SPACE_LG))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(label))
+                        .into_any_element(),
+                );
+            }
             let (sending, queued, elapsed) = {
                 let state = self.state.read(cx);
                 if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
@@ -7220,6 +7493,14 @@ impl Transcript {
                 self.compact_last_elapsed.insert(entry_id, elapsed_secs);
             }
         }
+        let waited = match (&self.doc_override, &self.chat_id) {
+            (None, Some(chat_id)) => {
+                let state = self.state.read(cx);
+                let turn_started = state.session_for(chat_id).and_then(|s| s.started_at);
+                turn_wait_secs(&state.transcript, turn_started)
+            }
+            _ => None,
+        };
         let word = if queued {
             "Queued — will send automatically"
         } else if sending {
@@ -7283,6 +7564,18 @@ impl Transcript {
                             .text_color(theme.text_faint)
                             .child(SharedString::from(format_elapsed(elapsed_secs))),
                     )
+                    .when_some(waited, |el, waited| {
+                        el.child(
+                            div()
+                                .relative()
+                                .top(px(1.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!(
+                                    "· waited {} to start",
+                                    format_elapsed(waited)
+                                ))),
+                        )
+                    })
                 })
         };
         Some(
@@ -7342,6 +7635,7 @@ impl Transcript {
 
         let inner: AnyElement = match &row.kind {
             RowKind::User {
+                agent_sender,
                 text,
                 mentions,
                 attachments,
@@ -7357,6 +7651,15 @@ impl Transcript {
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
                 // HStack); image-only sends show no bubble at all.
                 let mut column = div().w_full().flex().flex_col();
+                if let Some(sender) = agent_sender {
+                    column = column.child(
+                        div()
+                            .pb(px(6.0))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(format!("Agent message · {sender}")),
+                    );
+                }
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(
                         &row.id,
@@ -7393,11 +7696,12 @@ impl Transcript {
                     // left edge, and long prompts render as one clipped line
                     // instead of wrapping inside the 80% column cap.
                     column = column.child(
-                        div().w_full().flex().justify_end().child(
+                        div().w_full().flex().when(agent_sender.is_none(), |el| el.justify_end()).child(
                             div()
                                 .min_w_0()
                                 .max_w(px(self.content_width * 0.8))
-                                .bg(crate::theme::user_bubble_bg())
+                                .when(agent_sender.is_none(), |el| el.bg(crate::theme::user_bubble_bg()))
+                                .when(agent_sender.is_some(), |el| el.border_l_1().border_color(theme.border))
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .px(px(16.0))
                                 .py(px(10.0))
@@ -7418,9 +7722,10 @@ impl Transcript {
                     return gpui::Empty.into_any_element();
                 };
                 let code = self.code_uis_for(&row.id, &top.block, *block_ix, cx);
+                let media = self.reply_media_ui(&top.block, workspace_root.as_deref(), cx);
                 let opts = RenderOptions {
                     tasks: None,
-                    media: None,
+                    media,
                     row_key: row.id.clone(),
                     veil: None,
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -7477,9 +7782,10 @@ impl Transcript {
                         })
                         .clone()
                 });
+                let media = self.reply_media_ui(&top.block, workspace_root.as_deref(), cx);
                 let opts = RenderOptions {
                     tasks: None,
-                    media: None,
+                    media,
                     row_key: row.id.clone(),
                     veil: veil.clone(),
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -8334,6 +8640,8 @@ impl Transcript {
                         None => tool_group_title(summary.clone(), shimmer_phase, theme),
                     }),
             );
+        #[cfg(test)]
+        let header = header.debug_selector(|| "transcript-tool-group-header".into());
 
         if compact_shell {
             let view = cx.entity_id();
@@ -10174,6 +10482,7 @@ mod tests {
     fn a_url_printed_in_tool_output_opens_through_the_transcript_link(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _selection = crate::markdown::selection::test_state_lock();
         struct Output {
             activated: Rc<RefCell<Vec<render::LinkActivation>>>,
         }
@@ -10221,7 +10530,11 @@ mod tests {
             bounds.left() + px(6.0),
             bounds.top() + px(6.0 + OUTPUT_LINE_HEIGHT / 2.0),
         );
+        // A settled selection can outlive the row that painted its listeners.
+        crate::markdown::selection::begin_with_span("unmounted-row", "selected", 0..8);
+        crate::markdown::selection::end_active_drag();
         cx.simulate_click(first_line, gpui::Modifiers::default());
+        crate::markdown::selection::clear_if_owner("unmounted-row");
         let seen = activated.borrow();
         assert_eq!(seen.len(), 1, "one activation");
         assert_eq!(seen[0].target.original, "https://example.com/review/123");
@@ -12997,6 +13310,88 @@ mod tests {
     }
 
     #[test]
+    fn reply_images_resolve_against_the_chat_workspace() {
+        let (root, absolute, url) = if cfg!(windows) {
+            (
+                r"C:\work\repo",
+                "C:/tmp/before.png",
+                "file:///C:/tmp/before.png",
+            )
+        } else {
+            ("/work/repo", "/tmp/before.png", "file:///tmp/before.png")
+        };
+        let in_root = |relative: &str| {
+            std::path::Path::new(root)
+                .join(relative)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let root = Some(root);
+        assert_eq!(
+            reply_image_path("shot.png", root),
+            Some(in_root("shot.png"))
+        );
+        assert_eq!(
+            reply_image_path("./docs/after.png", root),
+            Some(in_root("docs/after.png"))
+        );
+        assert_eq!(reply_image_path(absolute, None).as_deref(), Some(absolute));
+        assert_eq!(reply_image_path(url, root).as_deref(), Some(absolute));
+        assert_eq!(reply_image_path("https://example.com/a.png", root), None);
+        assert_eq!(reply_image_path("data:image/png;base64,AAAA", root), None);
+        assert_eq!(reply_image_path("shot.png", None), None);
+    }
+
+    #[gpui::test]
+    fn reply_markdown_images_load_through_the_attachment_cache(cx: &mut gpui::TestAppContext) {
+        use crate::attachments::*;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.local_device_id = Some("reply-owner".into());
+                state
+            });
+            let transcript = cx.new(|cx| Transcript::new(state, cx));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(64, 48)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            store_loaded_for(
+                &AttachmentKey::new("reply-owner", "/fixture/ws/shot.png", None),
+                "shot.png".into(),
+                Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    bytes.into_inner(),
+                )),
+            );
+            transcript.update(cx, |this, cx| {
+                let block = |source: &str| parse_full(source).blocks[0].block.clone();
+                let root = Some("/fixture/ws");
+                assert!(
+                    this.reply_media_ui(&block("plain reply"), root, cx)
+                        .is_none()
+                );
+                assert!(
+                    this.reply_media_ui(&block("![Before and after](shot.png)"), root, cx)
+                        .is_some()
+                );
+                assert!(
+                    this.reply_media_ui(&block("![Remote](https://example.com/a.png)"), root, cx)
+                        .is_some()
+                );
+                assert!(
+                    this.attachment_loads.is_empty(),
+                    "a cached image repaints without a fetch, and a remote URL is never fetched"
+                );
+            });
+        });
+    }
+
+    #[test]
     fn generated_image_owner_candidates_and_same_length_corrections() {
         assert_eq!(
             generated_image_devices("owner", &["host".into(), "local".into(), "owner".into()]),
@@ -13397,6 +13792,84 @@ mod tests {
         rows.iter()
             .filter(|row| row.compact_fold.is_none())
             .collect()
+    }
+
+    #[test]
+    fn compact_mode_keeps_a_saved_view_visible_after_the_fold() {
+        let view = harness_proto::ToolView::new(
+            harness_proto::ToolViewKind::Html,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let mut render = tool_part("v", "render_html");
+        if let MessagePart::Tool { view: slot, .. } = &mut render {
+            *slot = Some(view.clone());
+        }
+        let entry = assistant(
+            "a-view",
+            MessageStatus::Complete,
+            vec![
+                tool_part("t1", "ls"),
+                render,
+                text_part("r1", "Ready to open."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, true, &mut parse);
+        let visible = compact_visible(&rows);
+        assert_eq!(visible.len(), 3, "work header, the view, the reply");
+        let RowKind::ToolGroup {
+            tools,
+            compact_shell,
+            ..
+        } = &visible[0].kind
+        else {
+            panic!("expected the work group");
+        };
+        assert!(*compact_shell);
+        assert!(tools.iter().all(|t| t.view.is_none()));
+        let RowKind::ToolGroup {
+            tools,
+            compact_shell,
+            ..
+        } = &visible[1].kind
+        else {
+            panic!("expected the view row");
+        };
+        assert!(!*compact_shell);
+        assert!(!tool_group_collapses(tools));
+        assert_eq!(tools[0].view, Some(view));
+        // Expanding the fold doesn't show the view a second time.
+        let folded_views = rows
+            .iter()
+            .filter(|r| r.compact_fold.is_some())
+            .filter(|r| matches!(&r.kind, RowKind::ToolGroup { tools, .. } if tools.iter().any(|t| t.view.is_some())))
+            .count();
+        assert_eq!(folded_views, 0);
+        // A turn whose only tool saved a view has no work header at all.
+        let mut only = tool_part("v", "render_html");
+        if let MessagePart::Tool { view: slot, .. } = &mut only {
+            *slot = Some(
+                harness_proto::ToolView::new(
+                    harness_proto::ToolViewKind::Html,
+                    "0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            );
+        }
+        let entry = assistant(
+            "a-only",
+            MessageStatus::Complete,
+            vec![only, text_part("r1", "Ready.")],
+        );
+        let rows = rows_for_entry(&entry, false, true, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::ToolGroup {
+                compact_shell: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -14337,18 +14810,34 @@ mod tests {
             vec![tool_part("a", "ls"), render],
         );
         let rows = rows_for_entry(&entry, false, false, &mut parse);
-        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
-            panic!("tool group expected")
-        };
-        let chips: Vec<_> = tools.iter().map(|t| (is_link_chip(t), t.view.clone())).collect();
-        assert_eq!(chips, vec![(false, None), (true, Some(view))]);
-        // The row re-splices when the view lands after the result.
+        let groups: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                let RowKind::ToolGroup { tools, .. } = &row.kind else {
+                    panic!("tool group expected")
+                };
+                let chips: Vec<_> =
+                    tools.iter().map(|t| (is_link_chip(t), t.view.clone())).collect();
+                (tool_group_collapses(tools), chips)
+            })
+            .collect();
+        // The view is never folded into "Called N tools" with the ls.
+        assert_eq!(
+            groups,
+            vec![
+                (true, vec![(false, None)]),
+                (false, vec![(true, Some(view))]),
+            ]
+        );
+        // Before the view lands the render chip folds with the ls; the rows
+        // re-splice when it arrives after the result.
         let before = assistant(
             "m-view",
             MessageStatus::Complete,
             vec![tool_part("a", "ls"), tool_part("r", "render_html")],
         );
         let before = rows_for_entry(&before, false, false, &mut parse);
+        assert_eq!(before.len(), 1);
         assert_ne!(before[0].version, rows[0].version);
     }
 
@@ -16243,6 +16732,36 @@ mod tests {
     }
 
     #[test]
+    fn agent_messages_are_attributed_instead_of_impersonating_user_prompts() {
+        for header in [
+            "Cleanup (abc12345). Sender chat: abc12345. Relay depth: 1/4. Agent coordination, not a human request. Do not send acknowledgements or progress updates.",
+            "Cleanup (abc12345). Reply to it with the Harness `send_message` tool, chat abc12345.",
+        ] {
+            let body = "Keep active tests running.";
+            let envelope = format!("[Message from Harness chat {header}]\n\n{body}");
+            let mut entry = assistant("peer", MessageStatus::Complete, vec![]);
+            entry.role = MessageRole::User;
+            entry.parts = vec![text_part("t0", &envelope)];
+            let rows = rows_for_entry(&entry, false, false, &mut parse);
+            let RowKind::User { agent_sender, text, .. } = &rows[0].kind else {
+                panic!("expected an attributed prompt row");
+            };
+            assert_eq!(agent_sender.as_deref(), Some("Cleanup (abc12345)"));
+            assert_eq!(text.as_ref(), body);
+            assert_eq!(rows[0].copy_text.as_deref(), Some(body));
+            assert_eq!(rows[0].version, (envelope.len() as u64) << 1);
+
+            entry.parts = vec![text_part("t0", body)];
+            let rows = rows_for_entry(&entry, false, false, &mut parse);
+            let RowKind::User { agent_sender, text, .. } = &rows[0].kind else {
+                panic!("expected an ordinary user row");
+            };
+            assert!(agent_sender.is_none());
+            assert_eq!(text.as_ref(), body);
+        }
+    }
+
+    #[test]
     fn user_rows_split_attachment_refs_from_text() {
         let content = crate::attachments::with_attachments(
             "what color is this?",
@@ -17114,6 +17633,43 @@ mod tests {
         assert_eq!(pane_working_since(None, Assistant, Some(MessageStatus::Streaming), 5), Some(5));
         assert_eq!(pane_working_since(None, User, Some(MessageStatus::Complete), 5), Some(5));
         assert_eq!(pane_working_since(None, Assistant, Some(MessageStatus::Complete), 5), None);
+    }
+
+    #[test]
+    fn a_turn_that_started_long_after_its_prompt_shows_the_wait() {
+        let sent = chrono::DateTime::parse_from_rfc3339("2026-10-18T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let at = |secs: i64| (sent + chrono::Duration::seconds(secs)).timestamp_millis();
+        let entry = |id: &str, role, created_at| SessionMessageEntry {
+            id: id.into(),
+            role,
+            parts: Vec::new(),
+            created_at,
+            device_id: "phone".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let started = Some(sent + chrono::Duration::seconds(597));
+        let prompt = vec![entry("u1", MessageRole::User, at(0))];
+        assert_eq!(turn_wait_secs(&prompt, started), Some(597));
+        let mut running = prompt.clone();
+        running.push(entry("a1", MessageRole::Assistant, at(598)));
+        assert_eq!(turn_wait_secs(&running, started), Some(597));
+        // An ordinary send round-trip, or no turn yet: nothing to show.
+        assert_eq!(
+            turn_wait_secs(&prompt, Some(sent + chrono::Duration::seconds(3))),
+            None
+        );
+        assert_eq!(turn_wait_secs(&prompt, None), None);
+        // A turn its last prompt didn't start (a resume after an earlier
+        // reply), or a steer sent after the turn began.
+        let mut resumed = prompt.clone();
+        resumed.push(entry("a0", MessageRole::Assistant, at(5)));
+        assert_eq!(turn_wait_secs(&resumed, started), None);
+        let steer = vec![entry("u2", MessageRole::User, at(900))];
+        assert_eq!(turn_wait_secs(&steer, started), None);
     }
 
     #[test]

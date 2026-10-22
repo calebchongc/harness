@@ -115,6 +115,7 @@ actions!(
         FocusComposer,
         // Chat tabs, each holding its own split (`shell/chat_tabs.rs`).
         NewChatTab,
+        ReopenClosedChatTab,
         NextChatTab,
         PrevChatTab,
         // Settings → Devices' update button: the sidebar strip's flow
@@ -535,6 +536,14 @@ pub fn apply_keymap(
                 ShortcutId::CloseTabWithoutArchiving.default_combo(),
             ),
             crate::app_menus::CloseTabWithoutArchiving,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.reopen_closed_tab,
+                ShortcutId::ReopenClosedTab.default_combo(),
+            ),
+            ReopenClosedChatTab,
             None,
         ),
         KeyBinding::new(
@@ -1849,6 +1858,8 @@ pub struct Shell {
     chat_tab_revealed: Option<usize>,
     /// Open tab indices from least to most recently visited.
     chat_tab_history: Vec<usize>,
+    /// Closed tabs, most recent last, for ⌘⇧T (#455).
+    closed_chat_tabs: Vec<chat_tabs::ClosedChatTab>,
     /// Live read-only transcripts for unfocused panes, keyed by chat id.
     peer_chat_views: std::collections::HashMap<String, chat_split::PeerChatView>,
     /// A split divider being dragged, and the split root's measured bounds.
@@ -2148,7 +2159,6 @@ impl Shell {
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
-            let transcript = transcript.clone();
             move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::WorkspaceCommand(command) => {
                     this.pending_workspace_command = Some(*command);
@@ -2162,7 +2172,7 @@ impl Shell {
                     chat_id,
                     message_id,
                 } => {
-                    transcript.update(cx, |t, cx| {
+                    this.transcript.update(cx, |t, cx| {
                         t.on_own_send(chat_id.clone(), message_id.clone(), cx)
                     });
                 }
@@ -2182,7 +2192,7 @@ impl Shell {
                     chat_id,
                     message_id,
                 } => {
-                    transcript.update(cx, |t, cx| {
+                    this.transcript.update(cx, |t, cx| {
                         t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
                     });
                 }
@@ -2385,6 +2395,7 @@ impl Shell {
             chat_tab_scroll: gpui::ScrollHandle::new(),
             chat_tab_revealed: None,
             chat_tab_history: Vec::new(),
+            closed_chat_tabs: Vec::new(),
             peer_chat_views: std::collections::HashMap::new(),
             chat_split_drag: None,
             boot_restored: false,
@@ -12203,7 +12214,7 @@ impl Render for Shell {
                     .composer
                     .update(cx, |c, cx| c.open_model_menu(window, cx)),
                 WorkspaceCommand::New => self.open_new_session(cx),
-                WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
+                WorkspaceCommand::Resume => self.toggle_resume_palette(window, cx),
                 WorkspaceCommand::Settings => {
                     let section = self.remembered_settings_section();
                     self.open_settings(section, cx)
@@ -12535,6 +12546,9 @@ impl Render for Shell {
                 this.toggle_chat_pane_zoom(cx)
             }))
             .on_action(cx.listener(|this, _: &NewChatTab, window, cx| this.new_chat_tab(None, window, cx)))
+            .on_action(cx.listener(|this, _: &ReopenClosedChatTab, window, cx| {
+                this.reopen_closed_chat_tab(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &StartAppUpdate, _, cx| {
                 if matches!(this.update_flow, UpdateFlow::Idle | UpdateFlow::Failed(_)) {
                     this.on_update_strip_click(cx);
@@ -16063,6 +16077,30 @@ mod exit_regressions {
                     LinkOutcome::Internal
                 );
                 assert_eq!(shell.browsers.len(), 4);
+                // The reported GitHub issue URL passes validation and reaches
+                // either destination; it is not diverted into file handling.
+                let issue_url = "https://github.com/justrach/harness/issues/447";
+                activation.target = LinkTarget::new("Issue", issue_url);
+                assert_eq!(activation.target.navigation, Ok(issue_url.into()));
+                assert!(crate::browser::model::allowed_navigation(issue_url));
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Internal
+                );
+                assert_eq!(shell.browsers.len(), 5);
+                assert_eq!(
+                    shell.browsers[&shell.browser_seq]
+                        .read(cx)
+                        .page
+                        .url
+                        .as_deref(),
+                    Some(issue_url)
+                );
+                activation.action = LinkAction::External;
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::External(issue_url.into())
+                );
                 let weak = shell.browsers[&first].downgrade();
                 shell.close_right_surface(RightSurface::Browser(first), window, cx);
                 weak

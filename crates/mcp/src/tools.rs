@@ -196,6 +196,17 @@ fn catalog() -> Vec<ToolDef> {
             })),
         },
         ToolDef {
+            name: "rename_chat",
+            description: "Set a chat's sidebar title, for example after its task changed. It replaces the generated title, and the engine won't retitle the chat afterwards.",
+            input_schema: {
+                let mut schema = chat_key_schema(json!({
+                    "title": { "type": "string", "minLength": 1, "maxLength": 200 }
+                }));
+                schema["required"] = json!(["chat", "title"]);
+                schema
+            },
+        },
+        ToolDef {
             name: "archive_chat",
             description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.",
             input_schema: chat_key_schema(json!({
@@ -312,6 +323,12 @@ struct WaitArgs {
 struct ArchiveArgs {
     chat: String,
     archived: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RenameArgs {
+    chat: String,
+    title: String,
 }
 
 #[derive(Deserialize)]
@@ -463,6 +480,7 @@ impl Tools {
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "dismiss_input" => self.dismiss_input(parse(args)?).await,
+            "rename_chat" => self.rename_chat(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             "show_image" => self.show_image(parse(args)?).await,
             "show_visual" => self.show_visual(parse(args)?).await,
@@ -874,6 +892,18 @@ impl Tools {
             .await_turn(&chat, None, false, self.wait_limit(args.timeout_secs), 0)
             .await?;
         Ok(json!({ "chatId": chat.id, "title": chat.title, "turn": turn }))
+    }
+
+    async fn rename_chat(&self, args: RenameArgs) -> anyhow::Result<Value> {
+        let title = args.title.trim();
+        if title.is_empty() {
+            anyhow::bail!("rename_chat needs a nonblank title");
+        }
+        let chat = self.harness.resolve_chat(&args.chat).await?;
+        self.harness
+            .mutate(json!({ "op": "renameChat", "chatId": chat.id, "title": title }))
+            .await?;
+        Ok(json!({ "chatId": chat.id, "previousTitle": chat.title, "title": title }))
     }
 
     async fn archive_chat(&self, args: ArchiveArgs) -> anyhow::Result<Value> {
@@ -1581,6 +1611,38 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+    }
+
+    #[tokio::test]
+    async fn rename_chat_retitles_an_existing_chat() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let renamed = tools
+            .call(
+                "rename_chat",
+                json!({ "chat": "alpha", "title": "  Release checklist  " }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed["chatId"], "chat-alpha-1");
+        assert_eq!(renamed["title"], "Release checklist");
+        {
+            let writes = world.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].1["op"], "renameChat");
+            assert_eq!(writes[0].1["chatId"], "chat-alpha-1");
+            assert_eq!(writes[0].1["title"], "Release checklist");
+        }
+        let err = tools
+            .call("rename_chat", json!({ "chat": "alpha", "title": "   " }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("nonblank title"), "{err}");
+        assert_eq!(
+            world.writes.lock().unwrap().len(),
+            1,
+            "a blank title writes nothing"
+        );
     }
 
     #[tokio::test]

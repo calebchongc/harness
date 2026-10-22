@@ -9,6 +9,10 @@ struct SessionView: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     /// Open another session beside this one, or close this pane: set only on a Max-class iPhone (SplitScreen).
     @Environment(\.splitScreen) private var splitScreen
+    /// Open a new session below this one, in the phone's stacked split (⌘D on the desktop).
+    @Environment(\.stackedSplit) private var stackedSplit
+    /// Close this pane of the stacked split, while two are shown.
+    @Environment(\.stackedClose) private var stackedClose
     let chatId: String
 
     /// Width the nav bar's own controls need around a LEADING title — the
@@ -18,6 +22,12 @@ struct SessionView: View {
     /// iPhone Air at 110.
     private static let headerChromeInset: CGFloat = 170
     private static let topFadeHeight: CGFloat = 28
+
+    /// Room the stacked split's trailing buttons take from the title: the titled Split button, or the ×.
+    private var stackedButtonsWidth: CGFloat {
+        if stackedSplit != nil { return 92 }
+        return stackedClose == nil ? 0 : 44
+    }
 
     /// The view's own width, the only reliable basis for capping the principal
     /// toolbar item (its container proposes an unbounded width).
@@ -174,12 +184,38 @@ struct SessionView: View {
                         // frame collapses to its minimum ("S…"). Claiming the
                         // remainder of the bar outright lays the texts out with
                         // real room and truncates them properly.
-                        .frame(width: max(140, viewWidth - Self.headerChromeInset), alignment: .leading)
+                        .frame(width: max(140, viewWidth - Self.headerChromeInset - stackedButtonsWidth),
+                               alignment: .leading)
                         // Swipe the header to page to the neighbouring session.
                         .pagerSwipe()
                 }
                 // Bare text on the bar, not a glass capsule.
                 .sharedBackgroundVisibility(.hidden)
+            }
+            if let stackedSplit {
+                ToolbarItem(placement: .topBarTrailing) {
+                    // Titled: the icon alone read as a plain box. A Label in the bar drops its title, so the
+                    // icon and the word are laid out here.
+                    Button(action: stackedSplit) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "rectangle.split.1x2")
+                            Text("Split")
+                                .font(Theme.sans(15, weight: .medium))
+                        }
+                        .padding(.horizontal, 4)
+                        .fixedSize()
+                    }
+                    .accessibilityLabel("Open another session below this one")
+                    .accessibilityIdentifier("stacked-split-open")
+                }
+            }
+            if let stackedClose {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: stackedClose) {
+                        Label("Close this pane", systemImage: "xmark")
+                    }
+                    .accessibilityIdentifier("stacked-pane-close")
+                }
             }
         }
         .alert("Rename session", isPresented: $renamingSession) {

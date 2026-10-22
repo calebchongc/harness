@@ -1998,16 +1998,28 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Prompts first: watch_queue's publish then fills both.
+                let prompts = handle.watch_pending_prompts();
                 let rx = handle.watch_queue();
                 Ok(RpcReply::Stream(
-                    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
-                        if !first {
-                            rx.changed().await.ok()?;
-                        }
-                        let items = rx.borrow_and_update().clone();
-                        let value = serde_json::json!({ "items": items });
-                        Some((value, (rx, false)))
-                    })
+                    futures::stream::unfold(
+                        (rx, prompts, true),
+                        |(mut rx, mut prompts, first)| async move {
+                            if !first {
+                                tokio::select! {
+                                    changed = rx.changed() => changed.ok()?,
+                                    changed = prompts.changed() => changed.ok()?,
+                                }
+                            }
+                            let items = rx.borrow_and_update().clone();
+                            let pending = prompts.borrow_and_update().clone();
+                            let value = serde_json::json!({
+                                "items": items,
+                                "pendingPrompts": pending,
+                            });
+                            Some((value, (rx, prompts, false)))
+                        },
+                    )
                     .boxed(),
                 ))
             }

@@ -46,6 +46,9 @@
          the same isolated development instance. -->
     <key>LSEnvironment</key>
     <dict>
+        <!-- A release update would replace this bundle and erase local fixes. -->
+        <key>HARNESS_AUTO_UPDATE</key>
+        <string>0</string>
         <key>HARNESS_DATA_DIR</key>
         <string>__DATA_DIR__</string>
         <key>HARNESS_IPC_PORT</key>

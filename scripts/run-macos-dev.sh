@@ -80,6 +80,7 @@ echo "running Harness Dev (bundle $BUNDLE_ID, data $DATA_DIR, IPC $IPC_PORT)" >&
 # -W keeps the script attached until the app exits. Runtime logs remain in the
 # isolated data directory (`target/macos-dev/data/logs/harness-headed.log`).
 OPEN_ENV=(
+  --env "HARNESS_AUTO_UPDATE=0"
   --env "HARNESS_DATA_DIR=$DATA_DIR"
   --env "HARNESS_IPC_PORT=$IPC_PORT"
 )
