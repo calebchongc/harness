@@ -14,6 +14,8 @@ use crate::pickers::CanvasDraft;
 mod opening;
 
 #[cfg(test)]
+mod archived_tests;
+#[cfg(test)]
 mod sidebar_tests;
 #[cfg(test)]
 mod interaction_tests;
@@ -259,8 +261,8 @@ impl ChatSplit {
     }
 
     /// Empty the panes whose chat is gone from the chats list. `archived(id)`
-    /// is `None` when the list lacks the chat, else whether it is archived.
-    /// An archived chat's pane simply closes; a missing chat is remembered,
+    /// is `None` when the list lacks the chat, else whether it was archived
+    /// while shown. That pane simply closes; a missing chat is remembered,
     /// because a list can lack a chat only briefly and emptying the pane for
     /// good turned it into a new-session canvas (user report, 2026-09-29).
     pub fn prune(&mut self, archived: impl Fn(&str) -> Option<bool>) {
@@ -639,11 +641,23 @@ impl Shell {
         }
         if state.chats_synced {
             let chat = |id: &str| state.chats.iter().find(|c| c.id == id);
+            // Archived since the pane last saw it live: the pane closes. One
+            // that was archived when it entered the pane is being read, and
+            // emptying its pane turned it into a new session (#489). A pane a
+            // reopen is unarchiving stays either way.
             let unarchiving = &self.chat_tab_unarchiving;
-            split.prune(|id| chat(id).map(|c| c.archived && !unarchiving.contains_key(id)));
+            let live = &self.chat_split_live;
+            split.prune(|id| {
+                chat(id).map(|c| c.archived && live.contains(id) && !unarchiving.contains_key(id))
+            });
             split.restore_returned(|id| {
                 chat(id).is_some_and(|c| !c.archived || unarchiving.contains_key(id))
             });
+            self.chat_split_live = split
+                .peer_chats()
+                .filter(|id| chat(id).is_some_and(|c| !c.archived))
+                .map(str::to_owned)
+                .collect();
         }
         self.sync_chat_panes(cx);
     }
