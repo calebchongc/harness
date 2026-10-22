@@ -454,12 +454,13 @@ pub fn ghost_hover(theme: &Theme, s: gpui::StyleRefinement) -> gpui::StyleRefine
 
 /// A plain one-line hover tooltip: `.tooltip(widgets::text_tooltip("…"))`.
 pub fn text_tooltip(
-    text: &'static str,
+    text: impl Into<SharedString>,
 ) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
-    move |_, cx| cx.new(|_| TextTooltip(text)).into()
+    let text = text.into();
+    move |_, cx| cx.new(|_| TextTooltip(text.clone())).into()
 }
 
-struct TextTooltip(&'static str);
+struct TextTooltip(SharedString);
 
 impl gpui::Render for TextTooltip {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -475,7 +476,7 @@ impl gpui::Render for TextTooltip {
             .shadow_md()
             .text_size(crate::typography::ui_rems(11.0))
             .text_color(theme.text)
-            .child(self.0)
+            .child(self.0.clone())
     }
 }
 

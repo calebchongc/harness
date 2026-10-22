@@ -9653,6 +9653,12 @@ impl Shell {
         let theme = Theme::of(cx).for_popup();
         let mut overlays: Vec<AnyElement> = Vec::new();
 
+        // First, so menus and dialogs layer above it: with the sidebar collapsed, a running
+        // cloud sandbox (billed until turned off) still shows under the sidebar toggle.
+        if let Some(chip) = self.render_cloud_sandbox_chip(&theme, cx) {
+            overlays.push(chip);
+        }
+
         if let Some(menu_state) = self.chat_menu.get().cloned() {
             let chat_id = menu_state.chat_id;
             let position = menu_state.position;

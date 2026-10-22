@@ -135,6 +135,8 @@ pub fn sandbox_detail(sandbox: &CodegraffSandbox, now: DateTime<Utc>) -> String 
     parts.join(" · ")
 }
 
+const BILLED: &str = "Billed per second until you turn it off";
+
 /// What the always-visible strip says while sandboxes cost credit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunningSummary {
@@ -181,7 +183,7 @@ pub fn running_summary(list: &CodegraffSandboxes, now: DateTime<Utc>) -> Option<
             .and_then(|s| running_outlook(s, now))
         {
             Some(lease) if lease.starts_with("pauses") => (capitalize(&lease), false),
-            _ => ("Billed per second until you turn it off".to_string(), false),
+            _ => (BILLED.to_string(), false),
         },
     };
     Some(RunningSummary {
@@ -190,6 +192,16 @@ pub fn running_summary(list: &CodegraffSandboxes, now: DateTime<Utc>) -> Option<
         warning,
         running_ids: running.iter().map(|s| s.id.clone()).collect(),
     })
+}
+
+/// The collapsed-sidebar chip's hover text: "Cloud sandbox running — billed per second", or
+/// the summary's own news ("… — Out of credit — pauses in 4 min"). Pure.
+pub fn compact_tooltip(summary: &RunningSummary) -> String {
+    if summary.detail == BILLED {
+        format!("{} — billed per second", summary.label)
+    } else {
+        format!("{} — {}", summary.label, summary.detail)
+    }
 }
 
 /// Anything running, starting or stopping changes on its own (billing, renewals, pauses), so
@@ -365,6 +377,28 @@ mod tests {
         let starting = running_summary(&list(vec![sandbox("starting", false, None)]), now).unwrap();
         assert_eq!(starting.label, "Cloud sandbox starting");
         assert!(starting.running_ids.is_empty(), "nothing to turn off yet");
+    }
+
+    #[test]
+    fn the_collapsed_chip_says_what_it_costs_or_what_is_wrong() {
+        let now = at(12, 0);
+        let one = running_summary(&list(vec![kept("2026-10-01T12:24:00Z", None)]), now).unwrap();
+        assert_eq!(
+            compact_tooltip(&one),
+            "Cloud sandbox running — billed per second"
+        );
+        let failing = running_summary(
+            &list(vec![kept(
+                "2026-10-01T12:04:00Z",
+                Some("insufficient_credit"),
+            )]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            compact_tooltip(&failing),
+            "Cloud sandbox running — Out of credit — pauses in 4 min"
+        );
     }
 
     #[test]
