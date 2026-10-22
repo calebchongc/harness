@@ -1276,16 +1276,16 @@ final class AppModel {
         return false
     }
 
-    /// The user-visible truth of a chat's oldest unadopted send. `failed`
-    /// (unadopted past the 2-minute grace, with a retry affordance) wins over
-    /// `queued` (pending on a degraded path); a healthy in-flight send reads
-    /// `sending`. nil = nothing pending.
+    /// The user-visible truth of a chat's unadopted sends (`SendState.of`).
+    /// `failed` only when the doc says a send can no longer run; past the
+    /// grace a still-pending command reads `waiting` (#413). nil = nothing
+    /// pending.
     func sendState(for chat: Chat, now: Int64 = nowMs()) -> SendState? {
         guard demo == nil, let store = sessionStores[chat.id],
               let oldest = store.pendingSends.map(\.started).min() else { return nil }
-        if now - oldest > undeliveredGraceMs { return .failed }
-        if chatDeliveryDegraded(chat) { return .queued }
-        return .sending
+        return SendState.of(oldestStarted: oldest,
+                            undeliverable: !store.undeliverableSends(now: now).isEmpty,
+                            degraded: chatDeliveryDegraded(chat), now: now)
     }
 
     func releaseSessionStore(chatId: String) {

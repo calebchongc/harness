@@ -288,7 +288,7 @@ struct SessionView: View {
                 if verticalSizeClass != .compact || status == .working || status == .errored
                     || model.sendState(for: chat) != nil || model.connectivity.state != .connected {
                     statusStrip(chat: chat, status: status, store: store)
-                        .allowsHitTesting(model.sendState(for: chat) == .failed)
+                        .allowsHitTesting(model.sendState(for: chat).map { $0 == .failed || $0 == .waiting } ?? false)
                 }
                 Group {
                     if let request = store.openInputRequest {
@@ -352,8 +352,9 @@ struct SessionView: View {
     /// shows "Run failed"; the strip always reserves its height so the
     /// composer never shifts. An unadopted send's truth takes precedence:
     /// "Sending…" (healthy, within the 2-minute grace), "Queued — will send
-    /// automatically" (degraded path — no fake progress), or the explicit
-    /// "Not delivered — tap to retry" (transcript.rs retry_send).
+    /// automatically" (degraded path — no fake progress), "Waiting for Mac to
+    /// start it" (past the grace, still pending in the doc), or "Not
+    /// delivered — tap to retry" once no command for it can run.
     private func statusStrip(chat: Chat, status: SessionStatus?, store: SessionStore) -> some View {
         // Ticks once a second only while something on the strip is timed: the Working elapsed counter, a
         // pending send's grace, or the reconnect countdown. An idle open chat repaints nothing.
@@ -369,6 +370,25 @@ struct SessionView: View {
                         Text("Not delivered — tap to retry")
                             .font(Theme.sans(11))
                             .foregroundStyle(Theme.danger)
+                    }
+                    .buttonStyle(.plain)
+                case .waiting?:
+                    // Still pending in the doc: the host can start it at any
+                    // time (#413). Tapping re-checks delivery; it never sends
+                    // a second copy of a command that can still run.
+                    Button {
+                        store.retryDelivery()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(Theme.warning)
+                                .frame(width: 5, height: 5)
+                            Text(waitingLabel(chat: chat, store: store))
+                                .font(Theme.sans(11))
+                                .foregroundStyle(Theme.textMuted)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                        }
                     }
                     .buttonStyle(.plain)
                 case .queued?:
@@ -402,7 +422,7 @@ struct SessionView: View {
                         Text(reconnectingLabel)
                             .font(Theme.sans(11)).foregroundStyle(Theme.textFaint).monospacedDigit()
                     case .connected:
-                        normalStatus(chat: chat, status: status)
+                        normalStatus(chat: chat, status: status, store: store)
                     }
                 }
             }
@@ -412,6 +432,18 @@ struct SessionView: View {
         }
     }
 
+    /// "Waiting for Mac to start it · sent 9m 57s ago". The age counts from the original
+    /// submission, which a retry keeps; only the delivery grace restarts.
+    private func waitingLabel(chat: Chat, store: SessionStore) -> String {
+        let host = model.deviceName(store.hostDeviceId ?? chat.deviceId)
+        let sent = store.pendingSends.map(\.at).min() ?? nowMs()
+        let age = Motion.formatElapsed((nowMs() - sent) / 1000)
+        let what = store.transferProgress != nil
+            ? "Attachments still on their way to \(host)"
+            : "Waiting for \(host) to start it"
+        return "\(what) · sent \(age) ago"
+    }
+
     private var reconnectingLabel: String {
         guard let retryAt = model.connectivity.retryAt else { return "Reconnecting…" }
         let secs = Int(retryAt.timeIntervalSinceNow.rounded(.up))
@@ -419,7 +451,7 @@ struct SessionView: View {
     }
 
     @ViewBuilder
-    private func normalStatus(chat: Chat, status: SessionStatus?) -> some View {
+    private func normalStatus(chat: Chat, status: SessionStatus?, store: SessionStore) -> some View {
         Group {
                 switch status {
                 case .working:
@@ -433,6 +465,15 @@ struct SessionView: View {
                         .font(Theme.sans(11))
                         .foregroundStyle(Theme.textFaint)
                         .monospacedDigit()
+                    // The timer counts the run; a prompt that sat waiting
+                    // for its host says how long, after it (#413).
+                    if let waited = turnWaitSecs(entries: store.entries, turnStartedAt: turnStartedAt(chat: chat)) {
+                        Text("· waited \(Motion.formatElapsed(waited)) to start")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textFaint)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                    }
                 case .errored:
                     Text("Run failed")
                         .font(Theme.sans(11))
@@ -441,6 +482,11 @@ struct SessionView: View {
                     EmptyView()
                 }
         }
+    }
+
+    /// The host's start of this turn only, without the timer's fallbacks.
+    private func turnStartedAt(chat: Chat) -> Int64? {
+        (model.demo?.sessions[chat.id] ?? model.workspace?.sessions[chat.id])?.startedAt
     }
 
     private func sessionStartedAt(chat: Chat) -> Int64 {

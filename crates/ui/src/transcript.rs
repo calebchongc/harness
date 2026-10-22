@@ -2681,12 +2681,19 @@ pub fn turn_wait_secs(
     (waited >= TURN_WAIT_SHOWN_SECS).then_some(waited)
 }
 
-/// The trailer under another device's prompt that hasn't started yet.
-pub fn remote_pending_label(waiting_for_attachments: bool) -> &'static str {
-    if waiting_for_attachments {
+/// The trailer under another device's prompt that hasn't started yet. Past
+/// an ordinary send round-trip it says how long the prompt has been waiting,
+/// which the run's own timer will not count once it starts (#413).
+pub fn remote_pending_label(waiting_for_attachments: bool, waited_secs: i64) -> String {
+    let what = if waiting_for_attachments {
         "Sent from another device · waiting for its attachments"
     } else {
         "Sent from another device · waiting to start"
+    };
+    if waited_secs >= TURN_WAIT_SHOWN_SECS {
+        format!("{what} · sent {} ago", format_elapsed(waited_secs))
+    } else {
+        what.to_string()
     }
 }
 
@@ -7425,10 +7432,11 @@ impl Transcript {
                 let state = self.state.read(cx);
                 (state.indicator_for(&chat_id, now) != crate::state::Indicator::Working)
                     .then(|| {
-                        let mut prompts = state.remote_pending_prompts().peekable();
-                        prompts.peek()?;
+                        let prompts: Vec<_> = state.remote_pending_prompts().collect();
+                        let sent = prompts.iter().map(|p| p.entry.created_at).min()?;
                         Some(remote_pending_label(
-                            prompts.any(|p| p.waiting_for_attachments),
+                            prompts.iter().any(|p| p.waiting_for_attachments),
+                            (now.timestamp_millis() - sent) / 1000,
                         ))
                     })
                     .flatten()
@@ -17695,6 +17703,22 @@ mod tests {
         assert_eq!(pane_working_since(None, Assistant, Some(MessageStatus::Streaming), 5), Some(5));
         assert_eq!(pane_working_since(None, User, Some(MessageStatus::Complete), 5), Some(5));
         assert_eq!(pane_working_since(None, Assistant, Some(MessageStatus::Complete), 5), None);
+    }
+
+    #[test]
+    fn another_devices_waiting_prompt_says_how_long_it_has_waited() {
+        assert_eq!(
+            remote_pending_label(false, 4),
+            "Sent from another device · waiting to start"
+        );
+        assert_eq!(
+            remote_pending_label(false, 597),
+            "Sent from another device · waiting to start · sent 9m 57s ago"
+        );
+        assert_eq!(
+            remote_pending_label(true, 144),
+            "Sent from another device · waiting for its attachments · sent 2m 24s ago"
+        );
     }
 
     #[test]

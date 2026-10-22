@@ -2224,6 +2224,8 @@ impl Shell {
                         s.selected_chat
                             .as_deref()
                             .is_some_and(|id| s.indicator_for(id, Utc::now()) != Indicator::None)
+                            // Another device's waiting prompt shows its age.
+                            || s.remote_pending_prompts().next().is_some()
                             // The connection pill's retry countdown needs the
                             // same per-second refresh while degraded.
                             || matches!(
