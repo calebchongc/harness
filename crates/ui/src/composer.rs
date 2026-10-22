@@ -5104,24 +5104,26 @@ fn invocation_token(text: &str, cursor: usize, prefix: char) -> Option<MentionTo
 }
 
 /// Pasted prose is eligible only at completion boundaries, never inside
-/// Markdown code/links. Catalog matching below decides whether it is a reference.
-fn pasted_reference_tokens(text: &str, pasted: Range<usize>) -> Vec<(char, MentionToken)> {
+/// Markdown code/links. File search below decides whether it is a reference.
+///
+/// Only `@` file mentions resolve. A pasted `/command` or `$skill` stays
+/// literal text: naming a command in prose is not choosing it, and an
+/// invocation chip is created only by accepting a completion (#506). Chips
+/// copied from Harness itself survive a paste through the lossless clipboard.
+fn pasted_reference_tokens(text: &str, pasted: Range<usize>) -> Vec<MentionToken> {
     if text.len() > 256 * 1024 || text.get(pasted.clone()).is_none() {
         return Vec::new();
     }
     let mut tokens = Vec::new();
     let mut attempts = 0;
     for (relative, prefix) in text[pasted.clone()].char_indices() {
-        if !matches!(prefix, '@' | '$' | '/') {
+        if prefix != '@' {
             continue;
         }
         let start = pasted.start + relative;
         let mut end = start + 1;
         for ch in text[end..].chars() {
-            if !(ch.is_alphanumeric()
-                || matches!(ch, '_' | '-' | '.' | ':')
-                || (prefix == '@' && ch == '/'))
-            {
+            if !(ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':' | '/')) {
                 break;
             }
             end += ch.len_utf8();
@@ -5149,15 +5151,11 @@ fn pasted_reference_tokens(text: &str, pasted: Range<usize>) -> Vec<(char, Menti
             break;
         }
         attempts += 1;
-        let token = if prefix == '@' {
-            mention_token(text, end)
-        } else {
-            invocation_token(text, end, prefix)
-        };
-        if let Some(mut token) = token.filter(|token| token.range.start == start) {
+        if let Some(mut token) = mention_token(text, end).filter(|token| token.range.start == start)
+        {
             token.range.end = end;
             token.query = text[start + 1..end].to_owned();
-            tokens.push((prefix, token));
+            tokens.push(token);
         }
     }
     tokens
@@ -6827,7 +6825,9 @@ impl Composer {
             return;
         }
         let params = self.catalog_params(cx);
-        let file_params = self.file_search_params("", cx);
+        let Some(file_params) = self.file_search_params("", cx) else {
+            return;
+        };
         if !params["targetDeviceId"].as_str().is_some_and(|target| {
             self.state
                 .read(cx)
@@ -6835,92 +6835,44 @@ impl Composer {
         }) {
             return;
         }
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let preferences =
-            crate::settings::current(cx).skill_completion(harness.unwrap_or(HarnessId::Codex));
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let context = format!(
-            "{}:{params}:{preferences:?}",
-            self.completion_connection_context(cx)
-        );
+        let context = format!("{}:{params}", self.completion_connection_context(cx));
         cx.spawn(async move |this, cx| {
-            let mut candidates = Vec::new();
-            if tokens.iter().any(|(prefix, _)| *prefix != '@') && harness.is_some() {
-                let commands = async {
-                    engine
-                        .client()
-                        .call(methods::LIST_COMMANDS, params.clone())
-                        .await
-                        .ok()
-                        .and_then(|v| serde_json::from_value::<Vec<SlashCommand>>(v).ok())
-                        .unwrap_or_default()
-                };
-                let skills = async {
-                    engine
-                        .client()
-                        .call(methods::LIST_SKILLS, params.clone())
-                        .await
-                        .ok()
-                        .and_then(|v| {
-                            serde_json::from_value::<Option<Vec<harness_proto::invocation::Skill>>>(v)
-                                .ok()
-                        })
-                        .flatten()
-                        .unwrap_or_default()
-                };
-                let (commands, skills) = futures::join!(commands, skills);
-                candidates = invocation_candidates(commands, skills);
-            }
             let mut replacements = Vec::new();
             let mut files = HashMap::new();
-            for (prefix, token) in tokens {
+            for token in tokens {
                 if this
                     .update(cx, |this, cx| this.input.read(cx).edit_revision != revision)
                     .unwrap_or(true)
                 {
                     return;
                 }
-                let replacement = if prefix == '@' {
-                    if !files.contains_key(&token.query) {
-                        let Some(mut search) = file_params.clone() else {
-                            continue;
-                        };
-                        search["query"] = token.query.clone().into();
-                        let results = engine
-                            .client()
-                            .call(methods::SEARCH_FILES, search)
-                            .await
-                            .ok()
-                            .and_then(|v| serde_json::from_value::<Vec<FileSearchMatch>>(v).ok())
-                            .unwrap_or_default();
-                        let exact: Vec<_> = results
-                            .into_iter()
-                            .filter(|file| {
-                                file.path.trim_end_matches('/') == token.query.trim_end_matches('/')
-                                    && local_path_is_safe(&file.path)
-                            })
-                            .collect();
-                        files.insert(
-                            token.query.clone(),
-                            (exact.len() == 1)
-                                .then(|| local_file_link(&exact[0].path, exact[0].is_dir)),
-                        );
-                    }
-                    files.get(&token.query).cloned().flatten()
-                } else if prefix == '$' && !preferences.dollar {
-                    None
-                } else {
-                    let exact: Vec<_> = candidates
-                        .iter()
-                        .filter(|candidate| {
-                            candidate.invocation.prefix() == prefix && candidate.name == token.query
+                if !files.contains_key(&token.query) {
+                    let mut search = file_params.clone();
+                    search["query"] = token.query.clone().into();
+                    let results = engine
+                        .client()
+                        .call(methods::SEARCH_FILES, search)
+                        .await
+                        .ok()
+                        .and_then(|v| serde_json::from_value::<Vec<FileSearchMatch>>(v).ok())
+                        .unwrap_or_default();
+                    let exact: Vec<_> = results
+                        .into_iter()
+                        .filter(|file| {
+                            file.path.trim_end_matches('/') == token.query.trim_end_matches('/')
+                                && local_path_is_safe(&file.path)
                         })
                         .collect();
-                    (exact.len() == 1).then(|| exact[0].invocation.link())
-                };
-                if let Some(replacement) = replacement {
+                    files.insert(
+                        token.query.clone(),
+                        (exact.len() == 1)
+                            .then(|| local_file_link(&exact[0].path, exact[0].is_dir)),
+                    );
+                }
+                if let Some(replacement) = files.get(&token.query).cloned().flatten() {
                     replacements.push((token.range, replacement));
                 }
             }
@@ -6928,11 +6880,8 @@ impl Composer {
                 return;
             }
             this.update(cx, |this, cx| {
-                let harness = this.pickers.read(cx).resolved(cx).harness;
-                let preferences = crate::settings::current(cx)
-                    .skill_completion(harness.unwrap_or(HarnessId::Codex));
                 let current = format!(
-                    "{}:{}:{preferences:?}",
+                    "{}:{}",
                     this.completion_connection_context(cx),
                     this.catalog_params(cx)
                 );
@@ -13369,13 +13318,24 @@ mod tests {
     fn pasted_references_only_recognize_complete_prose_tokens() {
         let text = "Use @README.md, ($framer) and /review. café@example.com $12.50 /usr/bin x/review `@code.rs` \\@escaped.rs [@label](url) https://host/@remote";
         let tokens = pasted_reference_tokens(text, 0..text.len());
+        // `$framer` and `/review` are mentions, not chosen completions (#506).
         assert_eq!(
             tokens
                 .iter()
-                .map(|(prefix, token)| (*prefix, token.query.as_str()))
+                .map(|token| token.query.as_str())
                 .collect::<Vec<_>>(),
-            vec![('@', "README.md"), ('$', "framer"), ('/', "review")]
+            vec!["README.md"]
         );
+        for text in [
+            "Would /resume open a previous conversation?",
+            "Run $review\nthen /compact.",
+            "/resume",
+        ] {
+            assert!(
+                pasted_reference_tokens(text, 0..text.len()).is_empty(),
+                "{text}"
+            );
+        }
         for text in [
             "```\n@README.md\n```",
             "    @README.md",
@@ -13401,10 +13361,11 @@ mod tests {
         assert!(pasted_reference_tokens(&text, 0..text.len()).is_empty());
     }
 
+    /// #506: pasting prose that names an advertised command or skill keeps
+    /// it as literal text. Only `@` file mentions resolve, and only with a
+    /// project to search; the catalog is never consulted for a paste.
     #[gpui::test]
-    fn projectless_paste_discovers_invocations_and_rejects_changed_targets(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn pasted_commands_and_skills_stay_literal_text(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -13418,7 +13379,8 @@ mod tests {
         .save(directory.path())
         .unwrap();
         cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
-        for change_target in [false, true] {
+        let raw = "Would /resume open a previous conversation?\nThen $review and /compact.\nSee @README.md";
+        for (with_chat, change_target) in [(false, false), (true, false), (true, true)] {
             let (out, mut requests) = tokio::sync::mpsc::channel(64);
             let (replies, inbound) = tokio::sync::mpsc::channel(64);
             let state = cx.new(|_| AppState::new());
@@ -13432,14 +13394,23 @@ mod tests {
                     }))
                     .unwrap(),
                 ];
+                if with_chat {
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "chat", "deviceId": "peer", "cwd": "/repo",
+                            "archived": false, "createdAt": "2026-01-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    ];
+                    state.selected_chat = Some("chat".into());
+                }
                 state.set_test_engine(crate::state::EngineHandle::from_test_client(
                     harness_rpc::RpcClient::new(out, inbound),
                 ));
             });
             let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-            let raw = "$review /compact @README.md";
             composer.update(cx, |composer, cx| {
-                assert!(composer.file_search_params("", cx).is_none());
+                assert_eq!(composer.file_search_params("", cx).is_some(), with_chat);
                 composer
                     .input
                     .update(cx, |input, cx| input.set_text(raw, cx));
@@ -13448,21 +13419,18 @@ mod tests {
             });
             cx.run_until_parked();
             if change_target {
-                state.update(cx, |state, _| state.selected_device = Some("other".into()));
+                state.update(cx, |state, _| state.selected_chat = None);
             }
             let mut methods = Vec::new();
             while let Ok(frame) = requests.try_recv() {
                 let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
                 assert_eq!(frame.params["targetDeviceId"], "peer");
-                assert!(frame.params.get("cwd").is_none());
                 let value = match frame.method.as_deref() {
-                    Some(methods::LIST_COMMANDS) => {
-                        serde_json::json!([{"name":"compact", "description":"Compact"}])
+                    Some(methods::SEARCH_FILES) => {
+                        assert_eq!(frame.params["query"], "README.md");
+                        serde_json::json!([{"path":"README.md", "isDir":false}])
                     }
-                    Some(methods::LIST_SKILLS) => {
-                        serde_json::json!([{"name":"review", "path":"/skills/SKILL.md", "description":"Review", "enabled":true}])
-                    }
-                    method => panic!("unexpected projectless request: {method:?}"),
+                    method => panic!("a paste must not discover {method:?}"),
                 };
                 methods.push(frame.method.unwrap());
                 replies
@@ -13476,19 +13444,30 @@ mod tests {
                     )
                     .unwrap();
             }
-            methods.sort();
-            let mut expected = vec![methods::LIST_COMMANDS, methods::LIST_SKILLS];
-            expected.sort();
+            let expected: Vec<&str> = if with_chat {
+                vec![methods::SEARCH_FILES]
+            } else {
+                vec![]
+            };
             assert_eq!(methods, expected);
             runtime.block_on(async { tokio::task::yield_now().await });
             cx.run_until_parked();
             composer.read_with(cx, |composer, cx| {
                 let text = composer.input.read(cx).text();
-                if change_target {
-                    assert_eq!(text, raw);
+                assert!(
+                    harness_proto::invocation::invocation_links(text).is_empty(),
+                    "{text}"
+                );
+                if with_chat && !change_target {
+                    assert!(
+                        text.starts_with(
+                            "Would /resume open a previous conversation?\nThen $review and /compact.\nSee "
+                        ),
+                        "{text}"
+                    );
+                    assert!(text.ends_with(&local_file_link("README.md", false)), "{text}");
                 } else {
-                    assert_eq!(harness_proto::invocation::invocation_links(text).len(), 2);
-                    assert!(text.ends_with(" @README.md"));
+                    assert_eq!(text, raw);
                 }
             });
         }
