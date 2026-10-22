@@ -5,12 +5,16 @@
 //! `content_reference::rewrite`) and shown as readable Unicode: `w₀`,
 //! `h(x) = w₀ + w₁x`, `≤`, `∑`, `a/b`. Display math gets its own line.
 //!
-//! A single `$` is left alone: prices ("$5 and $10") would read as math.
+//! Single-dollar inline math follows currency-aware delimiter rules: no
+//! whitespace just inside either delimiter, no digit after the closing dollar,
+//! and no crossing a line, a literal region, or another dollar delimiter.
 
 use std::ops::Range;
 
 /// Longest formula treated as math; anything longer stays literal text.
 const MAX_MATH_BYTES: usize = 8 * 1024;
+/// Groups and commands both recurse; byte limits alone do not bound stack use.
+const MAX_CONVERSION_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MathSpan {
@@ -26,6 +30,30 @@ pub(crate) fn spans(source: &str, protected: &[Range<usize>]) -> Vec<MathSpan> {
     let mut out = Vec::new();
     let mut at = 0;
     while at + 1 < bytes.len() {
+        if bytes[at] == b'$' {
+            if backslashes_before(bytes, at) % 2 != 0 {
+                at += 1;
+                continue;
+            }
+            let count = bytes[at..].iter().take_while(|&&b| b == b'$').count();
+            if count > 2 {
+                at += count;
+                continue;
+            }
+            if count == 1 {
+                if let Some(end) = inline_dollar_end(source, at, protected) {
+                    out.push(MathSpan {
+                        range: at..end,
+                        latex: source[at + 1..end - 1].to_owned(),
+                        display: false,
+                    });
+                    at = end;
+                } else {
+                    at += 1;
+                }
+                continue;
+            }
+        }
         let delims = match &bytes[at..at + 2] {
             b"\\(" => Some(("\\)", false)),
             b"\\[" => Some(("\\]", true)),
@@ -48,7 +76,11 @@ pub(crate) fn spans(source: &str, protected: &[Range<usize>]) -> Vec<MathSpan> {
         };
         let body = &source[body_start..body_start + body_len];
         let end = body_start + body_len + close.len();
-        if body.len() > MAX_MATH_BYTES || body.contains("\n\n") || !looks_like_math(body) {
+        if body.len() > MAX_MATH_BYTES
+            || crosses_paragraph(body)
+            || !looks_like_math(body)
+            || protected.iter().any(|r| r.start < end && at < r.end)
+        {
             at += 2;
             continue;
         }
@@ -60,6 +92,81 @@ pub(crate) fn spans(source: &str, protected: &[Range<usize>]) -> Vec<MathSpan> {
         at = end;
     }
     out
+}
+
+/// Pandoc-style dollar boundaries prevent `$5 and $10` (including price
+/// ranges) from becoming math without excluding `$x$`, `$1$` or LaTeX commands.
+/// Stop at the first unescaped dollar even if it is not a valid closer: looking
+/// past a price/code/display delimiter can swallow later prose or equations.
+fn inline_dollar_end(source: &str, start: usize, protected: &[Range<usize>]) -> Option<usize> {
+    if protected.iter().any(|r| r.contains(&start)) {
+        return None;
+    }
+    let body_start = start + 1;
+    let first = source[body_start..].chars().next()?;
+    if first.is_whitespace() || first == '$' {
+        return None;
+    }
+    for (offset, c) in source[body_start..].char_indices() {
+        if offset > MAX_MATH_BYTES || matches!(c, '\n' | '\r') {
+            return None;
+        }
+        let close = body_start + offset;
+        if c != '$' || backslashes_before(source.as_bytes(), close) % 2 != 0 {
+            continue;
+        }
+        let body = &source[body_start..close];
+        let end = close + 1;
+        return (!body.is_empty()
+            && !price_before_parenthesis(body)
+            && !body.ends_with(char::is_whitespace)
+            && !source[end..].starts_with(|c: char| c == '$' || c.is_numeric())
+            && !source[end..]
+                .strip_prefix('.')
+                .is_some_and(|tail| tail.starts_with(char::is_numeric))
+            && !protected.iter().any(|r| r.start < end && start < r.end))
+        .then_some(end);
+    }
+    None
+}
+
+/// Prefer a price in `pay $5 ($x^2$)`: otherwise the amount and opening
+/// parentheses steal the equation's opening dollar. A bare `$5$` and complete
+/// mathematical expressions such as `$5 (x)$` remain valid inline math.
+fn price_before_parenthesis(body: &str) -> bool {
+    if !body.starts_with(char::is_numeric)
+        && !body
+            .strip_prefix('.')
+            .is_some_and(|tail| tail.starts_with(char::is_numeric))
+    {
+        return false;
+    }
+    let rest = body.trim_start_matches(|c: char| c.is_numeric() || matches!(c, '.' | ','));
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, '(' | '[' | '{'))
+}
+
+/// CommonMark also treats CR and whitespace-only lines as paragraph breaks.
+/// Rewriting across one can change code/link structure and leak placeholders.
+fn crosses_paragraph(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut after_break = false;
+    for (at, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' && at > 0 && bytes[at - 1] == b'\r' {
+            continue;
+        }
+        if matches!(byte, b'\n' | b'\r') {
+            if after_break {
+                return true;
+            }
+            after_break = true;
+        } else if !matches!(byte, b' ' | b'\t') {
+            after_break = false;
+        }
+    }
+    false
 }
 
 fn backslashes_before(bytes: &[u8], at: usize) -> usize {
@@ -74,19 +181,21 @@ fn backslashes_before(bytes: &[u8], at: usize) -> usize {
 /// (`\\)` is a LaTeX line break followed by a parenthesis).
 fn find_close(rest: &str, close: &str) -> Option<usize> {
     let bytes = rest.as_bytes();
-    let mut from = 0;
-    while let Some(found) = rest[from..].find(close) {
-        let at = from + found;
-        let escaped = close.starts_with('\\') && backslashes_before(bytes, at) % 2 == 1;
-        if !escaped && at <= MAX_MATH_BYTES {
-            return Some(at);
-        }
-        if at > MAX_MATH_BYTES {
-            return None;
-        }
-        from = at + close.len();
-    }
-    None
+    bytes
+        .windows(close.len())
+        .take(MAX_MATH_BYTES + 1)
+        .enumerate()
+        .find_map(|(at, window)| {
+            let whole_dollar_pair = close != "$$"
+                || (bytes.get(at + 2) != Some(&b'$')
+                    && (at == 0
+                        || bytes[at - 1] != b'$'
+                        || backslashes_before(bytes, at - 1) % 2 != 0));
+            (window == close.as_bytes()
+                && whole_dollar_pair
+                && backslashes_before(bytes, at) % 2 == 0)
+                .then_some(at)
+        })
 }
 
 /// `\[1\]` and `\(optional\)` are escaped Markdown punctuation, not math.
@@ -111,17 +220,25 @@ fn looks_like_math(body: &str) -> bool {
 /// LaTeX as readable Unicode. Unknown commands keep their name.
 pub(crate) fn to_unicode(latex: &str) -> String {
     let mut out = String::new();
-    Converter {
+    let mut converter = Converter {
         chars: latex.chars().collect(),
         at: 0,
+        depth: 0,
+        exhausted: false,
+    };
+    converter.convert_into(&mut out, None);
+    if converter.exhausted {
+        latex.to_owned()
+    } else {
+        tidy(&out)
     }
-    .convert_into(&mut out, None);
-    tidy(&out)
 }
 
 struct Converter {
     chars: Vec<char>,
     at: usize,
+    depth: usize,
+    exhausted: bool,
 }
 
 impl Converter {
@@ -131,6 +248,24 @@ impl Converter {
 
     /// Convert until `stop` (a closing brace) or the end.
     fn convert_into(&mut self, out: &mut String, stop: Option<char>) {
+        if !self.descend() {
+            return;
+        }
+        self.convert_inner(out, stop);
+        self.depth -= 1;
+    }
+
+    fn descend(&mut self) -> bool {
+        if self.depth == MAX_CONVERSION_DEPTH {
+            self.exhausted = true;
+            self.at = self.chars.len();
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    fn convert_inner(&mut self, out: &mut String, stop: Option<char>) {
         while let Some(c) = self.peek() {
             if Some(c) == stop {
                 self.at += 1;
@@ -199,6 +334,14 @@ impl Converter {
     }
 
     fn command(&mut self, out: &mut String) {
+        if !self.descend() {
+            return;
+        }
+        self.command_inner(out);
+        self.depth -= 1;
+    }
+
+    fn command_inner(&mut self, out: &mut String) {
         let Some(first) = self.peek() else {
             return;
         };
@@ -550,6 +693,10 @@ fn tidy(s: &str) -> String {
         .trim()
         .to_owned()
 }
+
+#[cfg(test)]
+#[path = "math_dollar_tests.rs"]
+mod dollar_tests;
 
 #[cfg(test)]
 mod tests {
