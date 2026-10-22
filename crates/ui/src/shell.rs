@@ -2613,6 +2613,7 @@ impl Shell {
             cx.notify();
         }
         self.prune_file_explorers(cx);
+        self.prune_browser_surfaces(cx);
         self.chat_split_on_state_changed(cx);
         self.maybe_auto_download_update(cx);
         if let Some(chat_id) = state.update(cx, |state, _| state.take_linked_chat()) {
@@ -4169,6 +4170,60 @@ impl Shell {
         }))
     }
 
+    /// Release browser ownership without changing keyboard focus. State-sync
+    /// deletion has no Window and must not disturb a different visible control.
+    /// Return whether an explicit tab close should restore composer focus.
+    fn release_browser_surface(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        let surface = RightSurface::Browser(id);
+        let Some(owner) = self
+            .right_tabs
+            .iter()
+            .find_map(|(key, tabs)| tabs.contains(&surface).then(|| key.clone()))
+        else {
+            return false;
+        };
+        let was_active = self.browser_host_is_active(&owner, id, cx);
+        if let Some(tabs) = self.right_tabs.get_mut(&owner) {
+            tabs.retain(|tab| *tab != surface);
+        }
+        if let Some(browser) = self.browsers.remove(&id) {
+            browser.update(cx, |browser, cx| browser.close(cx));
+        }
+        self.browser_subs.remove(&id);
+        self.panels.update(&owner, |panel| {
+            if panel.right_active == surface {
+                panel.right_active = RightSurface::Picker;
+            }
+        });
+        self.collapse_surfaces_if_empty(&owner, cx);
+        cx.notify();
+        was_active
+    }
+
+    fn prune_browser_surfaces(&mut self, cx: &mut Context<Self>) {
+        let stale: Vec<_> = {
+            let state = self.state.read(cx);
+            // Missing rows before the first complete snapshot are not deletions.
+            if !state.chats_synced {
+                return;
+            }
+            let live: std::collections::HashSet<_> =
+                state.chats.iter().map(|chat| chat.id.as_str()).collect();
+            self.right_tabs
+                .iter()
+                .filter(|(owner, _)| !live.contains(owner.as_str()))
+                .flat_map(|(_, tabs)| tabs.iter())
+                .filter_map(|surface| match surface {
+                    RightSurface::Browser(id) => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        };
+        for id in stale {
+            self.release_browser_surface(id, cx);
+        }
+    }
+
     /// A surface tab's ✕. The active fallback happens naturally through
     /// [`Self::resolved_right_active`] on the next frame.
     fn close_right_surface(
@@ -4177,22 +4232,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current_key = self.panel_key(cx);
-        let key = if matches!(surface, RightSurface::Browser(_)) {
-            // Browser close events can arrive after another pane takes focus.
-            // Tear down the owning tab, not the currently displayed chat's tab.
-            let Some(owner) = self
-                .right_tabs
-                .iter()
-                .find_map(|(key, tabs)| tabs.contains(&surface).then(|| key.clone()))
-            else {
-                return;
-            };
-            owner
-        } else {
-            current_key.clone()
-        };
-        let was_active = matches!(surface, RightSurface::Browser(id) if self.browser_host_is_active(&key, id, cx));
+        if let RightSurface::Browser(id) = surface {
+            if self.release_browser_surface(id, cx) {
+                window.focus(&self.composer.focus_handle(cx), cx);
+            }
+            return;
+        }
+        let key = self.panel_key(cx);
         let files = match surface {
             RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
             _ => None,
@@ -4214,15 +4260,7 @@ impl Shell {
         }
         match surface {
             RightSurface::File(_) => {}
-            RightSurface::Browser(id) => {
-                if let Some(browser) = self.browsers.remove(&id) {
-                    browser.update(cx, |browser, cx| browser.close(cx));
-                }
-                self.browser_subs.remove(&id);
-                if was_active {
-                    window.focus(&self.composer.focus_handle(cx), cx);
-                }
-            }
+            RightSurface::Browser(_) => unreachable!("browser surfaces are released above"),
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.
                 self.diffs.remove(&id);
@@ -5523,10 +5561,13 @@ impl Shell {
             .into_iter()
             .flatten()
             .copied()
-            .filter(|surface| matches!(surface, RightSurface::Browser(_)))
+            .filter_map(|surface| match surface {
+                RightSurface::Browser(id) => Some(id),
+                _ => None,
+            })
             .collect();
-        for surface in browsers {
-            self.close_right_surface(surface, window, cx);
+        for id in browsers {
+            self.release_browser_surface(id, cx);
         }
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             // Deleting the sole session in a tab returns to the last visited
