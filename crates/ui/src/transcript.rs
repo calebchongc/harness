@@ -14703,18 +14703,21 @@ mod tests {
                 })
                 .collect()
         };
+        // An absolute path needs a drive on Windows.
+        let root = if cfg!(windows) { "C:/work" } else { "/work" };
+        let at = |path: &str| format!("{root}/{path}");
         let entry = assistant(
             "m1",
             MessageStatus::Complete,
             vec![
-                read_part("r1", "/work/shots/home.png", false, true),
-                read_part("r2", "/work/src/main.rs", false, true),
+                read_part("r1", &at("shots/home.png"), false, true),
+                read_part("r2", &at("src/main.rs"), false, true),
                 read_part("r3", "shots/relative.png", false, true),
-                read_part("r4", "/work/shots/missing.png", true, true),
-                read_part("r5", "/work/shots/pending.jpg", false, false),
-                read_part("r6", "/work/shots/home.png", false, true),
-                read_part("r7", "/work/shots/photo.JPEG", false, true),
-                read_part("r8", "/work/shots/diagram.svg", false, true),
+                read_part("r4", &at("shots/missing.png"), true, true),
+                read_part("r5", &at("shots/pending.jpg"), false, false),
+                read_part("r6", &at("shots/home.png"), false, true),
+                read_part("r7", &at("shots/photo.JPEG"), false, true),
+                read_part("r8", &at("shots/diagram.svg"), false, true),
                 text_part("t1", "Here is what I saw."),
             ],
         );
@@ -14724,8 +14727,8 @@ mod tests {
             assert_eq!(
                 viewed(&rows),
                 [
-                    "/work/shots/home.png image/png",
-                    "/work/shots/photo.JPEG image/jpeg"
+                    format!("{} image/png", at("shots/home.png")),
+                    format!("{} image/jpeg", at("shots/photo.JPEG")),
                 ],
                 "compact={compact}"
             );
