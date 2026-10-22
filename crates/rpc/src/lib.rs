@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
 mod server;
+mod ws;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
@@ -607,6 +608,79 @@ mod tests {
         assert_eq!(items.recv().await, Some(serde_json::json!(0)));
         assert_eq!(items.recv().await, Some(serde_json::json!(1)));
         assert_eq!(items.recv().await, None);
+    }
+
+    /// A reply past tungstenite's default 16 MiB frame cap (a long chat's
+    /// transcript watch) must arrive, not drop the connection.
+    #[tokio::test]
+    async fn websocket_carries_messages_past_the_default_frame_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+        // Multi-byte chars so fragment boundaries land mid-codepoint.
+        let big = "é".repeat(9_500_000);
+
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let echoed = client.call("Echo", serde_json::json!(big)).await.unwrap();
+        assert_eq!(echoed.as_str().map(str::len), Some(big.len()));
+        assert_eq!(client.close_reason(), None);
+
+        // A peer still on tungstenite's default limits (an older app build)
+        // reassembles the fragmented reply too.
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (mut legacy, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let request = serde_json::to_string(&ClientFrame {
+            id: 1,
+            method: Some("Echo".into()),
+            params: serde_json::json!(big),
+            cancel: false,
+        })
+        .unwrap();
+        // It sends one unfragmented frame past 16 MiB: the raised cap takes it.
+        assert!(request.len() > 16 << 20);
+        legacy.send(Message::Text(request)).await.unwrap();
+        let reply = loop {
+            match legacy.next().await.unwrap().unwrap() {
+                Message::Text(text) => break text,
+                _ => continue,
+            }
+        };
+        let frame: ServerFrame = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            frame.ok.and_then(|v| v.as_str().map(str::len)),
+            Some(big.len())
+        );
+    }
+
+    /// A transport failure (here, a text frame that isn't UTF-8) fails the
+    /// pending call and leaves the reason behind for the caller to report.
+    #[tokio::test]
+    async fn close_reason_names_a_transport_failure() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Wait for the request, then answer with bytes no text frame may carry.
+            let _ = ws.next().await;
+            let bad = Frame::message(vec![0xff, 0xfe], OpCode::Data(Data::Text), true);
+            let _ = ws.send(Message::Frame(bad)).await;
+            let _ = ws.next().await;
+        });
+
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let err = client.call("Echo", serde_json::json!(1)).await.unwrap_err();
+        assert!(matches!(err, RpcError::Closed), "{err:?}");
+        let reason = client.close_reason().expect("a failed transport says why");
+        assert!(reason.starts_with("reading the socket failed"), "{reason}");
     }
 
     #[tokio::test]
