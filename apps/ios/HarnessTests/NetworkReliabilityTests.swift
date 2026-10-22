@@ -81,6 +81,24 @@ final class NetworkReliabilityTests: XCTestCase {
         ))
     }
 
+    /// #344: a quota refusal waits out the room's hint (bounded), and backs
+    /// off without one instead of retrying every 5 s.
+    func testQuotaRetryHonorsTheRoomsHintAndBacksOffWithoutOne() {
+        for (hint, base) in [(UInt64(0), UInt64(250)), (12_500, 12_500), (3_600_000, 120_000)] {
+            for strikes in [0, 7] {
+                let delay = ChatRoomClient.quotaRetryDelayMs(strikes: strikes, hintMs: hint)
+                XCTAssert(delay >= base && delay <= base + min(base / 8, 2_000), "hint \(hint): \(delay)")
+            }
+        }
+        for (strikes, base) in [(0, UInt64(5_000)), (1, 10_000), (3, 40_000), (4, 60_000), (40, 60_000)] {
+            let delay = ChatRoomClient.quotaRetryDelayMs(strikes: strikes, hintMs: nil)
+            XCTAssert(delay >= base && delay <= base + base / 4, "\(strikes) strikes: \(delay)")
+        }
+        XCTAssertEqual(ChatRoomClient.quotaHintMs(["retryAfterMs": 41_250], retryAfterHeader: "42"), 41_250)
+        XCTAssertEqual(ChatRoomClient.quotaHintMs(nil, retryAfterHeader: " 42 "), 42_000)
+        XCTAssertNil(ChatRoomClient.quotaHintMs(["error": "quota"]))
+    }
+
     func testChat2Snapshot02LoadsWithEmptyOutbox() throws {
         let id = "snap02-\(UUID().uuidString)"
         defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
