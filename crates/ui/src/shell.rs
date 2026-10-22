@@ -2645,6 +2645,39 @@ impl Shell {
         cx.notify();
     }
 
+    /// Chime and/or show a banner for one session or connectivity alert, routed by
+    /// [`crate::sound::plan_alert`]: a background chime rides on its banner so
+    /// macOS Focus applies; a chime the notification couldn't carry plays
+    /// locally instead, never both.
+    fn deliver_alert(
+        &self,
+        sound: crate::sound::Sound,
+        wants_sound: bool,
+        app_focused: bool,
+        title: &str,
+        body: &str,
+        chat_id: Option<&str>,
+    ) {
+        use crate::sound::Chime;
+        let banner = self.settings.notifications_enabled
+            && !(self.settings.notifications_background_only && app_focused);
+        let plan = crate::sound::plan_alert(
+            wants_sound,
+            banner,
+            app_focused,
+            crate::notify::CARRIES_CHIME,
+        );
+        let mut local = plan.chime == Chime::Local;
+        if plan.banner {
+            let chime = (plan.chime == Chime::WithNotification).then_some(sound);
+            let carried = crate::notify::post_with_chime(title, body, chat_id, chime);
+            local |= chime.is_some() && !carried;
+        }
+        if local {
+            crate::sound::play(sound);
+        }
+    }
+
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
@@ -2812,26 +2845,25 @@ impl Shell {
                     && let Some(sound) = status.sound_since(&prev, send_pending)
                 {
                     crate::perf_stats::turn_finished(&chat_id, sound == crate::sound::Sound::Done);
-                    if self.settings.session_sound_enabled(sound) {
-                        let should_play = sound != crate::sound::Sound::Attention
+                    let wants_sound = self.settings.session_sound_enabled(sound)
+                        && (sound != crate::sound::Sound::Attention
                             || self
                                 .attention_sound_gate
-                                .should_play(std::time::Instant::now());
-                        if should_play {
-                            crate::sound::play(sound);
-                        }
-                    }
-                    if self.settings.notifications_enabled
-                        && !(self.settings.notifications_background_only && app_focused)
-                    {
-                        let title = title.unwrap_or_else(|| "New session".into());
-                        let body = match sound {
-                            crate::sound::Sound::Done => "Run finished",
-                            crate::sound::Sound::Request => "Waiting on your input",
-                            crate::sound::Sound::Attention => "Run failed",
-                        };
-                        crate::notify::post(&title, body, Some(&chat_id));
-                    }
+                                .should_play(std::time::Instant::now()));
+                    let body = match sound {
+                        crate::sound::Sound::Done => "Run finished",
+                        crate::sound::Sound::Request => "Waiting on your input",
+                        crate::sound::Sound::Attention => "Run failed",
+                    };
+                    let title = title.unwrap_or_else(|| "New session".into());
+                    self.deliver_alert(
+                        sound,
+                        wants_sound,
+                        app_focused,
+                        &title,
+                        body,
+                        Some(&chat_id),
+                    );
                 }
             }
             if let Some(sound) = self.connectivity_notifications.update(
@@ -2839,22 +2871,22 @@ impl Shell {
                 connectivity_observed,
                 std::time::Instant::now(),
             ) {
-                if self.settings.session_sound_enabled(sound)
+                let wants_sound = self.settings.session_sound_enabled(sound)
                     && self
                         .attention_sound_gate
-                        .should_play(std::time::Instant::now())
-                {
-                    crate::sound::play(sound);
-                }
-                if self.settings.notifications_enabled
-                    && !(self.settings.notifications_background_only && app_focused)
-                {
-                    let body = match connectivity {
-                        harness_proto::ConnectivityState::Offline => "Your device is offline",
-                        _ => "Harness is trying to reconnect",
-                    };
-                    crate::notify::post("Connection unavailable", body, None);
-                }
+                        .should_play(std::time::Instant::now());
+                let body = match connectivity {
+                    harness_proto::ConnectivityState::Offline => "Your device is offline",
+                    _ => "Harness is trying to reconnect",
+                };
+                self.deliver_alert(
+                    sound,
+                    wants_sound,
+                    app_focused,
+                    "Connection unavailable",
+                    body,
+                    None,
+                );
             }
         }
         // An explicit projectless canvas must be visible in the sidebar:
