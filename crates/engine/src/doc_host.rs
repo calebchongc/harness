@@ -3922,8 +3922,12 @@ impl DocHost {
                 FinishQueueEditAction::ReleaseUnchanged => FinishQueueEditOutcome::Released,
             }
         };
-        // Turn-end may already have happened while the edit was open.
-        self.drain_queue(&handle).await;
+        // Turn-end may already have happened while the edit was open. Deliver
+        // in the background: the outcome reports the edit, which is already
+        // applied, and a slow or contended drain must not turn it into a
+        // failed save on a client whose RPC deadline expires first (#465).
+        let host = self.clone();
+        self.spawn_worker(async move { host.drain_queue(&handle).await });
         Ok(outcome)
     }
 
@@ -6453,6 +6457,75 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 host.chat2_maintenance(&handle).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_edit_finish_tests {
+    use super::*;
+
+    /// Finishing a protected edit acknowledges the edit, not its delivery
+    /// (#465). A drain contending for the queue lock must not hold back an
+    /// outcome the client is waiting on under an RPC deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_acknowledges_an_applied_edit_without_waiting_for_delivery() {
+        const CHAT: &str = "chat-edit-finish";
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble(
+            dir.path(),
+            Arc::new(crate::HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let host = core.doc_host.clone();
+        let handle = host.open(CHAT).unwrap();
+        // Only lock contention matters here, not what a drain would send.
+        handle.queue_paused.store(true, Ordering::Release);
+        let id = host.queue_message(CHAT, "old text", Vec::new()).unwrap();
+        let BeginQueueEditOutcome::Acquired {
+            lease_id,
+            base_text_hash,
+            ..
+        } = host
+            .begin_queued_message_edit(CHAT, &id, "phone", "view-1")
+            .await
+            .unwrap()
+        else {
+            panic!("edit must be acquired");
+        };
+
+        // Finish waits for the lock first; a delivery drain waits behind it.
+        // The mutex is fair, so once finish releases its edit scope the
+        // drain owns the lock and anything finish awaits after that blocks.
+        let held = handle.drain_lock.lock().await;
+        let mut finish = std::pin::pin!(host.finish_queued_message_edit(
+            CHAT,
+            &id,
+            &lease_id,
+            FinishQueueEditAction::Commit,
+            Some("new text"),
+            Some(&base_text_hash),
+        ));
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        let mut delivery = std::pin::pin!(handle.drain_lock.lock());
+        assert!(futures::poll!(delivery.as_mut()).is_pending());
+        drop(held);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), finish)
+            .await
+            .expect("finish must not wait for delivery")
+            .unwrap();
+        assert!(matches!(outcome, FinishQueueEditOutcome::Committed));
+        let row = handle.doc.read_queue().unwrap().remove(0);
+        assert_eq!(
+            (row.id.as_str(), row.text.as_str()),
+            (id.as_str(), "new text")
+        );
+        assert!(row.delivery_gate.is_none());
+
+        drop(delivery.await);
+        core.shutdown().await;
     }
 }
 
