@@ -1824,6 +1824,12 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
     }
 
     cx.bind_keys(palette_input_bindings());
+    // Sidebar search uses palette text editing but has no horizontal menu
+    // navigation. Bind bare caret motion only inside its parent context.
+    cx.bind_keys([
+        KeyBinding::new("left", Left, Some("SidebarSearch")),
+        KeyBinding::new("right", Right, Some("SidebarSearch")),
+    ]);
     cx.bind_keys(generic_bindings);
     cx.bind_keys(message_bindings);
 }
@@ -2088,6 +2094,12 @@ impl ComposerInput {
 
     pub fn with_accessibility_role(mut self, role: Role) -> Self {
         self.accessibility_role = role;
+        self
+    }
+
+    /// Include a standalone field in natural keyboard focus traversal.
+    pub fn with_tab_stop(mut self, tab_stop: bool) -> Self {
+        self.focus_handle = self.focus_handle.clone().tab_stop(tab_stop);
         self
     }
 
