@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod composer;
 pub mod devices;
 pub mod files;
+pub mod github_ci;
 pub mod harnesses;
 pub mod notifications;
 pub mod project_folders;

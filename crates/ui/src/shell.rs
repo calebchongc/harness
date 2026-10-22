@@ -41,6 +41,7 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
+use crate::settings::github_ci::GithubCiPage;
 use crate::settings::mcp::McpPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
@@ -599,11 +600,13 @@ pub enum SettingsSection {
     Archived,
     /// graff's MCP servers: state, tools, reconnect, on/off.
     Mcp,
+    /// GitHub Actions jobs on Codegraff sandboxes: connect, budgets, repositories, recent jobs.
+    GithubCi,
 }
 
 impl SettingsSection {
     /// Sidebar order: grouped under [`Self::group`] headings.
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
@@ -611,6 +614,7 @@ impl SettingsSection {
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Mcp,
+        SettingsSection::GithubCi,
         SettingsSection::Devices,
         SettingsSection::Appshots,
         SettingsSection::Archived,
@@ -623,7 +627,10 @@ impl SettingsSection {
             | SettingsSection::Notifications
             | SettingsSection::Shortcuts
             | SettingsSection::Files => "General",
-            SettingsSection::Harnesses | SettingsSection::Agents | SettingsSection::Mcp => "Agents",
+            SettingsSection::Harnesses
+            | SettingsSection::Agents
+            | SettingsSection::Mcp
+            | SettingsSection::GithubCi => "Agents",
             SettingsSection::Devices | SettingsSection::Appshots | SettingsSection::Archived => {
                 "Devices and data"
             }
@@ -648,6 +655,7 @@ impl SettingsSection {
             SettingsSection::Appshots => "appshots",
             SettingsSection::Archived => "archived",
             SettingsSection::Mcp => "mcp",
+            SettingsSection::GithubCi => "github-ci",
         }
     }
 
@@ -670,6 +678,7 @@ impl SettingsSection {
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Mcp => "MCP servers",
+            SettingsSection::GithubCi => "GitHub CI",
         }
     }
 }
@@ -1914,6 +1923,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     mcp_page: Option<Entity<McpPage>>,
+    github_ci_page: Option<Entity<GithubCiPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -2277,6 +2287,7 @@ impl Shell {
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             Some("settings/mcp") => Route::Settings(SettingsSection::Mcp),
+            Some("settings/github-ci") => Route::Settings(SettingsSection::GithubCi),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -2444,6 +2455,7 @@ impl Shell {
             devices_page: None,
             archived_page: None,
             mcp_page: None,
+            github_ci_page: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
@@ -4770,6 +4782,10 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
+        // Every visit re-reads GitHub CI (an install made in the browser shows up).
+        if section == SettingsSection::GithubCi {
+            self.github_ci_page = None;
+        }
         if section == SettingsSection::Shortcuts
             && let Some(page) = &self.shortcuts_page
         {
@@ -5171,6 +5187,16 @@ impl Shell {
                     self.mcp_page = Some(cx.new(|cx| McpPage::new(state, cx)));
                 }
                 match &self.mcp_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::GithubCi => {
+                if self.github_ci_page.is_none() {
+                    let state = self.state.clone();
+                    self.github_ci_page = Some(cx.new(|cx| GithubCiPage::new(state, cx)));
+                }
+                match &self.github_ci_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -6895,6 +6921,7 @@ impl Shell {
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Mcp => icons::REMOTE_SERVER,
+            SettingsSection::GithubCi => icons::PULL_REQUEST,
         };
         let search = self.ensure_settings_search(cx);
         let search_input = search.input.clone();

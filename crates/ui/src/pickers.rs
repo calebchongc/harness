@@ -612,7 +612,9 @@ enum GraffWorktreeOutcome {
 //
 // The engine's `CodegraffSandboxes` / `CodegraffCreateSandbox` / `CodegraffSandboxAction` calls (names
 // repeated here as strings so this file does not depend on where they are declared). The picker only
-// reads the list as JSON: `{enabled, sandboxes:[{id, provider, name?, deviceName?, state}]}`.
+// reads the list as JSON: `{enabled, sandboxes:[{id, provider, name?, deviceName?, state,
+// pricePerHourMicroUsd?}], sizes?:[…]}`. With sizes, "New cloud sandbox" carries a small size
+// switch (the default size preselected) and its hourly rate; without, it creates as before.
 
 const CLOUD_LIST: &str = "CodegraffSandboxes";
 const CLOUD_CREATE: &str = "CodegraffCreateSandbox";
@@ -629,6 +631,8 @@ struct CloudSandbox {
     state: String,
     /// The name its Harness device registers under.
     device_name: String,
+    /// What it costs per hour while running, when the gateway says.
+    price: Option<i64>,
 }
 
 impl CloudSandbox {
@@ -659,8 +663,49 @@ struct CloudState {
     /// `false` until the engine says this build offers cloud sandboxes (stable builds show nothing).
     enabled: bool,
     sandboxes: Vec<CloudSandbox>,
+    /// The sizes a new sandbox can be (empty: no size switch).
+    sizes: Vec<crate::codegraff_sandboxes::PersonalSize>,
+    /// The size switched to (`None`: the default one).
+    size: Option<String>,
     busy: Option<CloudBusy>,
     error: Option<String>,
+}
+
+impl CloudState {
+    /// Take a fresh list answer, keeping the size picked.
+    fn read(&mut self, value: &serde_json::Value) {
+        let (enabled, sandboxes) = parse_cloud(value);
+        self.enabled = enabled;
+        self.sandboxes = sandboxes;
+        self.sizes = value
+            .get("sizes")
+            .cloned()
+            .and_then(|sizes| serde_json::from_value(sizes).ok())
+            .unwrap_or_default();
+    }
+
+    /// The size a create asks for, when the gateway offers sizes.
+    fn create_size(&self) -> Option<&crate::codegraff_sandboxes::PersonalSize> {
+        crate::codegraff_sandboxes::selected_size(&self.sizes, self.size.as_deref())
+    }
+
+    /// The next size on the switch (wrapping), for a click on it.
+    fn next_size(&self) -> Option<String> {
+        let current = self.create_size()?;
+        let at = self.sizes.iter().position(|s| s.id == current.id)?;
+        Some(self.sizes[(at + 1) % self.sizes.len()].id.clone())
+    }
+}
+
+/// "Running", or "Running · $0.10/h" when the sandbox says what it costs. Pure.
+fn cloud_running_label(price: Option<i64>) -> String {
+    match price {
+        Some(price) => format!(
+            "Running · {}",
+            crate::codegraff_sandboxes::format_rate(price)
+        ),
+        None => "Running".into(),
+    }
 }
 
 /// What the device popover's cloud row offers right now.
@@ -700,6 +745,10 @@ fn parse_cloud(value: &serde_json::Value) -> (bool, Vec<CloudSandbox>) {
                 device_name: text("deviceName")
                     .or_else(|| text("name"))
                     .unwrap_or_else(|| CLOUD_DEVICE_NAME.to_string()),
+                price: row
+                    .get("pricePerHourMicroUsd")
+                    .and_then(|v| v.as_i64())
+                    .filter(|p| *p >= 0),
             })
         })
         .collect();
@@ -2461,9 +2510,7 @@ impl Pickers {
                 }
                 match result {
                     Ok(value) => {
-                        let (enabled, sandboxes) = parse_cloud(&value);
-                        pickers.cloud.enabled = enabled;
-                        pickers.cloud.sandboxes = sandboxes;
+                        pickers.cloud.read(&value);
                         // The same answer keeps the running-sandbox strip current.
                         pickers.state.update(cx, |state, cx| {
                             state.apply_cloud_sandboxes_value(&value, cx)
@@ -2492,6 +2539,10 @@ impl Pickers {
             CloudBusy::Creating
         });
         self.cloud.error = None;
+        let create = match self.cloud.create_size() {
+            Some(size) => serde_json::json!({ "size": size.id }),
+            None => serde_json::json!({}),
+        };
         cx.notify();
         self.cloud_task = Some(cx.spawn(async move |this, cx| {
             let started = match &wake {
@@ -2504,7 +2555,7 @@ impl Pickers {
                         )
                         .await
                 }
-                None => engine.client().call(CLOUD_CREATE, serde_json::json!({})).await,
+                None => engine.client().call(CLOUD_CREATE, create).await,
             };
             if let Err(err) = started {
                 this.update(cx, |pickers, cx| {
@@ -2527,9 +2578,7 @@ impl Pickers {
                 .ok();
             this.update(cx, |pickers, cx| {
                 if let Some(value) = &list {
-                    let (enabled, sandboxes) = parse_cloud(value);
-                    pickers.cloud.enabled = enabled;
-                    pickers.cloud.sandboxes = sandboxes;
+                    pickers.cloud.read(value);
                     // It is running (and billed) now: the strip shows it from here on.
                     pickers
                         .state
@@ -2670,15 +2719,25 @@ impl Pickers {
             .map(|s| s.device_name.clone())
             .collect();
         // Running cloud sandboxes are billed until turned off: their rows say so.
-        let cloud_running: Vec<String> = self
+        let cloud_running: Vec<(String, Option<i64>)> = self
             .cloud
             .sandboxes
             .iter()
             .filter(|s| s.running())
-            .map(|s| s.device_name.clone())
+            .map(|s| (s.device_name.clone(), s.price))
             .collect();
         let cloud_row = self.current_cloud_row(cx);
         let cloud_error = self.cloud.error.clone();
+        // The size switch on "New cloud sandbox": the picked size and its rate.
+        let cloud_size = self.cloud.create_size().map(|size| {
+            (
+                crate::codegraff_sandboxes::size_title(size),
+                crate::codegraff_sandboxes::size_detail(size),
+                size.price_per_hour_micro_usd
+                    .map(crate::codegraff_sandboxes::format_rate),
+            )
+        });
+        let can_switch_size = self.cloud.sizes.len() > 1;
         let device_count = rows.len();
         let scrollbar = popover::rail(self, "device-scrollbar", &theme, cx);
         let body: AnyElement = if rows.is_empty() {
@@ -2704,7 +2763,13 @@ impl Pickers {
                                 let is_cloud = device.platform == "linux"
                                     && cloud_names.iter().any(|name| *name == device.name);
                                 let cloud_is_running = is_cloud
-                                    && cloud_running.iter().any(|name| *name == device.name);
+                                    .then(|| {
+                                        cloud_running
+                                            .iter()
+                                            .find(|(name, _)| *name == device.name)
+                                    })
+                                    .flatten()
+                                    .map(|(_, price)| cloud_running_label(*price));
                                 let label: SharedString = device.name.clone().into();
                                 let is_selected = effective.as_deref() == Some(device.id.as_str());
                                 let pick_id = device.id.clone();
@@ -2728,13 +2793,13 @@ impl Pickers {
                                             .text_color(theme.text_muted),
                                     )
                                 })
-                                .when(cloud_is_running, |el| {
+                                .when_some(cloud_is_running, |el, running| {
                                     el.child(
                                         div()
                                             .flex_none()
                                             .text_size(crate::typography::ui_rems(10.0))
                                             .text_color(theme.accent)
-                                            .child(SharedString::from("Running")),
+                                            .child(SharedString::from(running)),
                                     )
                                 })
                                 // The local device wears a muted right-aligned "You"
@@ -2785,10 +2850,55 @@ impl Pickers {
                     .into_any_element(),
             ),
             action @ (CloudRow::Create | CloudRow::Wake(_)) => {
+                let creating = matches!(action, CloudRow::Create);
                 let (icon, text) = match action {
                     CloudRow::Wake(_) => (crate::icons::CLOUD, "Wake cloud sandbox"),
                     _ => (crate::icons::PLUS, "New cloud sandbox"),
                 };
+                // Create offers the size (a click switches it) and says what it costs.
+                let size_switch = cloud_size.clone().filter(|_| creating).map(
+                    |(title, detail, rate)| {
+                        let chip = div()
+                            .id("device-cloud-size")
+                            .debug_selector(|| "device-cloud-size".into())
+                            .flex_none()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_size(crate::typography::ui_rems(10.0))
+                            .text_color(theme.text_muted)
+                            .tooltip(crate::settings::widgets::text_tooltip(format!(
+                                "{title}: {detail}. {}",
+                                crate::codegraff_sandboxes::CREATE_COPY
+                            )))
+                            .child(SharedString::from(match rate {
+                                Some(rate) => format!("{title} · {rate}"),
+                                None => title,
+                            }));
+                        if can_switch_size {
+                            chip.cursor_pointer()
+                                .hover(|s| s.bg(crate::theme::ink(0.06)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.cloud.size = this.cloud.next_size();
+                                    cx.notify();
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::SORT_VERTICAL)
+                                        .size(px(10.0))
+                                        .text_color(theme.text_muted.opacity(0.6)),
+                                )
+                        } else {
+                            chip
+                        }
+                    },
+                );
                 Some(
                     popover::menu_row_nav(
                         &theme,
@@ -2811,6 +2921,7 @@ impl Pickers {
                             .truncate()
                             .child(SharedString::from(text)),
                     )
+                    .children(size_switch)
                     .into_any_element(),
                 )
             }
@@ -8305,6 +8416,7 @@ mod tests {
                 id: "cnd_1".into(),
                 state: state.into(),
                 device_name: "Harness cloud".into(),
+                price: None,
             }],
             ..Default::default()
         }
@@ -8409,12 +8521,46 @@ mod tests {
     }
 
     #[test]
+    fn the_cloud_row_offers_sizes_and_running_rows_show_their_rate() {
+        let mut cloud = CloudState::default();
+        cloud.read(&serde_json::json!({
+            "enabled": true,
+            "sandboxes": [
+                {"id": "cnd_1", "provider": "fleet", "state": "started",
+                 "pricePerHourMicroUsd": 100000},
+                {"id": "cnd_2", "provider": "fleet", "state": "paused"}
+            ],
+            "sizes": [
+                {"id": "standard", "cpu": 2, "memoryGiB": 4, "diskGiB": 40,
+                 "pricePerHourMicroUsd": 100000, "default": true},
+                {"id": "large", "cpu": 4, "memoryGiB": 8, "diskGiB": 40,
+                 "pricePerHourMicroUsd": 200000}
+            ]
+        }));
+        assert_eq!(cloud.sandboxes[0].price, Some(100_000));
+        assert_eq!(cloud.sandboxes[1].price, None);
+        assert_eq!(cloud.create_size().unwrap().id, "standard", "the default first");
+        cloud.size = cloud.next_size();
+        assert_eq!(cloud.create_size().unwrap().id, "large");
+        cloud.size = cloud.next_size();
+        assert_eq!(cloud.create_size().unwrap().id, "standard", "the switch wraps");
+        cloud.size = Some("large".into());
+        cloud.read(&serde_json::json!({"enabled": true, "sandboxes": []}));
+        assert!(cloud.sizes.is_empty(), "an older gateway offers no sizes");
+        assert_eq!(cloud.create_size(), None);
+        assert_eq!(cloud.next_size(), None);
+        assert_eq!(cloud_running_label(Some(100_000)), "Running · $0.10/h");
+        assert_eq!(cloud_running_label(None), "Running");
+    }
+
+    #[test]
     fn the_online_cloud_device_is_matched_by_name_and_platform() {
         let now = chrono::Utc::now();
         let sandbox = CloudSandbox {
             id: "cnd_1".into(),
             state: "started".into(),
             device_name: "My cloud".into(),
+            price: None,
         };
         let devices = [
             device("a", "My cloud", "macos", 1),

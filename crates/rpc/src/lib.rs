@@ -163,11 +163,18 @@ pub mod methods {
     pub const CODEGRAFF_CANCEL_JOB: &str = "CodegraffCancelJob";
     /// The account's cloud sandboxes (`GET /v1/sandboxes`); `enabled: false` hides the card.
     pub const CODEGRAFF_SANDBOXES: &str = "CodegraffSandboxes";
-    /// Create the account's Harness cloud sandbox (fleet, persistent, kept running).
+    /// `{size?}` → create the account's Harness cloud sandbox (fleet, persistent, kept running),
+    /// `size` a personal size id from the list's `sizes` (default size when absent).
     pub const CODEGRAFF_CREATE_SANDBOX: &str = "CodegraffCreateSandbox";
     /// `{id, action}` on one sandbox: `start` (wake, kept running), `stop` (pause), `delete`,
     /// or `keep-running-on` / `keep-running-off` (whether the gateway renews its window).
     pub const CODEGRAFF_SANDBOX_ACTION: &str = "CodegraffSandboxAction";
+    /// The account's GitHub CI runners (`GET /v1/github/runners`): `null` while signed out,
+    /// `{available: false}` from a gateway without them.
+    pub const CODEGRAFF_GITHUB_RUNNERS: &str = "CodegraffGithubRunners";
+    /// `{action, installationId, …}` on one GitHub installation: `installation` (budgets, max
+    /// concurrent jobs), `repo` (`fullName`, `enabled?`, `defaultSize?`) or `disconnect`.
+    pub const CODEGRAFF_GITHUB_RUNNER_ACTION: &str = "CodegraffGithubRunnerAction";
     /// Agent rooms: one call to the edge's `/rooms…` or `/room/{id}/…` routes
     /// (`{method, path, query?, body?}` → `{status, body}`), made with the
     /// engine's own sign-in. harness-mcp's room tools compose it.

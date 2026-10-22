@@ -1701,8 +1701,13 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&sandboxes)
             }
             methods::CODEGRAFF_CREATE_SANDBOX => {
+                let size = params
+                    .get("size")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|size| !size.is_empty());
                 let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
-                    .create_sandbox()
+                    .create_sandbox(size)
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&sandbox)
@@ -1726,6 +1731,23 @@ impl RpcService for EngineRpc {
                     _ => Err("unknown sandbox action".into()),
                 }
                 .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CODEGRAFF_GITHUB_RUNNERS => {
+                let runners = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runners()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&runners)
+            }
+            methods::CODEGRAFF_GITHUB_RUNNER_ACTION => {
+                let action: crate::codegraff_auth::RunnerAction =
+                    serde_json::from_value(params.clone())
+                        .map_err(|e| RpcError::Failed(format!("bad GitHub CI action: {e}")))?;
+                crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runner_action(action)
+                    .await
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::ROOM_REQUEST => {

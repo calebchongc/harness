@@ -136,6 +136,7 @@ mod tests {
                 state: state.into(),
                 ..Default::default()
             }],
+            ..Default::default()
         })
     }
 
