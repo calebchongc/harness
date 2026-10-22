@@ -1073,6 +1073,8 @@ impl Shell {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.chat_split.as_ref().is_some_and(|s| s.focus == ix) {
+                            this.composer
+                                .update(cx, |composer, cx| composer.reveal_pending_question(cx));
                             window.focus(&this.composer.focus_handle(cx), cx);
                         } else {
                             this.focus_chat_pane(ix, window, cx);
