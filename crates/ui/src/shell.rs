@@ -18,8 +18,8 @@ use chrono::Utc;
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
     IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Subscription, Task, Window,
-    WindowControlArea, actions, div, prelude::*, px,
+    MouseUpEvent, NavigationDirection, Pixels, Point, Render, SharedString, Subscription, Task,
+    Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -12774,6 +12774,16 @@ impl Render for Shell {
                     }
                 }),
             )
+            // Mouse side buttons walk the same history as the titlebar
+            // back/forward arrows (the browser surface keeps them to itself).
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.navigate_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
+            )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
             .map(stale_input::coalesce_late_layout_commands)
             .on_key_down(cx.listener(Self::on_key_down))
@@ -14675,6 +14685,71 @@ mod exit_regressions {
                 assert!(!shell.settings_search.as_ref().unwrap().focus_pending);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn mouse_side_buttons_walk_the_route_history(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            // Past the setup splash, so the pointer reaches the shell.
+            state.connection = ConnectionStatus::Ready;
+            state
+        });
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    codegraff_client_id: None,
+                    default_harness: harness_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        shell.update(cx, |shell, cx| {
+            shell.open_settings(SettingsSection::Devices, cx);
+            shell.open_settings(SettingsSection::Files, cx);
+        });
+        let press = |cx: &mut gpui::VisualTestContext, direction| {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            let point = gpui::point(px(400.0), px(300.0));
+            let button = MouseButton::Navigate(direction);
+            cx.simulate_mouse_down(point, button, gpui::Modifiers::default());
+            cx.simulate_mouse_up(point, button, gpui::Modifiers::default());
+        };
+        let route = |cx: &mut gpui::VisualTestContext| shell.read_with(cx, |shell, _| shell.route);
+        press(cx, NavigationDirection::Back);
+        assert_eq!(route(cx), Route::Settings(SettingsSection::Devices));
+        press(cx, NavigationDirection::Back);
+        assert_eq!(route(cx), Route::Chat);
+        // Nothing further back: the button is a no-op, like the arrow.
+        press(cx, NavigationDirection::Back);
+        assert_eq!(route(cx), Route::Chat);
+        press(cx, NavigationDirection::Forward);
+        assert_eq!(route(cx), Route::Settings(SettingsSection::Devices));
+        press(cx, NavigationDirection::Forward);
+        assert_eq!(route(cx), Route::Settings(SettingsSection::Files));
     }
 
     #[gpui::test]
