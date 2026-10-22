@@ -70,6 +70,8 @@ mod chat_tabs;
 mod codegraff_account;
 mod command_palette;
 mod files_panel;
+#[cfg(test)]
+mod link_tests;
 mod project_icon;
 mod reauth;
 mod sidebar_pins;
@@ -153,6 +155,7 @@ fn fixed_shortcuts() -> Vec<crate::settings::shortcuts::FixedShortcut> {
         row("Make all panes the same size", Box::new(EqualizeChatPanes)),
         row("Zoom the pane (and back)", Box::new(ToggleChatPaneZoom)),
         row("New chat tab", Box::new(NewChatTab)),
+        row("Reopen closed chat tab", Box::new(ReopenClosedChatTab)),
         row("Next chat tab", Box::new(NextChatTab)),
         row("Previous chat tab", Box::new(PrevChatTab)),
         row(
@@ -1852,14 +1855,20 @@ pub struct Shell {
     /// at `chat_tab` is stale; the active tab lives in the fields above.
     chat_tabs: Vec<chat_tabs::ChatTab>,
     chat_tab: usize,
+    /// The implicit single tab keeps its identity when the tab list collapses.
+    chat_tab_id: uuid::Uuid,
     /// The sidebar tab list scrolls once it hits its height cap; the tab it
     /// last scrolled into view, so a switch reveals the new one exactly once.
     chat_tab_scroll: gpui::ScrollHandle,
     chat_tab_revealed: Option<usize>,
     /// Open tab indices from least to most recently visited.
     chat_tab_history: Vec<usize>,
-    /// Closed tabs, most recent last, for ⌘⇧T (#455).
+    /// Recently closed tabs, oldest first; kept only for this window's lifetime.
     closed_chat_tabs: Vec<chat_tabs::ClosedChatTab>,
+    /// Serialize archive-on-close and its undo so a quick reopen wins.
+    chat_close_archive_tasks: std::collections::HashMap<String, Task<()>>,
+    /// Keep restored split panes visible until their archive undo completes.
+    chat_tab_unarchiving: std::collections::HashMap<String, usize>,
     /// Live read-only transcripts for unfocused panes, keyed by chat id.
     peer_chat_views: std::collections::HashMap<String, chat_split::PeerChatView>,
     /// A split divider being dragged, and the split root's measured bounds.
@@ -2392,10 +2401,13 @@ impl Shell {
             chat_split_selected: None,
             chat_tabs: Vec::new(),
             chat_tab: 0,
+            chat_tab_id: uuid::Uuid::new_v4(),
             chat_tab_scroll: gpui::ScrollHandle::new(),
             chat_tab_revealed: None,
             chat_tab_history: Vec::new(),
             closed_chat_tabs: Vec::new(),
+            chat_close_archive_tasks: std::collections::HashMap::new(),
+            chat_tab_unarchiving: std::collections::HashMap::new(),
             peer_chat_views: std::collections::HashMap::new(),
             chat_split_drag: None,
             boot_restored: false,
@@ -3498,11 +3510,65 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> crate::markdown::render::LinkOutcome {
         use crate::markdown::render::{LinkAction, LinkOutcome};
-        if self.active_chat.is_empty()
-            || activation.source_session.as_deref() != Some(self.active_chat.as_str())
-            || self.state.read(cx).selected_chat.as_deref() != Some(self.active_chat.as_str())
+        if self
+            .state
+            .read(cx)
+            .selected_chat
+            .as_deref()
+            .unwrap_or_default()
+            != self.active_chat
         {
             return LinkOutcome::Rejected;
+        }
+        let Some(source) = activation
+            .source_session
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        else {
+            return LinkOutcome::Rejected;
+        };
+        let mut resolved = activation.clone();
+        if resolved.action == LinkAction::Primary {
+            resolved.action = if crate::settings::current(cx).open_web_links_in_harness {
+                LinkAction::Internal
+            } else {
+                LinkAction::External
+            };
+        }
+        let outcome = resolved.web_outcome(cfg!(any(target_os = "macos", target_os = "linux")));
+        if source != self.active_chat {
+            // Authorize only a rendered peer, not a cached/hidden transcript.
+            // Workspace resources still require their owner to be focused so
+            // they cannot resolve in another chat's workspace.
+            let peer_index = self.chat_split.as_ref().and_then(|split| {
+                (matches!(self.route, Route::Chat) && !split.zoomed)
+                    .then(|| {
+                        split.panes.iter().enumerate().find_map(|(ix, id)| {
+                            (ix != split.focus && id.as_deref() == Some(source)).then_some(ix)
+                        })
+                    })
+                    .flatten()
+            });
+            let Some(peer_index) = peer_index.filter(|_| self.peer_chat_views.contains_key(source))
+            else {
+                return LinkOutcome::Rejected;
+            };
+            if activation.target.navigation.is_err() {
+                return LinkOutcome::Rejected;
+            }
+            // Promote the source before opening its internal browser tab.
+            // Otherwise a primary click can open a tab in the old owner just
+            // before mouse-up focuses the source, hiding the new tab. The
+            // ordinary pane-switch path also parks any canvas draft safely.
+            if outcome == LinkOutcome::Internal {
+                if !self.select_chat_pane(peer_index, cx) {
+                    return LinkOutcome::Rejected;
+                }
+                self.on_state_changed(&self.state.clone(), cx);
+                if self.active_chat != source {
+                    return LinkOutcome::Rejected;
+                }
+            }
         }
         if let Some(request) =
             crate::markdown::content_reference::html_preview(&activation.target.original)
@@ -3551,15 +3617,6 @@ impl Shell {
                 LinkOutcome::Rejected
             };
         }
-        let mut resolved = activation.clone();
-        if resolved.action == LinkAction::Primary {
-            resolved.action = if crate::settings::current(cx).open_web_links_in_harness {
-                LinkAction::Internal
-            } else {
-                LinkAction::External
-            };
-        }
-        let outcome = resolved.web_outcome(cfg!(any(target_os = "macos", target_os = "linux")));
         if outcome == LinkOutcome::Internal {
             self.set_surfaces_open(true, cx);
             self.add_browser_surface(activation.target.navigation.clone().ok(), window, cx);
@@ -7060,7 +7117,8 @@ impl Shell {
         // composer-strip spinner, Done wears a check; Idle rows show the
         // relative time instead. Hovering the ROW swaps the corner for the
         // ARCHIVE button. Compact rows keep status first and elapsed time last;
-        // their archive control occupies the remote-icon slot on hover.
+        // their archive control occupies the remote-icon slot on hover, while
+        // an overflow-menu button replaces the timestamp in the same state.
         // A chat can appear on both surfaces at once. Namespace every hover
         // key and child id so the palette never animates the sidebar copy.
         let row_id = if search_query.is_some() {
@@ -7302,6 +7360,10 @@ impl Shell {
             let archive_id = id.clone();
             div()
                 .id(SharedString::from(format!("{row_id}-corner")))
+                .debug_selector({
+                    let row_id = row_id.clone();
+                    move || format!("{row_id}-corner")
+                })
                 .aria_label(if corner_hovered {
                     if archived { "Unarchive" } else { "Archive" }
                 } else {
@@ -7527,6 +7589,43 @@ impl Shell {
                         },
                     )
                     .when(compact, |el| {
+                        if corner_hovered {
+                            return el.child(
+                                div()
+                                    .id(SharedString::from(format!("{row_id}-menu")))
+                                    .debug_selector({
+                                        let row_id = row_id.clone();
+                                        move || format!("{row_id}-menu")
+                                    })
+                                    .aria_label("Session menu")
+                                    .ml(px(6.0))
+                                    .size(px(18.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .text_color(theme.text_muted)
+                                    .hover(|s| s.bg(crate::theme::wash(0.10)))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.chat_menu.open(ChatMenuState {
+                                            chat_id: id.clone(),
+                                            position: window.mouse_position(),
+                                            page: ChatMenuPage::Root,
+                                        });
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        icon(icons::MORE_HORIZONTAL)
+                                            .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                            .text_color(theme.text_muted),
+                                    ),
+                            );
+                        }
                         el.child(
                             div()
                                 .debug_selector({
@@ -15954,6 +16053,13 @@ mod exit_regressions {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
             crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
             settings::init(settings::UiSettings::default(), dir.path(), cx);
         });
         let window = cx.add_window(|_, cx| {
@@ -16100,6 +16206,133 @@ mod exit_regressions {
                 assert_eq!(
                     shell.activate_session_link(&activation, window, cx),
                     LinkOutcome::External(issue_url.into())
+                );
+                // Peer transcripts retain their own source even when another
+                // pane owns the composer. Both explicit menu actions must work.
+                shell.route = Route::Chat;
+                shell.chat_split = chat_split::ChatSplit::split(
+                    None,
+                    SplitAxis::Horizontal,
+                    Some("visible-peer".into()),
+                    None,
+                );
+                shell.sync_chat_panes(cx);
+                activation.source_session = shell.peer_chat_views["visible-peer"]
+                    .transcript
+                    .read(cx)
+                    .link_ui()
+                    .unwrap()
+                    .source_session;
+                let before = shell.browsers.len();
+                for action in [
+                    LinkAction::Primary,
+                    LinkAction::External,
+                    LinkAction::Internal,
+                ] {
+                    activation.action = action;
+                    let expected = if action == LinkAction::Internal {
+                        LinkOutcome::Internal
+                    } else {
+                        LinkOutcome::External(issue_url.into())
+                    };
+                    assert_eq!(
+                        shell.activate_session_link(&activation, window, cx),
+                        expected
+                    );
+                }
+                assert_eq!(shell.browsers.len(), before + 1);
+                assert_eq!(shell.active_chat, "visible-peer");
+                assert_eq!(shell.right_tabs["visible-peer"].len(), 1);
+                assert!(shell.select_chat_pane(1, cx));
+                shell.on_state_changed(&shell.state.clone(), cx);
+                assert_eq!(shell.active_chat, "first-session");
+
+                shell.chat_split.as_mut().unwrap().zoomed = true;
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+                shell.chat_split.as_mut().unwrap().zoomed = false;
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("switch-in-progress".into())
+                });
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("first-session".into())
+                });
+                let split = shell.chat_split.take();
+                assert!(shell.peer_chat_views.contains_key("visible-peer"));
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+                shell.chat_split = split;
+                shell.route = Route::Settings(SettingsSection::Devices);
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+                shell.route = Route::Chat;
+                for destination in [
+                    "README.md",
+                    "\u{e200}visualize\u{e202}{\"path\":\"/workspace/design.html\"}\u{e201}",
+                ] {
+                    activation.target = LinkTarget::new("Peer resource", destination);
+                    assert_eq!(
+                        shell.activate_session_link(&activation, window, cx),
+                        LinkOutcome::Rejected,
+                        "peer resources must not resolve in the focused chat's workspace"
+                    );
+                }
+                assert_eq!(shell.browsers.len(), before + 1);
+
+                // A new-session canvas can own the composer while the peer
+                // transcript is still visible. External navigation needs no
+                // chat owner; internal navigation must reveal a real owner.
+                shell.active_chat.clear();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = None;
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "visible-peer", "deviceId": "local", "title": "Session",
+                            "archived": false, "createdAt": Utc::now(),
+                        }))
+                        .unwrap(),
+                    ];
+                });
+                activation.target = LinkTarget::new("Issue", issue_url);
+                for action in [LinkAction::Primary, LinkAction::External] {
+                    activation.action = action;
+                    assert_eq!(
+                        shell.activate_session_link(&activation, window, cx),
+                        LinkOutcome::External(issue_url.into())
+                    );
+                    assert!(shell.active_chat.is_empty());
+                    assert!(shell.state.read(cx).selected_chat.is_none());
+                }
+                activation.action = LinkAction::Internal;
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Internal
+                );
+                assert_eq!(shell.active_chat, "visible-peer");
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some("visible-peer")
+                );
+                assert!(shell.right_pane_open(cx));
+                assert_eq!(shell.browsers.len(), before + 2);
+                assert_eq!(shell.right_tabs["visible-peer"].len(), 2);
+                assert_eq!(
+                    shell.browsers[&shell.browser_seq]
+                        .read(cx)
+                        .page
+                        .url
+                        .as_deref(),
+                    Some(issue_url)
                 );
                 let weak = shell.browsers[&first].downgrade();
                 shell.close_right_surface(RightSurface::Browser(first), window, cx);

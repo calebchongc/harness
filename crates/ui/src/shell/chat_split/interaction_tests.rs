@@ -294,6 +294,308 @@ fn selecting_in_an_inactive_pane_activates_and_preserves_selection(cx: &mut gpui
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui::test]
+fn peer_link_menu_actions_open_the_requested_destination(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    let url = "https://example.com/split-link";
+    for canvas in [false, true] {
+        for label in ["Open in Harness", "Open in external browser"] {
+            with_panes(
+                cx,
+                vec![reply(&format!("[Documentation]({url})"))],
+                |shell, peer, _, cx| {
+                    // This fixture renders the panes directly, not Shell's
+                    // normal render path that synchronizes its active chat.
+                    shell.update(cx, |shell, cx| {
+                        shell.on_state_changed(&shell.state.clone(), cx);
+                    });
+                    if canvas {
+                        shell.update(cx, |shell, cx| {
+                            shell
+                                .state
+                                .update(cx, |state, cx| state.select_chat(None, cx));
+                            shell.on_state_changed(&shell.state.clone(), cx);
+                        });
+                        draw(cx);
+                    }
+                    let source = text_point(&peer, "reply#text.0:0");
+                    cx.simulate_mouse_move(source, None, Default::default());
+                    cx.background_executor
+                        .advance_clock(std::time::Duration::from_millis(650));
+                    draw(cx);
+                    cx.simulate_mouse_down(source, MouseButton::Right, Default::default());
+                    cx.simulate_mouse_up(source, MouseButton::Right, Default::default());
+                    draw(cx);
+                    cx.background_executor
+                        .advance_clock(std::time::Duration::from_millis(200));
+                    draw(cx);
+                    let row = cx.debug_bounds(label).expect("painted link menu action");
+                    cx.simulate_click(row.center(), Default::default());
+                    draw(cx);
+                    if label == "Open in external browser" {
+                        assert_eq!(cx.opened_url().as_deref(), Some(url));
+                    } else {
+                        shell.read_with(cx, |shell, cx| {
+                            assert!(
+                                shell.right_pane_open(cx),
+                                "{label}, canvas={canvas}: active={}, selected={:?}, focus={}, browsers={}, chat_route={}",
+                                shell.active_chat,
+                                shell.state.read(cx).selected_chat,
+                                shell.chat_split.as_ref().unwrap().focus,
+                                shell.browsers.len(),
+                                matches!(shell.route, Route::Chat)
+                            );
+                            assert_eq!(
+                                shell.browsers[&shell.browser_seq]
+                                    .read(cx)
+                                    .page
+                                    .url
+                                    .as_deref(),
+                                Some(url)
+                            );
+                        });
+                    }
+                },
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_link_panes(
+    shell: &Entity<Shell>,
+    canvas: bool,
+    internal: bool,
+    cx: &mut gpui::VisualTestContext,
+) {
+    shell.update(cx, |shell, cx| {
+        settings::update(settings::SavePolicy::Immediate, cx, |settings| {
+            settings.open_web_links_in_harness = internal;
+        });
+        if canvas {
+            shell
+                .state
+                .update(cx, |state, cx| state.select_chat(None, cx));
+        }
+        shell.on_state_changed(&shell.state.clone(), cx);
+    });
+    draw(cx);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_peer_link_menu(peer: &Entity<Transcript>, row: &str, cx: &mut gpui::VisualTestContext) {
+    let source = text_point(peer, row);
+    cx.simulate_mouse_move(source, None, Default::default());
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(650));
+    draw(cx);
+    cx.simulate_mouse_down(source, MouseButton::Right, Default::default());
+    cx.simulate_mouse_up(source, MouseButton::Right, Default::default());
+    draw(cx);
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(200));
+    draw(cx);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui::test]
+fn peer_primary_links_follow_preferences_after_hover_and_repeated_clicks(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    for canvas in [false, true] {
+        for internal in [false, true] {
+            for hover in [false, true] {
+                let url = format!("https://example.com/primary/{canvas}/{internal}/{hover}");
+                with_panes(
+                    cx,
+                    vec![reply(&format!("[Documentation]({url})"))],
+                    |shell, peer, _, cx| {
+                        prepare_link_panes(&shell, canvas, internal, cx);
+                        let previous_url = cx.opened_url();
+                        for clicks in 1..=2 {
+                            let source = text_point(&peer, "reply#text.0:0");
+                            if hover {
+                                cx.simulate_mouse_move(source, None, Default::default());
+                                cx.background_executor
+                                    .advance_clock(std::time::Duration::from_millis(650));
+                                draw(cx);
+                            }
+                            cx.simulate_click(source, Default::default());
+                            draw(cx);
+                            shell.read_with(cx, |shell, cx| {
+                                if internal {
+                                    assert_eq!(
+                                        shell.browsers.len(),
+                                        clicks,
+                                        "canvas={canvas}, hover={hover}"
+                                    );
+                                    assert!(shell.right_pane_open(cx));
+                                    assert_eq!(
+                                        shell.browsers[&shell.browser_seq]
+                                            .read(cx)
+                                            .page
+                                            .url
+                                            .as_deref(),
+                                        Some(url.as_str())
+                                    );
+                                } else {
+                                    assert!(shell.browsers.is_empty());
+                                }
+                            });
+                            if internal {
+                                assert_eq!(cx.opened_url(), previous_url);
+                            } else {
+                                assert_eq!(cx.opened_url().as_deref(), Some(url.as_str()));
+                            }
+                        }
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui::test]
+fn peer_link_menu_actions_ignore_existing_text_highlights(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    let url = "https://example.com/highlighted-link";
+    for highlight_peer in [false, true] {
+        for label in ["Open in Harness", "Open in external browser"] {
+            with_panes(
+                cx,
+                vec![reply(&format!(
+                    "Selectable response text.\n\n[Documentation]({url})"
+                ))],
+                |shell, peer, current, cx| {
+                    prepare_link_panes(&shell, false, true, cx);
+                    let (selected, row) = if highlight_peer {
+                        (&peer, "reply#text.0:0")
+                    } else {
+                        (&current, "current-reply#text.0:0")
+                    };
+                    let start = text_point(selected, row);
+                    let end = start + gpui::point(px(90.0), px(0.0));
+                    cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+                    cx.simulate_mouse_move(end, Some(MouseButton::Left), Default::default());
+                    cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+                    draw(cx);
+                    assert!(selection::selected_text().is_some());
+                    open_peer_link_menu(&peer, "reply#text.1:1", cx);
+                    let row_bounds = cx.debug_bounds(label).expect("painted link menu action");
+                    cx.simulate_click(row_bounds.center(), Default::default());
+                    draw(cx);
+                    if label == "Open in Harness" {
+                        shell.read_with(cx, |shell, cx| {
+                            assert_eq!(shell.browsers.len(), 1);
+                            assert_eq!(
+                                shell.browsers[&shell.browser_seq]
+                                    .read(cx)
+                                    .page
+                                    .url
+                                    .as_deref(),
+                                Some(url)
+                            );
+                        });
+                    } else {
+                        assert_eq!(cx.opened_url().as_deref(), Some(url));
+                    }
+                    selection::end_active_drag();
+                    selection::clear_if_owner(&key(selected, row));
+                },
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui::test]
+fn peer_link_menu_escape_copy_and_reopen_do_not_navigate(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    let url = "https://example.com/copy?first=1&second=two#section";
+    for canvas in [false, true] {
+        with_panes(
+            cx,
+            vec![reply(&format!("[Documentation]({url})"))],
+            |shell, peer, _, cx| {
+                prepare_link_panes(&shell, canvas, true, cx);
+                let previous_url = cx.opened_url();
+                open_peer_link_menu(&peer, "reply#text.0:0", cx);
+                cx.simulate_keystrokes("escape");
+                draw(cx);
+                assert!(cx.debug_bounds("Open in Harness").is_none());
+                for _ in 0..2 {
+                    open_peer_link_menu(&peer, "reply#text.0:0", cx);
+                    let row = cx.debug_bounds("Copy link address").expect("copy action");
+                    cx.simulate_click(row.center(), Default::default());
+                    draw(cx);
+                    cx.update(|_, cx| {
+                        assert_eq!(
+                            cx.read_from_clipboard().unwrap().text().as_deref(),
+                            Some(url)
+                        )
+                    });
+                    assert_eq!(cx.opened_url(), previous_url);
+                    shell.read_with(cx, |shell, cx| {
+                        assert!(shell.browsers.is_empty());
+                        assert_eq!(
+                            shell.state.read(cx).selected_chat.as_deref(),
+                            if canvas { None } else { Some("current") }
+                        );
+                    });
+                }
+            },
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui::test]
+fn peer_link_menu_unsafe_destinations_only_allow_copy(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    for target in [
+        "javascript:alert(1)",
+        "data:text/html,hello",
+        "file:///etc/passwd",
+    ] {
+        with_panes(
+            cx,
+            vec![reply(&format!("[Unsafe destination]({target})"))],
+            |shell, peer, _, cx| {
+                prepare_link_panes(&shell, true, true, cx);
+                let previous_url = cx.opened_url();
+                for label in [
+                    "Open in Harness",
+                    "Open in external browser",
+                    "Copy link address",
+                ] {
+                    open_peer_link_menu(&peer, "reply#text.0:0", cx);
+                    let row = cx
+                        .debug_bounds(label)
+                        .expect("painted disabled or copy action");
+                    cx.simulate_click(row.center(), Default::default());
+                    draw(cx);
+                    assert_eq!(cx.opened_url(), previous_url);
+                    shell.read_with(cx, |shell, cx| {
+                        assert!(shell.browsers.is_empty());
+                        assert!(shell.state.read(cx).selected_chat.is_none());
+                    });
+                    if label == "Copy link address" {
+                        cx.update(|_, cx| {
+                            assert_eq!(
+                                cx.read_from_clipboard().unwrap().text().as_deref(),
+                                Some(target)
+                            )
+                        });
+                    }
+                }
+            },
+        );
+    }
+}
+
 #[gpui::test]
 fn every_mouse_button_activates_an_inactive_pane_on_release(cx: &mut gpui::TestAppContext) {
     let _selection = selection::test_state_lock();

@@ -1582,6 +1582,13 @@ impl Composer {
                 .insert(self.current_key.clone(), attachments);
         }
         self.restore_question_input(cx);
+        // A question can arrive while this editor owns the composer. Its
+        // AppState notification was intentionally deferred; reconcile after
+        // this cleanup (which can itself run inside on_state_changed).
+        let composer = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = composer.update(cx, |composer, cx| composer.on_state_changed(cx));
+        });
         self.focus_pending = true;
         cx.notify();
     }

@@ -497,9 +497,9 @@ fn is_agent_wait(call: &ToolCall) -> bool {
 }
 
 /// A chip renders as the spawn LINK (whole-card click → subagent tab) only
-/// when an agent call has actually been bound to its doc.
+/// when an agent call has a real task title and has been bound to its doc.
 fn is_spawn_link(item: &ToolItem) -> bool {
-    is_agent_tool(item) && item.subagent_ref.is_some()
+    is_agent_tool(item) && item.subagent_ref.is_some() && subagent_tab_title(&item.call).is_some()
 }
 
 /// Chips that open something instead of expanding: a bound spawn (its
@@ -526,7 +526,7 @@ fn started_agent(output: &str) -> Option<(&str, Option<&str>)> {
 }
 
 /// A background agent a turn started: its number, title, doc and status.
-type AgentSpawn = (String, String, Option<SharedString>, Option<SubagentStatus>);
+type AgentSpawn = (String, Option<String>, Option<SharedString>, Option<SubagentStatus>);
 
 /// The background agents this turn's spawn results announced, in order.
 fn agent_spawns(parts: &[MessagePart]) -> Vec<AgentSpawn> {
@@ -536,13 +536,9 @@ fn agent_spawns(parts: &[MessagePart]) -> Vec<AgentSpawn> {
             && let Some((number, title)) = started_agent(output)
         {
             let title = title
+                .and_then(subagent_task_title)
                 .map(str::to_owned)
-                .or_else(|| match call {
-                    ToolCall::Unknown { name, .. } => Some(strip_spawn_prefix(name).to_owned()),
-                    _ => None,
-                })
-                .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| format!("agent {number}"));
+                .or_else(|| subagent_tab_title(call).map(|title| title.to_string()));
             spawns.push((
                 number.to_owned(),
                 title,
@@ -555,8 +551,8 @@ fn agent_spawns(parts: &[MessagePart]) -> Vec<AgentSpawn> {
 }
 
 /// Bind a "Wait for agent N" to the spawn that started agent N in the same
-/// turn: take its title ("Waiting on Audit frontend login") and its subagent
-/// doc + status, so the row opens the same live transcript.
+/// turn: take its title and subagent doc + status, so the generic
+/// "Waiting on subagent" row still opens the same named live transcript.
 fn bind_agent_wait(spawns: &[AgentSpawn], item: &mut ToolItem) {
     // Chats recorded before the graff driver named these keep the raw tool
     // names; read them the same way.
@@ -586,10 +582,12 @@ fn bind_agent_wait(spawns: &[AgentSpawn], item: &mut ToolItem) {
     let Some((_, title, doc, status)) = spawns.iter().rev().find(|(n, ..)| n == number) else {
         return;
     };
-    item.call = ToolCall::Unknown {
-        name: format!("Wait for agent {number}: {title}"),
-        input: input.clone(),
-    };
+    if let Some(title) = title {
+        item.call = ToolCall::Unknown {
+            name: format!("Wait for agent {number}: {title}"),
+            input: input.clone(),
+        };
+    }
     if item.subagent_ref.is_none() {
         item.subagent_ref = doc.clone();
         item.subagent_status = *status;
@@ -8690,9 +8688,11 @@ impl Transcript {
                 // Spawn chips are LINKS, not accordions: the click opens the
                 // subagent's transcript as a right-pane tab (the shell hosts
                 // the surface — the chip only announces which doc it indexes).
-                if let Some(doc_id) = tool.subagent_ref.clone().filter(|_| is_spawn_link(tool)) {
+                if let (Some(doc_id), Some(title)) = (
+                    tool.subagent_ref.clone().filter(|_| is_agent_tool(tool)),
+                    subagent_tab_title(&tool.call),
+                ) {
                     let chat_id = self.chat_id.clone().unwrap_or_default();
-                    let title = subagent_tab_title(&tool.call);
                     let frozen = matches!(
                         tool.subagent_status,
                         Some(
@@ -9832,33 +9832,49 @@ fn strip_spawn_prefix(text: &str) -> &str {
     t
 }
 
+/// Task text for a subagent title, excluding control labels and worker IDs.
+fn subagent_task_title(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let text = if let Some(rest) = text.strip_prefix("Wait for agent") {
+        rest.split_once(": ")?.1
+    } else {
+        text
+    };
+    let title = strip_spawn_prefix(text);
+    if title.is_empty()
+        || title.eq_ignore_ascii_case("subagent")
+        || (title != text && title.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(title)
+}
+
 /// Tab title for a spawn chip's subagent surface: the BARE task description
 /// ("verify the marker pipeline"). The chip keeps the tool's fuller name —
 /// a fixed-width tab spent on "Agent: " never shows the task, so the genus
 /// is stripped here and the call input's description/prompt fields back up
-/// a bare name (older docs); "Subagent" only as the last resort.
-fn subagent_tab_title(call: &ToolCall) -> SharedString {
+/// a bare name (older docs). Without a task title, no transcript is offered.
+fn subagent_tab_title(call: &ToolCall) -> Option<SharedString> {
     let (name, input) = match call {
         ToolCall::Unknown { name, input } => (name.as_str(), input.as_ref()),
         ToolCall::Mcp { tool, input, .. } => (tool.as_str(), input.as_ref()),
-        _ => return "Subagent".into(),
+        _ => return None,
     };
-    // A wait row opens its subagent under the subagent's own title.
-    let name = name
-        .strip_prefix("Wait for agent")
-        .and_then(|rest| rest.split_once(": "))
-        .map_or(name, |(_, title)| title);
+    // Prefer a real task title, then input metadata; never use a worker ID.
     let candidates = [
         Some(name),
         input.and_then(|i| i.get("description")?.as_str()),
         input.and_then(|i| i.get("prompt")?.as_str()),
     ];
     for text in candidates.into_iter().flatten() {
-        if let Some(title) = title_line(strip_spawn_prefix(text), SUBAGENT_TITLE_MAX) {
-            return title.into();
+        if let Some(title) = subagent_task_title(text)
+            .and_then(|text| title_line(text, SUBAGENT_TITLE_MAX))
+        {
+            return Some(title.into());
         }
     }
-    "Subagent".into()
+    None
 }
 
 /// Clip one newly appended task row to its committed height. Fade and lift are
@@ -17101,7 +17117,7 @@ mod tests {
             name: "Agent: scan repo".into(),
             input: None,
         };
-        assert_eq!(subagent_tab_title(&named).as_ref(), "scan repo");
+        assert_eq!(subagent_tab_title(&named).as_deref(), Some("scan repo"));
         // A bare "Task"/"Agent" digs the description out of the call input
         // (which sheds any genus of its own).
         let bare = ToolCall::Unknown {
@@ -17111,37 +17127,47 @@ mod tests {
                 "prompt": "very long instructions…",
             })),
         };
-        assert_eq!(subagent_tab_title(&bare).as_ref(), "audit the auth flow");
+        assert_eq!(subagent_tab_title(&bare).as_deref(), Some("audit the auth flow"));
         // Word boundaries only — a name that merely STARTS with the genus
         // keeps itself.
         let compound = ToolCall::Unknown {
             name: "Taskmaster".into(),
             input: None,
         };
-        assert_eq!(subagent_tab_title(&compound).as_ref(), "Taskmaster");
-        // Nothing to derive → the generic label.
+        assert_eq!(subagent_tab_title(&compound).as_deref(), Some("Taskmaster"));
+        // Nothing to derive → no transcript title or link.
         let blank = ToolCall::Unknown {
             name: "agent".into(),
             input: None,
         };
-        assert_eq!(subagent_tab_title(&blank).as_ref(), "Subagent");
+        assert!(subagent_tab_title(&blank).is_none());
+        // A worker number is not a task title; use metadata before the fallback.
+        for name in ["agent 7", "Agent: 7", "Wait for agent 7", "Wait for agents", "Subagent"] {
+            let mut call = ToolCall::Unknown { name: name.into(), input: None };
+            assert!(subagent_tab_title(&call).is_none());
+            if let ToolCall::Unknown { input, .. } = &mut call {
+                *input = Some(serde_json::json!({"description": "Audit login"}));
+            }
+            assert_eq!(subagent_tab_title(&call).as_deref(), Some("Audit login"));
+        }
+        let prompt_only = ToolCall::Unknown {
+            name: "Wait for agent 7".into(),
+            input: Some(serde_json::json!({"prompt": "Verify checkout links\nMore instructions"})),
+        };
+        assert_eq!(subagent_tab_title(&prompt_only).as_deref(), Some("Verify checkout links"));
         // Absurd lengths cap with an ellipsis; multiline prompts keep only
         // their first line.
         let long = ToolCall::Unknown {
             name: "x".repeat(120),
             input: None,
         };
-        let title = subagent_tab_title(&long);
+        let title = subagent_tab_title(&long).unwrap();
         assert_eq!(title.chars().count(), SUBAGENT_TITLE_MAX + 1);
         assert!(title.ends_with('…'));
-        // Non-spawn-shaped calls stay generic.
-        assert_eq!(
-            subagent_tab_title(&ToolCall::Exec {
-                command: "ls".into()
-            })
-            .as_ref(),
-            "Subagent"
-        );
+        // Non-spawn-shaped calls never offer a subagent transcript.
+        assert!(subagent_tab_title(&ToolCall::Exec {
+            command: "ls".into()
+        }).is_none());
     }
 
     #[test]
@@ -17192,9 +17218,9 @@ mod tests {
         assert_eq!(wait.subagent_ref.as_deref(), Some("c--sub--spawn"));
         assert_eq!(
             tool_chip_content(&wait.call),
-            ("Waiting on", "Audit frontend login".to_string())
+            ("Waiting on", "subagent".to_string())
         );
-        assert_eq!(subagent_tab_title(&wait.call).as_ref(), "Audit frontend login");
+        assert_eq!(subagent_tab_title(&wait.call).as_deref(), Some("Audit frontend login"));
         // A chat recorded before the driver fix binds the same way.
         let mut legacy = wait.clone();
         legacy.call = ToolCall::Unknown {
@@ -17204,14 +17230,50 @@ mod tests {
         legacy.subagent_ref = None;
         bind_agent_wait(&spawns, &mut legacy);
         assert_eq!(legacy.subagent_ref.as_deref(), Some("c--sub--spawn"));
+        // Missing task metadata must not manufacture a generic transcript tab.
+        let mut unnamed_parts = parts.clone();
+        if let MessagePart::Tool { call, output, .. } = &mut unnamed_parts[0] {
+            *call = ToolCall::Unknown { name: "Agent".into(), input: None };
+            *output = Some("[agent 1 started]".into());
+        }
+        let unnamed_spawns = agent_spawns(&unnamed_parts);
+        assert!(unnamed_spawns[0].1.is_none());
+        let mut unnamed = wait.clone();
+        unnamed.call = ToolCall::Unknown { name: "Wait for agent 1".into(), input: None };
+        bind_agent_wait(&unnamed_spawns, &mut unnamed);
+        assert!(is_agent_tool(&unnamed));
+        assert!(!is_spawn_link(&unnamed));
+        assert_eq!(unnamed.subagent_ref.as_deref(), Some("c--sub--spawn"));
+        assert_eq!(tool_chip_content(&unnamed.call), ("Waiting on", "subagent".into()));
+        unnamed.call = ToolCall::Unknown { name: "Agent".into(), input: None };
+        assert!(!is_spawn_link(&unnamed));
         // An unbound wait still reads as a subagent wait, just unlinked.
         let lone = ToolCall::Unknown { name: "Wait for agent 7".into(), input: None };
-        assert_eq!(tool_chip_content(&lone), ("Waiting on", "agent 7".to_string()));
+        assert_eq!(tool_chip_content(&lone), ("Waiting on", "subagent".to_string()));
         assert!(is_agent_wait(&lone));
     }
 
     #[test]
     fn tool_chip_labels_per_kind() {
+        for (name, label) in [
+            ("Wait for agent 1", "Waiting on"),
+            ("Wait for agent 7: Audit login", "Waiting on"),
+            ("Wait for agents", "Waiting on"),
+            ("agent_output", "Waiting on"),
+            ("Message agent 2", "Message"),
+            ("Message agent 2: Audit login", "Message"),
+            ("Message agent", "Message"),
+            ("Send agent message", "Message"),
+            ("agent_message", "Message"),
+            ("Resume agent", "Resume"),
+            ("Resume agent 3", "Resume"),
+            ("subagent_resume", "Resume"),
+            ("Close agent", "Close"),
+            ("Close agent 4", "Close"),
+        ] {
+            let call = ToolCall::Unknown { name: name.into(), input: None };
+            assert_eq!(tool_chip_content(&call), (label, "subagent".to_string()));
+        }
         assert_eq!(
             tool_chip_content(&ToolCall::Exec {
                 command: "cargo test".into()
