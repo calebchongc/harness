@@ -70,6 +70,8 @@ mod chat_tabs;
 mod codegraff_account;
 mod command_palette;
 mod files_panel;
+#[cfg(test)]
+mod link_tests;
 mod project_icon;
 mod reauth;
 mod sidebar_pins;
@@ -3544,10 +3546,11 @@ impl Shell {
             if activation.target.navigation.is_err() {
                 return LinkOutcome::Rejected;
             }
-            // A canvas has no browser host. Promote the visible source pane
-            // before opening an internal tab, preserving the canvas draft via
-            // the ordinary pane-switch path. External links need no switch.
-            if self.active_chat.is_empty() && outcome == LinkOutcome::Internal {
+            // Promote the source before opening its internal browser tab.
+            // Otherwise a primary click can open a tab in the old owner just
+            // before mouse-up focuses the source, hiding the new tab. The
+            // ordinary pane-switch path also parks any canvas draft safely.
+            if outcome == LinkOutcome::Internal {
                 if !self.select_chat_pane(peer_index, cx) {
                     return LinkOutcome::Rejected;
                 }
@@ -16186,6 +16189,10 @@ mod exit_regressions {
                     );
                 }
                 assert_eq!(shell.browsers.len(), before + 1);
+                assert_eq!(shell.active_chat, "visible-peer");
+                assert_eq!(shell.right_tabs["visible-peer"].len(), 1);
+                assert!(shell.select_chat_pane(1, cx));
+                shell.on_state_changed(&shell.state.clone(), cx);
                 assert_eq!(shell.active_chat, "first-session");
 
                 shell.chat_split.as_mut().unwrap().zoomed = true;
@@ -16266,7 +16273,7 @@ mod exit_regressions {
                 );
                 assert!(shell.right_pane_open(cx));
                 assert_eq!(shell.browsers.len(), before + 2);
-                assert_eq!(shell.right_tabs["visible-peer"].len(), 1);
+                assert_eq!(shell.right_tabs["visible-peer"].len(), 2);
                 assert_eq!(
                     shell.browsers[&shell.browser_seq]
                         .read(cx)
