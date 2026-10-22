@@ -5582,6 +5582,8 @@ pub struct Composer {
     /// Live dictation through the device's Codex voice, while one runs.
     dictation: Option<ComposerDictation>,
     wizard: Option<Wizard>,
+    /// Unfinished question pages, separate from ordinary prompt drafts.
+    wizard_drafts: HashMap<(String, String), Wizard>,
     wizard_focus: FocusHandle,
     wizard_expanded: bool,
     wizard_scroll: gpui::ScrollHandle,
@@ -5852,6 +5854,7 @@ impl Composer {
             failure: None,
             dictation: None,
             wizard: None,
+            wizard_drafts: HashMap::new(),
             wizard_focus: cx.focus_handle(),
             wizard_expanded: false,
             wizard_scroll: gpui::ScrollHandle::new(),
@@ -7916,7 +7919,13 @@ impl Composer {
             self.launching_new_chat = false;
             // A question temporarily borrows the editor. Its answer must never
             // replace the ordinary chat draft saved when the panel opened.
-            if self.wizard.is_none() {
+            if let Some(mut wizard) = self.wizard.take() {
+                wizard.set_typed(self.input.read(cx).text().to_string());
+                self.wizard_drafts.insert(
+                    (self.current_key.clone(), wizard.request_id.clone()),
+                    wizard,
+                );
+            } else {
                 let mut old_text = self.input.read(cx).text().to_string();
                 // Leaving mid-recall keeps the real draft, not the recalled prompt.
                 if let Some(nav) = self.prompt_history.take()
@@ -7936,7 +7945,7 @@ impl Composer {
             // failures render only under their own chat (see `failure_key`),
             // so switching away and back must not erase the one visible
             // trace of a failed send.
-            self.wizard = None;
+            self.advance_task = None;
             self.wizard_expanded = false;
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
@@ -7979,7 +7988,7 @@ impl Composer {
             cx.notify();
             return;
         }
-        // Question panel lifecycle (wizard state cached per request id).
+        // Question drafts belong to both a chat and a particular request.
         match pending {
             Some((request_id, questions)) if !self.answered_requests.contains(&request_id) => {
                 let same = self
@@ -7994,23 +8003,37 @@ impl Composer {
                         );
                     }
                     self.reset_mention(None, cx);
-                    let prefill = questions
-                        .first()
-                        .and_then(|q| q.prefill.clone())
-                        .unwrap_or_default();
-                    self.wizard = Some(Wizard::new(request_id, questions));
-                    self.input
-                        .update(cx, |input, cx| input.set_text(prefill, cx));
+                    self.wizard_drafts.retain(|(chat, request), _| {
+                        chat != &self.current_key || request == &request_id
+                    });
+                    self.wizard = Some(
+                        self.wizard_drafts
+                            .remove(&(self.current_key.clone(), request_id.clone()))
+                            .unwrap_or_else(|| Wizard::new(request_id, questions)),
+                    );
+                    let text = self.wizard_page_text();
+                    self.input.update(cx, |input, cx| input.set_text(text, cx));
                     self.wizard_expanded = false;
                     self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
                     self.advance_task = None;
-                    // The shared input becomes the panel's free-text override.
+                    // Restore the hint for this page's selections, too.
+                    let has_pick = self.wizard.as_ref().is_some_and(|w| w.page_has_pick());
                     self.input.update(cx, |input, cx| {
-                        input.set_placeholder("Type your own answer, or pick an option above", cx)
+                        input.set_placeholder(
+                            if has_pick {
+                                "Type your own answer, or leave this blank to use the selected option"
+                            } else {
+                                "Type your own answer, or pick an option above"
+                            },
+                            cx,
+                        )
                     });
                 }
             }
             _ => {
+                if !self.state.read(cx).transcript.is_empty() {
+                    self.wizard_drafts.retain(|(chat, _), _| chat != &self.current_key);
+                }
                 if let Some(wizard) = self.wizard.as_ref() {
                     // LATCH (original composer.tsx `inputLatch`): a transient
                     // fold/sync blip — or a steer appended behind the
@@ -15941,6 +15964,193 @@ mod tests {
             assert_eq!(input.text(), committed);
             assert_ranges(input);
         });
+    }
+
+    fn switch_question_draft_chat(
+        composer: &mut Composer,
+        chat_id: &str,
+        pending: Option<(&str, Vec<UserInputQuestion>)>,
+        cx: &mut Context<Composer>,
+    ) {
+        composer.state.update(cx, |state, _| {
+            state.selected_chat = Some(chat_id.into());
+            state.transcript = pending
+                .map(|(request_id, questions)| SessionMessageEntry {
+                    id: format!("message-{request_id}"),
+                    role: MessageRole::Assistant,
+                    parts: vec![MessagePart::Input {
+                        id: format!("input-{request_id}"),
+                        request_id: request_id.into(),
+                        questions,
+                        resolved: false,
+                    }],
+                    created_at: 0,
+                    device_id: "host".into(),
+                    status: Some(harness_doc::MessageStatus::Streaming),
+                    continuation_of: None,
+                    duration_ms: None,
+                })
+                .into_iter()
+                .collect();
+        });
+        composer.on_state_changed(cx);
+    }
+
+    #[gpui::test]
+    fn question_draft_survives_tab_switch_until_submitted(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let questions = vec![question("custom", &["Yes", "No"], false)];
+        let answer = "  My unfinished answer\n还有一些细节…  ";
+        handle
+            .update(cx, |composer, window, cx| {
+                switch_question_draft_chat(composer, "question", None, cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Prompt draft", cx));
+                switch_question_draft_chat(
+                    composer,
+                    "question",
+                    Some(("ask", questions.clone())),
+                    cx,
+                );
+                assert!(
+                    composer.input.read(cx).is_empty(),
+                    "do not borrow the prompt draft as an answer"
+                );
+                composer.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, answer, window, cx);
+                });
+            })
+            .unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                switch_question_draft_chat(composer, "ordinary", None, cx);
+                assert!(composer.wizard.is_none());
+                assert!(composer.input.read(cx).is_empty());
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Other prompt", cx));
+            })
+            .unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                switch_question_draft_chat(
+                    composer,
+                    "question",
+                    Some(("ask", questions.clone())),
+                    cx,
+                );
+                assert_eq!(composer.input.read(cx).text(), answer);
+                composer.on_submit(cx);
+                assert!(composer.wizard.is_none());
+                assert!(composer.answered_requests.contains("ask"));
+                assert_eq!(composer.input.read(cx).text(), "Prompt draft");
+            })
+            .unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                switch_question_draft_chat(composer, "ordinary", None, cx);
+                assert_eq!(composer.input.read(cx).text(), "Other prompt");
+                switch_question_draft_chat(composer, "question", Some(("ask", questions)), cx);
+                assert!(
+                    composer.wizard.is_none(),
+                    "submitted answers must not reappear"
+                );
+                assert_eq!(composer.input.read(cx).text(), "Prompt draft");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn question_drafts_survive_navigation_and_page_changes(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let questions = vec![
+            question("first", &["one", "two"], true),
+            question("second", &[], false),
+        ];
+        let first = "  First answer\nwith unfinished details  ";
+        let second = "Second answer, still typing…";
+        handle
+            .update(cx, |composer, window, cx| {
+                switch_question_draft_chat(composer, "a", None, cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Ordinary draft A", cx));
+                switch_question_draft_chat(composer, "a", Some(("request", questions.clone())), cx);
+                composer.wizard_select(1, cx);
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("", cx);
+                    input.replace_text_in_range(None, first, window, cx);
+                });
+                // The button path must capture text too, not just Enter.
+                composer.wizard_advance(cx);
+                composer.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, second, window, cx);
+                });
+                switch_question_draft_chat(composer, "b", None, cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Ordinary draft B", cx));
+                // Even identical request IDs in different chats must stay isolated.
+                switch_question_draft_chat(composer, "b", Some(("request", questions.clone())), cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Answer B", cx));
+                switch_question_draft_chat(composer, "a", Some(("request", questions.clone())), cx);
+                let wizard = composer.wizard.as_ref().unwrap();
+                assert_eq!(wizard.page, 1, "return to the unfinished question page");
+                assert_eq!(wizard.answers()[0].labels, vec![first.trim()]);
+                assert_eq!(composer.input.read(cx).text(), second);
+                composer.wizard_back(cx);
+                assert_eq!(
+                    composer.input.read(cx).text(),
+                    first,
+                    "restore exact unsubmitted text"
+                );
+                assert!(composer.wizard.as_ref().unwrap().is_picked(1));
+                composer.wizard_advance(cx);
+                assert_eq!(composer.input.read(cx).text(), second);
+                switch_question_draft_chat(composer, "b", Some(("request", questions.clone())), cx);
+                assert_eq!(composer.wizard.as_ref().unwrap().page, 0);
+                assert_eq!(composer.input.read(cx).text(), "Answer B");
+                switch_question_draft_chat(composer, "a", Some(("request", questions.clone())), cx);
+                // An empty sync frame must not discard the active answer.
+                switch_question_draft_chat(composer, "a", None, cx);
+                assert!(composer.wizard.is_some());
+                assert_eq!(composer.input.read(cx).text(), second);
+                composer.state.update(cx, |state, _| {
+                    state.transcript = vec![SessionMessageEntry {
+                        id: "resolved-message".into(),
+                        role: MessageRole::Assistant,
+                        parts: vec![MessagePart::Input {
+                            id: "resolved-input".into(),
+                            request_id: "request".into(),
+                            questions: questions.clone(),
+                            resolved: true,
+                        }],
+                        created_at: 0,
+                        device_id: "host".into(),
+                        status: Some(harness_doc::MessageStatus::Complete),
+                        continuation_of: None,
+                        duration_ms: None,
+                    }];
+                });
+                composer.on_state_changed(cx);
+                assert!(composer.wizard.is_none());
+                assert_eq!(composer.input.read(cx).text(), "Ordinary draft A");
+                // A newer request must not inherit an older answer or page.
+                switch_question_draft_chat(
+                    composer,
+                    "a",
+                    Some(("new-request", questions.clone())),
+                    cx,
+                );
+                assert_eq!(composer.wizard.as_ref().unwrap().page, 0);
+                assert!(composer.input.read(cx).is_empty());
+                switch_question_draft_chat(composer, "b", Some(("request", questions)), cx);
+                assert_eq!(composer.input.read(cx).text(), "Answer B");
+            })
+            .unwrap();
     }
 
     #[gpui::test]
