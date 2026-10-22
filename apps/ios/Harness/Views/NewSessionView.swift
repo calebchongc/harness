@@ -803,6 +803,15 @@ struct TraitPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var reasoning: String?
     let levels: [String]
+    @State private var initialReasoning: String?
+
+    init(reasoning: Binding<String?>, levels: [String]) {
+        self._reasoning = reasoning
+        self.levels = levels
+        self._initialReasoning = State(initialValue: reasoning.wrappedValue)
+    }
+
+    private var selectionChanged: Bool { reasoning != initialReasoning }
 
     var body: some View {
         NavigationStack {
@@ -829,11 +838,23 @@ struct TraitPickerSheet: View {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
+                        if selectionChanged {
+                            Image(systemName: "checkmark.circle.fill")
+                                .renderingMode(.original)
+                                .resizable()
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(Theme.bg, Theme.text)
+                                .frame(width: 44, height: 44)
+                        } else {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
                     }
-                    .accessibilityLabel("Close")
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(selectionChanged ? "Done" : "Close")
+                    .accessibilityIdentifier("reasoning-picker-confirm")
                 }
+                .sharedBackgroundVisibility(selectionChanged ? .hidden : .automatic)
             }
         }
         .presentationDetents([.medium, .large])
