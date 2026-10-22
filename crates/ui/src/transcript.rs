@@ -10708,6 +10708,7 @@ mod tests {
                     started_at: Some(chrono::Utc::now()),
                     updated_at: chrono::Utc::now(),
                     last_completed_turn: None,
+                    last_completed_peer_only: false,
                 });
             });
             primary.update(cx, |this, _| this.chat_id = Some("chat".into()));
@@ -15796,6 +15797,7 @@ mod tests {
                     this.state.update(cx, |state, _| {
                         state.sessions.push(harness_proto::Session {
                             last_completed_turn: None,
+                            last_completed_peer_only: false,
                             chat_id: "chat".into(),
                             device_id: "test".into(),
                             status: harness_proto::SessionStatus::Working,

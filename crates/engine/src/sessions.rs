@@ -211,6 +211,12 @@ struct Inner {
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
+    /// chat_id → who asked for the current (or last) turn's work: a person's
+    /// prompt or only peer mail. A prompt that opens a new turn resets it; a
+    /// steer into a running turn adds to it; a turn the agent continues on
+    /// its own keeps the last one. Read when a completion is published
+    /// (`Session::last_completed_peer_only`).
+    turn_origins: Mutex<HashMap<String, harness_proto::peer_mail::TurnOrigin>>,
     /// chat_id → background tasks its agent has open (a background shell
     /// command, monitor, agent or workflow). Read at shutdown: that work dies
     /// with the agent, so the next boot tells the agent to restart it.
@@ -286,6 +292,7 @@ impl SessionsEngine {
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
+                turn_origins: Mutex::new(HashMap::new()),
                 background_open: Mutex::new(HashMap::new()),
                 awaiting_since: Mutex::new(HashMap::new()),
                 tool_progress: Mutex::new(HashMap::new()),
@@ -340,6 +347,23 @@ impl SessionsEngine {
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
         }
+    }
+
+    /// Record who asked for the turn `prompt` feeds. A prompt reaching a
+    /// settled chat opens a new turn; one reaching a working turn joins it.
+    fn note_prompt_origin(&self, chat_id: &str, prompt: &str) {
+        let in_turn = lock(&self.inner.statuses).get(chat_id).is_some_and(|s| {
+            matches!(
+                s.status,
+                SessionStatus::Working | SessionStatus::AwaitingInput
+            )
+        });
+        let mut origins = lock(&self.inner.turn_origins);
+        let origin = origins.entry(chat_id.to_string()).or_default();
+        if !in_turn {
+            *origin = Default::default();
+        }
+        origin.note_prompt(prompt);
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -516,6 +540,7 @@ impl SessionsEngine {
             .map_err(EngineError::Other)?;
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
+        self.note_prompt_origin(chat_id, &request.prompt);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -805,6 +830,7 @@ impl SessionsEngine {
                 issued_at: now_ms(),
             });
         }
+        self.note_prompt_origin(chat_id, prompt);
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, prompt, now_ms())?;
         // A routed steer is a turn too. Fired here (not only on the confirmed
@@ -1602,6 +1628,7 @@ impl Inner {
                 .entry(chat_id.to_string())
                 .or_insert_with(|| Session {
                     last_completed_turn: None,
+                    last_completed_peer_only: false,
                     chat_id: chat_id.to_string(),
                     device_id: self.device_id.clone(),
                     status,
@@ -1620,6 +1647,9 @@ impl Inner {
             );
             if let Some(turn) = completed_turn {
                 entry.last_completed_turn = Some(turn);
+                entry.last_completed_peer_only = lock(&self.turn_origins)
+                    .get(chat_id)
+                    .is_some_and(|origin| origin.peer_only());
             }
             entry.status = status;
             entry.updated_at = now;
@@ -1830,7 +1860,7 @@ impl Inner {
     }
 
     fn resume_candidates(&self, chat_id: &str, cwd: &str) -> Option<String> {
-        let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || session_cwd == cwd;
+        let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || same_dir(session_cwd, cwd);
         if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
             return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
                 .then_some(known.session_id);
@@ -1945,6 +1975,18 @@ fn is_active(session: &Session) -> bool {
         session.status,
         SessionStatus::Working | SessionStatus::AwaitingInput
     )
+}
+
+/// Whether two cwds name the same folder. Agents report their session cwd with
+/// symlinks resolved (Claude Code records `/private/tmp/x` for a chat in
+/// `/tmp/x`), so a plain string compare would refuse to resume a session in a
+/// folder opened through a symlink. Paths that don't exist compare as strings.
+fn same_dir(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 // ── subagent docs ───────────────────────────────────────────────────────────
@@ -4039,6 +4081,26 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn same_dir_matches_a_symlink_to_its_real_path_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let other = tmp.path().join("other");
+        let link = tmp.path().join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let real_resolved = s(&std::fs::canonicalize(&real).unwrap());
+
+        assert!(super::same_dir(&real_resolved, &s(&link)));
+        assert!(super::same_dir(&s(&link), &s(&real)));
+        assert!(!super::same_dir(&real_resolved, &s(&other)));
+        assert!(super::same_dir("/no/such/dir", "/no/such/dir"));
+        assert!(!super::same_dir("/no/such/dir", "/no/such/other"));
+    }
+
     #[tokio::test]
     async fn acp_effort_update_persists_and_refreshes_chat_picker_without_cross_harness_clobber() {
         use super::*;

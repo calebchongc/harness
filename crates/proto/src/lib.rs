@@ -11,6 +11,7 @@ pub mod graff_worktree;
 pub mod invocation;
 pub mod mcp_servers;
 pub mod motion;
+pub mod peer_mail;
 pub mod preview;
 pub mod room_delivery;
 pub mod sidebar_pins;

@@ -482,6 +482,7 @@ impl WorkspaceDoc {
             "lastCompletedTurn",
             session.last_completed_turn.as_deref(),
         )?;
+        row.insert("lastCompletedPeerOnly", session.last_completed_peer_only)?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         self.doc.commit();
@@ -772,6 +773,8 @@ impl From<RawChat> for Chat {
 pub(crate) struct RawSession {
     #[serde(default)]
     last_completed_turn: Option<String>,
+    #[serde(default)]
+    last_completed_peer_only: bool,
     chat_id: String,
     device_id: String,
     status: SessionStatus,
@@ -785,6 +788,7 @@ impl From<RawSession> for Session {
     fn from(raw: RawSession) -> Self {
         Session {
             last_completed_turn: raw.last_completed_turn,
+            last_completed_peer_only: raw.last_completed_peer_only,
             chat_id: raw.chat_id,
             device_id: raw.device_id,
             status: raw.status,
@@ -893,6 +897,7 @@ mod tests {
     fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
         Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: chat_id.into(),
             device_id: device_id.into(),
             status,

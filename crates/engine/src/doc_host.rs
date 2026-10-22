@@ -3206,8 +3206,12 @@ impl DocHost {
             }
             let Some(id) = wake["id"].as_u64() else { continue };
             let chat_id = wake["toRef"].as_str().unwrap_or_default();
-            let known = !chat_id.is_empty()
-                && workspace.is_some_and(|w| matches!(w.chat(chat_id), Ok(Some(_))));
+            let row = (!chat_id.is_empty())
+                .then(|| workspace.and_then(|w| w.chat(chat_id).ok().flatten()))
+                .flatten();
+            // An archived chat is out of the room's wake set (#498): settle
+            // its wake as dropped rather than queue it or retry it forever.
+            let known = row.as_ref().is_some_and(|chat| !chat.archived);
             if known {
                 let origin = harness_proto::room_delivery::RoomOrigin {
                     room_id: wake["roomId"].as_str().unwrap_or_default().to_owned(),
@@ -3236,7 +3240,7 @@ impl DocHost {
             } else {
                 // A chat this device no longer has: nothing to wake, so the
                 // row is settled as dropped rather than retried forever.
-                tracing::info!(chat = %chat_id, "room wake for an unknown chat dropped");
+                tracing::info!(chat = %chat_id, "room wake for an unknown or archived chat dropped");
                 dropped.push(id);
             }
         }
@@ -3511,6 +3515,19 @@ impl DocHost {
         payload: SessionCommandPayload,
         transfers: Vec<crate::uploads::AttachmentTransfer>,
     ) -> Result<String, EngineError> {
+        // An archived chat takes no peer mail (#498): refuse it here, before
+        // anything is staged, so it neither starts a turn nor restores the chat.
+        if let SessionCommandPayload::Run {
+            request: harness_proto::RunRequest { prompt, .. },
+            ..
+        }
+        | SessionCommandPayload::Steer { prompt, .. } = &payload
+            && self.refuses_peer_mail(chat_id, prompt)
+        {
+            return Err(EngineError::Other(
+                harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
+            ));
+        }
         let handle = self.open(chat_id)?;
         let id = new_id();
         let now = now_ms();
@@ -3580,6 +3597,11 @@ impl DocHost {
         attachments: Vec<String>,
         hold_for_turn_end: bool,
     ) -> Result<String, EngineError> {
+        if self.refuses_peer_mail(chat_id, text) {
+            return Err(EngineError::Other(
+                harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
+            ));
+        }
         let handle = self.open(chat_id)?;
         let id = new_id();
         let _restore = lock(&self.inner.prompt_restore);
@@ -3602,6 +3624,32 @@ impl DocHost {
         self.nudge_remote_host(chat_id);
         self.nudge_remote_host_after_flush(chat_id);
         Ok(id)
+    }
+
+    /// Whether `text` is peer mail aimed at an archived chat, which takes none
+    /// (#498). Checked when mail is accepted and again when it would be
+    /// delivered, so mail accepted before an archive cannot wake the chat
+    /// after it. A person's prompt is never refused.
+    pub(crate) fn refuses_peer_mail(&self, chat_id: &str, text: &str) -> bool {
+        let archived = self
+            .workspace()
+            .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
+            .is_some_and(|chat| chat.archived);
+        archived
+            && !harness_proto::peer_mail::delivery_allowed(
+                archived,
+                harness_proto::peer_mail::is_peer_mail(text),
+            )
+    }
+
+    /// Re-run a warm chat's queue drain now: a restored chat delivers the
+    /// peer mail it held while archived.
+    pub fn kick_queue(&self, chat_id: &str) {
+        let Some(handle) = lock(&self.inner.handles).get(chat_id).cloned() else {
+            return;
+        };
+        let host = self.clone();
+        self.spawn_worker(async move { host.drain_queue(&handle).await });
     }
 
     /// Recover accepted steers whose run failed, before publishing its terminal
@@ -4199,6 +4247,11 @@ impl DocHost {
             }
             if self.branch_drift_pending(handle) {
                 return; // The answer dispatches; nothing jumps the question.
+            }
+            // Peer mail accepted before the chat was archived stays queued
+            // (visible, removable) instead of waking it; a restore re-drains.
+            if self.refuses_peer_mail(&handle.chat_id, &head.text) {
+                return;
             }
             // In flight, not just Working: an agent parked on a question owns
             // the turn too, and the composer queues on the same reading. Taking
@@ -5326,6 +5379,21 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        // Recheck at delivery (#498): a peer command accepted before an
+        // archive, or synced from a device that did not check, must not wake
+        // the archived chat.
+        if let SessionCommandPayload::Run {
+            request: harness_proto::RunRequest { prompt, .. },
+            ..
+        }
+        | SessionCommandPayload::Steer { prompt, .. } = &entry.payload
+            && self.refuses_peer_mail(chat_id, prompt)
+        {
+            return Ok((
+                SessionCommandStatus::Rejected,
+                Some(harness_proto::peer_mail::ARCHIVED_REFUSAL.into()),
+            ));
+        }
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,

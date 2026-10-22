@@ -88,6 +88,11 @@ cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/f
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
 cp "$ROOT/third_party/licenses/Zeron-MIT.txt" "$APP/Contents/Resources/licenses/"
 cp "$ROOT/third_party/licenses/CodeGraff-LICENSE.txt" "$APP/Contents/Resources/licenses/"
+# Session chimes, by name, for the notification center to play: background
+# chimes ride on their banner so Focus applies (crates/ui/src/sound.rs).
+for chime in done request attention; do
+  cp "$ROOT/crates/ui/assets/sounds/$chime.wav" "$APP/Contents/Resources/harness-$chime.wav"
+done
 
 # Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow
 # baked into dist/macos/icon-1024.png — sips can't alpha-mask, so the mask is
