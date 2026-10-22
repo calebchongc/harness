@@ -568,6 +568,190 @@ fn deleting_a_chat_releases_its_browser_tabs_and_queued_callbacks(cx: &mut TestA
 }
 
 #[gpui::test]
+fn cached_navigation_survives_an_incomplete_chat_snapshot(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for source in ["owner", "peer-a"] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            assert_eq!(
+                shell.activate_session_link(
+                    &activation(Some(source), LinkAction::Internal),
+                    window,
+                    cx
+                ),
+                LinkOutcome::Internal,
+            );
+            setup = Some((
+                cx.entity(),
+                window.window_handle(),
+                shell.browsers[&shell.browser_seq].clone(),
+            ));
+        });
+        let (shell, window, browser) = setup.unwrap();
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.chats_synced = false;
+                state.chats.retain(|chat| chat.id != source);
+            });
+        });
+        let before = shell.read_with(cx, link_state);
+        window
+            .update(cx, |_, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    assert_eq!(
+                        shell.activate_session_link(
+                            &activation(Some(source), LinkAction::External),
+                            window,
+                            cx
+                        ),
+                        LinkOutcome::External(URL.into()),
+                    );
+                });
+            })
+            .unwrap();
+        shell.read_with(cx, |shell, cx| assert_eq!(link_state(shell, cx), before));
+        browser.update(cx, |_, cx| cx.emit(BrowserEvent::NewTab(None)));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.active_chat, source);
+            assert_eq!(shell.browsers.len(), 2);
+            assert_eq!(
+                shell.resolved_right_active(cx),
+                RightSurface::Browser(shell.browser_seq)
+            );
+        });
+    }
+}
+
+#[gpui::test]
+fn transcript_callbacks_reject_deleted_or_archived_sources_before_layout_reconciliation(
+    cx: &mut TestAppContext,
+) {
+    for source in ["owner", "peer-a"] {
+        for archived in [false, true] {
+            for action in [
+                LinkAction::Primary,
+                LinkAction::Internal,
+                LinkAction::External,
+            ] {
+                with_link_panes(cx, Some("owner"), |shell, window, cx| {
+                    let row = shell.state.update(cx, |state, _| {
+                        state.chats_synced = true;
+                        let index = state
+                            .chats
+                            .iter()
+                            .position(|chat| chat.id == source)
+                            .unwrap();
+                        let row = state.chats[index].clone();
+                        if archived {
+                            state.chats[index].archived = true;
+                        } else {
+                            state.chats.remove(index);
+                        }
+                        // Stop between the authoritative snapshot and Shell's
+                        // observer/next paint: the old transcript still exists.
+                        row
+                    });
+                    assert_rejected_unchanged(shell, &activation(Some(source), action), window, cx);
+                    // Restoring the row also restores authority; rejecting one
+                    // stale callback must not permanently disable this view.
+                    shell.state.update(cx, |state, _| {
+                        state.chats.retain(|chat| chat.id != source);
+                        state.chats.push(row);
+                    });
+                    assert_eq!(
+                        shell.activate_session_link(
+                            &activation(Some(source), LinkAction::External),
+                            window,
+                            cx
+                        ),
+                        LinkOutcome::External(URL.into()),
+                    );
+                });
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn browser_callbacks_recheck_owner_liveness_before_snapshot_cleanup(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for archived in [false, true] {
+        for event in [
+            BrowserEvent::NewTab(None),
+            BrowserEvent::OpenSource("/workspace/link-tests/handoff.rs".into()),
+        ] {
+            let mut setup = None;
+            with_link_panes(cx, Some("owner"), |shell, window, cx| {
+                shell.activate_session_link(
+                    &activation(Some("peer-a"), LinkAction::Internal),
+                    window,
+                    cx,
+                );
+                setup = Some((cx.entity(), shell.browsers[&shell.browser_seq].clone()));
+            });
+            let (shell, browser) = setup.unwrap();
+            let row = shell.update(cx, |shell, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.chats_synced = true;
+                    let index = state
+                        .chats
+                        .iter()
+                        .position(|chat| chat.id == "peer-a")
+                        .unwrap();
+                    let row = state.chats[index].clone();
+                    if archived {
+                        state.chats[index].archived = true;
+                    } else {
+                        state.chats.remove(index);
+                    }
+                    // No notify yet: event delivery must be safe even before
+                    // the observer releases a deleted owner's browser host.
+                    row
+                })
+            });
+            let before = shell.read_with(cx, link_state);
+            browser.update(cx, |_, cx| cx.emit(event.clone()));
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| {
+                assert_eq!(
+                    link_state(shell, cx),
+                    before,
+                    "archived={archived}, {event:?}"
+                );
+            });
+            shell.update(cx, |shell, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.chats.retain(|chat| chat.id != "peer-a");
+                    state.chats.push(row);
+                });
+            });
+            browser.update(cx, |_, cx| cx.emit(event.clone()));
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| match event {
+                BrowserEvent::NewTab(_) => {
+                    assert_eq!(shell.browsers.len(), 2);
+                    assert_eq!(
+                        shell.resolved_right_active(cx),
+                        RightSurface::Browser(shell.browser_seq)
+                    );
+                }
+                BrowserEvent::OpenSource(_) => {
+                    assert_eq!(shell.file_surfaces.len(), 1);
+                    assert!(matches!(
+                        shell.resolved_right_active(cx),
+                        RightSurface::File(_)
+                    ));
+                }
+                _ => unreachable!(),
+            });
+        }
+    }
+}
+
+#[gpui::test]
 fn browser_cleanup_waits_for_authoritative_chat_deletion_not_archive_or_partial_sync(
     cx: &mut TestAppContext,
 ) {

@@ -3498,6 +3498,18 @@ impl Shell {
         }
     }
 
+    /// A snapshot can revoke a source before layout/host observers run. Keep
+    /// cached views usable during partial startup sync, but never navigate from
+    /// a known archived owner or an owner absent from an authoritative list.
+    fn chat_navigation_is_live(&self, chat_id: &str, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map_or(!state.chats_synced, |chat| !chat.archived)
+    }
+
     fn activate_session_link(
         &mut self,
         activation: &crate::markdown::render::LinkActivation,
@@ -3522,6 +3534,9 @@ impl Shell {
         else {
             return LinkOutcome::Rejected;
         };
+        if !self.chat_navigation_is_live(source, cx) {
+            return LinkOutcome::Rejected;
+        }
         let mut resolved = activation.clone();
         if resolved.action == LinkAction::Primary {
             resolved.action = if crate::settings::current(cx).open_web_links_in_harness {
@@ -3684,6 +3699,7 @@ impl Shell {
         matches!(self.route, Route::Chat)
             && self.active_chat == owner
             && self.state.read(cx).selected_chat.as_deref() == Some(owner)
+            && self.chat_navigation_is_live(owner, cx)
             && self.right_pane_open(cx)
             && self.resolved_right_active(cx) == RightSurface::Browser(id)
     }
