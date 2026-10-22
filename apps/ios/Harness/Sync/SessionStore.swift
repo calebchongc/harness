@@ -274,8 +274,7 @@ final class SessionStore {
                 return Self.containsFrontier(frontier, in: self.doc)
             },
             applyCheckpoint: { [weak self] bytes, seq in
-                guard let self,
-                      (try? self.doc.importWith(bytes: bytes, origin: "remote")) != nil else {
+                guard let self, await self.importRemote(bytes) else {
                     return false
                 }
                 self.cursor = max(self.cursor, seq)
@@ -288,7 +287,7 @@ final class SessionStore {
                 // Malformed remote bytes cost the row, never the doc. The
                 // cursor still advances: replaying a poison row forever is
                 // the wedge class chat2 replaces.
-                if (try? self.doc.importWith(bytes: bytes, origin: "remote")) == nil {
+                if !(await self.importRemote(bytes)) {
                     roomLog.warning("chat2 \(self.chatId, privacy: .public): row import failed; skipping row \(seq)")
                 }
                 self.cursor = max(self.cursor, seq)
@@ -652,6 +651,21 @@ final class SessionStore {
                 }
             }
         }
+    }
+
+    /// Import remote bytes into the doc, off the main actor.
+    ///
+    /// An import whose ops are concurrent with ours (a command the host had
+    /// not yet seen) makes Loro rebuild each changed text from its whole
+    /// history. On a long streamed reply that is seconds per row, and on the
+    /// main actor a catch-up of many rows exhausted the 10 s scene-update
+    /// watchdog and the app was killed (#484). The doc is safe to use from
+    /// any thread; `subscribeRoot`'s EntryCache takes its own lock.
+    private func importRemote(_ bytes: Data) async -> Bool {
+        let doc = self.doc
+        return await Task.detached(priority: .userInitiated) {
+            (try? doc.importWith(bytes: bytes, origin: "remote")) != nil
+        }.value
     }
 
     private func apply(_ decoded: [MessageEntry], queue decodedQueue: [QueuedMessage] = []) {

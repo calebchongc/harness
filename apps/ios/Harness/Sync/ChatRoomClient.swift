@@ -58,12 +58,13 @@ actor ChatRoomClient {
 
     /// MainActor-isolated bridge to SessionStore's doc. Every apply persists
     /// doc + cursor together; `applyCheckpoint` returns false on an import
-    /// failure (the session redials rather than run blind).
+    /// failure (the session redials rather than run blind). The two applies
+    /// are async: their Loro import runs off the main actor (#484).
     struct Delegate: Sendable {
         var cursor: @MainActor @Sendable () -> UInt64
         var containsFrontier: @MainActor @Sendable (Data) -> Bool
-        var applyCheckpoint: @MainActor @Sendable (Data, UInt64) -> Bool
-        var applyRow: @MainActor @Sendable (Data, UInt64) -> Void
+        var applyCheckpoint: @MainActor @Sendable (Data, UInt64) async -> Bool
+        var applyRow: @MainActor @Sendable (Data, UInt64) async -> Void
         var advanceCursor: @MainActor @Sendable (UInt64) -> Void
         /// Cursor amnesty: lower the cursor to the checkpoint seq (no-op if
         /// already at or below). See the once-per-session clamp in
