@@ -6137,16 +6137,22 @@ impl Composer {
     }
 
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
+        self.add_staged_for(self.current_key.clone(), staged, cx);
+    }
+
+    fn add_staged_for(
+        &mut self,
+        key: String,
+        staged: Vec<StagedAttachment>,
+        cx: &mut Context<Self>,
+    ) {
         if self.queue_edit_finishing {
             return;
         }
         if staged.is_empty() {
             return;
         }
-        self.attachments
-            .entry(self.current_key.clone())
-            .or_default()
-            .extend(staged);
+        self.attachments.entry(key).or_default().extend(staged);
         self.focus_pending = true;
         cx.notify();
     }
@@ -6157,18 +6163,30 @@ impl Composer {
     /// PDF did nothing at all (user report). Read failures, folders and
     /// oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.add_paths_for(self.current_key.clone(), paths, cx);
+    }
+
+    /// [`Self::add_paths`] for chat `key` (`""` = the canvas). A drop on an
+    /// unfocused pane selects its chat first, and the composer only switches
+    /// to that chat once the selection change reaches it.
+    pub(crate) fn add_paths_for(
+        &mut self,
+        key: String,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         let mut staged = Vec::new();
         for path in &paths {
             match attachments::stage_any_file(path) {
                 Ok(att) => staged.push(att),
                 Err(message) => {
                     self.failure = Some(message.into());
-                    self.failure_key = Some(self.current_key.clone());
+                    self.failure_key = Some(key.clone());
                     cx.notify();
                 }
             }
         }
-        self.add_staged(staged, cx);
+        self.add_staged_for(key, staged, cx);
     }
 
     /// Add a file-tree or file-tab drop through the existing file-mention

@@ -10372,22 +10372,7 @@ impl Shell {
                     .child(self.render_terminal_container(window, cx))
             })
             .child(
-                div()
-                    .id("attachment-drop-overlay")
-                    .absolute()
-                    .inset_0()
-                    .opacity(0.0)
-                    .bg(theme.scrim().opacity(0.4 / 0.6))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(crate::typography::ui_rems(13.0))
-                    .text_color(theme.text)
-                    // GPUI matches these styles against the active payload's
-                    // concrete TypeId. Resize markers therefore cannot reveal
-                    // this overlay, even after an external drag exits without
-                    // another move event.
-                    .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.opacity(1.0))
+                chat_split::attachment_drop_veil("attachment-drop-overlay", &theme)
                     .drag_over::<WorkspacePathDrag>(|style, _, _, _| style.opacity(1.0))
                     .drag_over::<RightTabDrag>(|style, tab, _, _| {
                         if tab.workspace_path.is_some() {
@@ -10395,8 +10380,7 @@ impl Shell {
                         } else {
                             style
                         }
-                    })
-                    .child("Drop to attach"),
+                    }),
             )
             .into_any_element()
     }
