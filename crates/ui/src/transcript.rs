@@ -57,6 +57,9 @@ use harness_syntax::LanguageId as Lang;
 #[cfg(test)]
 #[path = "transcript/selection_tests.rs"]
 mod selection_tests;
+#[cfg(test)]
+#[path = "transcript/stall_tests.rs"]
+mod stall_tests;
 
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
