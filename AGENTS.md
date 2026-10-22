@@ -21,6 +21,53 @@ counts asserted in `workspace_commands_preserve_native_commands_and_avoid_collis
 offered in drafts. Update them in the same change and run
 `cargo test -p harness-ui --lib workspace_commands`.
 
+## Tests every change carries
+
+- **Reproduce first.** A bug fix comes with a test that fails on `main` and
+  passes with the fix. The PR names the test and says it fails on `main`. If
+  the cause can't be shown with evidence, report what was found rather than
+  shipping a guess.
+- **Don't redo merged or open work.** Before starting, search open and merged
+  PRs and the issue's history (a closed issue may have been reopened as a
+  recurrence). If a PR already covers it, build on that PR instead.
+- **Synthetic data only.** Never read a person's Harness data, journals or logs
+  to build a test.
+- **Pull rules into pure functions** (for example `next_row_cursor` in Rust and
+  `chatNextRowCursor` in Swift), so a test or a shared vector can call them.
+- **Rules several implementations share live as data:**
+  - the chat2 sync protocol (frame codec, catch-up plan, row cursor):
+    `protocol/chat2-vectors.json`. The Rust client, the Swift client and the
+    edge server each run it (see `protocol/README.md`). Change a wire rule by
+    changing the vector and every runner in the same PR. A new implementation,
+    a Zig port for example, adds its own runner against the same file.
+  - iOS and Android rules and copy: `apps/parity/` (see its README).
+- **Performance bugs get a test of the shape**, not just the outcome: compare
+  the slow path with the fixed one using a generous ratio. For example,
+  `ConcurrentImportCostTests` asserts that a batched import is at least 5×
+  faster than importing row by row.
+
+### iOS tests
+
+- `export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`: the
+  selected developer directory may be the Command Line Tools.
+- Boot the simulator, then `xcrun simctl bootstatus <udid> -b`. The first launch
+  after a boot can fail with "No such process"; re-run with
+  `test-without-building`.
+- Run one `xcodebuild` per simulator at a time. Overlapping runs make the
+  simulator kill the test host ("signal kill").
+- UI tests that need the on-screen keyboard: shut the simulator down, run
+  `defaults write com.apple.iphonesimulator ConnectHardwareKeyboard -bool false`,
+  and delete the setting afterwards.
+- UI tests that aren't about the phone split pass `-phoneSplit off`, because
+  `PhoneSplitUITests`' "Try it" saves a split mode that later runs inherit.
+- The iOS UI-test CI job is off, so verify iOS changes locally. `parity.yml`
+  runs `ParityTests` and `Chat2VectorTests` in CI.
+- Read results with `xcrun xcresulttool get test-results summary --path X.xcresult`.
+  `xcrun xcresulttool export attachments` saves the failure screenshots.
+- Device crash and hang reports from TestFlight builds are unsymbolicated, and
+  the workflow doesn't keep dSYMs. Rebuild the same commit with the workflow's
+  Xcode version and map the offsets with `atos`.
+
 ## Commits and pull requests
 
 No agent or tool attribution anywhere: no `Co-Authored-By` trailers for an
@@ -104,6 +151,14 @@ A description of a picture can't be checked against the fix; a screenshot can.
   It uploads to the repository's `issue-media` branch and prints Markdown to
   paste into the issue, PR or comment. An uploaded image stays in that
   branch's history, so check it first.
+- **Text rendering:** the GPUI fixtures in `crates/ui/examples` render synthetic
+  content and save their own screenshots (for example `markdown-math-fixture`).
+  Add a probe line that isolates the case (precomposed and combining forms side by
+  side, for example) instead of reasoning from a description.
+- **Showing a picture in a Harness chat:** save it inside the chat's folder and
+  link it as `![caption](path)`, or call `show_image`. Harness only loads images
+  from a chat's folder and its uploads, so a file elsewhere (under `/tmp`, say)
+  shows only its caption.
 - **If it can only be seen with real data**, don't post that capture. Say in
   the issue that no screenshot is attached and why, and describe what it shows.
 
@@ -112,6 +167,12 @@ A description of a picture can't be checked against the fix; a screenshot can.
 One compile at a time; watch `ps -o rss=` on long builds and stop anything
 growing past ~40 GB. Never use Zig's self-hosted backend for large builds
 (system-level rule, applies to zigrepper/codedb work in this tree).
+
+When several agents work in parallel worktrees on one machine, wrap every
+`cargo`, `xcodebuild` and `zig build` in `scripts/heavy-build.sh <command>`,
+which runs them one at a time across processes. Each worktree builds into its
+own `CARGO_TARGET_DIR`. A shared target directory reuses crates built from
+another checkout's sources.
 
 ## Imported conversations continue in graff
 
