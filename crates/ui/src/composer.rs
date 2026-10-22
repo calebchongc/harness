@@ -16196,6 +16196,23 @@ mod tests {
     #[gpui::test]
     fn question_draft_survives_tab_switch_until_submitted(cx: &mut gpui::TestAppContext) {
         let (_dir, handle) = composer_focus_window(cx);
+        // Submitting retires the question only with an engine to answer to.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, _requests) = tokio::sync::mpsc::channel(64);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                        harness_rpc::RpcClient::new(out, inbound),
+                    ));
+                })
+            })
+            .unwrap();
         let questions = vec![question("custom", &["Yes", "No"], false)];
         let answer = "  My unfinished answer\n还有一些细节…  ";
         handle
