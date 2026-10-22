@@ -2205,6 +2205,110 @@ async fn check_visual_script(script: String) -> Result<(), EngineError> {
         })
 }
 
+/// How long a run of streaming deltas may sit in [`DeltaCoalescer`] before
+/// it is journaled, and how large it may grow.
+const JOURNAL_DELTA_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+const JOURNAL_DELTA_MAX_BYTES: usize = 32 * 1024;
+
+/// Journals consecutive text or reasoning deltas as one row (#341). Agents
+/// stream a delta per token, and a long turn was thousands of journal rows,
+/// almost all reasoning fragments. Consecutive deltas of the same stream (the
+/// chat's text, its reasoning, or one subagent's) merge into a pending row;
+/// any other event, the window, or the size cap journals it first, so the
+/// journal keeps the order of events and replays to the same text. The doc
+/// fold is unaffected: it still sees every delta as it arrives.
+#[derive(Default)]
+struct DeltaCoalescer {
+    pending: Option<AgentEvent>,
+    since: Option<tokio::time::Instant>,
+}
+
+impl DeltaCoalescer {
+    /// Journal and broadcast `event`, or hold it if it is a delta. Returns the
+    /// journal seq, or 0 for a delta still held.
+    fn publish(&mut self, inner: &Inner, chat_id: &str, event: &AgentEvent) -> u64 {
+        if delta_text(event).is_none() {
+            self.flush(inner, chat_id);
+            return inner.publish(chat_id, event);
+        }
+        if let Some(pending) = self.pending.as_mut()
+            && append_delta(pending, event)
+        {
+            let full = delta_text(pending).map_or(0, str::len) >= JOURNAL_DELTA_MAX_BYTES;
+            let stale = self
+                .since
+                .is_some_and(|since| since.elapsed() >= JOURNAL_DELTA_WINDOW);
+            if full || stale {
+                self.flush(inner, chat_id);
+            }
+            return 0;
+        }
+        self.flush(inner, chat_id);
+        self.pending = Some(event.clone());
+        self.since = Some(tokio::time::Instant::now());
+        0
+    }
+
+    fn flush(&mut self, inner: &Inner, chat_id: &str) {
+        self.since = None;
+        if let Some(pending) = self.pending.take() {
+            inner.publish(chat_id, &pending);
+        }
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.since.map(|since| since + JOURNAL_DELTA_WINDOW)
+    }
+}
+
+/// The text a coalescable delta carries: the chat's own text or reasoning, or
+/// a subagent's.
+fn delta_text(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::TextDelta { text } | AgentEvent::ReasoningDelta { text } => Some(text),
+        AgentEvent::Subagent { event, .. } => delta_text(event),
+        _ => None,
+    }
+}
+
+/// Append `next` to `pending` when both are deltas of the same stream.
+fn append_delta(pending: &mut AgentEvent, next: &AgentEvent) -> bool {
+    match (pending, next) {
+        (AgentEvent::TextDelta { text }, AgentEvent::TextDelta { text: more })
+        | (AgentEvent::ReasoningDelta { text }, AgentEvent::ReasoningDelta { text: more }) => {
+            text.push_str(more);
+            true
+        }
+        (
+            AgentEvent::Subagent {
+                parent_tool_use_id: held,
+                event: held_event,
+            },
+            AgentEvent::Subagent {
+                parent_tool_use_id: next_id,
+                event: next_event,
+            },
+        ) if held == next_id => append_delta(held_event, next_event),
+        _ => false,
+    }
+}
+
+/// The terminal Done that ends a self-continued chain past its cap (#341).
+fn runaway_chain_done(resumes: u32, elapsed: std::time::Duration) -> AgentEvent {
+    let minutes = elapsed.as_secs().div_ceil(60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    AgentEvent::Done {
+        status: DoneStatus::Errored,
+        result: None,
+        error: Some(format!(
+            "Stopped: the agent kept working on its own for {minutes} {unit} \
+             ({resumes} automatic resumes) without ending its turn. \
+             Send a message to continue."
+        )),
+        session_id: None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
@@ -2435,8 +2539,11 @@ async fn drive_run(
     // or steer) is bounded. An agent that keeps streaming without ever ending
     // its turn otherwise parks at the watchdog, resumes on its next delta and
     // parks again forever, minting a segment and journal rows each cycle
-    // (#341). Past either cap the session stays parked and further
-    // self-continued output is dropped until a real turn boundary.
+    // (#341). Past either cap the run ends with a visible error and the
+    // agent is stopped: dropping its output while it kept running hid the
+    // runaway and still spent its tokens. The wall-clock cap also holds
+    // while a resumed turn is streaming, since one that never goes quiet
+    // never parks and never reaches the resume check.
     // `HARNESS_SELF_RESUME_MAX` / `HARNESS_SELF_CHAIN_MAX_MS`; 0 = no cap.
     let self_resume_cap: Option<u32> = match std::env::var("HARNESS_SELF_RESUME_MAX")
         .ok()
@@ -2457,7 +2564,8 @@ async fn drive_run(
         };
     let mut self_resumes: u32 = 0;
     let mut self_chain_started: Option<tokio::time::Instant> = None;
-    let mut self_chain_capped = false;
+    // Journal-side delta coalescing (see `DeltaCoalescer`).
+    let mut deltas = DeltaCoalescer::default();
     // Spawn chips that have SETTLED (tagged Done seen). Content events for a
     // settled chip with no live sink are dropped — a straggler frame after
     // the freeze must not mint a new doc entry or wedge the transcript back
@@ -2485,7 +2593,7 @@ async fn drive_run(
 
     let mut final_completed_turn = None;
     let final_status = loop {
-        let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+        let mut event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
         } else {
             let raw_event = tokio::select! {
@@ -2703,6 +2811,14 @@ async fn drive_run(
                     }
                     continue;
                 }
+                // A held run of deltas reaches the journal within its window
+                // even when the stream then goes quiet.
+                _ = tokio::time::sleep_until(
+                    deltas.deadline().unwrap_or_else(tokio::time::Instant::now)
+                ), if deltas.deadline().is_some() => {
+                    deltas.flush(&inner, &chat_id);
+                    continue;
+                }
                 // Turn-quiesce watchdog (see the knob above). Armed only when the
                 // fold says nothing is in flight: an unresolved tool part is a
                 // command still running (legitimately silent for minutes — the
@@ -2755,6 +2871,7 @@ async fn drive_run(
                     let completed_turn = ((!folded.is_empty() || writer.is_some())
                         && !inner.has_pending_steers(&chat_id, &run_id))
                         .then(|| entry_id.clone());
+                    deltas.flush(&inner, &chat_id);
                     if !folded.is_empty() || writer.is_some() {
                         if let Err(err) = finish_segment(
                             doc_ref,
@@ -2830,7 +2947,7 @@ async fn drive_run(
             event: sub_event,
         } = &event
         {
-            inner.publish(&chat_id, &event);
+            deltas.publish(&inner, &chat_id, &event);
             let is_steer = matches!(
                 sub_event.as_ref(),
                 AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. }
@@ -3145,6 +3262,7 @@ async fn drive_run(
         // non-boundary stays inert, exactly as before.
         let turn_was_active = idle_since.is_none();
         const RESUME_GATE: std::time::Duration = std::time::Duration::from_secs(1);
+        let mut chain_capped = false;
         if idle_since.is_some() {
             let self_continued = idle_since
                 .is_some_and(|parked_at| parked_at.elapsed() >= RESUME_GATE)
@@ -3162,29 +3280,21 @@ async fn drive_run(
                 if self_resume_cap.is_some_and(|cap| self_resumes >= cap)
                     || self_chain_cap.is_some_and(|cap| chain_started.elapsed() >= cap)
                 {
-                    if !self_chain_capped {
-                        self_chain_capped = true;
-                        tracing::warn!(
-                            chat = %chat_id,
-                            resumes = self_resumes,
-                            chain_secs = chain_started.elapsed().as_secs(),
-                            "self-continued turn chain capped; staying parked until the next prompt"
-                        );
-                    }
-                    continue;
+                    chain_capped = true;
+                } else {
+                    self_resumes += 1;
+                    tracing::info!(
+                        chat = %chat_id,
+                        "parked session resumed by self-continued agent output"
+                    );
+                    idle_since = None;
+                    self_continued_turn = true;
+                    // The park cleared the fold; rotate to a fresh entry and
+                    // fall through — this event is the new segment's first part.
+                    entry_id = new_id();
+                    segment_started = now_ms();
+                    inner.set_status(&chat_id, SessionStatus::Working, true);
                 }
-                self_resumes += 1;
-                tracing::info!(
-                    chat = %chat_id,
-                    "parked session resumed by self-continued agent output"
-                );
-                idle_since = None;
-                self_continued_turn = true;
-                // The park cleared the fold; rotate to a fresh entry and
-                // fall through — this event is the new segment's first part.
-                entry_id = new_id();
-                segment_started = now_ms();
-                inner.set_status(&chat_id, SessionStatus::Working, true);
             } else {
                 match &event {
                     AgentEvent::Steered { .. } => {
@@ -3214,6 +3324,48 @@ async fn drive_run(
                     _ => continue,
                 }
             }
+        }
+        // A resumed turn that keeps streaming never parks, so it never meets
+        // the resume check above: its chain's wall-clock cap holds here too.
+        if self_continued_turn
+            && idle_since.is_none()
+            && !matches!(&event, AgentEvent::Done { .. })
+            && self_chain_cap
+                .zip(self_chain_started)
+                .is_some_and(|(cap, started)| started.elapsed() >= cap)
+        {
+            chain_capped = true;
+        }
+        // Past the cap the chain ends for good: the agent is stopped and the
+        // run ends with an errored Done that says why, so the transcript and
+        // the session status show it instead of output silently vanishing.
+        if chain_capped {
+            let elapsed = self_chain_started.map(|s| s.elapsed()).unwrap_or_default();
+            tracing::warn!(
+                chat = %chat_id,
+                resumes = self_resumes,
+                chain_secs = elapsed.as_secs(),
+                "self-continued turn chain capped; stopping the agent"
+            );
+            if let Some(token) = lock(&inner.runs)
+                .get(&chat_id)
+                .filter(|h| h.run_id == run_id)
+                .map(|h| h.interrupt_token.clone())
+            {
+                harness_adapters::interrupt_reason::note(&chat_id, "runaway self-continued turn");
+                token.cancel();
+            }
+            // Nothing will close an open row now.
+            for part in folded.iter_mut() {
+                if let MessagePart::Tool { resolved, .. } = part {
+                    *resolved = true;
+                }
+            }
+            idle_since = None;
+            self_continued_turn = false;
+            // Not a startup crash: never retried.
+            retry_request = None;
+            event = runaway_chain_done(self_resumes, elapsed);
         }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
         // tool-input-generation windows stream them with no text. They fold
@@ -3297,6 +3449,7 @@ async fn drive_run(
                 chat = %chat_id,
                 "run died before session start; retrying once (resume kept)"
             );
+            deltas.flush(&inner, &chat_id);
             // The retry owns only the original prompt. Preserve anything this
             // failed runtime accepted while starting, without replaying it.
             inner.recover_orphaned_steers(&chat_id, &run_id, SessionStatus::Errored);
@@ -3330,13 +3483,12 @@ async fn drive_run(
             ..
         } = &event
         {
-            inner.publish(&chat_id, &event);
+            deltas.publish(&inner, &chat_id, &event);
             // A steer boundary means a real prompt owns the turn again — its
             // Done will come; the short self-continued window stands down.
             self_continued_turn = false;
             self_resumes = 0;
             self_chain_started = None;
-            self_chain_capped = false;
             if let Err(err) = finish_segment(
                 doc_ref,
                 writer.take(),
@@ -3422,7 +3574,7 @@ async fn drive_run(
             _ => {}
         }
 
-        let publish_seq = inner.publish(&chat_id, &event);
+        let publish_seq = deltas.publish(&inner, &chat_id, &event);
 
         // Defensive rule from harness: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
@@ -3589,7 +3741,6 @@ async fn drive_run(
                 self_continued_turn = false;
                 self_resumes = 0;
                 self_chain_started = None;
-                self_chain_capped = false;
                 inner.set_status_with_completion(
                     &chat_id,
                     SessionStatus::Idle,
@@ -3611,6 +3762,9 @@ async fn drive_run(
                 tokio::time::Instant::now() + std::time::Duration::from_millis(STREAM_COMMIT_MS);
         }
     };
+
+    // Nothing the run held back may outlive it.
+    deltas.flush(&inner, &chat_id);
 
     // Any subagent still streaming when the run ends freezes as-is: the
     // parent process is gone, so nothing more can arrive on this stream.
