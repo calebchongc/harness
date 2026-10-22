@@ -25,7 +25,8 @@ use harness_rpc::methods;
 
 use crate::codegraff_jobs::{CodegraffJob, job_active, job_summary};
 use crate::codegraff_sandboxes::{
-    CodegraffSandboxes, can_start, can_stop, sandbox_detail, sandbox_title, start_labels,
+    TURN_OFF, TURN_OFF_HINT, can_keep_running, can_start, can_stop, sandbox_detail, sandbox_title,
+    start_labels,
 };
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
@@ -350,10 +351,8 @@ pub struct AccountsPage {
     jobs_poll_task: Option<Task<()>>,
     /// Job id with an in-flight Cancel.
     cancelling_job: Option<String>,
-    /// Cloud sandboxes (`None` when signed out; `enabled: false` hides the card).
-    codegraff_sandboxes: Loadable<Option<CodegraffSandboxes>>,
-    sandboxes_task: Option<Task<()>>,
-    /// The sandbox with an in-flight Start / Stop / Delete, and which.
+    /// The sandbox with an in-flight Start / Turn off / Keep running / Delete, and which. The
+    /// list itself lives on [`AppState`], shared with the sidebar strip.
     sandbox_busy: Option<(String, &'static str)>,
     /// Delete asks for a second click.
     sandbox_confirm_delete: Option<String>,
@@ -406,8 +405,6 @@ impl AccountsPage {
             jobs_task: None,
             jobs_poll_task: None,
             cancelling_job: None,
-            codegraff_sandboxes: Loadable::Idle,
-            sandboxes_task: None,
             sandbox_busy: None,
             sandbox_confirm_delete: None,
             creating_sandbox: false,
@@ -795,34 +792,12 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// The account's cloud sandboxes. They belong to this device's Codegraff sign-in, so the
-    /// call is never retargeted at another device.
+    /// Re-read the account's cloud sandboxes (kept on [`AppState`], which also keeps them
+    /// fresh while one runs). They belong to this device's Codegraff sign-in, so the call is
+    /// never retargeted at another device.
     fn load_codegraff_sandboxes(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        if matches!(self.codegraff_sandboxes, Loadable::Idle) {
-            self.codegraff_sandboxes = Loadable::Loading;
-        }
-        self.sandboxes_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CODEGRAFF_SANDBOXES, serde_json::json!({}))
-                .await;
-            this.update(cx, |page, cx| {
-                page.codegraff_sandboxes = match result {
-                    Ok(value) => {
-                        match serde_json::from_value::<Option<CodegraffSandboxes>>(value) {
-                            Ok(list) => Loadable::Ready(list),
-                            Err(err) => Loadable::Error(err.to_string()),
-                        }
-                    }
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.state
+            .update(cx, |state, cx| state.refresh_cloud_sandboxes(cx));
     }
 
     fn create_codegraff_sandbox(&mut self, cx: &mut Context<Self>) {
@@ -877,7 +852,8 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// `action`: `start` (wakes a paused sandbox and attaches Harness again), `stop`, `delete`.
+    /// `action`: `start` (wakes a paused sandbox, kept running, and attaches Harness again),
+    /// `stop` (Turn off: a pause), `keep-running-on`, `delete`.
     fn codegraff_sandbox_action(
         &mut self,
         id: String,
@@ -915,9 +891,7 @@ impl AccountsPage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let Loadable::Ready(Some(list)) = &self.codegraff_sandboxes else {
-            return None;
-        };
+        let list = self.state.read(cx).cloud_sandboxes()?.clone();
         if !list.enabled {
             return None;
         }
@@ -945,11 +919,32 @@ impl AccountsPage {
                         start_labels(sandbox).0
                     })
             });
+            let keep_running = can_keep_running(sandbox).then(|| {
+                let id = sandbox.id.clone();
+                widgets::ghost_action(theme)
+                    .id(("codegraff-sandbox-keep-running", ix))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip(
+                        "Keep it running until you turn it off, billed per second from your Codegraff credit.",
+                    ))
+                    .when(busy.is_some(), |el| el.opacity(0.5))
+                    .when(busy.is_none(), |el| {
+                        el.on_click(cx.listener(move |page, _, _, cx| {
+                            page.codegraff_sandbox_action(id.clone(), "keep-running-on", cx)
+                        }))
+                    })
+                    .child(if busy == Some("keep-running-on") {
+                        "Keeping running…"
+                    } else {
+                        "Keep running"
+                    })
+            });
             let stop = can_stop(sandbox).then(|| {
                 let id = sandbox.id.clone();
                 widgets::ghost_action(theme)
                     .id(("codegraff-sandbox-stop", ix))
                     .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip(TURN_OFF_HINT))
                     .when(busy.is_some(), |el| el.opacity(0.5))
                     .when(busy.is_none(), |el| {
                         el.on_click(cx.listener(move |page, _, _, cx| {
@@ -957,9 +952,9 @@ impl AccountsPage {
                         }))
                     })
                     .child(if busy == Some("stop") {
-                        "Stopping…"
+                        TURN_OFF.1
                     } else {
-                        "Stop"
+                        TURN_OFF.0
                     })
             });
             let confirming = self.sandbox_confirm_delete.as_deref() == Some(sandbox.id.as_str());
@@ -1011,6 +1006,7 @@ impl AccountsPage {
                         ),
                 )
                 .children(start)
+                .children(keep_running)
                 .children(stop)
                 .child(delete)
         });
@@ -1039,7 +1035,7 @@ impl AccountsPage {
                             .text_size(crate::typography::ui_rems(11.5))
                             .text_color(theme.text_muted)
                             .child(
-                                "A machine that keeps running Harness for you. It shows up in your devices, billed per second from your Codegraff credit.",
+                                "A machine that runs Harness for you and shows up in your devices. It keeps running, billed per second from your Codegraff credit, until you turn it off.",
                             ),
                     ),
             )

@@ -69,7 +69,8 @@
           "provider": "fleet",
           "persistent": true,
           "name": "Harness cloud",
-          "autoStopMinutes": 30
+          "autoStopMinutes": 30,
+          "keepRunning": true
         }
       },
       {
@@ -87,7 +88,11 @@
       },
       {
         "method": "POST",
-        "path": "/v1/sandboxes/{id}/start"
+        "path": "/v1/sandboxes/{id}/start",
+        "body": {
+          "leaseSeconds": 1800,
+          "keepRunning": true
+        }
       },
       {
         "method": "POST",
@@ -116,6 +121,24 @@
         "path": "/v1/sandboxes/{id}/stop"
       }
     ],
+    "keepRunningOn": [
+      {
+        "method": "POST",
+        "path": "/v1/sandboxes/{id}/keep-running",
+        "body": {
+          "enabled": true
+        }
+      }
+    ],
+    "keepRunningOff": [
+      {
+        "method": "POST",
+        "path": "/v1/sandboxes/{id}/keep-running",
+        "body": {
+          "enabled": false
+        }
+      }
+    ],
     "delete": [
       {
         "method": "DELETE",
@@ -139,6 +162,102 @@
         "expiresAt": "2026-10-01T12:24:00Z"
       },
       "title": "Harness cloud ab12",
+      "detail": "Running · Harness ready · pauses in 24 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "deviceName": "Harness cloud ab12",
+        "expiresAt": "2026-10-01T12:24:00Z",
+        "keepRunning": true,
+        "renewError": null
+      },
+      "title": "Harness cloud ab12",
+      "detail": "Running · Harness ready · keeps running until you turn it off",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": false,
+        "renewError": "insufficient_credit"
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness ready · Out of credit — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": false,
+        "renewError": "key_budget"
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness ready · Key budget reached — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": false,
+        "renewError": "fleet_unavailable"
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness ready · Couldn't renew — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:04:00Z",
+        "keepRunning": true,
+        "renewError": "something_new"
+      },
+      "title": "Cloud sandbox",
+      "detail": "Running · Harness ready · Couldn't renew — pauses in 4 min",
+      "canStart": false,
+      "canStop": true,
+      "startLabel": null
+    },
+    {
+      "sandbox": {
+        "id": "cnd_ab12cd34ef56",
+        "provider": "fleet",
+        "state": "running",
+        "harness": true,
+        "expiresAt": "2026-10-01T12:24:00Z",
+        "keepRunning": false
+      },
+      "title": "Cloud sandbox",
       "detail": "Running · Harness ready · pauses in 24 min",
       "canStart": false,
       "canStop": true,
@@ -224,7 +343,7 @@
         "expiresAt": "2026-10-01T12:24:00Z"
       },
       "title": "Harness cloud ab12",
-      "detail": "Paused",
+      "detail": "Paused — memory and files kept",
       "canStart": true,
       "canStop": false,
       "startLabel": "Start"
@@ -357,5 +476,6 @@
       "sentence": "CodeGraff couldn't create the sandbox."
     }
   ],
-  "rowsNote": "startLabel is pinned only for rows that can be started; it is null where there is no start button."
+  "rowsNote": "startLabel is pinned only for rows that can be started; it is null where there is no start button.",
+  "keepRunningNote": "Sandboxes created or woken from Harness keep running: the gateway renews their window (autoStopMinutes long) and bills per second from Codegraff credit until they are turned off (stop, a pause) or a renewal fails. Views may carry keepRunning (missing = false) and renewError (missing = null); a renewError means the sandbox pauses when its current window ends."
 }

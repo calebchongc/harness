@@ -1717,6 +1717,12 @@ impl RpcService for EngineRpc {
                     Some("start") => auth.start_sandbox(id).await,
                     Some("stop") => auth.stop_sandbox(id).await,
                     Some("delete") => auth.delete_sandbox(id).await,
+                    Some("keep-running-on") => {
+                        auth.set_sandbox_keep_running(id, true).await.map(drop)
+                    }
+                    Some("keep-running-off") => {
+                        auth.set_sandbox_keep_running(id, false).await.map(drop)
+                    }
                     _ => Err("unknown sandbox action".into()),
                 }
                 .map_err(RpcError::Failed)?;

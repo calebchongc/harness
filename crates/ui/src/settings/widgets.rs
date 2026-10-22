@@ -452,6 +452,33 @@ pub fn ghost_hover(theme: &Theme, s: gpui::StyleRefinement) -> gpui::StyleRefine
     s.bg(ink(0.06)).text_color(theme.text)
 }
 
+/// A plain one-line hover tooltip: `.tooltip(widgets::text_tooltip("…"))`.
+pub fn text_tooltip(
+    text: &'static str,
+) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
+    move |_, cx| cx.new(|_| TextTooltip(text)).into()
+}
+
+struct TextTooltip(&'static str);
+
+impl gpui::Render for TextTooltip {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .max_w(px(280.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(crate::typography::ui_rems(11.0))
+            .text_color(theme.text)
+            .child(self.0)
+    }
+}
+
 /// The dismissible red error strip (`flex items-start gap-2 rounded-xl border
 /// border-red-400/20 bg-red-400/[0.06] text-red-300/90` with a leading
 /// `DangerTriangle mt-0.5 size-4`).
