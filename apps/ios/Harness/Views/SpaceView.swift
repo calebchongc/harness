@@ -8,6 +8,8 @@ struct SpaceView: View {
     @Environment(AppModel.self) private var model
     let spaceId: String
     @Binding var path: [Route]
+    /// A session whose Delete is waiting on its confirmation.
+    @State private var pendingDelete: Chat?
 
     private var space: Space? {
         model.spaces.first { $0.id == spaceId }
@@ -36,9 +38,24 @@ struct SpaceView: View {
                         Label("Archive", systemImage: "archivebox")
                     }
                     .tint(Theme.surfaceRaised)
+                    // No destructive role: SwiftUI would slide the row out
+                    // before the confirmation is answered.
+                    Button {
+                        pendingDelete = chat
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                    .tint(Theme.danger)
+                    .accessibilityIdentifier("session-delete")
                 }
             }
             ArchivedSection(spaceId: spaceId, path: $path)
+        }
+        .sessionDeleteConfirmation(pending: $pendingDelete) { chat in
+            withAnimation(Motion.resort) {
+                model.delete(chatId: chat.id)
+            }
+            path.removeAll { $0 == .chat(chat.id) }
         }
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 10)
