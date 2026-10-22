@@ -1852,6 +1852,10 @@ pub struct Shell {
     chat_split: Option<chat_split::ChatSplit>,
     /// The selection the split last saw, to tell outside picks from its own.
     chat_split_selected: Option<String>,
+    /// Unfocused panes' chats last seen unarchived. Only archiving one of
+    /// those closes its pane; an archived session opened to read keeps its
+    /// pane when focus moves away (#489).
+    chat_split_live: std::collections::HashSet<String>,
     /// Chat tabs (`shell/chat_tabs.rs`): empty = one implicit tab. The entry
     /// at `chat_tab` is stale; the active tab lives in the fields above.
     chat_tabs: Vec<chat_tabs::ChatTab>,
@@ -2402,6 +2406,7 @@ impl Shell {
             subagent_seq: 0,
             chat_split: None,
             chat_split_selected: None,
+            chat_split_live: std::collections::HashSet::new(),
             chat_tabs: Vec::new(),
             chat_tab: 0,
             chat_tab_id: uuid::Uuid::new_v4(),
