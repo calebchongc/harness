@@ -140,6 +140,237 @@ fn assert_rejected_unchanged(
 }
 
 #[gpui::test]
+fn saved_view_callbacks_reject_hidden_revoked_or_unknown_local_owners(cx: &mut TestAppContext) {
+    for source in ["owner", "owner--sub--synthetic-call"] {
+        for kind in [
+            harness_proto::ToolViewKind::Html,
+            harness_proto::ToolViewKind::McpApp,
+        ] {
+            for invalid in ["settings", "archived", "deleted", "partial-missing"] {
+                let mut setup = None;
+                with_link_panes(cx, Some("owner"), |shell, window, cx| {
+                    shell
+                        .state
+                        .update(cx, |state, _| state.local_device_id = Some("local".into()));
+                    setup = Some((cx.entity(), window.window_handle(), Shell::view_opener(cx)));
+                });
+                let (shell, window, opener) = setup.unwrap();
+                shell.update(cx, |shell, cx| {
+                    if invalid == "settings" {
+                        shell.route = Route::Settings(SettingsSection::Appearance);
+                    }
+                    shell.state.update(cx, |state, _| {
+                        state.chats_synced = invalid != "partial-missing";
+                        if invalid == "archived" {
+                            state
+                                .chats
+                                .iter_mut()
+                                .find(|chat| chat.id == "owner")
+                                .unwrap()
+                                .archived = true;
+                        } else if matches!(invalid, "deleted" | "partial-missing") {
+                            state.chats.retain(|chat| chat.id != "owner");
+                        }
+                        // Keep the old chip callback alive before reconciliation.
+                    });
+                });
+                let before = shell.read_with(cx, link_state);
+                let view =
+                    harness_proto::ToolView::new(kind, "00000000000000000000000000000001").unwrap();
+                window
+                    .update(cx, |_, window, cx| opener(source, &view, window, cx))
+                    .unwrap();
+                cx.run_until_parked();
+                shell.read_with(cx, |shell, cx| {
+                    assert_eq!(
+                        link_state(shell, cx),
+                        before,
+                        "{source}, {kind:?}, {invalid}"
+                    );
+                });
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn saved_view_callbacks_keep_selected_owner_and_device_boundaries(cx: &mut TestAppContext) {
+    for kind in [
+        harness_proto::ToolViewKind::Html,
+        harness_proto::ToolViewKind::McpApp,
+    ] {
+        for (source, device, synced, allowed) in [
+            ("owner", "local", false, true),
+            ("owner--sub--synthetic-call", "local", true, true),
+            ("peer-a", "local", true, false),
+            ("peer-a--sub--synthetic-call", "local", false, false),
+            ("owner-extra", "local", true, false),
+            ("", "local", true, false),
+            ("owner", "remote", true, false),
+            ("owner", "unknown-local", true, false),
+        ] {
+            let mut setup = None;
+            with_link_panes(cx, Some("owner"), |shell, window, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = (device != "unknown-local").then(|| "local".into());
+                    state.chats_synced = synced;
+                    if device == "remote" {
+                        state
+                            .chats
+                            .iter_mut()
+                            .find(|chat| chat.id == "owner")
+                            .unwrap()
+                            .device_id = "remote".into();
+                    }
+                });
+                setup = Some((cx.entity(), window.window_handle(), Shell::view_opener(cx)));
+            });
+            let (shell, window, opener) = setup.unwrap();
+            let mut expected = shell.read_with(cx, link_state);
+            let view =
+                harness_proto::ToolView::new(kind, "00000000000000000000000000000001").unwrap();
+            window
+                .update(cx, |_, window, cx| opener(source, &view, window, cx))
+                .unwrap();
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| {
+                if allowed && cfg!(target_os = "macos") {
+                    assert_eq!(shell.browsers.len(), 1);
+                    assert_eq!(shell.right_tabs["owner"], vec![RightSurface::Browser(1)]);
+                    assert_eq!(shell.resolved_right_active(cx), RightSurface::Browser(1));
+                } else {
+                    if matches!(device, "remote" | "unknown-local") {
+                        expected.notice =
+                            Some("This view is saved on another computer. Open it there.".into());
+                    } else if allowed {
+                        expected.notice =
+                            Some("Saved views open in the browser pane on macOS for now.".into());
+                    }
+                    assert_eq!(
+                        link_state(shell, cx),
+                        expected,
+                        "{source}, {device}, {kind:?}"
+                    );
+                }
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn callback_authority_recovers_across_repeated_route_snapshot_and_selection_transitions(
+    cx: &mut TestAppContext,
+) {
+    use crate::browser::BrowserEvent;
+
+    for callback in ["transcript", "browser", "saved-view"] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            shell
+                .state
+                .update(cx, |state, _| state.local_device_id = Some("local".into()));
+            shell.activate_session_link(
+                &activation(Some("owner"), LinkAction::Internal),
+                window,
+                cx,
+            );
+            setup = Some((
+                cx.entity(),
+                window.window_handle(),
+                Shell::view_opener(cx),
+                shell.browsers[&1].clone(),
+            ));
+        });
+        let (shell, window, opener, browser) = setup.unwrap();
+        let original_row = shell.read_with(cx, |shell, cx| {
+            shell.state.read(cx).selected_chat_row().unwrap().clone()
+        });
+        // These transitions deliberately precede observers/painting. Reuse the
+        // exact same callbacks through revocation and recovery, not fresh ones.
+        for (chat_route, row_state, synced, selected) in [
+            (true, "live", true, Some("owner")),
+            (false, "live", true, Some("owner")),
+            (false, "archived", true, Some("owner")),
+            (true, "archived", true, Some("owner")),
+            (true, "archived", false, Some("owner")),
+            (true, "missing", false, Some("owner")),
+            (true, "missing", true, Some("owner")),
+            (true, "live", true, Some("peer-a")),
+            (true, "live", true, None),
+            (true, "live", true, Some("owner")),
+            (false, "live", false, Some("owner")),
+            (true, "live", false, Some("owner")),
+        ] {
+            shell.update(cx, |shell, cx| {
+                shell.route = if chat_route {
+                    Route::Chat
+                } else {
+                    Route::Settings(SettingsSection::Appearance)
+                };
+                shell.state.update(cx, |state, _| {
+                    state.chats_synced = synced;
+                    state.selected_chat = selected.map(str::to_owned);
+                    state.chats.retain(|chat| chat.id != "owner");
+                    if row_state != "missing" {
+                        let mut row = original_row.clone();
+                        row.archived = row_state == "archived";
+                        state.chats.push(row);
+                    }
+                });
+                shell.set_right_active(RightSurface::Browser(1), cx);
+            });
+            let before = shell.read_with(cx, link_state);
+            let known_live = row_state == "live";
+            let allowed = chat_route
+                && selected == Some("owner")
+                && (known_live || (row_state == "missing" && !synced && callback != "saved-view"));
+            window
+                .update(cx, |_, window, cx| match callback {
+                    "transcript" => shell.update(cx, |shell, cx| {
+                        assert_eq!(
+                            shell.activate_session_link(
+                                &activation(Some("owner"), LinkAction::External),
+                                window,
+                                cx
+                            ),
+                            if allowed {
+                                LinkOutcome::External(URL.into())
+                            } else {
+                                LinkOutcome::Rejected
+                            }
+                        );
+                    }),
+                    "browser" => browser.update(cx, |_, cx| cx.emit(BrowserEvent::NewTab(None))),
+                    "saved-view" => {
+                        let view = harness_proto::ToolView::new(
+                            harness_proto::ToolViewKind::Html,
+                            "00000000000000000000000000000001",
+                        )
+                        .unwrap();
+                        opener("owner--sub--synthetic-call", &view, window, cx);
+                    }
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| {
+                if allowed && callback != "transcript" && (callback != "saved-view" || cfg!(target_os = "macos")) {
+                    assert_eq!(shell.browser_seq, before.browser_seq + 1, "{callback}, {row_state}");
+                    assert_eq!(shell.browsers.len(), before.browsers.len() + 1);
+                    assert_eq!(shell.resolved_right_active(cx), RightSurface::Browser(shell.browser_seq));
+                } else {
+                    let mut expected = before;
+                    if allowed && callback == "saved-view" {
+                        expected.notice = Some("Saved views open in the browser pane on macOS for now.".into());
+                    }
+                    assert_eq!(link_state(shell, cx), expected, "{callback}, route={chat_route}, row={row_state}, synced={synced}, selected={selected:?}");
+                }
+            });
+        }
+    }
+}
+
+#[gpui::test]
 fn split_links_require_a_nonempty_source_and_a_live_unfocused_peer(cx: &mut TestAppContext) {
     with_link_panes(cx, Some("owner"), |shell, window, cx| {
         for source in [None, Some(""), Some("deleted-session"), Some("parked")] {

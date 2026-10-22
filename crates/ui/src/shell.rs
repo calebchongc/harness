@@ -3658,18 +3658,27 @@ impl Shell {
     ) {
         // Subagent transcripts are keyed `{chatId}--sub--{call}`.
         let chat_id = source.split("--sub--").next().unwrap_or(source);
-        if self.active_chat.is_empty()
+        if !matches!(self.route, Route::Chat)
+            || self.active_chat.is_empty()
             || chat_id != self.active_chat
             || self.state.read(cx).selected_chat.as_deref() != Some(chat_id)
+            || !self.chat_navigation_is_live(chat_id, cx)
         {
             return;
         }
         let host = {
             let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .filter(|chat| Some(chat.device_id.as_str()) != state.local_device_id.as_deref())
-                .map(|chat| state.device_name(&chat.device_id).unwrap_or("another computer").to_owned())
+            // Unlike a web URL, this page is a host-local file. A partial
+            // snapshot without its owner cannot establish which device has it.
+            let Some(chat) = state.selected_chat_row() else {
+                return;
+            };
+            (Some(chat.device_id.as_str()) != state.local_device_id.as_deref()).then(|| {
+                state
+                    .device_name(&chat.device_id)
+                    .unwrap_or("another computer")
+                    .to_owned()
+            })
         };
         if let Some(host) = host {
             self.sidebar_notice = Some(format!("This view is saved on {host}. Open it there.").into());
