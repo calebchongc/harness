@@ -54,7 +54,9 @@ final class NetworkReliabilityTests: XCTestCase {
                 ? [("pending", Data([1]))] : []
             XCTAssertTrue(DocDisk.saveChat2(doc: LoroDoc(), id: id, cursor: 0,
                                             verified: false, outbox: outbox))
-            let date = Date(timeIntervalSince1970: TimeInterval(index + 1))
+            // Newer than any snapshot another test left in the shared docs
+            // directory, so `keep: 1` keeps this test's newest file.
+            let date = Date().addingTimeInterval(3_600 + TimeInterval(index))
             try FileManager.default.setAttributes([.modificationDate: date],
                                                   ofItemAtPath: DocDisk.chat2URL(for: id).path)
         }

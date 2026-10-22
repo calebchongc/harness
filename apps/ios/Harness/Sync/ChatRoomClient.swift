@@ -65,6 +65,10 @@ actor ChatRoomClient {
         var containsFrontier: @MainActor @Sendable (Data) -> Bool
         var applyCheckpoint: @MainActor @Sendable (Data, UInt64) async -> Bool
         var applyRow: @MainActor @Sendable (Data, UInt64) async -> Void
+        /// A contiguous run of rows in one import, the cursor then moved to
+        /// the run's last seq. A catch-up that queued many rows rebuilds a
+        /// concurrently edited text once rather than once per row (#484).
+        var applyRows: @MainActor @Sendable ([Data], UInt64) async -> Void
         var advanceCursor: @MainActor @Sendable (UInt64) -> Void
         /// Cursor amnesty: lower the cursor to the checkpoint seq (no-op if
         /// already at or below). See the once-per-session clamp in
@@ -159,6 +163,12 @@ actor ChatRoomClient {
     private var lastInbound = DispatchTime.now()
     /// Protocol clock — only real frames count (pongs prove nothing).
     private var lastProtocolRx = DispatchTime.now()
+    /// Frames received but not yet handled, oldest first, with the socket
+    /// generation they arrived on. The receive loop only queues them, so
+    /// rows that arrive while an import runs wait here and are then imported
+    /// together (`drainInbox`).
+    private var inbox: [(frame: ChatWireFrame, gen: Int)] = []
+    private var draining = false
     /// Setting any of the four deadlines wakes a liveness loop that is parked in a long sleep
     /// (LivenessSchedule). Clearing one needs nothing: the loop's next look sees it gone.
     private var helloSentAt: DispatchTime? { didSet { if helloSentAt != nil { wakeLivenessIfParked() } } }
@@ -343,10 +353,9 @@ actor ChatRoomClient {
             }
         }
         guard !closed else { return }
-        for frame in frames.dropFirst()
-        where frame.kind == ChatFrameType.row || frame.kind == ChatFrameType.rowsDone {
-            await applyRowFrame(frame)
-        }
+        await applyRowFrames(frames.dropFirst().filter {
+            $0.kind == ChatFrameType.row || $0.kind == ChatFrameType.rowsDone
+        })
     }
 
     private func shouldPoll() -> Bool {
@@ -630,6 +639,9 @@ actor ChatRoomClient {
 
     // MARK: Inbound
 
+    /// The receive loop's side: stamp the liveness clocks and queue the
+    /// frame. Handling waits for the drain, so a long import neither stalls
+    /// the socket read nor reads as a silent socket.
     private func handleInbound(_ message: URLSessionWebSocketTask.Message, gen: Int) async {
         guard gen == generation else { return }
         lastInbound = .now()
@@ -643,7 +655,45 @@ actor ChatRoomClient {
         }
         lastProtocolRx = .now()
         probeSentAt = nil
+        inbox.append((frame, gen))
+        guard !draining else { return }
+        draining = true
+        Task { await self.drainInbox() }
+    }
 
+    /// Handle queued frames in arrival order. A run of row frames is applied
+    /// together (`applyRowFrames`); anything else goes through `handleFrame`.
+    private func drainInbox() async {
+        while !inbox.isEmpty {
+            let frames = inbox
+            inbox.removeAll()
+            var i = 0
+            while i < frames.count {
+                let (frame, gen) = frames[i]
+                guard gen == generation, !closed else {
+                    i += 1
+                    continue
+                }
+                guard frame.kind == ChatFrameType.row, checkpointBuffer == nil else {
+                    await handleFrame(frame, gen: gen)
+                    i += 1
+                    continue
+                }
+                var run: [ChatWireFrame] = []
+                while i < frames.count, frames[i].frame.kind == ChatFrameType.row,
+                      frames[i].gen == gen {
+                    run.append(frames[i].frame)
+                    i += 1
+                }
+                await applyRowFrames(run)
+                await maybeRepairGap(gen: gen)
+            }
+        }
+        draining = false
+    }
+
+    private func handleFrame(_ frame: ChatWireFrame, gen: Int) async {
+        guard gen == generation else { return }
         switch frame.kind {
         case ChatFrameType.state:
             await handleState(frame, gen: gen)
@@ -808,13 +858,39 @@ actor ChatRoomClient {
             }
             return
         }
-        while let frame = checkpointBuffer?.first {
-            checkpointBuffer?.removeFirst()
-            await applyRowFrame(frame)
+        // Rows that arrive meanwhile keep joining the (non-nil) buffer.
+        while let frames = checkpointBuffer, !frames.isEmpty {
+            checkpointBuffer = []
+            await applyRowFrames(frames)
             guard !closed else { return }
         }
         checkpointBuffer = nil
         await maybeRepairGap(gen: generation)
+    }
+
+    /// Frames in order, with each run of rows that keeps to the contiguity
+    /// rule (`seq <= cursor + 1`) imported in one call. A gap row and
+    /// ROWS_DONE go through `applyRowFrame` exactly as before.
+    private func applyRowFrames(_ frames: [ChatWireFrame]) async {
+        var i = 0
+        while i < frames.count {
+            var cursor = await delegate.cursor()
+            var bytes: [Data] = []
+            while i < frames.count, frames[i].kind == ChatFrameType.row,
+                  let seq = (frames[i].header["seq"] as? NSNumber)?.uint64Value,
+                  seq <= cursor + 1 {
+                bytes.append(frames[i].payload)
+                cursor = max(cursor, seq)
+                i += 1
+            }
+            if bytes.isEmpty {
+                await applyRowFrame(frames[i])
+                i += 1
+            } else {
+                await delegate.applyRows(bytes, cursor)
+            }
+            guard !closed else { return }
+        }
     }
 
     /// One backfill/broadcast frame: a row, or the ROWS_DONE terminator.
