@@ -642,6 +642,10 @@ impl CloudSandbox {
     fn paused(&self) -> bool {
         self.state == "paused"
     }
+
+    fn running(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "started")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2460,6 +2464,10 @@ impl Pickers {
                         let (enabled, sandboxes) = parse_cloud(&value);
                         pickers.cloud.enabled = enabled;
                         pickers.cloud.sandboxes = sandboxes;
+                        // The same answer keeps the running-sandbox strip current.
+                        pickers.state.update(cx, |state, cx| {
+                            state.apply_cloud_sandboxes_value(&value, cx)
+                        });
                     }
                     Err(_) => pickers.cloud.enabled = false,
                 }
@@ -2502,6 +2510,10 @@ impl Pickers {
                 this.update(cx, |pickers, cx| {
                     pickers.cloud.busy = None;
                     pickers.cloud.error = Some(err.to_string());
+                    // A create can fail half-way with the machine already running.
+                    pickers
+                        .state
+                        .update(cx, |state, cx| state.refresh_cloud_sandboxes(cx));
                     cx.notify();
                 })
                 .ok();
@@ -2518,6 +2530,10 @@ impl Pickers {
                     let (enabled, sandboxes) = parse_cloud(value);
                     pickers.cloud.enabled = enabled;
                     pickers.cloud.sandboxes = sandboxes;
+                    // It is running (and billed) now: the strip shows it from here on.
+                    pickers
+                        .state
+                        .update(cx, |state, cx| state.apply_cloud_sandboxes_value(value, cx));
                 }
                 cx.notify();
             })
@@ -2653,6 +2669,14 @@ impl Pickers {
             .filter(|s| s.live())
             .map(|s| s.device_name.clone())
             .collect();
+        // Running cloud sandboxes are billed until turned off: their rows say so.
+        let cloud_running: Vec<String> = self
+            .cloud
+            .sandboxes
+            .iter()
+            .filter(|s| s.running())
+            .map(|s| s.device_name.clone())
+            .collect();
         let cloud_row = self.current_cloud_row(cx);
         let cloud_error = self.cloud.error.clone();
         let device_count = rows.len();
@@ -2679,6 +2703,8 @@ impl Pickers {
                                 let is_local = local.as_deref() == Some(device.id.as_str());
                                 let is_cloud = device.platform == "linux"
                                     && cloud_names.iter().any(|name| *name == device.name);
+                                let cloud_is_running = is_cloud
+                                    && cloud_running.iter().any(|name| *name == device.name);
                                 let label: SharedString = device.name.clone().into();
                                 let is_selected = effective.as_deref() == Some(device.id.as_str());
                                 let pick_id = device.id.clone();
@@ -2700,6 +2726,15 @@ impl Pickers {
                                             .size(px(12.0))
                                             .flex_none()
                                             .text_color(theme.text_muted),
+                                    )
+                                })
+                                .when(cloud_is_running, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(crate::typography::ui_rems(10.0))
+                                            .text_color(theme.accent)
+                                            .child(SharedString::from("Running")),
                                     )
                                 })
                                 // The local device wears a muted right-aligned "You"

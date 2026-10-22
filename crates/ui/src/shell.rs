@@ -67,6 +67,7 @@ mod actions_ui;
 mod appearance_sync;
 mod chat_split;
 mod chat_tabs;
+mod cloud_sandbox_strip;
 mod codegraff_account;
 mod command_palette;
 mod files_panel;
@@ -1884,6 +1885,9 @@ pub struct Shell {
     /// "Sign in with Codegraff" state (`shell/codegraff_account.rs`).
     codegraff: Option<codegraff_account::CodegraffStatus>,
     codegraff_flow: Option<Task<()>>,
+    /// The cloud sandbox strip's Turn off is in flight (`shell/cloud_sandbox_strip.rs`).
+    cloud_turning_off: bool,
+    cloud_turn_off_task: Option<Task<()>>,
     /// In-chat ChatGPT reconnects in flight, one per host and route (`shell/reauth.rs`).
     reauth_tasks: std::collections::HashMap<crate::reauth_recovery::ReauthKey, Task<()>>,
     codegraff_status_task: Option<Task<()>>,
@@ -2421,6 +2425,8 @@ impl Shell {
             boot_restored: false,
             codegraff: None,
             codegraff_flow: None,
+            cloud_turning_off: false,
+            cloud_turn_off_task: None,
             reauth_tasks: std::collections::HashMap::new(),
             codegraff_status_task: None,
             chat_split_bounds: Default::default(),
@@ -7060,6 +7066,10 @@ impl Shell {
                     )
                     .child(list),
             )
+            // A running cloud sandbox stays in view on every settings page too.
+            .when_some(self.render_cloud_sandbox_strip(theme, cx), |el, strip| {
+                el.child(div().pb(px(4.0)).child(strip))
+            })
             // Back pinned to the bottom (harness settings-sidebar.tsx).
             .child(
                 div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
@@ -8328,6 +8338,10 @@ impl Shell {
                         }))
                         .child(notice),
                 )
+            })
+            // A running cloud sandbox is billed until it is turned off: always in view.
+            .when_some(self.render_cloud_sandbox_strip(theme, cx), |el, strip| {
+                el.child(strip)
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
@@ -9638,6 +9652,12 @@ impl Shell {
     ) -> Vec<AnyElement> {
         let theme = Theme::of(cx).for_popup();
         let mut overlays: Vec<AnyElement> = Vec::new();
+
+        // First, so menus and dialogs layer above it: with the sidebar collapsed, a running
+        // cloud sandbox (billed until turned off) still shows under the sidebar toggle.
+        if let Some(chip) = self.render_cloud_sandbox_chip(&theme, cx) {
+            overlays.push(chip);
+        }
 
         if let Some(menu_state) = self.chat_menu.get().cloned() {
             let chat_id = menu_state.chat_id;

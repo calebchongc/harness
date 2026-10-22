@@ -11,6 +11,11 @@
 //! sandbox gets a unique `deviceName`, remembered in `cloud-sandboxes.json` in the data
 //! directory and joined onto the list.
 //!
+//! Sandboxes created or woken here keep running: the gateway renews their window
+//! (`autoStopMinutes` long) on its own, billed per second from the account's credit, until the
+//! user turns them off (`/stop`, a pause) or a renewal fails (`renewError`), after which the
+//! sandbox pauses at the end of its current window with its state kept.
+//!
 //! Every build offers them to an account signed in with Codegraff; the gateway decides what the
 //! account may do (credit, reservations) and its errors are shown as they come.
 //! [`cloud_sandboxes_enabled`] can still turn the feature off.
@@ -27,8 +32,11 @@ use super::{CodegraffAuth, http, urlencode};
 
 const FLEET: &str = "fleet";
 const SANDBOX_NAME: &str = "Harness cloud";
-/// The gateway pauses a persistent sandbox this long after its last activity.
+/// The length of each running window. A keep-running sandbox has its window renewed before it
+/// ends; any other sandbox pauses when it ends.
 const AUTO_STOP_MINUTES: u32 = 30;
+/// The window a wake asks for (the same length as a fresh sandbox's).
+const WAKE_LEASE_SECONDS: u32 = AUTO_STOP_MINUTES * 60;
 const QUICK: Duration = Duration::from_secs(20);
 /// Creating or waking a sandbox boots a machine.
 const BOOT: Duration = Duration::from_secs(90);
@@ -53,6 +61,12 @@ pub struct CodegraffSandbox {
     pub harness: bool,
     /// The name its device registers under (remembered at create time).
     pub device_name: Option<String>,
+    /// The gateway renews its window until it is turned off. `None` from gateways that don't
+    /// know the setting (treated as off).
+    pub keep_running: Option<bool>,
+    /// Why the last renewal failed (`insufficient_credit`, `key_budget`, `fleet_unavailable`,
+    /// or another word); the sandbox pauses when its current window ends.
+    pub renew_error: Option<String>,
 }
 
 /// `enabled: false` means this build doesn't offer cloud sandboxes (the UI hides the card).
@@ -95,6 +109,8 @@ fn parse_sandbox(value: &Value) -> CodegraffSandbox {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         device_name: None,
+        keep_running: value.get("keepRunning").and_then(Value::as_bool),
+        renew_error: text("/renewError").filter(|e| !e.trim().is_empty()),
     }
 }
 
@@ -323,6 +339,7 @@ impl CodegraffAuth {
             "persistent": true,
             "name": SANDBOX_NAME,
             "autoStopMinutes": AUTO_STOP_MINUTES,
+            "keepRunning": true,
         });
         let created = self
             .sandbox_call(Method::POST, "/v1/sandboxes", Some(body), BOOT)
@@ -350,16 +367,23 @@ impl CodegraffAuth {
     }
 
     /// Start a sandbox that isn't running (or set Harness up again in a running one): `/start`
-    /// when needed, then `/harness` under the name remembered at create time.
+    /// when needed, kept running like a fresh one, then `/harness` under the name remembered
+    /// at create time.
     pub async fn start_sandbox(&self, id: &str) -> Result<(), String> {
         let current = self
             .sandbox_call(Method::GET, &Self::sandbox_path(id, ""), None, QUICK)
             .await
             .map_err(|f| f.sentence("CodeGraff couldn't read the sandbox"))?;
         if parse_sandbox(&current).state != "running" {
-            self.sandbox_call(Method::POST, &Self::sandbox_path(id, "/start"), None, BOOT)
-                .await
-                .map_err(|f| f.sentence("CodeGraff couldn't start the sandbox"))?;
+            let body = json!({ "leaseSeconds": WAKE_LEASE_SECONDS, "keepRunning": true });
+            self.sandbox_call(
+                Method::POST,
+                &Self::sandbox_path(id, "/start"),
+                Some(body),
+                BOOT,
+            )
+            .await
+            .map_err(|f| f.sentence("CodeGraff couldn't start the sandbox"))?;
         }
         let mut names = self.device_names();
         let device_name = names
@@ -377,12 +401,45 @@ impl CodegraffAuth {
         Ok(())
     }
 
-    /// Pause (fleet: memory and processes are kept).
+    /// Pause (fleet: memory and processes are kept). Billing for the machine stops.
     pub async fn stop_sandbox(&self, id: &str) -> Result<(), String> {
         self.sandbox_call(Method::POST, &Self::sandbox_path(id, "/stop"), None, QUICK)
             .await
             .map(drop)
             .map_err(|f| f.sentence("CodeGraff couldn't stop the sandbox"))
+    }
+
+    /// Turn window renewal on or off for a running sandbox. Off, it pauses when its current
+    /// window ends. Answers the sandbox as the gateway now sees it.
+    pub async fn set_sandbox_keep_running(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<CodegraffSandbox, String> {
+        let value = self
+            .sandbox_call(
+                Method::POST,
+                &Self::sandbox_path(id, "/keep-running"),
+                Some(json!({ "enabled": enabled })),
+                QUICK,
+            )
+            .await
+            .map_err(|f| {
+                f.sentence("CodeGraff couldn't change whether the sandbox keeps running")
+            })?;
+        // The gateway answers the bare view (like `/start` and `/stop`); a `{sandbox}`
+        // wrapper is read too.
+        let view = match value.get("sandbox") {
+            Some(inner) if inner.is_object() && value.get("id").is_none() => inner,
+            _ => &value,
+        };
+        let mut sandbox = parse_sandbox(view);
+        if sandbox.id.is_empty() {
+            sandbox.id = id.to_owned();
+        }
+        sandbox.device_name = self.device_names().get(id).cloned();
+        sandbox.harness = sandbox.harness || sandbox.device_name.is_some();
+        Ok(sandbox)
     }
 
     pub async fn delete_sandbox(&self, id: &str) -> Result<(), String> {
@@ -602,6 +659,7 @@ mod tests {
             r#""provider":"fleet""#,
             r#""persistent":true"#,
             r#""autoStopMinutes":30"#,
+            r#""keepRunning":true"#,
         ] {
             assert!(sent[0].contains(needle), "{needle} in {}", sent[0]);
         }
@@ -712,6 +770,92 @@ mod tests {
             ]
         );
         assert!(seen.lock().unwrap()[2].contains(r#""deviceName":"Harness cloud 0001""#));
+        let start = &recorded(&seen)[1];
+        assert_eq!(
+            start.1,
+            Some(json!({"leaseSeconds": 1800, "keepRunning": true})),
+            "a wake keeps the sandbox running like a fresh one"
+        );
+    }
+
+    #[test]
+    fn views_carry_keep_running_and_renew_errors_and_older_gateways_omit_them() {
+        let kept = parse_sandbox(&json!({
+            "id": "cnd_1", "state": "started", "keepRunning": true, "renewError": null
+        }));
+        assert_eq!(kept.keep_running, Some(true));
+        assert_eq!(kept.renew_error, None);
+        let failing = parse_sandbox(&json!({
+            "id": "cnd_1", "state": "started", "keepRunning": false,
+            "renewError": "insufficient_credit"
+        }));
+        assert_eq!(failing.keep_running, Some(false));
+        assert_eq!(failing.renew_error.as_deref(), Some("insufficient_credit"));
+        let old = parse_sandbox(&json!({"id": "cnd_1", "state": "started"}));
+        assert_eq!((old.keep_running, old.renew_error), (None, None));
+        let blank = parse_sandbox(&json!({"id": "cnd_1", "renewError": " "}));
+        assert_eq!(blank.renew_error, None);
+    }
+
+    #[tokio::test]
+    async fn keep_running_posts_the_flag_and_answers_the_sandbox() {
+        let (gateway, seen) = fake(vec![(
+            "POST /v1/sandboxes/cnd_1/keep-running ",
+            200,
+            r#"{"id":"cnd_1","provider":"fleet","state":"started","keepRunning":false,"renewError":null}"#,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        let mut names = BTreeMap::new();
+        names.insert("cnd_1".to_string(), "Harness cloud 0001".to_string());
+        auth.save_device_names(&names);
+        let sandbox = auth.set_sandbox_keep_running("cnd_1", false).await.unwrap();
+        assert_eq!(sandbox.keep_running, Some(false));
+        assert_eq!(sandbox.state, "running");
+        assert_eq!(sandbox.device_name.as_deref(), Some("Harness cloud 0001"));
+        assert_eq!(
+            recorded(&seen),
+            [(
+                "POST /v1/sandboxes/cnd_1/keep-running".to_string(),
+                Some(json!({"enabled": false}))
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_running_also_reads_a_wrapped_view() {
+        let (gateway, _) = fake(vec![(
+            "POST /v1/sandboxes/cnd_1/keep-running ",
+            200,
+            r#"{"sandbox":{"id":"cnd_1","state":"started","keepRunning":true}}"#,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        let sandbox = auth.set_sandbox_keep_running("cnd_1", true).await.unwrap();
+        assert_eq!(sandbox.keep_running, Some(true));
+        assert_eq!(sandbox.state, "running");
+    }
+
+    #[tokio::test]
+    async fn a_refused_keep_running_says_why() {
+        let (gateway, _) = fake(vec![(
+            "POST /v1/sandboxes/cnd_1/keep-running ",
+            402,
+            r#"{"error":{"type":"insufficient_credits","message":"x"}}"#,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        let error = auth
+            .set_sandbox_keep_running("cnd_1", true)
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("Your Codegraff credit is used up"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -979,6 +1123,20 @@ mod tests {
         let mut expected = expand(&plans["stop"], id, name);
         expected.extend(expand(&plans["delete"], id, name));
         assert_eq!(recorded(&seen), expected, "stop then delete");
+
+        let (gateway, seen) = fake(vec![(
+            "POST /v1/sandboxes/cnd_ab12cd34ef56/keep-running ",
+            200,
+            r#"{"id":"cnd_ab12cd34ef56","state":"started"}"#,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(dir.path(), gateway);
+        auth.set_sandbox_keep_running(id, true).await.unwrap();
+        auth.set_sandbox_keep_running(id, false).await.unwrap();
+        let mut expected = expand(&plans["keepRunningOn"], id, name);
+        expected.extend(expand(&plans["keepRunningOff"], id, name));
+        assert_eq!(recorded(&seen), expected, "keep running on then off");
 
         for never in plans["neverCalled"].as_array().unwrap() {
             let never = never.as_str().unwrap();
