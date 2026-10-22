@@ -9702,6 +9702,15 @@ impl Shell {
             cx.notify();
             return true;
         }
+        // Settings → Archived's "Delete all archived sessions?" dialog.
+        if matches!(self.route, Route::Settings(SettingsSection::Archived))
+            && self
+                .archived_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx)))
+        {
+            return true;
+        }
         if self.spaces_menu.is_open() {
             self.close_spaces_menu(cx);
             return true;
