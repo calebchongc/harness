@@ -38,3 +38,7 @@ call: behavior that only exists inside a view has to be pulled out before it can
 
 Known differences that are not pinned: the queue panel shows an image placeholder where iOS decodes the upload, and
 Android's drafts survive navigation but not the process being killed, while iOS keeps them on disk.
+
+The Attachments editor on a queued message (add, preview, replace and remove its images; #187, #493) is iOS-only
+for now. Its copy goes into `ux-contract.json` when the Compose app gets the editor, since the string check would
+otherwise fail the Android build.

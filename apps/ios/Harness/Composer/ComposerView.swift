@@ -280,6 +280,11 @@ struct ComposerView: View {
     /// Distinguishes a live composer from an async acquire that completed
     /// after navigation removed this view.
     @State private var queueEditorVisible = false
+    /// The queued row whose images are open in the Attachments editor.
+    @State private var attachmentEdit: QueuedAttachmentEdit?
+    /// The lease that editor holds until it saves; released if it closes
+    /// any other way.
+    @State private var attachmentLease: QueueEditLease?
 
     init(store: SessionStore, chat: Chat, runLive: Bool) {
         self.store = store
@@ -353,7 +358,8 @@ struct ComposerView: View {
                            onEdit: { item in Task { await beginQueueEdit(item) } },
                            onCancelEdit: { Task { await cancelQueueEdit() } },
                            supportsActions: supportsQueueActions,
-                           onAction: performQueueAction)
+                           onAction: performQueueAction,
+                           onAttachments: { item in Task { await beginAttachmentEdit(item) } })
             }
             if editingQueuedId != nil {
                 Button(queueEdit?.terminal == true ? "Copy edit and stop editing" : "Stop editing") {
@@ -416,6 +422,19 @@ struct ComposerView: View {
             guard !items.isEmpty else { return }
             stage(items)
         }
+        .sheet(item: $attachmentEdit, onDismiss: releaseAttachmentLease) { edit in
+            QueuedImageEditor(draft: edit.draft, deviceId: queueImageDeviceId) { draft in
+                await commitAttachments(draft, lease: edit.lease)
+            }
+        }
+        .task(id: attachmentLease?.leaseId) {
+            guard let lease = attachmentLease else { return }
+            while !Task.isCancelled, attachmentLease?.leaseId == lease.leaseId {
+                try? await Task.sleep(for: .seconds(20))
+                guard !Task.isCancelled, attachmentLease?.leaseId == lease.leaseId else { return }
+                _ = await store.renewQueuedEdit(lease)
+            }
+        }
         .sheet(isPresented: $showModelPicker) {
             ModelPickerSheet(
                 harness: .constant(harness),
@@ -475,6 +494,7 @@ struct ComposerView: View {
         }
         .onDisappear {
             queueEditorVisible = false
+            releaseAttachmentLease()
             guard let lease = queueEditLease else { return }
             text = queueEdit?.originalDraft ?? ""
             queueEdit = nil
@@ -579,6 +599,110 @@ struct ComposerView: View {
         case .unavailable:
             uploadError = "Connect to the chat host to edit this message."
         }
+    }
+
+    /// Where the queue's committed images live: the chat's host.
+    private var queueImageDeviceId: String { store.hostDeviceId ?? store.deviceId }
+
+    /// Open the Attachments editor on a queued row. The host holds the row
+    /// back from delivery under the same protected-edit lease a text edit
+    /// takes, so adding an image never sends it early.
+    @MainActor
+    private func beginAttachmentEdit(_ item: QueuedMessage) async {
+        guard editingQueuedId == nil, attachmentEdit == nil, !queueEditBusy else { return }
+        if model.demo != nil {
+            // No host in demo mode; the editor writes the local row.
+            attachmentEdit = QueuedAttachmentEdit(lease: nil, draft: QueuedAttachmentDraft(row: item))
+            return
+        }
+        guard model.hostSupportsQueueEditLease(chat) else {
+            uploadError = "Update the chat host to edit queued messages safely."
+            return
+        }
+        queueEditBusy = true
+        let result = await store.beginQueuedEdit(id: item.id, instanceId: queueEditInstanceId)
+        queueEditBusy = false
+        switch result {
+        case .acquired(let lease):
+            guard queueEditorVisible else {
+                _ = await store.finishQueuedEdit(lease, action: "cancel")
+                return
+            }
+            var row = item
+            row.attachments = lease.attachments ?? item.attachments
+            attachmentLease = lease
+            attachmentEdit = QueuedAttachmentEdit(
+                lease: lease, draft: QueuedAttachmentDraft(row: row, leasedText: lease.text))
+            uploadError = nil
+        case .locked:
+            uploadError = "That queued message is being edited on another device."
+        case .missing:
+            uploadError = "That queued message is no longer available."
+        case .unavailable:
+            uploadError = "Connect to the chat host to edit this message."
+        }
+    }
+
+    /// Upload the new images to the host, then commit the row's attachment
+    /// list through `FinishQueuedMessageEdit`, as the desktop does. Returns
+    /// the error to show in the editor, or nil once saved.
+    @MainActor
+    private func commitAttachments(_ draft: QueuedAttachmentDraft,
+                                   lease: QueueEditLease?) async -> String? {
+        guard let text = draft.commitText else { return "A queued message needs text or an image." }
+        let deviceId = queueImageDeviceId
+        var uploaded: [String: String] = [:]
+        guard let lease else {
+            // Demo: stand-in paths, seeded so the row previews them.
+            for staged in draft.pendingUploads {
+                let path = "/demo/queued/\(staged.name)"
+                AttachmentImageCache.shared.seed(deviceId: deviceId, path: path,
+                                                 name: staged.name, data: staged.data)
+                uploaded[staged.id] = path
+            }
+            guard let paths = draft.committedPaths(uploaded: uploaded),
+                  store.applyQueuedAttachmentsLocally(id: draft.rowId, text: text, attachments: paths)
+            else { return "That queued message is no longer available." }
+            attachmentEdit = nil
+            return nil
+        }
+        do {
+            for staged in draft.pendingUploads {
+                let path = try await store.uploadAttachment(name: staged.name, data: staged.data)
+                AttachmentImageCache.shared.seed(deviceId: deviceId, path: path,
+                                                 name: staged.name, data: staged.data)
+                uploaded[staged.id] = path
+            }
+        } catch {
+            return "Attachment upload failed — \(error.localizedDescription)"
+        }
+        guard let params = draft.finishParams(chatId: store.chatId, lease: lease, uploaded: uploaded) else {
+            return "Couldn't save the attachments."
+        }
+        switch await store.finishQueuedEdit(lease, params: params) {
+        case .finished:
+            attachmentLease = nil
+            attachmentEdit = nil
+            return nil
+        case .conflict:
+            return "This message changed on another device. Close and try again."
+        case .missing:
+            attachmentLease = nil
+            return "That queued message is no longer available."
+        case .lost:
+            attachmentLease = nil
+            return "Edit protection changed. Close and try again."
+        case .unavailable:
+            return "Couldn't save the attachments. Check the connection to the chat host."
+        }
+    }
+
+    /// The editor closed without saving: let the row go as it was.
+    private func releaseAttachmentLease() {
+        attachmentEdit = nil
+        guard let lease = attachmentLease else { return }
+        attachmentLease = nil
+        Task { _ = await store.finishQueuedEdit(lease, action: "cancel") }
     }
 
     @MainActor
@@ -952,4 +1076,12 @@ struct QuestionPanel: View {
         typing = false
         respond(requestId, answers)
     }
+}
+
+/// One open Attachments editor: the row's draft and, outside demo mode, the
+/// lease that holds the row back from delivery while it is open.
+struct QueuedAttachmentEdit: Identifiable {
+    var id: String { draft.rowId }
+    let lease: QueueEditLease?
+    let draft: QueuedAttachmentDraft
 }
