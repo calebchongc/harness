@@ -3041,10 +3041,14 @@ impl Shell {
     /// Closing the last surface tab closes the surface host; a docked
     /// explorer keeps the pane open on its own.
     fn collapse_surfaces_if_empty(&mut self, panel_key: &str, cx: &mut Context<Self>) {
-        if panel_key == self.panel_key(cx)
-            && self.right_tabs.get(panel_key).is_none_or(Vec::is_empty)
-        {
-            self.set_surfaces_open(false, cx);
+        if self.right_tabs.get(panel_key).is_none_or(Vec::is_empty) {
+            if panel_key == self.panel_key(cx) {
+                self.set_surfaces_open(false, cx);
+            } else {
+                // A background surface can close after its chat loses focus.
+                // Park the collapsed state without animating the current pane.
+                self.panels.update(panel_key, |p| p.changes_open = false);
+            }
         }
     }
 
@@ -4161,8 +4165,22 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let was_active = self.resolved_right_active(cx) == surface;
-        let key = self.panel_key(cx);
+        let current_key = self.panel_key(cx);
+        let key = if matches!(surface, RightSurface::Browser(_)) {
+            // Browser close events can arrive after another pane takes focus.
+            // Tear down the owning tab, not the currently displayed chat's tab.
+            let Some(owner) = self
+                .right_tabs
+                .iter()
+                .find_map(|(key, tabs)| tabs.contains(&surface).then(|| key.clone()))
+            else {
+                return;
+            };
+            owner
+        } else {
+            current_key.clone()
+        };
+        let was_active = key == current_key && self.resolved_right_active(cx) == surface;
         let files = match surface {
             RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
             _ => None,

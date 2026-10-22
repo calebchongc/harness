@@ -384,3 +384,248 @@ fn canvas_link_promotion_parks_the_draft_and_repeated_links_keep_the_new_owner(
         assert!(!shell.right_pane_open(cx));
     });
 }
+
+#[gpui::test]
+fn browser_close_after_peer_focus_change_cleans_only_its_owner(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for keep_another_tab in [false, true] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            let link = activation(Some("peer-a"), LinkAction::Internal);
+            assert_eq!(
+                shell.activate_session_link(&link, window, cx),
+                LinkOutcome::Internal
+            );
+            if keep_another_tab {
+                assert_eq!(
+                    shell.activate_session_link(&link, window, cx),
+                    LinkOutcome::Internal
+                );
+            }
+            let closing = shell.browser_seq;
+            let browser = shell.browsers[&closing].clone();
+            assert_eq!(
+                shell.activate_session_link(
+                    &activation(Some("peer-b"), LinkAction::Internal),
+                    window,
+                    cx
+                ),
+                LinkOutcome::Internal
+            );
+            setup = Some((
+                cx.entity(),
+                browser,
+                closing,
+                shell.browser_seq,
+                shell.panels.get("peer-b"),
+            ));
+        });
+        let (shell, browser, closing, other, other_panel) = setup.unwrap();
+        browser.update(cx, |_, cx| cx.emit(BrowserEvent::Close));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.active_chat, "peer-b");
+            assert_eq!(
+                shell.state.read(cx).selected_chat.as_deref(),
+                Some("peer-b")
+            );
+            assert_eq!(
+                shell.resolved_right_active(cx),
+                RightSurface::Browser(other)
+            );
+            assert_eq!(shell.panels.get("peer-b"), other_panel);
+            assert_eq!(
+                shell.right_tabs["peer-b"],
+                vec![RightSurface::Browser(other)]
+            );
+            assert!(shell.browsers.contains_key(&other));
+            assert!(!shell.browsers.contains_key(&closing));
+            assert!(!shell.browser_subs.contains_key(&closing));
+            assert!(!shell.right_tabs["peer-a"].contains(&RightSurface::Browser(closing)));
+            assert_eq!(
+                shell.right_tabs["peer-a"].len(),
+                usize::from(keep_another_tab)
+            );
+            assert_eq!(shell.panels.get("peer-a").changes_open, keep_another_tab);
+        });
+        // A released subscription cannot close a second tab on duplicate delivery.
+        let before = shell.read_with(cx, link_state);
+        browser.update(cx, |_, cx| cx.emit(BrowserEvent::Close));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| assert_eq!(link_state(shell, cx), before));
+    }
+}
+
+#[gpui::test]
+fn browser_navigation_events_cannot_leak_into_another_peer_after_promotion(
+    cx: &mut TestAppContext,
+) {
+    use crate::browser::BrowserEvent;
+
+    let mut setup = None;
+    with_link_panes(cx, Some("owner"), |shell, window, cx| {
+        let link = activation(Some("peer-a"), LinkAction::Internal);
+        assert_eq!(
+            shell.activate_session_link(&link, window, cx),
+            LinkOutcome::Internal
+        );
+        let old = shell.browsers[&shell.browser_seq].clone();
+        assert_eq!(
+            shell.activate_session_link(&link, window, cx),
+            LinkOutcome::Internal
+        );
+        let active = shell.browsers[&shell.browser_seq].clone();
+        setup = Some((cx.entity(), old, active));
+    });
+    let (shell, old, active) = setup.unwrap();
+    for background_owner in [false, true] {
+        if background_owner {
+            shell.update(cx, |shell, cx| {
+                assert!(shell.select_chat_pane(1, cx));
+                shell.on_state_changed(&shell.state.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let before = shell.read_with(cx, link_state);
+        for browser in if background_owner {
+            vec![&old, &active]
+        } else {
+            vec![&old]
+        } {
+            for event in [
+                BrowserEvent::NewTab(Some(URL.into())),
+                BrowserEvent::OpenSource("/workspace/link-tests/source.rs".into()),
+            ] {
+                browser.update(cx, |_, cx| cx.emit(event));
+                cx.run_until_parked();
+                shell.read_with(cx, |shell, cx| assert_eq!(link_state(shell, cx), before));
+            }
+        }
+    }
+    shell.update(cx, |shell, cx| {
+        assert!(shell.select_chat_pane(0, cx));
+        shell.on_state_changed(&shell.state.clone(), cx);
+    });
+    cx.run_until_parked();
+    active.update(cx, |_, cx| cx.emit(BrowserEvent::NewTab(Some(URL.into()))));
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, cx| {
+        assert_eq!(shell.active_chat, "peer-a");
+        assert_eq!(shell.right_tabs["peer-a"].len(), 3);
+        assert!(!shell.right_tabs.contains_key("peer-b"));
+        assert_eq!(
+            shell.resolved_right_active(cx),
+            RightSurface::Browser(shell.browser_seq)
+        );
+        assert!(shell.right_pane_open(cx));
+    });
+}
+
+#[gpui::test]
+fn link_callbacks_follow_sources_across_focus_zoom_and_chat_tab_round_trips(
+    cx: &mut TestAppContext,
+) {
+    with_link_panes(cx, Some("owner"), |shell, window, cx| {
+        let link = activation(Some("peer-a"), LinkAction::Internal);
+        assert_eq!(
+            shell.activate_session_link(&link, window, cx),
+            LinkOutcome::Internal
+        );
+        let first = shell.browser_seq;
+
+        // A menu callback retained while another pane is zoomed cannot navigate
+        // until its source is visible again.
+        assert!(shell.select_chat_pane(1, cx));
+        shell.on_state_changed(&shell.state.clone(), cx);
+        shell.toggle_chat_pane_zoom(cx);
+        assert_rejected_unchanged(shell, &link, window, cx);
+        shell.toggle_chat_pane_zoom(cx);
+        assert_eq!(
+            shell.activate_session_link(&link, window, cx),
+            LinkOutcome::Internal
+        );
+        assert_eq!(shell.right_tabs["peer-a"].len(), 2);
+
+        // Parked layouts and browsers do not authorize a hidden transcript.
+        // Restoring the tab should make a fresh activation work normally.
+        shell.new_chat_tab(Some("parked".into()), window, cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        assert_eq!(shell.active_chat, "parked");
+        assert!(shell.browsers.contains_key(&first));
+        assert_rejected_unchanged(shell, &link, window, cx);
+        shell.switch_chat_tab(0, window, cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        assert_eq!(shell.active_chat, "peer-a");
+        assert!(shell.right_pane_open(cx));
+        assert_eq!(
+            shell.activate_session_link(&link, window, cx),
+            LinkOutcome::Internal
+        );
+        assert_eq!(shell.right_tabs["peer-a"].len(), 3);
+        assert!(!shell.right_tabs.contains_key("parked"));
+    });
+}
+
+#[gpui::test]
+fn alternating_peer_links_preserve_each_owners_active_browser_and_transcript(
+    cx: &mut TestAppContext,
+) {
+    with_link_panes(cx, Some("owner"), |shell, window, cx| {
+        let owner_view = shell.transcript.entity_id();
+        let a_view = shell.peer_chat_views["peer-a"].transcript.entity_id();
+        let b_view = shell.peer_chat_views["peer-b"].transcript.entity_id();
+        let mut latest = std::collections::HashMap::new();
+        for (turn, (source, entity)) in [
+            ("peer-a", a_view),
+            ("owner", owner_view),
+            ("peer-b", b_view),
+            ("peer-a", a_view),
+            ("peer-b", b_view),
+            ("owner", owner_view),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut link = activation(Some(source), LinkAction::Internal);
+            let url = format!("https://example.com/owners/{source}/{turn}");
+            link.target = LinkTarget::new("Synthetic page", &url);
+            assert_eq!(
+                shell.activate_session_link(&link, window, cx),
+                LinkOutcome::Internal
+            );
+            assert_eq!(shell.active_chat, source);
+            assert_eq!(shell.transcript.entity_id(), entity);
+            assert!(shell.right_pane_open(cx));
+            assert_eq!(
+                shell.resolved_right_active(cx),
+                RightSurface::Browser(shell.browser_seq)
+            );
+            latest.insert(source, shell.browser_seq);
+            assert_eq!(
+                shell.browsers[&shell.browser_seq]
+                    .read(cx)
+                    .page
+                    .url
+                    .as_deref(),
+                Some(url.as_str())
+            );
+        }
+        for (index, source, entity) in [
+            (0, "peer-a", a_view),
+            (1, "peer-b", b_view),
+            (2, "owner", owner_view),
+        ] {
+            assert!(shell.select_chat_pane(index, cx));
+            shell.on_state_changed(&shell.state.clone(), cx);
+            assert_eq!(shell.active_chat, source);
+            assert_eq!(shell.transcript.entity_id(), entity);
+            assert_eq!(shell.right_tabs[source].len(), 2);
+            assert_eq!(
+                shell.resolved_right_active(cx),
+                RightSurface::Browser(latest[source])
+            );
+            assert!(shell.right_pane_open(cx));
+        }
+    });
+}
