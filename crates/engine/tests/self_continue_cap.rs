@@ -1,8 +1,9 @@
 //! A chain of self-continued turns is capped (#341). An agent that keeps
 //! streaming without ever ending its turn used to park at the quiesce
 //! watchdog, resume on its next delta and park again forever, each cycle a
-//! new segment and more journal rows. Past `HARNESS_SELF_RESUME_MAX` resumes
-//! the session stays parked until a real turn boundary resets the chain.
+//! new segment and more journal rows. A real turn boundary resets the chain;
+//! past `HARNESS_SELF_RESUME_MAX` resumes the agent is stopped and the run
+//! ends with a visible error.
 //!
 //! A separate file because the env knobs are process-global.
 
@@ -15,6 +16,7 @@ use futures::stream::BoxStream;
 use tokio::sync::{Mutex, mpsc};
 
 use harness_adapters::{Harness, HarnessError, RunControls};
+use harness_doc::{MessagePart, SessionMessageEntry};
 use harness_engine::{EngineCore, HarnessRegistry};
 use harness_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
@@ -187,6 +189,26 @@ fn status(core: &EngineCore) -> Option<SessionStatus> {
     core.sessions.session_status(CHAT).map(|s| s.status)
 }
 
+fn journal(core: &EngineCore) -> Vec<AgentEvent> {
+    core.sessions
+        .subscribe(CHAT, 0)
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|e| e.event)
+        .collect()
+}
+
+/// Tolerant read (see e2e.rs): a snapshot mid-segment-write deserializes with
+/// fields missing — treat that instant as "not yet".
+fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
+    core.doc_host
+        .open(CHAT)
+        .ok()
+        .and_then(|h| h.doc().read_entries().ok())
+        .unwrap_or_default()
+}
+
 async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
@@ -222,7 +244,7 @@ async fn self_continue(rig: &Rig, line: &str) -> bool {
 }
 
 #[tokio::test]
-async fn a_self_continued_chain_stops_resuming_at_its_cap_until_the_next_turn() {
+async fn a_self_continued_chain_ends_visibly_at_its_cap() {
     let rig = assemble("watch the builds");
     rig.core
         .sessions
@@ -244,19 +266,54 @@ async fn a_self_continued_chain_stops_resuming_at_its_cap_until_the_next_turn() 
             "resume {round} is within the cap"
         );
     }
-    assert!(
-        !self_continue(&rig, "Still going, with no turn end.").await,
-        "past the cap the session stays parked"
-    );
-    assert_eq!(status(&rig.core), Some(SessionStatus::Idle));
-
-    // A real turn end closes the chain; the next wake resumes again.
+    // A real turn end closes the chain; the next wakes count afresh.
     rig.feed.send(done(DoneStatus::Completed)).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
+    for round in 0..SELF_RESUME_MAX {
+        assert!(
+            self_continue(&rig, &format!("New build {round} finished.")).await,
+            "a turn boundary resets the chain (resume {round})"
+        );
+    }
+
+    // Past the cap the run ends, visibly: an errored session, a journal
+    // closed by a Done that says why, and that reason in the transcript.
     assert!(
-        self_continue(&rig, "A new build finished.").await,
-        "a turn boundary resets the chain"
+        !self_continue(&rig, "Still going, with no turn end.").await,
+        "past the cap the session does not resume"
     );
+    wait_for(
+        || status(&rig.core) == Some(SessionStatus::Errored),
+        "the capped chain ends the run",
+    )
+    .await;
+    let events = journal(&rig.core);
+    match events.last() {
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error: Some(error),
+            ..
+        }) => assert!(error.contains("without ending its turn"), "{error}"),
+        other => panic!("journal must close with an errored Done, got {other:?}"),
+    }
+    wait_for(
+        || {
+            entries(&rig.core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(p, MessagePart::Error { message, .. }
+                        if message.contains("without ending its turn"))
+                })
+            })
+        },
+        "the stop reason in the transcript",
+    )
+    .await;
+
+    // The agent's further output goes nowhere.
+    let rows = events.len();
+    let _ = rig.feed.send(text("And more."));
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert_eq!(journal(&rig.core).len(), rows);
 
     rig.core.sessions.shutdown().await;
 }
