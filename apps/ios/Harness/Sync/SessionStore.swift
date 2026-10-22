@@ -1116,6 +1116,31 @@ final class SessionStore {
         respawnEscorts()
     }
 
+    /// Pending sends no command can run any more (#413): none of this
+    /// device's attempts for the message is still pending and unexpired. A
+    /// missed delivery deadline is not one of these; the host can adopt a
+    /// pending command at any time until it expires.
+    func undeliverableSends(now: Int64) -> Set<String> {
+        guard !pendingSends.isEmpty else { return [] }
+        let commands = doc.getList(id: "commands").getDeepValue().listValue ?? []
+        return Self.undeliverable(pending: pendingSends.map(\.messageId), commands: commands,
+                                  deviceId: config.deviceId, now: now)
+    }
+
+    nonisolated static func undeliverable(pending: [String], commands: [LoroValue],
+                                          deviceId: String, now: Int64) -> Set<String> {
+        var live: Set<String> = []
+        for value in commands {
+            guard let m = value.mapValue,
+                  m["issuedBy"]?.stringValue == deviceId,
+                  let messageId = m["payload"]?.mapValue?["messageId"]?.stringValue,
+                  (m["status"]?.stringValue ?? "pending") == "pending" else { continue }
+            if let expires = m["expiresAt"]?.i64Value, expires <= now { continue }
+            live.insert(messageId)
+        }
+        return Set(pending).subtracting(live)
+    }
+
     /// PR #172's retry semantics, phone half: exactly-once is per command
     /// ID, so a Run/Steer whose user message never landed and whose command
     /// can never execute again — Rejected (the host's dead-command sweep

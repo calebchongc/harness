@@ -864,7 +864,8 @@ struct ChatRow: View {
     /// spinner too — no fake progress on a send that hasn't left.
     private func sendBadge(_ state: SendState) -> (label: String, color: Color)? {
         switch state {
-        case .failed: return ("Failed", Theme.danger)
+        case .failed: return ("Not delivered", Theme.danger)
+        case .waiting: return ("Waiting", Theme.warning)
         case .queued: return ("Queued", Theme.warning)
         case .sending: return nil
         }

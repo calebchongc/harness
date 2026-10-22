@@ -168,6 +168,78 @@ final class NetworkReliabilityTests: XCTestCase {
         XCTAssertEqual(store.outbox.map(\.batchId), ["stable-b"])
     }
 
+    /// #413: missing the delivery grace does not make a send failed. While
+    /// its command is pending and unexpired the host can still run it, so the
+    /// phone says it is waiting. Only when no attempt can run does it read
+    /// Not delivered, and the original send time survives a retry.
+    @MainActor
+    func testUnadoptedSendWaitsForTheHostWhileItsCommandCanStillRun() throws {
+        let id = "waiting-send-\(UUID().uuidString)"
+        let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
+                               userId: "u", orgId: "o", deviceId: "phone",
+                               deviceName: "phone", tokens: nil, devBearer: "u@o")
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let store = SessionStore(chatId: id, config: config)
+        store.start(holdDial: true)
+        defer { store.stop() }
+        store.sendSteer(prompt: "sent from the phone")
+        let send = try XCTUnwrap(store.pendingSends.first)
+        let tenMinutes = send.started + 10 * 60_000
+        XCTAssertTrue(store.undeliverableSends(now: tenMinutes).isEmpty,
+                      "a pending, unexpired command can still run")
+        XCTAssertEqual(SendState.of(oldestStarted: send.started, undeliverable: false,
+                                    degraded: false, now: send.started + 1_000), .sending)
+        XCTAssertEqual(SendState.of(oldestStarted: send.started, undeliverable: false,
+                                    degraded: false, now: tenMinutes), .waiting)
+        XCTAssertEqual(SendState.of(oldestStarted: send.started, undeliverable: false,
+                                    degraded: true, now: tenMinutes), .queued)
+        // Past its own TTL the host will never drain it.
+        let expired = send.started + 365 * 24 * 3_600_000
+        XCTAssertEqual(store.undeliverableSends(now: expired), [send.messageId])
+        // A retry restarts the grace only; the age shown keeps the send time.
+        store.retryDelivery()
+        XCTAssertEqual(store.pendingSends.first?.at, send.at)
+
+        let attempt = { (status: String, expiresAt: Int64) -> LoroValue in
+            .map(value: [
+                "issuedBy": .string(value: "phone"),
+                "status": .string(value: status),
+                "expiresAt": .i64(value: expiresAt),
+                "payload": .map(value: ["messageId": .string(value: "m1")]),
+            ])
+        }
+        let now: Int64 = 1_000_000
+        // The host rejected it: authoritative, even inside the grace.
+        XCTAssertEqual(SessionStore.undeliverable(
+            pending: ["m1"], commands: [attempt("rejected", now + 60_000)],
+            deviceId: "phone", now: now), ["m1"])
+        XCTAssertEqual(SendState.of(oldestStarted: now, undeliverable: true,
+                                    degraded: false, now: now), .failed)
+        // A re-issued attempt that is still pending makes it live again.
+        XCTAssertTrue(SessionStore.undeliverable(
+            pending: ["m1"],
+            commands: [attempt("rejected", now + 60_000), attempt("pending", now + 60_000)],
+            deviceId: "phone", now: now).isEmpty)
+    }
+
+    /// #413: the run's timer counts the run; the wait before it is shown
+    /// separately, and only when the last prompt started this turn.
+    func testTurnWaitCountsFromThePromptToTheTurnStart() {
+        let entry = { (id: String, role: MessageRole, at: Int64) in
+            MessageEntry(id: id, role: role, parts: [], createdAt: at, deviceId: "phone")
+        }
+        let sent: Int64 = 1_000_000
+        let started = sent + 597_000
+        let prompt = [entry("u1", .user, sent)]
+        XCTAssertEqual(turnWaitSecs(entries: prompt, turnStartedAt: started), 597)
+        XCTAssertEqual(turnWaitSecs(entries: prompt + [entry("a1", .assistant, started + 1_000)],
+                                    turnStartedAt: started), 597)
+        XCTAssertNil(turnWaitSecs(entries: prompt, turnStartedAt: sent + 3_000))
+        XCTAssertNil(turnWaitSecs(entries: prompt, turnStartedAt: nil))
+        XCTAssertNil(turnWaitSecs(entries: prompt + [entry("a0", .assistant, sent + 5_000)],
+                                  turnStartedAt: started))
+    }
+
     /// #412: the nudge sent with a command can beat the command's row to the
     /// room. A second nudge goes out once the outbox, that row included, is
     /// acknowledged.
