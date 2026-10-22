@@ -2655,6 +2655,7 @@ impl Shell {
             cx.notify();
         }
         self.prune_file_explorers(cx);
+        self.prune_browser_surfaces(cx);
         self.chat_split_on_state_changed(cx);
         self.maybe_auto_download_update(cx);
         if let Some(chat_id) = state.update(cx, |state, _| state.take_linked_chat()) {
@@ -3086,10 +3087,14 @@ impl Shell {
     /// Closing the last surface tab closes the surface host; a docked
     /// explorer keeps the pane open on its own.
     fn collapse_surfaces_if_empty(&mut self, panel_key: &str, cx: &mut Context<Self>) {
-        if panel_key == self.panel_key(cx)
-            && self.right_tabs.get(panel_key).is_none_or(Vec::is_empty)
-        {
-            self.set_surfaces_open(false, cx);
+        if self.right_tabs.get(panel_key).is_none_or(Vec::is_empty) {
+            if panel_key == self.panel_key(cx) {
+                self.set_surfaces_open(false, cx);
+            } else {
+                // A background surface can close after its chat loses focus.
+                // Park the collapsed state without animating the current pane.
+                self.panels.update(panel_key, |p| p.changes_open = false);
+            }
         }
     }
 
@@ -3538,6 +3543,18 @@ impl Shell {
         }
     }
 
+    /// A snapshot can revoke a source before layout/host observers run. Keep
+    /// cached views usable during partial startup sync, but never navigate from
+    /// a known archived owner or an owner absent from an authoritative list.
+    fn chat_navigation_is_live(&self, chat_id: &str, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map_or(!state.chats_synced, |chat| !chat.archived)
+    }
+
     fn activate_session_link(
         &mut self,
         activation: &crate::markdown::render::LinkActivation,
@@ -3545,6 +3562,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> crate::markdown::render::LinkOutcome {
         use crate::markdown::render::{LinkAction, LinkOutcome};
+        if !matches!(self.route, Route::Chat) {
+            return LinkOutcome::Rejected;
+        }
         if self
             .state
             .read(cx)
@@ -3562,6 +3582,9 @@ impl Shell {
         else {
             return LinkOutcome::Rejected;
         };
+        if !self.chat_navigation_is_live(source, cx) {
+            return LinkOutcome::Rejected;
+        }
         let mut resolved = activation.clone();
         if resolved.action == LinkAction::Primary {
             resolved.action = if crate::settings::current(cx).open_web_links_in_harness {
@@ -3680,18 +3703,27 @@ impl Shell {
     ) {
         // Subagent transcripts are keyed `{chatId}--sub--{call}`.
         let chat_id = source.split("--sub--").next().unwrap_or(source);
-        if self.active_chat.is_empty()
+        if !matches!(self.route, Route::Chat)
+            || self.active_chat.is_empty()
             || chat_id != self.active_chat
             || self.state.read(cx).selected_chat.as_deref() != Some(chat_id)
+            || !self.chat_navigation_is_live(chat_id, cx)
         {
             return;
         }
         let host = {
             let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .filter(|chat| Some(chat.device_id.as_str()) != state.local_device_id.as_deref())
-                .map(|chat| state.device_name(&chat.device_id).unwrap_or("another computer").to_owned())
+            // Unlike a web URL, this page is a host-local file. A partial
+            // snapshot without its owner cannot establish which device has it.
+            let Some(chat) = state.selected_chat_row() else {
+                return;
+            };
+            (Some(chat.device_id.as_str()) != state.local_device_id.as_deref()).then(|| {
+                state
+                    .device_name(&chat.device_id)
+                    .unwrap_or("another computer")
+                    .to_owned()
+            })
         };
         if let Some(host) = host {
             self.sidebar_notice = Some(format!("This view is saved on {host}. Open it there.").into());
@@ -3716,6 +3748,17 @@ impl Shell {
     ) {
         let open = url.map_or(BrowserOpen::Blank, BrowserOpen::Url);
         self.open_browser_surface(open, window, cx);
+    }
+
+    /// Recheck the actual host at event delivery, not just when a native
+    /// page queued the event. Hidden or changing owners cannot drive UI focus.
+    fn browser_host_is_active(&self, owner: &str, id: u64, cx: &App) -> bool {
+        matches!(self.route, Route::Chat)
+            && self.active_chat == owner
+            && self.state.read(cx).selected_chat.as_deref() == Some(owner)
+            && self.chat_navigation_is_live(owner, cx)
+            && self.right_pane_open(cx)
+            && self.resolved_right_active(cx) == RightSurface::Browser(id)
     }
 
     fn open_browser_surface(
@@ -3750,22 +3793,24 @@ impl Shell {
         }
         let owner = key.clone();
         let sub = cx.subscribe_in(&browser, window, move |this, _, event, window, cx| {
+            // A native/action event may already be queued when the host hides
+            // or selection starts changing. Only the visible selected browser
+            // may navigate; lifecycle cleanup must still work in the background.
+            if matches!(
+                event,
+                crate::browser::BrowserEvent::NewTab(_)
+                    | crate::browser::BrowserEvent::OpenSource(_)
+            ) && !this.browser_host_is_active(&owner, id, cx)
+            {
+                return;
+            }
             match event {
                 crate::browser::BrowserEvent::Changed => cx.notify(),
                 crate::browser::BrowserEvent::NewTab(url) => {
-                    // A background page cannot open a tab in the wrong session.
-                    if this.panel_key(cx) == owner
-                        && this.resolved_right_active(cx) == RightSurface::Browser(id)
-                    {
-                        this.add_browser_surface(url.clone(), window, cx);
-                    }
+                    this.add_browser_surface(url.clone(), window, cx);
                 }
                 crate::browser::BrowserEvent::OpenSource(path) => {
-                    if this.panel_key(cx) == owner
-                        && this.resolved_right_active(cx) == RightSurface::Browser(id)
-                    {
-                        this.open_workspace_file_link(path, window, cx);
-                    }
+                    this.open_workspace_file_link(path, window, cx);
                 }
                 crate::browser::BrowserEvent::Close => {
                     this.close_right_surface(RightSurface::Browser(id), window, cx)
@@ -4198,6 +4243,60 @@ impl Shell {
         }))
     }
 
+    /// Release browser ownership without changing keyboard focus. State-sync
+    /// deletion has no Window and must not disturb a different visible control.
+    /// Return whether an explicit tab close should restore composer focus.
+    fn release_browser_surface(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        let surface = RightSurface::Browser(id);
+        let Some(owner) = self
+            .right_tabs
+            .iter()
+            .find_map(|(key, tabs)| tabs.contains(&surface).then(|| key.clone()))
+        else {
+            return false;
+        };
+        let was_active = self.browser_host_is_active(&owner, id, cx);
+        if let Some(tabs) = self.right_tabs.get_mut(&owner) {
+            tabs.retain(|tab| *tab != surface);
+        }
+        if let Some(browser) = self.browsers.remove(&id) {
+            browser.update(cx, |browser, cx| browser.close(cx));
+        }
+        self.browser_subs.remove(&id);
+        self.panels.update(&owner, |panel| {
+            if panel.right_active == surface {
+                panel.right_active = RightSurface::Picker;
+            }
+        });
+        self.collapse_surfaces_if_empty(&owner, cx);
+        cx.notify();
+        was_active
+    }
+
+    fn prune_browser_surfaces(&mut self, cx: &mut Context<Self>) {
+        let stale: Vec<_> = {
+            let state = self.state.read(cx);
+            // Missing rows before the first complete snapshot are not deletions.
+            if !state.chats_synced {
+                return;
+            }
+            let live: std::collections::HashSet<_> =
+                state.chats.iter().map(|chat| chat.id.as_str()).collect();
+            self.right_tabs
+                .iter()
+                .filter(|(owner, _)| !live.contains(owner.as_str()))
+                .flat_map(|(_, tabs)| tabs.iter())
+                .filter_map(|surface| match surface {
+                    RightSurface::Browser(id) => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        };
+        for id in stale {
+            self.release_browser_surface(id, cx);
+        }
+    }
+
     /// A surface tab's ✕. The active fallback happens naturally through
     /// [`Self::resolved_right_active`] on the next frame.
     fn close_right_surface(
@@ -4206,7 +4305,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let was_active = self.resolved_right_active(cx) == surface;
+        if let RightSurface::Browser(id) = surface {
+            if self.release_browser_surface(id, cx) {
+                window.focus(&self.composer.focus_handle(cx), cx);
+            }
+            return;
+        }
         let key = self.panel_key(cx);
         let files = match surface {
             RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
@@ -4229,15 +4333,7 @@ impl Shell {
         }
         match surface {
             RightSurface::File(_) => {}
-            RightSurface::Browser(id) => {
-                if let Some(browser) = self.browsers.remove(&id) {
-                    browser.update(cx, |browser, cx| browser.close(cx));
-                }
-                self.browser_subs.remove(&id);
-                if was_active {
-                    window.focus(&self.composer.focus_handle(cx), cx);
-                }
-            }
+            RightSurface::Browser(_) => unreachable!("browser surfaces are released above"),
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.
                 self.diffs.remove(&id);
@@ -5544,15 +5640,21 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if let Some(tabs) = self.right_tabs.get(&chat_id) {
-            for surface in tabs {
-                if let RightSurface::Browser(id) = surface {
-                    if let Some(browser) = self.browsers.remove(id) {
-                        browser.update(cx, |browser, cx| browser.close(cx));
-                    }
-                    self.browser_subs.remove(id);
-                }
-            }
+        // Use the ordinary owner-aware close path: releasing only browser
+        // entities leaves dangling tab registrations and an open empty host.
+        let browsers: Vec<_> = self
+            .right_tabs
+            .get(&chat_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter_map(|surface| match surface {
+                RightSurface::Browser(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        for id in browsers {
+            self.release_browser_surface(id, cx);
         }
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             // Deleting the sole session in a tab returns to the last visited

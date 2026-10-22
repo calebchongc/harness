@@ -400,6 +400,52 @@ fn open_peer_link_menu(peer: &Entity<Transcript>, row: &str, cx: &mut gpui::Visu
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[gpui::test]
+fn promoted_peer_links_still_work_after_focus_moves_away_and_back(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    for menu in [false, true] {
+        with_panes(
+            cx,
+            vec![reply(
+                "[Documentation](https://example.com/focus-round-trip)",
+            )],
+            |shell, peer, current, cx| {
+                prepare_link_panes(&shell, false, true, cx);
+                for count in 1..=3 {
+                    if menu {
+                        open_peer_link_menu(&peer, "reply#text.0:0", cx);
+                        let row = cx.debug_bounds("Open in Harness").unwrap();
+                        cx.simulate_click(row.center(), Default::default());
+                    } else {
+                        cx.simulate_click(text_point(&peer, "reply#text.0:0"), Default::default());
+                    }
+                    assert_peer_active(&shell, &peer, &current, cx);
+                    shell.read_with(cx, |shell, cx| {
+                        assert_eq!(shell.active_chat, "peer");
+                        assert_eq!(shell.right_tabs["peer"].len(), count);
+                        assert!(!shell.right_tabs.contains_key("current"));
+                        assert!(shell.right_pane_open(cx));
+                    });
+                    // Demote the same entity through a real pointer release.
+                    let point = text_point(&current, "current-reply#text.0:0");
+                    cx.simulate_click(point, Default::default());
+                    draw(cx);
+                    shell.read_with(cx, |shell, cx| {
+                        assert_eq!(shell.active_chat, "current");
+                        assert_eq!(shell.transcript.entity_id(), current.entity_id());
+                        assert_eq!(
+                            shell.peer_chat_views["peer"].transcript.entity_id(),
+                            peer.entity_id()
+                        );
+                        assert!(!shell.right_pane_open(cx));
+                    });
+                }
+            },
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui::test]
 fn peer_primary_links_follow_preferences_after_hover_and_repeated_clicks(
     cx: &mut gpui::TestAppContext,
 ) {
