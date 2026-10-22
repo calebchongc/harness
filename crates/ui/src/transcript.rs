@@ -9395,6 +9395,35 @@ fn detail_body(
     theme: &Theme,
 ) -> AnyElement {
     let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
+    // Every line joins the transcript's selection, so paths, output and
+    // thoughts can be drag-selected (across lines too) and copied. Lines clip
+    // rather than ellipsize: selection maps the pointer onto the full text.
+    let line_key = |line_ix: usize| -> std::sync::Arc<str> { format!("{key}:{line_ix}").into() };
+    let clip = |text: AnyElement| {
+        div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(text)
+    };
+    let mono = || gpui::font(theme.font_mono.clone());
+    let plain_line = |line_ix: usize, text: SharedString| {
+        let runs = vec![TextRun {
+            len: text.len(),
+            font: mono(),
+            color: theme.text_faint,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        clip(render::selectable_text_element(
+            line_key(line_ix),
+            text,
+            runs,
+            theme.selection,
+        ))
+    };
     match detail {
         // No comment layer: an inline tool diff is a record of what the
         // agent already did, not a review surface.
@@ -9409,7 +9438,8 @@ fn detail_body(
             .py(px(6.0))
             .font_family(theme.font_mono.clone())
             .text_size(px(TOOL_TEXT_SIZE))
-            .children(stats.iter().map(|stat| {
+            .children(stats.iter().enumerate().map(|(stat_ix, stat)| {
+                let path = plain_line(stat_ix, SharedString::from(stat.path.clone()));
                 div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
@@ -9425,14 +9455,7 @@ fn detail_body(
                         .size(px(14.0))
                         .flex_none(),
                     )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(stat.path.clone())),
-                    )
+                    .child(div().min_w_0().flex_1().child(path))
                     .child(
                         div()
                             .flex_none()
@@ -9455,21 +9478,24 @@ fn detail_body(
             .font_family(theme.font_mono.clone())
             .text_size(px(TOOL_TEXT_SIZE))
             .children(lines.iter().enumerate().map(|(ix, line)| {
-                let text = render::autolinked_text(
-                    format!("{key}:{ix}").into(),
-                    line.clone(),
-                    link.cloned(),
-                    theme,
-                )
-                .unwrap_or_else(|| line.clone().into_any_element());
-                div()
+                let row = div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .text_color(theme.text_faint)
-                    .child(div().w_full().min_w_0().truncate().child(text))
+                    .text_color(theme.text_faint);
+                if line.is_empty() {
+                    return row;
+                }
+                row.child(clip(render::selectable_autolinked_text(
+                    line_key(ix),
+                    line.clone(),
+                    mono(),
+                    theme.text_faint,
+                    link.cloned(),
+                    theme,
+                )))
             }))
             .when(*truncated_by > 0, |block| {
                 block.child(more_lines_row(*truncated_by, theme))
@@ -9481,7 +9507,7 @@ fn detail_body(
         } => body
             .py(px(6.0))
             .text_size(px(TOOL_TEXT_SIZE))
-            .children(lines.iter().map(|line| {
+            .children(lines.iter().enumerate().map(|(line_ix, line)| {
                 let row = div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
@@ -9491,13 +9517,12 @@ fn detail_body(
                 let Some((text, runs)) = thought_line_text(line, theme) else {
                     return row; // blank separator row
                 };
-                row.child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .truncate()
-                        .child(StyledText::new(text).with_runs(runs)),
-                )
+                row.child(clip(render::selectable_text_element(
+                    line_key(line_ix),
+                    text,
+                    runs,
+                    theme.selection,
+                )))
             }))
             .when(*truncated_by > 0, |block| {
                 block.child(more_lines_row(*truncated_by, theme))
@@ -10727,6 +10752,68 @@ mod tests {
         assert_eq!(seen[0].target.original, "https://example.com/review/123");
         assert_eq!(seen[0].action, render::LinkAction::Primary);
         assert_eq!(seen[0].source_session.as_deref(), Some("chat"));
+    }
+
+    #[gpui::test]
+    fn expanded_tool_output_text_drag_selects_across_lines(cx: &mut gpui::TestAppContext) {
+        let _selection = crate::markdown::selection::test_state_lock();
+        struct Detail;
+        impl Render for Detail {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                div()
+                    .w(px(600.0))
+                    .child(render::selection_frame_reset())
+                    .child(detail_body(
+                        &ToolDetail::Output {
+                            lines: vec![
+                                "cat /workspace/src/main.rs".into(),
+                                "see https://example.com/docs".into(),
+                            ],
+                            truncated_by: 0,
+                        },
+                        None,
+                        "probe#out",
+                        None,
+                        &theme,
+                    ))
+            }
+        }
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Detail);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let first = render::selection_test_bounds("probe#out:0");
+        // The line with a URL joins the selection too.
+        let second = render::selection_test_bounds("probe#out:1");
+        let start = first.origin + gpui::point(px(1.0), first.size.height / 2.0);
+        let end = gpui::point(second.right() + px(40.0), second.center().y);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Left,
+            position: start,
+            click_count: 1,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: end,
+            pressed_button: Some(MouseButton::Left),
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: MouseButton::Left,
+            position: end,
+            ..Default::default()
+        });
+        assert_eq!(
+            crate::markdown::selection::selected_text().as_deref(),
+            Some("cat /workspace/src/main.rs\nsee https://example.com/docs")
+        );
+        crate::markdown::selection::clear_if_owner("probe#out:0");
     }
 
     #[test]
