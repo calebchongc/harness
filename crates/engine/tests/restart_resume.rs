@@ -1199,3 +1199,144 @@ async fn a_quit_while_idle_with_nothing_running_resumes_nothing() {
         "resumed with nothing cut short: {dispatched:?}"
     );
 }
+
+/// Reports each session's cwd with symlinks resolved, as Claude Code does: a
+/// session started in `/tmp/x` on macOS reports `/private/tmp/x`.
+struct ResolvesCwd<H>(H);
+
+#[async_trait]
+impl<H: Harness> Harness for ResolvesCwd<H> {
+    fn id(&self) -> HarnessId {
+        self.0.id()
+    }
+    fn display_name(&self) -> &str {
+        self.0.display_name()
+    }
+    fn supports_steering(&self) -> bool {
+        self.0.supports_steering()
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        self.0.steering_mode()
+    }
+    fn deterministic_turn_end(&self) -> bool {
+        self.0.deterministic_turn_end()
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        self.0.reasoning_levels()
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.0.models().await
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let resolved = std::fs::canonicalize(&request.cwd)
+            .expect("run cwd exists")
+            .to_string_lossy()
+            .to_string();
+        let stream = self.0.run(request, controls).await?;
+        Ok(stream
+            .map(move |event| match event {
+                Ok(AgentEvent::SessionStarted {
+                    harness,
+                    model,
+                    tools,
+                    session_id,
+                    assistant_message_id,
+                    ..
+                }) => Ok(AgentEvent::SessionStarted {
+                    harness,
+                    model,
+                    tools,
+                    cwd: resolved.clone(),
+                    session_id,
+                    assistant_message_id,
+                }),
+                other => other,
+            })
+            .boxed())
+    }
+}
+
+/// A chat whose folder is opened through a symlink: the agent records the
+/// session under the folder's real path, which differs from the chat's path as
+/// a string. Quitting mid-turn must still resume that session on the next
+/// boot, not start a new one without the conversation.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_quit_mid_turn_resumes_the_session_of_a_chat_opened_through_a_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-quit").unwrap();
+    let real = tmp.path().join("real-project");
+    let link = tmp.path().join("linked-project");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let link = link.to_string_lossy().to_string();
+
+    let first: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble_with(
+        &dir,
+        ResolvesCwd(scripted(
+            &first,
+            vec![AgentEvent::TextDelta {
+                text: "working on it…".into(),
+            }],
+        )),
+    );
+    core.workspace
+        .create_space("space-linked", &core.device_id, &link, None, false)
+        .expect("create space row");
+    core.workspace
+        .create_chat(CHAT, Some("space-linked"), None, None, None)
+        .expect("create chat row");
+    core.workspace
+        .rename_chat(CHAT, "Pre-titled")
+        .expect("rename chat");
+    queue_run(&core, "long task", &link, "msg-user-1");
+    wait_for(
+        || session_status(&core) == Some(harness_proto::SessionStatus::Working),
+        "the turn to start",
+    )
+    .await;
+    core.shutdown().await;
+    drop(core);
+
+    let second: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble_with(
+        &dir,
+        ResolvesCwd(ScriptedHarness {
+            requests: second.clone(),
+            session_id: "hs-after-quit".into(),
+            script: Mutex::new(None),
+        }),
+    );
+    wait_for(
+        || {
+            second
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.prompt == "long task")
+        },
+        "the cut-short turn to be resumed",
+    )
+    .await;
+    let resumed = second
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.prompt == "long task")
+        .cloned()
+        .unwrap();
+    assert_eq!(resumed.cwd, link);
+    assert_eq!(
+        resumed.resume.as_deref(),
+        Some("hs-before-quit"),
+        "the resumed turn must continue the session it was cut short in"
+    );
+    core.shutdown().await;
+}
