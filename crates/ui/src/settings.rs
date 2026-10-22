@@ -555,6 +555,14 @@ pub enum ComposerSendBehavior {
     ModEnter,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowUpBehavior {
+    #[default]
+    Queue,
+    Steer,
+}
+
 /// Persist the latest revision. Safe to call at shutdown.
 pub fn flush(cx: &mut App) {
     if !cx.has_global::<SettingsStore>() {
@@ -741,6 +749,8 @@ pub struct UiSettings {
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
     pub composer_send_behavior: ComposerSendBehavior,
+    /// How messages sent while the agent is working are handled.
+    pub follow_up_behavior: FollowUpBehavior,
     /// Legacy global opt-in; per-harness preferences take precedence.
     pub skills_in_slash_menu: bool,
     pub skill_completion_by_harness:
@@ -979,6 +989,7 @@ impl Default for UiSettings {
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
             composer_send_behavior: ComposerSendBehavior::default(),
+            follow_up_behavior: FollowUpBehavior::default(),
             skills_in_slash_menu: false,
             skill_completion_by_harness: Default::default(),
             appshots_enabled: false,
@@ -1998,6 +2009,32 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_behavior_defaults_ignores_obsolete_key_and_round_trips() {
+        let missing: UiSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.follow_up_behavior, FollowUpBehavior::Queue);
+
+        let obsolete: UiSettings =
+            serde_json::from_str(r#"{"activeTurnSendBehavior":"steer"}"#).unwrap();
+        assert_eq!(obsolete.follow_up_behavior, FollowUpBehavior::Queue);
+
+        let dir = tempfile::tempdir().unwrap();
+        for behavior in [FollowUpBehavior::Queue, FollowUpBehavior::Steer] {
+            let mut settings = UiSettings::default();
+            settings.follow_up_behavior = behavior;
+            settings.save(dir.path()).unwrap();
+            let persisted = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+            assert!(persisted.contains(&format!(
+                r#""followUpBehavior": "{}""#,
+                match behavior {
+                    FollowUpBehavior::Queue => "queue",
+                    FollowUpBehavior::Steer => "steer",
+                }
+            )));
+            assert_eq!(UiSettings::load(dir.path()).follow_up_behavior, behavior);
+        }
+    }
+
+    #[test]
     fn window_geometry_round_trips_and_legacy_settings_default() {
         let dir = tempfile::tempdir().unwrap();
         let geometry = WindowGeometry {
@@ -2524,6 +2561,7 @@ mod tests {
             },
             escape_stops_active_agent: true,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
+            follow_up_behavior: FollowUpBehavior::Steer,
             skills_in_slash_menu: true,
             skill_completion_by_harness: Default::default(),
             appshots_enabled: false,

@@ -41,6 +41,7 @@ use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
 
+mod follow_up;
 // ---------------------------------------------------------------------------
 // Constants + pure decision logic
 // ---------------------------------------------------------------------------
@@ -1021,6 +1022,7 @@ actions!(
         Newline,
         MessageNewlineOrAccept,
         ModifiedSubmit,
+        FollowUpSubmit,
         Submit,
         Undo,
         Redo,
@@ -1860,6 +1862,11 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
             )),
         }
     }
+    message_bindings.push(KeyBinding::new(
+        &platform_combo("mod-alt-enter"),
+        FollowUpSubmit,
+        Some(MESSAGE_COMPOSER_CONTEXT),
+    ));
 
     cx.bind_keys(palette_input_bindings());
     // Sidebar search uses palette text editing but has no horizontal menu
@@ -1877,6 +1884,7 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
 pub enum ComposerInputEvent {
     Submitted,
     ModifiedSubmitted,
+    FollowUpSubmitted,
     Edited,
     CursorMoved,
     ViewportChanged,
@@ -3224,6 +3232,14 @@ impl ComposerInput {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
             EnterOutcome::Submit => cx.emit(ComposerInputEvent::ModifiedSubmitted),
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
+        }
+    }
+
+    fn follow_up_submit(&mut self, _: &FollowUpSubmit, _: &mut Window, cx: &mut Context<Self>) {
+        match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
+            EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
+            EnterOutcome::Submit => cx.emit(ComposerInputEvent::FollowUpSubmitted),
+            EnterOutcome::Newline => unreachable!("follow-up action cannot insert a newline"),
         }
     }
 
@@ -4889,6 +4905,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::message_newline_or_accept))
             .on_action(cx.listener(Self::modified_submit))
+            .on_action(cx.listener(Self::follow_up_submit))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
@@ -5769,6 +5786,8 @@ pub struct Composer {
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
+    follow_up_menu_open: bool,
+    follow_up_focus: FocusHandle,
     /// Interrupt/answer commands get their own slot: assigning `send_task`
     /// DROPPED an in-flight send future mid-upload — no banner, no cleanup,
     /// `sending` stuck true forever (2026-08-19 incident, "press Stop while
@@ -5935,6 +5954,7 @@ impl Composer {
             ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
                 this.on_input_edited(cx)
             }
+            ComposerInputEvent::FollowUpSubmitted => this.on_follow_up_shortcut(cx),
             ComposerInputEvent::ViewportChanged => cx.notify(),
             // The slash popup and the mention popup share the input's
             // completion key routing; they are mutually exclusive by token
@@ -6037,6 +6057,8 @@ impl Composer {
             queue_previews: HashMap::new(),
             queue_removing: HashSet::new(),
             queue_shortcut_revealed: false,
+            follow_up_menu_open: false,
+            follow_up_focus: cx.focus_handle(),
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: None,
@@ -8134,6 +8156,7 @@ impl Composer {
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
+            self.follow_up_menu_open = false;
             if !key.is_empty() && !self.current_key.is_empty() {
                 // Switching between established chats still snaps to the new
                 // draft; a tail from a hero transition belongs to its old chat.
@@ -8353,7 +8376,7 @@ impl Composer {
     /// New chats need a runnable agent, but may target the device's home
     /// directory without a project. Existing chats carry their own run config.
     fn send_blocked(&self, cx: &App) -> bool {
-        if self.queue_edit_finishing {
+        if self.sending || self.queue_edit_finishing {
             return true;
         }
         let state = self.state.read(cx);
@@ -8392,6 +8415,62 @@ impl Composer {
             send_button_mode(self.run_live(cx), has_text),
             pending_prompt,
         )
+    }
+
+    fn follow_up_steer_unavailable(&self, cx: &App) -> Option<follow_up::SteerUnavailable> {
+        let live = self.run_live(cx);
+        let has_text = !self.input.read(cx).text().trim().is_empty()
+            || !self
+                .state
+                .read(cx)
+                .review_comments(&self.current_key)
+                .is_empty();
+        let has_attachments = !self.staged().is_empty() || !self.staged_appshots().is_empty();
+        let queue_capability = capabilities::MESSAGE_QUEUE_ACTIONS_V1;
+        let state = self.state.read(cx);
+        let queue_actions_supported = state
+            .engine()
+            .is_some_and(|engine| engine.engine_info().supports(queue_capability))
+            && state
+                .selected_chat
+                .as_deref()
+                .is_some_and(|chat_id| state.chat_host_supports(chat_id, queue_capability));
+        let supports_step_boundary = self.pickers.read(cx).selected_chat_supports_steering(cx);
+        follow_up::steer_unavailable(
+            live,
+            has_text,
+            has_attachments,
+            queue_actions_supported,
+            supports_step_boundary,
+        )
+    }
+
+    fn follow_up_main_action(&self, cx: &App) -> follow_up::MainAction {
+        let mode = self.button_mode(cx);
+        let behavior = crate::settings::with_current(cx, |settings| settings.follow_up_behavior);
+        follow_up::main_action(
+            self.run_live(cx),
+            mode != SendButtonMode::Stop
+                && composer_has_content(
+                    self.input.read(cx).text(),
+                    self.staged().len() + self.staged_appshots().len(),
+                    self.state.read(cx).review_comments(&self.current_key).len(),
+                ),
+            behavior,
+            self.follow_up_steer_unavailable(cx),
+        )
+    }
+
+    fn follow_up_queue_actions_supported(&self, cx: &App) -> bool {
+        let capability = capabilities::MESSAGE_QUEUE_ACTIONS_V1;
+        let state = self.state.read(cx);
+        state
+            .engine()
+            .is_some_and(|engine| engine.engine_info().supports(capability))
+            && state
+                .selected_chat
+                .as_deref()
+                .is_some_and(|chat_id| state.chat_host_supports(chat_id, capability))
     }
 
     fn execute_workspace_command(
@@ -8509,10 +8588,60 @@ impl Composer {
             SendButtonMode::Stop => {}
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
-            SendButtonMode::Send => self.send(text, false, cx),
-            // Busy: keep the message queued until the current turn ends.
-            SendButtonMode::Queue => self.send(text, true, cx),
+            SendButtonMode::Send => self.send(text, false, None, cx),
+            SendButtonMode::Queue => {
+                // The saved policy and main button label share the same
+                // reducer, so Enter cannot quietly choose another delivery.
+                let follow_up = match self.follow_up_main_action(cx) {
+                    follow_up::MainAction::FollowUp(follow_up::FollowUpAction::Steer) => {
+                        Some(follow_up::FollowUpAction::Steer)
+                    }
+                    _ => None,
+                };
+                self.send(text, true, follow_up, cx);
+            }
         }
+    }
+
+    fn on_follow_up_shortcut(&mut self, cx: &mut Context<Self>) {
+        if self.editing_queued.is_some()
+            || self.wizard.is_some()
+            || self.button_mode(cx) != SendButtonMode::Queue
+            || self.send_blocked(cx)
+        {
+            return;
+        }
+        let behavior = crate::settings::with_current(cx, |settings| settings.follow_up_behavior);
+        let action = match follow_up::opposite_follow_up(behavior) {
+            crate::settings::FollowUpBehavior::Queue => follow_up::FollowUpAction::Queue,
+            crate::settings::FollowUpBehavior::Steer => follow_up::FollowUpAction::Steer,
+        };
+        self.choose_follow_up(action, cx);
+    }
+
+    fn choose_follow_up(&mut self, action: follow_up::FollowUpAction, cx: &mut Context<Self>) {
+        if self.button_mode(cx) != SendButtonMode::Queue || self.send_blocked(cx) {
+            return;
+        }
+        if matches!(action, follow_up::FollowUpAction::Steer)
+            && let Some(reason) = self.follow_up_steer_unavailable(cx)
+        {
+            self.failure = Some(follow_up::steer_reason(reason).into());
+            self.failure_key = self.state.read(cx).selected_chat.clone();
+            cx.notify();
+            return;
+        }
+        if matches!(action, follow_up::FollowUpAction::StopAndSend)
+            && !self.follow_up_queue_actions_supported(cx)
+        {
+            self.failure = Some("The chat host does not support stop and send".into());
+            self.failure_key = self.state.read(cx).selected_chat.clone();
+            cx.notify();
+            return;
+        }
+        let text = self.input.read(cx).text().to_string();
+        let intent = (!matches!(action, follow_up::FollowUpAction::Queue)).then_some(action);
+        self.send(text, true, intent, cx);
     }
 
     /// The shell's bubbling fallback handles the queue chord after a click
@@ -8570,7 +8699,13 @@ impl Composer {
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        text: String,
+        queue: bool,
+        follow_up: Option<follow_up::FollowUpAction>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.check_reference_delivery(&text, cx) {
             return;
         }
@@ -8586,6 +8721,25 @@ impl Composer {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
+        if let Some(action) = follow_up {
+            let capability = capabilities::MESSAGE_QUEUE_ACTIONS_V1;
+            let supported = !is_new
+                && engine.engine_info().supports(capability)
+                && self.state.read(cx).chat_host_supports(&chat_id, capability);
+            let steer_allowed = matches!(action, follow_up::FollowUpAction::Steer)
+                && self.staged().is_empty()
+                && self.staged_appshots().is_empty()
+                && self.pickers.read(cx).selected_chat_supports_steering(cx);
+            if !supported || (matches!(action, follow_up::FollowUpAction::Steer) && !steer_allowed)
+            {
+                self.failure = Some(
+                    "The follow-up action is no longer available; your message was not sent".into(),
+                );
+                self.failure_key = Some(chat_id);
+                cx.notify();
+                return;
+            }
+        }
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
@@ -8839,7 +8993,7 @@ impl Composer {
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
-            let result: Result<Option<String>, String> = async {
+            let result: Result<(Option<String>, Option<String>), String> = async {
                 // Attachments stage FIRST — before the chat row or anything
                 // else exists. Staging is chat-independent (keyed by
                 // uploadId), and ordering it first makes a new-chat send
@@ -9129,7 +9283,50 @@ impl Composer {
                         .and_then(serde_json::Value::as_str)
                         .filter(|id| !id.is_empty())
                         .ok_or_else(|| "Send failed: queue did not return an id".to_string())?;
-                    return Ok(Some(queue_id.to_string()));
+                    let queue_id = queue_id.to_string();
+                    let mut follow_up_warning = None;
+                    if let Some(action) = follow_up {
+                        let method = match action {
+                            follow_up::FollowUpAction::Queue => unreachable!("Queue needs no promotion"),
+                            follow_up::FollowUpAction::Steer => methods::STEER_QUEUED_MESSAGE_NOW,
+                            follow_up::FollowUpAction::StopAndSend => methods::SEND_QUEUED_MESSAGE_NOW,
+                        };
+                        this.update(cx, |composer, cx| {
+                            composer.state.update(cx, |state, cx| {
+                                state.begin_pending_send(&chat_id, &queue_id, chrono::Utc::now());
+                                cx.notify();
+                            });
+                        })
+                        .ok();
+                        let mut action_params = serde_json::json!({
+                            "chatId": chat_id.clone(),
+                            "id": queue_id.clone(),
+                        });
+                        if let Some(host) = host_device_id.as_ref()
+                            && let Some(object) = action_params.as_object_mut()
+                        {
+                            object.insert(
+                                "targetDeviceId".into(),
+                                serde_json::Value::String(host.clone()),
+                            );
+                        }
+                        match engine.client().call(method, action_params).await {
+                            Ok(reply) if reply.get("sent").and_then(serde_json::Value::as_bool) == Some(true) => {}
+                            Ok(reply) => {
+                                tracing::debug!(method, ?reply, "queued follow-up action was not accepted");
+                                follow_up_warning = Some(
+                                    "Message queued, but the follow-up action was not accepted. Check the queue or transcript.".to_string(),
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(method, error = %error, "queued follow-up action failed after enqueue");
+                                follow_up_warning = Some(
+                                    "Message queued, but the follow-up action failed. Check the queue or transcript.".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    return Ok((Some(queue_id), follow_up_warning));
                 }
 
                 let expects_setup_handoff = run_worktree
@@ -9241,7 +9438,7 @@ impl Composer {
                     })
                     .ok();
                 }
-                Ok(None)
+                Ok((None, None))
             }
             .await;
             if result.is_err() && is_new {
@@ -9265,11 +9462,27 @@ impl Composer {
                 composer
                     .state
                     .update(cx, |s, _| s.end_upload_progress());
-                if let Ok(Some(message_id)) = &result {
+                if let Ok((Some(message_id), _)) = &result {
                     cx.emit(ComposerEvent::Queued {
                         chat_id: err_chat_id.clone(),
                         message_id: message_id.clone(),
                     });
+                }
+                if result.is_ok() {
+                    if let Ok((Some(message_id), warning)) = &result
+                        && follow_up.is_some()
+                    {
+                        composer.state.update(cx, |state, cx| {
+                            state.end_pending_send(&err_chat_id, message_id);
+                            if state.selected_chat.as_deref() == Some(err_chat_id.as_str()) {
+                                state.refresh_selected_queue(cx);
+                            }
+                        });
+                        if let Some(warning) = warning {
+                            composer.failure = Some(warning.clone().into());
+                            composer.failure_key = Some(err_chat_id.clone());
+                        }
+                    }
                 }
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
@@ -9950,7 +10163,7 @@ impl Composer {
                             .flex_col()
                             .gap(px(4.0))
                             .children(options),
-                    )
+                    ),
             )
             // The answer and navigation never scroll away with the question.
             .child(
@@ -10019,11 +10232,10 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
-        // Harness composer-actions.tsx: a size-7 filled circle — up-arrow to
-        // send/queue, a dark rounded square on the same light circle to stop.
         match mode {
             SendButtonMode::Stop => div()
                 .id("composer-stop")
+                .aria_label("Stop")
                 .size(px(28.0))
                 .flex_none()
                 .rounded_full()
@@ -10036,12 +10248,11 @@ impl Composer {
                 .on_click(cx.listener(|this, _, _, cx| this.stop_from_button(cx)))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
-            SendButtonMode::Send | SendButtonMode::Queue => {
-                // Share the submission guard with Enter, including pending
-                // edits and the new-session runnable-agent check.
+            SendButtonMode::Send => {
                 let blocked = self.send_blocked(cx);
                 div()
                     .id("composer-send")
+                    .aria_label("Send")
                     .size(px(28.0))
                     .flex_none()
                     .rounded_full()
@@ -10055,11 +10266,228 @@ impl Composer {
                             .hover(|s| s.opacity(0.85))
                             .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
+                    .tooltip(|_, cx| cx.new(|_| AppshotActionTooltip("Send".into())).into())
                     .child(
                         crate::icons::icon(crate::icons::ARROW_UP)
                             .size(px(14.0))
                             .text_color(theme.bg),
                     )
+                    .into_any_element()
+            }
+            SendButtonMode::Queue => {
+                let blocked = self.send_blocked(cx);
+                let action = self.follow_up_main_action(cx);
+                let behavior =
+                    crate::settings::with_current(cx, |settings| settings.follow_up_behavior);
+                let fallback_reason = if behavior == crate::settings::FollowUpBehavior::Steer
+                    && matches!(
+                        action,
+                        follow_up::MainAction::FollowUp(follow_up::FollowUpAction::Queue)
+                    ) {
+                    self.follow_up_steer_unavailable(cx)
+                        .map(follow_up::steer_reason)
+                } else {
+                    None
+                };
+                let label = match action {
+                    follow_up::MainAction::FollowUp(follow_up::FollowUpAction::Steer) => "Steer",
+                    _ => "Queue",
+                };
+                let label_for_tooltip = fallback_reason.unwrap_or(match label {
+                    "Steer" => "Steer the active run at its next safe boundary",
+                    _ => "Queue this message for the next turn",
+                });
+                let main_button = div()
+                    .id("composer-follow-up-main")
+                    .debug_selector(|| "composer-follow-up-main".into())
+                    .role(gpui::Role::Button)
+                    .aria_label(label)
+                    .h(px(28.0))
+                    .w(px(52.0))
+                    .rounded_l(px(7.0))
+                    .bg(theme.text)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.bg)
+                    .when(blocked, |el| el.opacity(0.35))
+                    .when(!blocked, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
+                    })
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| AppshotActionTooltip(label_for_tooltip.into()))
+                            .into()
+                    })
+                    .child(label);
+                let menu_theme = theme.clone();
+                let mut trigger = div()
+                    .id("composer-follow-up-trigger")
+                    .debug_selector(|| "composer-follow-up-trigger".into())
+                    .role(gpui::Role::Button)
+                    .aria_label("Choose follow-up action")
+                    .tab_index(0)
+                    .track_focus(&self.follow_up_focus)
+                    .relative()
+                    .h(px(28.0))
+                    .w(px(24.0))
+                    .rounded_r(px(7.0))
+                    .bg(theme.text)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            window.focus(&this.follow_up_focus, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.follow_up_menu_open = !this.follow_up_menu_open;
+                        cx.notify();
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.follow_up_menu_open = !this.follow_up_menu_open;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .child(div().text_size(px(12.0)).text_color(theme.bg).child("⌄"));
+                if self.follow_up_menu_open {
+                    let queue_selected = behavior == crate::settings::FollowUpBehavior::Queue
+                        || fallback_reason.is_some();
+                    let steer_reason = self.follow_up_steer_unavailable(cx);
+                    let queue_row = crate::popover::menu_row(
+                        &menu_theme,
+                        queue_selected,
+                        "composer-follow-up-queue",
+                    )
+                    .id("composer-follow-up-queue")
+                    .role(gpui::Role::Button)
+                    .tab_index(0)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let focus = this.input.focus_handle(cx);
+                        window.focus(&focus, cx);
+                        this.follow_up_menu_open = false;
+                        this.choose_follow_up(follow_up::FollowUpAction::Queue, cx);
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            let focus = this.input.focus_handle(cx);
+                            window.focus(&focus, cx);
+                            this.follow_up_menu_open = false;
+                            this.choose_follow_up(follow_up::FollowUpAction::Queue, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child("Queue");
+                    let steer_row = crate::popover::menu_row(
+                        &menu_theme,
+                        behavior == crate::settings::FollowUpBehavior::Steer
+                            && steer_reason.is_none(),
+                        "composer-follow-up-steer",
+                    )
+                    .id("composer-follow-up-steer")
+                    .role(gpui::Role::Button)
+                    .tab_index(if steer_reason.is_none() { 0 } else { -1 })
+                    .when(steer_reason.is_none(), |row| {
+                        row.on_click(cx.listener(|this, _, window, cx| {
+                            let focus = this.input.focus_handle(cx);
+                            window.focus(&focus, cx);
+                            this.follow_up_menu_open = false;
+                            this.choose_follow_up(follow_up::FollowUpAction::Steer, cx);
+                        }))
+                    })
+                    .when(steer_reason.is_some(), |row| row.opacity(0.52))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if steer_reason.is_none()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            let focus = this.input.focus_handle(cx);
+                            window.focus(&focus, cx);
+                            this.follow_up_menu_open = false;
+                            this.choose_follow_up(follow_up::FollowUpAction::Steer, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child("Steer");
+                    let stop_supported = self.follow_up_queue_actions_supported(cx);
+                    let stop_row = crate::popover::menu_row(
+                        &menu_theme,
+                        false,
+                        "composer-follow-up-stop-send",
+                    )
+                    .id("composer-follow-up-stop-send")
+                    .role(gpui::Role::Button)
+                    .tab_index(if stop_supported { 0 } else { -1 })
+                    .when(stop_supported, |row| {
+                        row.on_click(cx.listener(|this, _, window, cx| {
+                            let focus = this.input.focus_handle(cx);
+                            window.focus(&focus, cx);
+                            this.follow_up_menu_open = false;
+                            this.choose_follow_up(follow_up::FollowUpAction::StopAndSend, cx);
+                        }))
+                    })
+                    .when(!stop_supported, |row| row.opacity(0.45))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if stop_supported
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            let focus = this.input.focus_handle(cx);
+                            window.focus(&focus, cx);
+                            this.follow_up_menu_open = false;
+                            this.choose_follow_up(follow_up::FollowUpAction::StopAndSend, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child("Stop and send");
+                    let reason = steer_reason.map(|reason| {
+                        div()
+                            .px(px(10.0))
+                            .pb(px(6.0))
+                            .text_size(px(10.5))
+                            .text_color(menu_theme.text_muted)
+                            .child(follow_up::steer_reason(reason))
+                            .into_any_element()
+                    });
+                    let mut menu = crate::popover::popover_card(&menu_theme)
+                        .debug_selector(|| "composer-follow-up-menu".into())
+                        .w(px(236.0))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.follow_up_menu_open = false;
+                            cx.notify();
+                        }))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(crate::popover::menu_heading(&menu_theme, "Follow-up"))
+                        .child(queue_row)
+                        .child(steer_row);
+                    if let Some(reason) = reason {
+                        menu = menu.child(reason);
+                    }
+                    menu = menu.child(stop_row);
+                    trigger = trigger.child(crate::popover::anchored_menu_below_end(
+                        "composer-follow-up-menu",
+                        menu.into_any_element(),
+                        None,
+                    ));
+                }
+                div()
+                    .id("composer-follow-up-split")
+                    .debug_selector(|| "composer-follow-up-split".into())
+                    .flex()
+                    .items_center()
+                    .gap(px(1.0))
+                    .child(main_button)
+                    .child(trigger)
                     .into_any_element()
             }
         }
@@ -10342,9 +10770,10 @@ impl Render for Composer {
         // What is waiting to be sent, stacked directly above the box it was
         // typed in — the queue is a property of this composer, not a panel
         // somewhere else.
-        let show_queue_latest_shortcut = !wizard_active
-            && self.queue_shortcut_revealed
-            && self.queue_shortcut_ready(cx);
+        let show_queue_latest_shortcut =
+            !wizard_active
+                && self.queue_shortcut_revealed
+                && self.queue_shortcut_ready(cx);
         let container = container.when_some(
             self.render_queue_panel(show_queue_latest_shortcut, window, cx),
             |el, panel| {
@@ -10499,6 +10928,19 @@ impl Render for Composer {
         if self.wizard.is_none() {
             self.wizard_expanded = false;
         }
+
+        let container = container.when(self.follow_up_menu_open, |el| {
+            el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape"
+                    && this.mention.token.is_none()
+                    && this.slash.token.is_none()
+                {
+                    this.follow_up_menu_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+        });
 
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
@@ -10801,7 +11243,11 @@ impl Render for Composer {
                 .get()
                 .map_or(0.0, |bounds| f32::from(bounds.size.width))
             - ACTION_PRIMARY_GAP
-            - 28.0
+            - if self.button_mode(cx) == SendButtonMode::Queue {
+                77.0
+            } else {
+                28.0
+            }
             - action_inset)
             .max(0.0);
         let (model_side, model_opacity, model_drift) = model_handoff(self.model_handoff_position);
@@ -11581,6 +12027,165 @@ mod tests {
     }
 
     #[gpui::test]
+    fn busy_follow_up_split_fits_narrow_composer_and_escape_only_closes_menu(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        cx.update(|cx| {
+            crate::settings::update(crate::settings::SavePolicy::Debounced, cx, |settings| {
+                settings.escape_stops_active_agent = true;
+            });
+        });
+        handle
+            .update(cx, |composer, window, cx| {
+                window.resize(size(px(640.0), px(800.0)));
+                composer.set_available_width(640.0, cx);
+                composer.state.update(cx, |state, cx| {
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "busy-chat", "deviceId": "host", "archived": false,
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    ];
+                    state.select_chat(Some("busy-chat".into()), cx);
+                    state.begin_pending_send("busy-chat", "pending", chrono::Utc::now());
+                });
+                cx.notify();
+            })
+            .unwrap();
+        // Let the selected-chat observer finish swapping the composer route
+        // before seeding a draft; short text keeps the compact layout stable.
+        cx.run_until_parked();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.input.update(cx, |input, cx| input.set_text("Hi", cx));
+                cx.notify();
+            })
+            .unwrap();
+
+        let mut visual = gpui::VisualTestContext::from_window(handle.into(), cx);
+        for (width, expected_expanded) in [(640.0, false), (320.0, true)] {
+            handle
+                .update(cx, |composer, window, cx| {
+                    window.resize(size(px(width), px(800.0)));
+                    composer.set_available_width(width, cx);
+                    cx.notify();
+                })
+                .unwrap();
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+
+            let (mode, live, selected_chat, draft, actual_expanded) = handle
+                .read_with(cx, |composer, cx| {
+                    (
+                        composer.button_mode(cx),
+                        composer.run_live(cx),
+                        composer.state.read(cx).selected_chat.clone(),
+                        composer.input.read(cx).text().to_owned(),
+                        composer.expanded_mode,
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                actual_expanded, expected_expanded,
+                "requested natural layout at width={width}: actual expanded={actual_expanded}"
+            );
+            let split = visual.debug_bounds("composer-follow-up-split").unwrap_or_else(|| {
+                panic!(
+                    "busy split missing: mode={mode:?}, live={live}, selected_chat={selected_chat:?}, draft={draft:?}, expanded={actual_expanded}"
+                )
+            });
+            let main = visual.debug_bounds("composer-follow-up-main").unwrap();
+            let trigger = visual.debug_bounds("composer-follow-up-trigger").unwrap();
+            let (input, model, live, mode) = handle
+                .read_with(cx, |composer, cx| {
+                    (
+                        composer.input.read(cx).last_bounds.unwrap(),
+                        composer.model_bounds.get().unwrap(),
+                        composer.run_live(cx),
+                        composer.button_mode(cx),
+                    )
+                })
+                .unwrap();
+            assert!(live);
+            assert_eq!(mode, SendButtonMode::Queue);
+            assert!(input.size.width > px(0.0));
+            assert!(main.right() <= trigger.left() + px(1.0));
+            assert!(split.left() <= main.left() && split.right() >= trigger.right());
+            assert!(
+                split.right() <= model.left()
+                    || split.left() >= model.right()
+                    || split.bottom() <= model.top()
+                    || split.top() >= model.bottom(),
+                "width={width} expected_expanded={expected_expanded} actual_expanded={actual_expanded}: split={split:?} overlaps model={model:?}"
+            );
+            assert!(
+                input.right() <= split.left()
+                    || input.left() >= split.right()
+                    || input.bottom() <= split.top()
+                    || input.top() >= split.bottom(),
+                "width={width} expected_expanded={expected_expanded} actual_expanded={actual_expanded}: input={input:?} overlaps split={split:?}"
+            );
+            assert!(
+                input.right() <= model.left()
+                    || input.left() >= model.right()
+                    || input.bottom() <= model.top()
+                    || input.top() >= model.bottom(),
+                "width={width} expected_expanded={expected_expanded} actual_expanded={actual_expanded}: input={input:?} overlaps model={model:?}"
+            );
+        }
+
+        // A mouse click gives the split trigger focus. Escape closes the menu,
+        // then Enter reopens it from the keyboard while the pending run stays live.
+        let trigger = visual.debug_bounds("composer-follow-up-trigger").unwrap();
+        visual.simulate_click(trigger.center(), gpui::Modifiers::default());
+        assert!(visual.debug_bounds("composer-follow-up-menu").is_some());
+        handle
+            .update(cx, |composer, window, _| {
+                assert!(
+                    composer.follow_up_focus.is_focused(window),
+                    "mouse opening the follow-up menu should focus its trigger"
+                );
+            })
+            .unwrap();
+        cx.simulate_keystrokes(handle.into(), "escape");
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(visual.debug_bounds("composer-follow-up-menu").is_none());
+        handle
+            .update(cx, |composer, window, _| {
+                assert!(
+                    composer.follow_up_focus.is_focused(window),
+                    "Escape should leave the follow-up trigger focused for keyboard reopen"
+                );
+            })
+            .unwrap();
+        cx.simulate_keystrokes(handle.into(), "enter");
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(visual.debug_bounds("composer-follow-up-menu").is_some());
+        cx.simulate_keystrokes(handle.into(), "escape");
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(visual.debug_bounds("composer-follow-up-menu").is_none());
+        handle
+            .read_with(cx, |composer, cx| {
+                assert!(composer.run_live(cx));
+                assert_eq!(composer.button_mode(cx), SendButtonMode::Queue);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn queue_shortcut_click_and_remove_restore_composer_focus(cx: &mut gpui::TestAppContext) {
         let (_dir, handle) = composer_focus_window(cx);
         handle
@@ -12133,9 +12738,10 @@ mod tests {
                         "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
                     let model = composer.model_bounds.get().unwrap();
                     let inset = motion::lerp(12.0, 8.0, amount);
+                    let send_width = if composer.button_mode(cx) == SendButtonMode::Queue { 77.0 } else { 28.0 };
                     let left = surface.left() + px(1.0 + inset + 28.0 + ACTION_UTILITY_GAP);
                     let travel = surface.size.width - px(2.0 + inset + 28.0 + ACTION_UTILITY_GAP
-                        + ACTION_PRIMARY_GAP + 28.0 + inset) - model.size.width;
+                        + ACTION_PRIMARY_GAP + send_width + inset) - model.size.width;
                     let (side, _, drift) = model_handoff(amount);
                     let expected_x = left + travel * side + px(drift);
                     assert!((f32::from(model.left() - expected_x)).abs() <= 1.0,
@@ -15691,7 +16297,7 @@ mod tests {
                 })).unwrap()];
                 });
                 assert!(!composer.reference_delivery_supported(cx));
-                composer.send(draft.clone(), false, cx);
+                composer.send(draft.clone(), false, None, cx);
                 assert!(
                     composer
                         .failure

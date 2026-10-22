@@ -503,6 +503,14 @@ impl EngineHandle {
 
     #[cfg(test)]
     pub(crate) fn from_test_client(client: RpcClient) -> Self {
+        Self::from_test_client_with_capabilities(client, Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_client_with_capabilities(
+        client: RpcClient,
+        capabilities: Vec<String>,
+    ) -> Self {
         Self {
             inner: Arc::new(RemoteEngine {
                 client: Arc::new(client),
@@ -513,7 +521,7 @@ impl EngineHandle {
                 device_id: "local".into(),
                 workspace_scope: WorkspaceScope::Local,
                 cursor_sdk_version: None,
-                capabilities: Vec::new(),
+                capabilities,
             },
             deferred_state: None,
         }
