@@ -5515,15 +5515,18 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if let Some(tabs) = self.right_tabs.get(&chat_id) {
-            for surface in tabs {
-                if let RightSurface::Browser(id) = surface {
-                    if let Some(browser) = self.browsers.remove(id) {
-                        browser.update(cx, |browser, cx| browser.close(cx));
-                    }
-                    self.browser_subs.remove(id);
-                }
-            }
+        // Use the ordinary owner-aware close path: releasing only browser
+        // entities leaves dangling tab registrations and an open empty host.
+        let browsers: Vec<_> = self
+            .right_tabs
+            .get(&chat_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|surface| matches!(surface, RightSurface::Browser(_)))
+            .collect();
+        for surface in browsers {
+            self.close_right_surface(surface, window, cx);
         }
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             // Deleting the sole session in a tab returns to the last visited

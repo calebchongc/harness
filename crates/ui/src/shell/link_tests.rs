@@ -385,6 +385,188 @@ fn canvas_link_promotion_parks_the_draft_and_repeated_links_keep_the_new_owner(
     });
 }
 
+#[gpui::test]
+fn queued_browser_navigation_and_close_batches_obey_delivery_order(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        for url in [None, Some(URL.to_owned())] {
+            let mut setup = None;
+            with_link_panes(cx, Some("owner"), |shell, window, cx| {
+                shell.activate_session_link(
+                    &activation(Some("peer-a"), LinkAction::Internal),
+                    window,
+                    cx,
+                );
+                let id = shell.browser_seq;
+                setup = Some((cx.entity(), id, shell.browsers[&id].clone()));
+            });
+            let (shell, id, browser) = setup.unwrap();
+            let events = [
+                BrowserEvent::NewTab(url),
+                BrowserEvent::OpenSource("/workspace/link-tests/batched.rs".into()),
+                BrowserEvent::Close,
+            ];
+            // Queue all three before allowing subscriptions to run. The first
+            // navigation changes the selected surface, revoking the old page's
+            // authority for the next event; Close must still clean it up.
+            browser.update(cx, |_, cx| {
+                for index in order {
+                    cx.emit(events[index].clone());
+                }
+            });
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| {
+                assert!(!shell.browsers.contains_key(&id), "{order:?}");
+                assert!(!shell.browser_subs.contains_key(&id));
+                assert!(!shell.right_tabs["peer-a"].contains(&RightSurface::Browser(id)));
+                assert_eq!(shell.active_chat, "peer-a");
+                assert_eq!(shell.browsers.len(), usize::from(order[0] == 0));
+                assert_eq!(shell.file_surfaces.len(), usize::from(order[0] == 1));
+                assert_eq!(shell.right_tabs["peer-a"].len(), usize::from(order[0] != 2));
+                assert_eq!(shell.right_pane_open(cx), order[0] != 2);
+                assert_eq!(shell.browser_seq, id + u64::from(order[0] == 0));
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn reordered_browser_fallback_transfers_navigation_authority_to_the_visible_tab(
+    cx: &mut TestAppContext,
+) {
+    use crate::browser::BrowserEvent;
+
+    for fallback_first in [false, true] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            let mut browsers = Vec::new();
+            for _ in 0..3 {
+                shell.activate_session_link(
+                    &activation(Some("peer-a"), LinkAction::Internal),
+                    window,
+                    cx,
+                );
+                browsers.push((
+                    shell.browser_seq,
+                    shell.browsers[&shell.browser_seq].clone(),
+                ));
+            }
+            // Move the second browser to the first slot, without changing the
+            // third browser's active selection.
+            shell.reorder_right_tabs(1, 0, cx);
+            setup = Some((cx.entity(), browsers));
+        });
+        let (shell, browsers) = setup.unwrap();
+        browsers[2]
+            .1
+            .update(cx, |_, cx| cx.emit(BrowserEvent::Close));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(
+                shell.resolved_right_active(cx),
+                RightSurface::Browser(browsers[1].0)
+            );
+        });
+        // The stored selection is now Picker, so authorization must use the
+        // actual fallback tab, not the stale pick or the pre-drag slot index.
+        for index in if fallback_first { [1, 0] } else { [0, 1] } {
+            browsers[index]
+                .1
+                .update(cx, |_, cx| cx.emit(BrowserEvent::NewTab(None)));
+        }
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.browser_seq, 4);
+            assert_eq!(shell.browsers.len(), 3);
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Browser(4));
+            assert_eq!(
+                shell.right_tabs["peer-a"],
+                vec![
+                    RightSurface::Browser(browsers[1].0),
+                    RightSurface::Browser(browsers[0].0),
+                    RightSurface::Browser(4),
+                ]
+            );
+        });
+    }
+}
+
+#[gpui::test]
+fn deleting_a_chat_releases_its_browser_tabs_and_queued_callbacks(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for foreground in [false, true] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            let mut deleted = Vec::new();
+            for owner in ["peer-a", "peer-a", "peer-b"] {
+                shell.activate_session_link(
+                    &activation(Some(owner), LinkAction::Internal),
+                    window,
+                    cx,
+                );
+                if owner == "peer-a" {
+                    deleted.push((
+                        shell.browser_seq,
+                        shell.browsers[&shell.browser_seq].clone(),
+                    ));
+                }
+            }
+            let surviving = shell.browser_seq;
+            if foreground {
+                assert!(shell.select_chat_pane(0, cx));
+                shell.on_state_changed(&shell.state.clone(), cx);
+            }
+            shell.delete_chat("peer-a".into(), window, cx);
+            setup = Some((cx.entity(), deleted, surviving));
+        });
+        let (shell, deleted, surviving) = setup.unwrap();
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.browsers.len(), 1);
+            assert_eq!(shell.browser_subs.len(), 1);
+            assert!(shell.browsers.contains_key(&surviving));
+            assert_eq!(
+                shell.right_tabs["peer-b"],
+                vec![RightSurface::Browser(surviving)]
+            );
+            for (id, _) in &deleted {
+                assert!(
+                    shell
+                        .right_tabs
+                        .values()
+                        .all(|tabs| !tabs.contains(&RightSurface::Browser(*id))),
+                    "deleted browser {id} left a dangling tab registration"
+                );
+            }
+            assert!(!shell.panels.get("peer-a").changes_open);
+            assert_eq!(
+                shell.panels.get("peer-a").right_active,
+                RightSurface::Picker
+            );
+        });
+        let before = shell.read_with(cx, link_state);
+        for (_, browser) in deleted {
+            browser.update(cx, |_, cx| {
+                cx.emit(BrowserEvent::NewTab(Some(URL.into())));
+                cx.emit(BrowserEvent::OpenSource(
+                    "/workspace/link-tests/deleted.rs".into(),
+                ));
+                cx.emit(BrowserEvent::Close);
+            });
+        }
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| assert_eq!(link_state(shell, cx), before));
+    }
+}
+
 fn hide_browser_navigation_host(shell: &mut Shell, hidden_by: &str, cx: &mut Context<Shell>) {
     assert_eq!(shell.active_chat, "peer-a");
     match hidden_by {
