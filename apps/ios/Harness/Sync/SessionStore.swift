@@ -294,6 +294,16 @@ final class SessionStore {
                 self.project()
                 self.saver?.poke()
             },
+            applyRows: { [weak self] rows, seq in
+                guard let self else { return }
+                let failed = await self.importRemote(batch: rows)
+                if failed > 0 {
+                    roomLog.warning("chat2 \(self.chatId, privacy: .public): \(failed) of \(rows.count) row import(s) failed; skipped through row \(seq)")
+                }
+                self.cursor = max(self.cursor, seq)
+                self.project()
+                self.saver?.poke()
+            },
             advanceCursor: { [weak self] seq in
                 guard let self else { return }
                 self.cursor = max(self.cursor, seq)
@@ -665,6 +675,21 @@ final class SessionStore {
         let doc = self.doc
         return await Task.detached(priority: .userInitiated) {
             (try? doc.importWith(bytes: bytes, origin: "remote")) != nil
+        }.value
+    }
+
+    /// Several rows in one import, so a rebuild happens once for the run.
+    /// If the batch is rejected, each row is retried alone so a malformed
+    /// row costs only itself. Returns how many rows failed.
+    private func importRemote(batch rows: [Data]) async -> Int {
+        guard rows.count > 1 else {
+            guard let row = rows.first else { return 0 }
+            return await importRemote(row) ? 0 : 1
+        }
+        let doc = self.doc
+        return await Task.detached(priority: .userInitiated) {
+            if (try? doc.importBatch(bytes: rows)) != nil { return 0 }
+            return rows.filter { (try? doc.importWith(bytes: $0, origin: "remote")) == nil }.count
         }.value
     }
 
