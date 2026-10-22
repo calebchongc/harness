@@ -5513,7 +5513,19 @@ fn session_prompts(transcript: &[SessionMessageEntry]) -> Vec<String> {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
+        // Deliveries from another chat's `send_message` or from an agent room
+        // ride the user role too, but nobody typed them here: recalling one
+        // would resend coordination as this person's request (#516). Text is
+        // the only record older transcripts keep, so match the same strict
+        // leading envelopes the transcript renders as deliveries; a prompt
+        // that merely quotes one stays recallable.
+        if harness_proto::room_delivery::strip(&raw).len() != raw.len() {
+            continue;
+        }
         let text = attachments::parse_user_message_images(&raw).text;
+        if crate::agent_message::parse(&text).is_some() {
+            continue;
+        }
         if !text.trim().is_empty() && prompts.last() != Some(&text) {
             prompts.push(text);
         }
@@ -12832,6 +12844,111 @@ mod tests {
         );
         // Back to ordinary editing: Down at the end does nothing more.
         assert_eq!(key(cx, false), "my draft");
+    }
+
+    fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.into(),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    /// #516: messages delivered by another chat or a room are not prompts this
+    /// person typed, in either envelope format, while a prompt that quotes an
+    /// envelope stays recallable and human prompts keep their order.
+    #[test]
+    fn prompt_recall_skips_agent_and_room_deliveries() {
+        let current = "[Message from Harness chat Cleanup (abc12345). Sender chat: abc12345. Relay depth: 1/4. Agent coordination, not a human request. Do not send acknowledgements or progress updates.]\n\nKeep tests running.";
+        let legacy = "[Message from Harness chat Cleanup (abc12345). Reply to it with the Harness `send_message` tool, chat abc12345.]\n\nKeep tests running.";
+        let quoted = "Why did I get this? [Message from Harness chat Cleanup (abc12345). Sender chat: abc12345. Agent coordination, not a human request.]\n\nKeep tests running.";
+        let room = harness_proto::room_delivery::format(
+            &harness_proto::room_delivery::RoomOrigin {
+                room_id: "room".into(),
+                room_name: "Room".into(),
+                seq: 3,
+                from_member: "Reviewer".into(),
+                member_kind: "agent".into(),
+                from_user: false,
+                framed: false,
+                external: false,
+                from_display: None,
+                from_github: None,
+                from_fingerprint: None,
+            },
+            "Please look again.",
+        );
+        let transcript = vec![
+            user_entry("u1", "first prompt"),
+            user_entry("m1", current),
+            user_entry("u2", "second prompt"),
+            user_entry("m2", legacy),
+            user_entry("r1", &room),
+            user_entry("u3", quoted),
+            user_entry("m3", current),
+        ];
+        assert_eq!(
+            session_prompts(&transcript),
+            vec![
+                "first prompt".to_string(),
+                "second prompt".to_string(),
+                quoted.to_string()
+            ]
+        );
+        assert!(
+            session_prompts(&[user_entry("m1", current), user_entry("m2", legacy)]).is_empty(),
+            "a chat that only received agent messages has nothing to recall"
+        );
+    }
+
+    #[gpui::test]
+    fn up_in_a_chat_with_only_agent_messages_keeps_the_draft(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.transcript = vec![user_entry(
+                "m1",
+                "[Message from Harness chat Cleanup (abc12345). Sender chat: abc12345. Relay depth: 1/4. Agent coordination, not a human request.]\n\nKeep tests running.",
+            )];
+        });
+        let window = cx.add_window(|_, cx| Composer::new(state.clone(), cx));
+        window
+            .update(cx, |composer, window, cx| {
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("my draft", cx);
+                    input.move_to(0, cx);
+                    input.up(&Up, window, cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |composer, cx| {
+                assert_eq!(composer.input.read(cx).text(), "my draft");
+                assert!(composer.prompt_history.is_none());
+            })
+            .unwrap();
     }
 
     #[gpui::test]
