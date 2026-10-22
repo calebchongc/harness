@@ -72,6 +72,18 @@
       "header": {},
       "payloadHex": "",
       "bytesHex": "09020000007b7d"
+    },
+    {
+      "name": "error: a push over the chat's quota, with the time left in the window",
+      "kind": 11,
+      "header": {
+        "batchId": "b7",
+        "code": "quota",
+        "message": "push quota exceeded for this chat",
+        "retryAfterMs": 4200
+      },
+      "payloadHex": "",
+      "bytesHex": "0b610000007b2262617463684964223a226237222c22636f6465223a2271756f7461222c226d657373616765223a22707573682071756f746120657863656564656420666f7220746869732063686174222c22726574727941667465724d73223a343230307d"
     }
   ],
   "decodeRejects": [
