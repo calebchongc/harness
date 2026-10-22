@@ -49,8 +49,28 @@ actor ChatRoomClient {
     /// session that joined AND survived this long resets backoff to base —
     /// reset-on-join let connect-and-die sockets hot-loop at 250ms forever.
     static let stableResetNs: UInt64 = 30_000_000_000
-    /// Re-push cadence after a `quota` rejection (server window is 60s).
-    static let quotaRetryNs: UInt64 = 5_000_000_000
+    /// Wait before the next head probe after a `quota` refusal (#344), the
+    /// twin of chat_client.rs `quota_retry_delay`: the room's `retryAfterMs`
+    /// bounded to 250 ms...120 s plus up to an eighth (at most 2 s) of
+    /// jitter; without a hint (an older edge), 5 s doubling per refused probe
+    /// up to the 60 s window, plus up to a quarter of jitter.
+    static func quotaRetryDelayMs(strikes: Int, hintMs: UInt64?) -> UInt64 {
+        if let hintMs {
+            let base = min(max(hintMs, 250), 120_000)
+            return base + UInt64.random(in: 0...min(base / 8, 2_000))
+        }
+        let base = min(UInt64(5_000) << UInt64(min(max(strikes, 0), 5)), 60_000)
+        return base + UInt64.random(in: 0...(base / 4))
+    }
+
+    /// `retryAfterMs` from a quota refusal: the WS error header or the HTTP
+    /// 429 JSON body, else the `Retry-After` header in whole seconds.
+    static func quotaHintMs(_ fields: [String: Any]?, retryAfterHeader: String? = nil) -> UInt64? {
+        if let ms = (fields?["retryAfterMs"] as? NSNumber)?.uint64Value { return ms }
+        guard let header = retryAfterHeader?.trimmingCharacters(in: .whitespaces),
+              let secs = UInt64(header) else { return nil }
+        return secs.multipliedReportingOverflow(by: 1000).overflow ? UInt64.max : secs * 1000
+    }
     /// Client-side push cap: the DO's per-row cap (1 MiB) minus frame-header
     /// headroom — the runtime closes WS messages at 1 MiB BEFORE the DO runs,
     /// so an over-cap payload would die with no error frame to retire it.
@@ -109,6 +129,11 @@ actor ChatRoomClient {
     private var pingTask: Task<Void, Never>?
     private var livenessTask: Task<Void, Never>?
     private var quotaTask: Task<Void, Never>?
+    /// Refused probes since the last ack (backoff without a server hint).
+    private var quotaStrikes = 0
+    /// Pushes (only pushes) wait until here after a quota refusal; pulls and
+    /// rows keep flowing. Shared by the socket and the HTTPS cycle.
+    private var quotaHoldUntil: DispatchTime?
     private var fetchTask: Task<Void, Never>?
     private var pending: [PendingPush] = []
     /// State frame received on the CURRENT socket — pushes are legal from
@@ -245,8 +270,10 @@ actor ChatRoomClient {
     func pullSync() async {
         guard !closed else { return }
         // Push first, so a message typed on dead wifi leaves the device on
-        // this cycle rather than the next.
-        for push in pending {
+        // this cycle rather than the next. A quota hold skips the pushes,
+        // never the pull.
+        let held = quotaHoldUntil.map { $0 > .now() } ?? false
+        for push in held ? [] : pending {
             guard var request = await pushRequest(push.batchId) else {
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): http push skipped — no URL (token unavailable)")
                 break
@@ -262,6 +289,8 @@ actor ChatRoomClient {
                let seq = (ack["seq"] as? NSNumber)?.uint64Value {
                 pending.removeAll { $0.batchId == push.batchId }
                 await delegate.retirePush(push.batchId)
+                quotaStrikes = 0
+                quotaHoldUntil = nil
                 // Contiguity rule (see the socket ACK path): a jump would
                 // stamp the cursor over interleaved rows we never pulled —
                 // hold, and this cycle's pull below walks the gap.
@@ -283,6 +312,16 @@ actor ChatRoomClient {
                 roomLog.error("chat2 \(self.chatId, privacy: .public): http push rejected (\(code, privacy: .public)); retiring batch")
                 pending.removeAll { $0.batchId == push.batchId }
                 await delegate.retirePush(push.batchId)
+            } else if http.statusCode == 429 {
+                // The room's quota: hold pushes until its window reopens;
+                // the pull below still runs.
+                let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let hint = Self.quotaHintMs(fields, retryAfterHeader: http.value(forHTTPHeaderField: "Retry-After"))
+                let delayMs = Self.quotaRetryDelayMs(strikes: quotaStrikes, hintMs: hint)
+                quotaStrikes += 1
+                quotaHoldUntil = .now() + .milliseconds(Int(delayMs))
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): http push over quota; pushes wait \(delayMs)ms, pulls continue")
+                break
             } else {
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): http push http=\(http.statusCode); will retry")
                 break  // quota/transient/middlebox: retry next cycle
@@ -715,6 +754,9 @@ actor ChatRoomClient {
                   let seq = (frame.header["seq"] as? NSNumber)?.uint64Value else { return }
             pending.removeAll { $0.batchId == batchId }
             await delegate.retirePush(batchId)
+            // The room took a push: its quota window has room again.
+            quotaStrikes = 0
+            quotaHoldUntil = nil
             // Contiguity rule, ack flavor: our own batch landing at `seq`
             // proves rows up to seq exist SERVER-side, not that we have the
             // interleaved ones from other devices.
@@ -979,9 +1021,15 @@ actor ChatRoomClient {
             for ix in pending.indices {
                 pending[ix].inFlight = false
             }
+            // Refusals of pushes already in flight belong to the same
+            // round: keep its clock instead of adding strikes.
+            if let until = quotaHoldUntil, until > .now() { break }
+            let delayMs = Self.quotaRetryDelayMs(strikes: quotaStrikes, hintMs: Self.quotaHintMs(header))
+            quotaStrikes += 1
+            quotaHoldUntil = .now() + .milliseconds(Int(delayMs))
             quotaTask?.cancel()
             quotaTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: ChatRoomClient.quotaRetryNs)
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
                 guard !Task.isCancelled, let self else { return }
                 await self.pushHead(gen: gen)
             }
@@ -997,6 +1045,8 @@ actor ChatRoomClient {
 
     private func pushPending() async {
         guard stateReceived else { return }
+        // During a quota hold only the head probe (pushHead) goes out.
+        if let until = quotaHoldUntil, until > .now() { return }
         for ix in pending.indices where !pending[ix].inFlight {
             pending[ix].inFlight = true
             let push = pending[ix]
