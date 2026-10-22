@@ -86,7 +86,7 @@ const SYNC_CATCH_UP_QUANTUM_MS: i64 = 300_000;
 /// A peer nudges as it pushes the row it announces, so the wake's catch-up
 /// can finish before that row lands; the client then went idle and the
 /// command waited for someone to open the chat (#412). A woken client stays
-/// connected this long while no other chat is waiting for a slot.
+/// connected this long unless the chats waiting to connect need its slot.
 const WAKE_LINGER_MS: i64 = 60_000;
 
 // All live-transport scenarios share the process budget, including tests in
@@ -1451,10 +1451,12 @@ impl DocHost {
                     // without this stamp, the next open reads "pre-chat2
                     // doc" and the M3 adopt DISCARDS everything written
                     // since (caught by the restart_resume suite: first-turn
-                    // transcripts vanished on reopen).
+                    // transcripts vanished on reopen). Cursor 0 is a
+                    // contiguous prefix by definition: stamp it verified, or
+                    // every later admission repeats the legacy repair.
                     let doc = SessionDoc::init(chat_id)?;
                     if let Ok(snapshot) = doc.export_snapshot() {
-                        let _ = self.inner.store.save_snapshot_with_cursor(
+                        let _ = self.inner.store.save_verified_snapshot_with_cursor(
                             chat_id,
                             &snapshot,
                             0,
@@ -1890,6 +1892,16 @@ impl DocHost {
                 if handoff.as_ref().is_some_and(|(id, _)| !waiting.iter().any(|(chat, _, _)| chat == id)) {
                     handoff = None;
                 }
+                let budget = harness_sync::budget::shared().stats();
+                let global_contended = !budget.resource_paused && budget.sockets >= budget.socket_limit && budget.socket_waiting > 0;
+                // A woken client yields its linger only to chats that need its
+                // slot. Any open elsewhere used to end it with slots to spare,
+                // and the row its wake announced then landed unheard (#412).
+                let resident = handles.iter().filter(|h|
+                    h.sync_started.load(Ordering::Acquire) || stopping_ids.contains(&h.chat_id)
+                ).count();
+                let slots_needed = global_contended
+                    || waiting.len() > ACTIVE_SYNC_CAP.saturating_sub(resident);
                 for handle in &handles {
                     if !handle.sync_started.load(Ordering::Acquire)
                         || stopping_ids.contains(&handle.chat_id)
@@ -1932,7 +1944,7 @@ impl DocHost {
                     // A quiet document can still be receiving its checkpoint
                     // or commands. Incomplete catch-up only yields via rotate's
                     // explicit service deadline, never the short reuse grace.
-                    let lingering = waiting.is_empty()
+                    let lingering = !slots_needed
                         && now_ms() < handle.sync_linger_until.load(Ordering::Acquire);
                     let idle = caught_up
                         && !lingering
@@ -1957,8 +1969,6 @@ impl DocHost {
                 let available = ACTIVE_SYNC_CAP.saturating_sub(running);
                 let now = now_ms();
                 let contended = available == 0 && !waiting.is_empty();
-                let budget = harness_sync::budget::shared().stats();
-                let global_contended = !budget.resource_paused && budget.sockets >= budget.socket_limit && budget.socket_waiting > 0;
                 // A teardown gap or the end of a paged disk scan is not the
                 // end of contention. Resetting there starves cold jobs under
                 // continuous navigation or a full set of active writers.
