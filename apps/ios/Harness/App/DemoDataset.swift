@@ -217,6 +217,25 @@ final class DemoDataset {
                     parts: [.text(id: "t0", text: "Bare: http://127.0.0.1:3777/bare and markdown: [the preview](http://127.0.0.1:3777/md).")],
                     createdAt: nowMs(), deviceId: "demo", status: .complete, continuationOf: nil)
             ])
+        } else if ProcessInfo.processInfo.arguments.contains("-errors") {
+            // Error-card checks: signed out and a usage limit read as such;
+            // a plain failure stays an Error.
+            let error = { (id: String, message: String) in
+                MessageEntry(id: id, role: .assistant, parts: [.error(id: "e0", message: message)],
+                    createdAt: nowMs(), deviceId: "demo", status: .aborted, continuationOf: nil)
+            }
+            let ask = { (id: String, text: String) in
+                MessageEntry(id: id, role: .user, parts: [.text(id: "t0", text: text)],
+                    createdAt: nowMs(), deviceId: "demo", status: .complete, continuationOf: nil)
+            }
+            store.setEntries([
+                ask("errors-ask-1", "Add a retry to the upload step."),
+                error("errors-signed-out", "Not logged in · Please run /login"),
+                ask("errors-ask-2", "Signed in, try again."),
+                error("errors-limit", "Claude usage limit reached — try again after the limit resets."),
+                ask("errors-ask-3", "And once more."),
+                error("errors-plain", "Claude Code exited with status 1: the upload test crashed"),
+            ])
         } else if ProcessInfo.processInfo.arguments.contains("-longprompt") {
             store.setEntries([
                 MessageEntry(id: "long-prompt", role: .user,

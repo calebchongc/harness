@@ -3868,6 +3868,11 @@ enum BlobFetch {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    /// An error card's "Log in": the run was refused because this chat's
+    /// agent is signed out or out of usage ([`harness_proto::run_errors`]).
+    /// The shell routes it by the chat's own agent and host, never by the
+    /// error text.
+    SignIn { chat_id: String },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -7979,7 +7984,22 @@ impl Transcript {
                 mime_type,
                 viewed,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, *viewed, cx),
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip { message } => {
+                let problem = harness_proto::run_errors::provider_problem(message);
+                let sign_in = self
+                    .chat_id
+                    .clone()
+                    .filter(|_| problem.is_some())
+                    .map(|chat_id| {
+                        cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(TranscriptEvent::SignIn {
+                                chat_id: chat_id.clone(),
+                            });
+                        })
+                    });
+                error_chip(&row.id, message.clone(), problem, sign_in, &theme)
+            }
             RowKind::ReauthRequired { message, provider } => {
                 self.render_reauth(ix, &row.id, message, *provider, &theme, cx)
             }
@@ -9168,13 +9188,6 @@ fn user_bubble_text(
         .into_any_element()
 }
 
-/// The transcript ErrorChip — the shared [`notice_chip`] in its tile
-/// treatment (a port of harness chat-view.tsx `ErrorChip`, restacked for long
-/// payloads: header row with the red-washed tile and the medium "Error"
-/// label, then the human message below). Unlike the web port, the message
-/// WRAPS instead of truncating: startup-crash errors carry the agent's exit
-/// status and stderr, and a one-line ellipsis was exactly what made
-/// the upstream adapter failure undiagnosable from the screenshot.
 /// Latest step lines per subagent still running, oldest first. graff's log
 /// is its step lines, a blank line, then the tail of the text the child is
 /// writing mid-stream — that tail is left out (mid-stream fragments read as
@@ -9250,12 +9263,40 @@ fn plan_usage_limit_card(
         .into_any_element()
 }
 
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+/// The transcript ErrorChip — the shared [`notice_chip`] in its tile
+/// treatment (a port of harness chat-view.tsx `ErrorChip`, restacked for long
+/// payloads: header row with the red-washed tile and the medium label, then
+/// the human message below). Unlike the web port, the message WRAPS instead
+/// of truncating: startup-crash errors carry the agent's exit status and
+/// stderr, and a one-line ellipsis was exactly what made the upstream adapter
+/// failure undiagnosable from the screenshot. A refusal that signing in fixes (signed out, a usage limit)
+/// says so in the label, and with a chat to route it carries a "Log in"
+/// button under the message that starts that agent's sign-in.
+fn error_chip(
+    row_id: &SharedString,
+    message: SharedString,
+    problem: Option<harness_proto::run_errors::ProviderProblem>,
+    sign_in: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
+    theme: &Theme,
+) -> AnyElement {
+    let label = problem.map_or("Error", |problem| problem.label());
+    let button = problem.zip(sign_in).map(|(problem, on_click)| {
+        crate::popover::btn_primary(theme, problem.action_label())
+            .id(SharedString::from(format!("{row_id}-sign-in")))
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .text_size(crate::typography::ui_rems(12.0))
+            .on_click(on_click)
+    });
     div()
         .py(px(4.0))
         .w_full()
         .child(
-            notice_chip(theme, false, "Error", message, Tile)
+            notice_chip(theme, false, label, message, Tile)
+                .when_some(button, |chip, button| {
+                    chip.child(div().pt(px(2.0)).flex().flex_row().child(button))
+                })
                 .overflow_hidden()
                 .w_full(),
         )

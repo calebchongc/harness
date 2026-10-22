@@ -4108,6 +4108,7 @@ impl Shell {
                 // may show another host.
                 self.on_reauth_action(chat_id, row_id, *provider, *action, cx);
             }
+            TranscriptEvent::SignIn { chat_id } => self.sign_in_for_chat(chat_id, cx),
             TranscriptEvent::NewChatWithModel { model } => {
                 self.new_chat_with_model(model.clone(), cx);
             }
@@ -16086,6 +16087,106 @@ mod exit_regressions {
                         .unwrap()
                         .contains("host unavailable")
                 );
+            })
+            .unwrap();
+    }
+
+    /// An error card's "Log in" opens Accounts on the chat's own computer
+    /// (never the viewer's pick) and starts that agent's sign-in; a chat
+    /// without a known host goes nowhere.
+    #[gpui::test]
+    fn error_card_sign_in_opens_accounts_on_the_chats_host(cx: &mut TestAppContext) {
+        use harness_proto::HarnessId;
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    codegraff_client_id: None,
+                    default_harness: HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    let chat = |id: &str, host: &str, harness: &str| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "deviceId": host, "archived": false,
+                            "createdAt": Utc::now(),
+                            "config": {
+                                "harness": harness, "model": null, "reasoning": null,
+                                "sandbox": "workspace-write",
+                            },
+                        }))
+                        .unwrap()
+                    };
+                    state.chats = vec![
+                        chat("local-chat", "viewer-host", "graff"),
+                        chat("remote-chat", "remote-host", "codex"),
+                        chat("orphan-chat", "", "codex"),
+                    ];
+                    state.selected_chat = Some("local-chat".into());
+                    state.selected_device = Some("viewer-host".into());
+                    state.local_device_id = Some("viewer-host".into());
+                });
+                let sign_in = |shell: &mut Shell, chat_id: &str, cx: &mut Context<Shell>| {
+                    shell.on_transcript_event(
+                        shell.transcript.clone(),
+                        &TranscriptEvent::SignIn {
+                            chat_id: chat_id.into(),
+                        },
+                        cx,
+                    );
+                };
+
+                // No host: nothing opens, and the viewer's computer isn't used.
+                sign_in(shell, "orphan-chat", cx);
+                assert_eq!(shell.route, Route::Chat);
+                assert!(shell.accounts_page.is_none());
+                assert!(
+                    shell
+                        .sidebar_notice
+                        .as_ref()
+                        .unwrap()
+                        .contains("host unavailable")
+                );
+
+                // Another computer's Codex chat: its Accounts, and Codex's
+                // sign-in started (no engine here, so it reports that).
+                sign_in(shell, "remote-chat", cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Agents));
+                let page = shell.accounts_page.clone().unwrap();
+                assert_eq!(
+                    page.read(cx).sign_in_state(),
+                    (Some("remote-host"), Some("Engine not connected"))
+                );
+
+                // This computer's graff chat: this computer's Accounts, where
+                // graff's provider sign-ins are listed; none is guessed.
+                sign_in(shell, "local-chat", cx);
+                assert_eq!(page.read(cx).sign_in_state(), (None, None));
             })
             .unwrap();
     }
