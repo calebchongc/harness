@@ -385,6 +385,350 @@ fn canvas_link_promotion_parks_the_draft_and_repeated_links_keep_the_new_owner(
     });
 }
 
+fn hide_browser_navigation_host(shell: &mut Shell, hidden_by: &str, cx: &mut Context<Shell>) {
+    assert_eq!(shell.active_chat, "peer-a");
+    match hidden_by {
+        "closed-host" => shell.set_surfaces_open(false, cx),
+        "settings" => shell.route = Route::Settings(SettingsSection::Appearance),
+        "selection-handoff" | "canvas-handoff" => shell.state.update(cx, |state, _| {
+            // Deliberately stop between AppState selection and Shell sync.
+            state.selected_chat = (hidden_by == "selection-handoff").then(|| "peer-b".into());
+        }),
+        _ => unreachable!(),
+    }
+}
+
+#[gpui::test]
+fn browser_navigation_events_require_a_visible_consistently_selected_host(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for hidden_by in [
+        "closed-host",
+        "settings",
+        "selection-handoff",
+        "canvas-handoff",
+    ] {
+        for event in [
+            BrowserEvent::NewTab(Some("https://example.com/queued-popup".into())),
+            BrowserEvent::OpenSource("/workspace/link-tests/queued-source.rs".into()),
+        ] {
+            let mut setup = None;
+            with_link_panes(cx, Some("owner"), |shell, window, cx| {
+                assert_eq!(
+                    shell.activate_session_link(
+                        &activation(Some("peer-a"), LinkAction::Internal),
+                        window,
+                        cx
+                    ),
+                    LinkOutcome::Internal
+                );
+                let browser = shell.browsers[&shell.browser_seq].clone();
+                setup = Some((cx.entity(), browser));
+            });
+            let (shell, browser) = setup.unwrap();
+            // Let initial promotion notifications settle before simulating a
+            // later in-flight handoff, so this really tests inconsistent state.
+            shell.update(cx, |shell, cx| {
+                hide_browser_navigation_host(shell, hidden_by, cx)
+            });
+            let before = shell.read_with(cx, link_state);
+            // A native/action event can have been queued while the page was
+            // live, before the host disappeared or selection began changing.
+            browser.update(cx, |_, cx| cx.emit(event.clone()));
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| {
+                assert_eq!(link_state(shell, cx), before, "{hidden_by}: {event:?}")
+            });
+
+            // The same live browser regains navigation authority when its
+            // owner and host are visible again; do not permanently mute it.
+            shell.update(cx, |shell, cx| {
+                shell.route = Route::Chat;
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("peer-a".into()));
+                shell.on_state_changed(&shell.state.clone(), cx);
+                shell.set_surfaces_open(true, cx);
+            });
+            cx.run_until_parked();
+            browser.update(cx, |_, cx| cx.emit(event.clone()));
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| {
+                assert_eq!(shell.active_chat, "peer-a");
+                assert!(shell.right_pane_open(cx));
+                match event {
+                    BrowserEvent::NewTab(_) => {
+                        assert_eq!(shell.browsers.len(), 2);
+                        assert!(shell.file_surfaces.is_empty());
+                        assert_eq!(
+                            shell.resolved_right_active(cx),
+                            RightSurface::Browser(shell.browser_seq)
+                        );
+                    }
+                    BrowserEvent::OpenSource(_) => {
+                        assert_eq!(shell.browsers.len(), 1);
+                        assert_eq!(shell.file_surfaces.len(), 1);
+                        assert!(matches!(
+                            shell.resolved_right_active(cx),
+                            RightSurface::File(_)
+                        ));
+                        assert_eq!(
+                            shell.file_surface_paths.values().next().map(String::as_str),
+                            Some("queued-source.rs")
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            });
+        }
+    }
+}
+
+/// Paint both focus destinations so GPUI can retain their focus across frames.
+struct BrowserFocusFixture {
+    composer: Entity<crate::composer::Composer>,
+    other: FocusHandle,
+}
+
+impl Render for BrowserFocusFixture {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .track_focus(&self.other)
+                    .child("Synthetic settings control"),
+            )
+            .child(self.composer.clone())
+    }
+}
+
+#[gpui::test]
+fn browser_close_remains_allowed_when_navigation_is_blocked(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for hidden_by in [
+        "visible-host",
+        "closed-host",
+        "settings",
+        "selection-handoff",
+        "canvas-handoff",
+    ] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            assert_eq!(
+                shell.activate_session_link(
+                    &activation(Some("peer-a"), LinkAction::Internal),
+                    window,
+                    cx
+                ),
+                LinkOutcome::Internal
+            );
+            let browser = shell.browsers[&shell.browser_seq].clone();
+            setup = Some((cx.entity(), browser, window.window_handle()));
+        });
+        let (shell, browser, window) = setup.unwrap();
+        if hidden_by != "visible-host" {
+            shell.update(cx, |shell, cx| {
+                hide_browser_navigation_host(shell, hidden_by, cx)
+            });
+        }
+        let (unrelated_control, composer_focus) = window
+            .update(cx, |_, window, cx| {
+                let composer = shell.read(cx).composer.clone();
+                let composer_focus = composer.focus_handle(cx);
+                let focus = cx.focus_handle();
+                window.replace_root(cx, |_, _| BrowserFocusFixture {
+                    composer,
+                    other: focus.clone(),
+                });
+                let _ = window.draw(cx);
+                window.focus(&focus, cx);
+                assert!(focus.is_focused(window));
+                (focus, composer_focus)
+            })
+            .unwrap();
+        if hidden_by == "visible-host" {
+            shell.read_with(cx, |shell, cx| {
+                assert!(shell.browser_host_is_active("peer-a", shell.browser_seq, cx))
+            });
+        }
+        let mut expected = shell.read_with(cx, link_state);
+        expected.browsers.clear();
+        expected.tabs.get_mut("peer-a").unwrap().clear();
+        let panel = expected.panels.get_mut("peer-a").unwrap();
+        panel.right_active = RightSurface::Picker;
+        panel.changes_open = false;
+        browser.update(cx, |_, cx| cx.emit(BrowserEvent::Close));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(link_state(shell, cx), expected, "{hidden_by}");
+            assert!(shell.browser_subs.is_empty());
+        });
+        window
+            .update(cx, |_, window, _| {
+                if hidden_by == "visible-host" {
+                    assert!(
+                        composer_focus.is_focused(window),
+                        "visible active close must restore composer focus"
+                    );
+                } else {
+                    assert!(
+                        unrelated_control.is_focused(window),
+                        "{hidden_by}: hidden browser close stole keyboard focus"
+                    );
+                }
+            })
+            .unwrap();
+    }
+}
+
+#[gpui::test]
+fn browser_close_batches_preserve_a_parked_canvas_in_every_delivery_order(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            let mut browsers = Vec::new();
+            for owner in ["peer-a", "peer-a", "peer-b"] {
+                assert_eq!(
+                    shell.activate_session_link(
+                        &activation(Some(owner), LinkAction::Internal),
+                        window,
+                        cx
+                    ),
+                    LinkOutcome::Internal
+                );
+                browsers.push((
+                    owner,
+                    shell.browser_seq,
+                    shell.browsers[&shell.browser_seq].clone(),
+                ));
+            }
+            shell.new_chat_tab(None, window, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            shell.adopt_canvas_draft(
+                Some(CanvasDraft {
+                    harness: Some(harness_proto::HarnessId::Mock),
+                    model: Some("synthetic-model".into()),
+                    target: Some(CanvasTarget {
+                        space: None,
+                        no_project: true,
+                        device: Some("local".into()),
+                    }),
+                    input: Some(CanvasInput {
+                        text: "Keep this unsent draft while browser closes arrive".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            setup = Some((cx.entity(), browsers));
+        });
+        let (shell, browsers) = setup.unwrap();
+        let mut expected = shell.read_with(cx, link_state);
+        assert!(expected.active.is_empty());
+        for index in order {
+            let (owner, id, browser) = &browsers[index];
+            let surface = RightSurface::Browser(*id);
+            expected.browsers.retain(|other| other != id);
+            let tabs = expected.tabs.get_mut(*owner).unwrap();
+            tabs.retain(|other| *other != surface);
+            let panel = expected.panels.get_mut(*owner).unwrap();
+            if panel.right_active == surface {
+                panel.right_active = RightSurface::Picker;
+            }
+            if tabs.is_empty() {
+                panel.changes_open = false;
+            }
+            browser.update(cx, |_, cx| cx.emit(BrowserEvent::Close));
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| {
+                assert_eq!(
+                    link_state(shell, cx),
+                    expected,
+                    "order={order:?}, closing={id}"
+                );
+                assert!(!shell.browser_subs.contains_key(id));
+            });
+        }
+        // Retained entities must not regain navigation authority after close.
+        for (_, _, browser) in &browsers {
+            for event in [
+                BrowserEvent::NewTab(Some(URL.into())),
+                BrowserEvent::OpenSource("/workspace/link-tests/stale.rs".into()),
+                BrowserEvent::Close,
+            ] {
+                browser.update(cx, |_, cx| cx.emit(event));
+            }
+        }
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(link_state(shell, cx), expected);
+            assert!(shell.browser_subs.is_empty());
+        });
+    }
+}
+
+#[gpui::test]
+fn closing_a_browser_preserves_a_surviving_diff_and_does_not_steal_focus(cx: &mut TestAppContext) {
+    use crate::browser::BrowserEvent;
+
+    for background in [false, true] {
+        let mut setup = None;
+        with_link_panes(cx, Some("owner"), |shell, window, cx| {
+            assert_eq!(
+                shell.activate_session_link(
+                    &activation(Some("peer-a"), LinkAction::Internal),
+                    window,
+                    cx
+                ),
+                LinkOutcome::Internal
+            );
+            let id = shell.browser_seq;
+            let browser = shell.browsers[&id].clone();
+            shell.add_diff_surface(cx);
+            let diff = shell.resolved_right_active(cx);
+            assert!(matches!(diff, RightSurface::Diff(_)));
+            if background {
+                assert!(shell.select_chat_pane(1, cx));
+                shell.on_state_changed(&shell.state.clone(), cx);
+            }
+            setup = Some((cx.entity(), browser, id, diff));
+        });
+        let (shell, browser, id, diff) = setup.unwrap();
+        let other_panel = shell.read_with(cx, |shell, _| shell.panels.get("peer-b"));
+        browser.update(cx, |_, cx| cx.emit(BrowserEvent::Close));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(
+                shell.active_chat,
+                if background { "peer-b" } else { "peer-a" }
+            );
+            assert_eq!(shell.right_tabs["peer-a"], vec![diff]);
+            assert_eq!(shell.panels.get("peer-a").right_active, diff);
+            assert!(shell.panels.get("peer-a").changes_open);
+            assert!(!shell.browsers.contains_key(&id));
+            assert_eq!(shell.panels.get("peer-b"), other_panel);
+            assert_eq!(shell.diffs.len(), 1);
+            if !background {
+                assert_eq!(shell.resolved_right_active(cx), diff);
+            }
+        });
+    }
+}
+
 #[gpui::test]
 fn browser_close_after_peer_focus_change_cleans_only_its_owner(cx: &mut TestAppContext) {
     use crate::browser::BrowserEvent;

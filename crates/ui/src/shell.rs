@@ -3677,6 +3677,16 @@ impl Shell {
         self.open_browser_surface(open, window, cx);
     }
 
+    /// Recheck the actual host at event delivery, not just when a native
+    /// page queued the event. Hidden or changing owners cannot drive UI focus.
+    fn browser_host_is_active(&self, owner: &str, id: u64, cx: &App) -> bool {
+        matches!(self.route, Route::Chat)
+            && self.active_chat == owner
+            && self.state.read(cx).selected_chat.as_deref() == Some(owner)
+            && self.right_pane_open(cx)
+            && self.resolved_right_active(cx) == RightSurface::Browser(id)
+    }
+
     fn open_browser_surface(
         &mut self,
         open: BrowserOpen,
@@ -3709,22 +3719,24 @@ impl Shell {
         }
         let owner = key.clone();
         let sub = cx.subscribe_in(&browser, window, move |this, _, event, window, cx| {
+            // A native/action event may already be queued when the host hides
+            // or selection starts changing. Only the visible selected browser
+            // may navigate; lifecycle cleanup must still work in the background.
+            if matches!(
+                event,
+                crate::browser::BrowserEvent::NewTab(_)
+                    | crate::browser::BrowserEvent::OpenSource(_)
+            ) && !this.browser_host_is_active(&owner, id, cx)
+            {
+                return;
+            }
             match event {
                 crate::browser::BrowserEvent::Changed => cx.notify(),
                 crate::browser::BrowserEvent::NewTab(url) => {
-                    // A background page cannot open a tab in the wrong session.
-                    if this.panel_key(cx) == owner
-                        && this.resolved_right_active(cx) == RightSurface::Browser(id)
-                    {
-                        this.add_browser_surface(url.clone(), window, cx);
-                    }
+                    this.add_browser_surface(url.clone(), window, cx);
                 }
                 crate::browser::BrowserEvent::OpenSource(path) => {
-                    if this.panel_key(cx) == owner
-                        && this.resolved_right_active(cx) == RightSurface::Browser(id)
-                    {
-                        this.open_workspace_file_link(path, window, cx);
-                    }
+                    this.open_workspace_file_link(path, window, cx);
                 }
                 crate::browser::BrowserEvent::Close => {
                     this.close_right_surface(RightSurface::Browser(id), window, cx)
@@ -4180,7 +4192,7 @@ impl Shell {
         } else {
             current_key.clone()
         };
-        let was_active = key == current_key && self.resolved_right_active(cx) == surface;
+        let was_active = matches!(surface, RightSurface::Browser(id) if self.browser_host_is_active(&key, id, cx));
         let files = match surface {
             RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
             _ => None,
