@@ -102,8 +102,9 @@ What went wrong, in generic terms, with the app's own error text verbatim.
 ## Repro
 The smallest sequence of steps that shows it.
 
-## Screenshot
-Required when the bug is visual (see below). Leave it out otherwise.
+## Image
+Required on every issue: a screenshot of what's wrong, or a picture of the
+change you'd like (a mockup or an annotated screenshot). See below.
 
 ## Root cause
 In code terms (`crate::module::function`), naming the tag or commit the
@@ -130,13 +131,30 @@ The expected behavior, or the proposed change.
 - **What the header must not contain:** account details, private repository
   names, local paths, session ids, or transcript excerpts.
 
-### Visual issues carry a screenshot
+### Every issue carries an image
 
-If the bug is about how something looks (layout, clipping, overlap,
-truncation, spacing, colors, rendering, a stuck or wrong animation frame), the
-issue includes a screenshot that shows it. A pull request that changes how
-something looks shows it before and after, at the sizes it was checked at.
-A description of a picture can't be checked against the fix; a screenshot can.
+Every issue includes an image: for a bug, a screenshot that shows it; for a
+change or feature, a picture of what you'd like changed, such as a mockup or
+an annotated screenshot of where it goes. For a bug about how something looks
+(layout, clipping, overlap, truncation, spacing, colors, rendering, a stuck or
+wrong animation frame), the screenshot must show that. A pull request that
+changes how something looks shows it before and after, at the sizes it was
+checked at. A description of a picture can't be checked against the fix; a
+screenshot can.
+
+GitHub has no hook that runs before an issue is created, so this is enforced
+right after:
+- **Issue forms** (`.github/ISSUE_TEMPLATE`) require an Image field, and blank
+  issues are off. `gh issue create --body` skips the forms; the workflow below
+  still applies.
+- **The `Issue image` workflow** (`scripts/check-issue-image.py`) runs on each
+  new, edited or reopened issue. With no image, it labels the issue
+  `needs-image`, comments, and closes it. Editing the issue to add one reopens
+  it. With an image, it asks TypeSafe whether the first image shows what the
+  issue describes (labelling `image-unclear` if not) and whether it shows
+  private details; those two only warn.
+- A maintainer who reopens an issue the check closed overrides it. Issues
+  opened before 2026-10-23 aren't checked.
 
 - **Capture from synthetic data, never the user's real app.** Run an isolated
   build (`scripts/run-macos-dev.sh`, or any build with its own
@@ -159,8 +177,18 @@ A description of a picture can't be checked against the fix; a screenshot can.
   link it as `![caption](path)`, or call `show_image`. Harness only loads images
   from a chat's folder and its uploads, so a file elsewhere (under `/tmp`, say)
   shows only its caption.
-- **If it can only be seen with real data**, don't post that capture. Say in
-  the issue that no screenshot is attached and why, and describe what it shows.
+- **If it can only be seen with real data**, don't post that capture.
+  Recreate it with made-up data, or attach a mockup of what it looks like, and
+  say in the issue why the real capture isn't attached.
+
+### TypeSafe image requests
+
+Requests to TypeSafe's System One API (`POST https://api.typesafe.ai/v1/systemone`)
+that carry an image or a Box question send the header
+`TypeSafe-Danger-Zone-Images: true`; without it the API answers `400`. Images
+are PNG or JPEG, 280 to 1568 px a side and at most 16 MiB each, and aren't
+resized for you. The key is the `TYPESAFE_API_KEY` Actions secret; never write
+it into a file, log or issue.
 
 ## Heavy builds
 
