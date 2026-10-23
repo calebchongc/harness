@@ -383,6 +383,25 @@ impl Shell {
         cx.notify();
     }
 
+    /// Publish the flow for Settings → Devices' version card, so it offers
+    /// the same next step as the titlebar control. Called each render; the
+    /// global (and its observers) only change when the phase does.
+    pub(super) fn publish_update_phase(&self, cx: &mut App) {
+        use crate::settings::devices::{SharedUpdatePhase, UpdatePhase};
+        let phase = match &self.update_flow {
+            UpdateFlow::Idle => UpdatePhase::Idle,
+            UpdateFlow::Downloading => UpdatePhase::Downloading,
+            UpdateFlow::Ready(staged) => UpdatePhase::Ready(staged.version.clone()),
+            UpdateFlow::Failed(message) => UpdatePhase::Failed(message.to_string()),
+        };
+        if cx
+            .try_global::<SharedUpdatePhase>()
+            .is_none_or(|shared| shared.0 != phase)
+        {
+            cx.set_global(SharedUpdatePhase(phase));
+        }
+    }
+
     fn update_control_now(&self, cx: &App) -> Option<(UpdateControl, String)> {
         update_control(
             self.state.read(cx).update.as_ref(),

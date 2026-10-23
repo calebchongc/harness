@@ -456,6 +456,34 @@ fn update_control_lives_in_the_titlebar_and_later_stops_the_countdown(
     assert!(cx.debug_bounds("app-update-countdown").is_none());
     assert!(cx.debug_bounds("titlebar-update").is_some());
 
+    // Settings → Devices sees the same flow, and its button does what the
+    // titlebar click does: here, try the (nonexistent) staged install, which
+    // fails into a retry instead of starting another download.
+    {
+        use crate::settings::devices::{SharedUpdatePhase, UpdatePhase};
+        assert_eq!(
+            cx.update(|_, cx| cx.global::<SharedUpdatePhase>().0.clone()),
+            UpdatePhase::Ready("9.9.9".into())
+        );
+        cx.update(|window, cx| window.dispatch_action(Box::new(StartAppUpdate), cx));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                matches!(shell.update_flow, UpdateFlow::Failed(_)),
+                "the version card's button restarts into the staged update"
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(matches!(
+            cx.update(|_, cx| cx.global::<SharedUpdatePhase>().0.clone()),
+            UpdatePhase::Failed(_)
+        ));
+        assert!(
+            !dir.path().join("app-update-relaunch.json").exists(),
+            "a failed install leaves no relaunch marker"
+        );
+    }
+
     // A new-session prompt parked in another tab is unsent work too.
     shell.update(cx, |shell, cx| {
         assert!(!shell.has_unsent_composer_input(cx));

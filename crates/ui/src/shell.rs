@@ -12767,6 +12767,7 @@ impl Render for Shell {
             self.button_layout_sub =
                 Some(cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()));
         }
+        self.publish_update_phase(cx);
         // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
@@ -12955,8 +12956,12 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ReopenClosedChatTab, window, cx| {
                 this.reopen_closed_chat_tab(window, cx);
             }))
+            // Settings → Devices' version card: the titlebar control's click
+            // (download, retry, or restart into the staged update).
             .on_action(cx.listener(|this, _: &StartAppUpdate, _, cx| {
-                if matches!(this.update_flow, UpdateFlow::Idle | UpdateFlow::Failed(_)) {
+                if this.install.supports_desktop_update()
+                    && !matches!(this.update_flow, UpdateFlow::Downloading)
+                {
                     this.on_update_control_click(cx);
                 }
             }))
