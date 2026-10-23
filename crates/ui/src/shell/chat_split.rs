@@ -1053,8 +1053,18 @@ impl Shell {
             // into the active outlet. Capturing observes consumed child events;
             // deferring lets their click handlers act on the still-mounted view.
             // Every mouse button activates, and a text selection is no veto.
-            .capture_any_mouse_up(cx.listener(move |this, _, _, cx| {
-                if cx.has_active_drag() {
+            // But a release here is not a new interaction if its press began
+            // elsewhere (for example, selecting in the active pane across us).
+            .capture_any_mouse_down(cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                this.chat_pane_press = Some((ix, event.button));
+            }))
+            .on_mouse_down_out(cx.listener(move |this, _, _, _| {
+                if this.chat_pane_press.is_some_and(|(pane, _)| pane == ix) {
+                    this.chat_pane_press = None;
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+                if this.chat_pane_press.take() != Some((ix, event.button)) || cx.has_active_drag() {
                     return;
                 }
                 let tab = this.chat_tab;
