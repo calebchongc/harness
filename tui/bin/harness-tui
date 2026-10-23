@@ -18,6 +18,62 @@ while [ -L "$self" ]; do
   esac
 done
 here=$(cd "$(dirname "$self")/.." && pwd)
+
+# Self-update. An install the Harness app manages (~/.harness/tui/<version>) moves to the newest
+# Harness release's client before starting: checked at most every 6 hours with a 3-second
+# lookup, verified against the release's SHA-256, never fatal. HARNESS_TUI_AUTO_UPDATE=0 turns
+# it off. HARNESS_TUI_RELEASES overrides the release URL (tests).
+maybe_update() {
+  [ "${HARNESS_TUI_AUTO_UPDATE:-1}" != 0 ] || return 0
+  [ -z "${HARNESS_TUI_UPDATED:-}" ] || return 0
+  root=${HARNESS_TUI_ROOT:-$HOME/.harness/tui}
+  [ "$(dirname "$here")" = "$root" ] || return 0
+  current=$(basename "$here")
+  case "$current" in '' | *[!0-9.]*) return 0 ;; esac
+  stamp=$root/.last-update-check
+  if [ -f "$stamp" ] && [ -z "$(find "$stamp" -mmin +360 2>/dev/null)" ]; then
+    return 0
+  fi
+  base=${HARNESS_TUI_RELEASES:-https://github.com/justrach/harness/releases}
+  latest=$(curl -fsSL --max-time 3 "$base/latest/download/manifest.json" 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null) || return 0
+  case "$latest" in '' | *[!0-9.]*) return 0 ;; esac
+  newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+  if [ "$newest" = "$current" ]; then
+    touch "$stamp"
+    return 0
+  fi
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case "$os" in darwin) os=macos ;; esac
+  arch=$(uname -m)
+  case "$arch" in arm64) arch=aarch64 ;; esac
+  name=harness-tui-$latest-$os-$arch
+  url=$base/download/v$latest/$name.tar.gz
+  work=$(mktemp -d "$root/.install-XXXXXX") || return 0
+  echo "Updating graff tui to $latest..." >&2
+  if curl -fsSL --max-time 300 -o "$work/t.tgz" "$url" &&
+    curl -fsSL --max-time 30 -o "$work/t.sha256" "$url.sha256" &&
+    want=$(awk '{print $1}' "$work/t.sha256") &&
+    got=$({ shasum -a 256 "$work/t.tgz" 2>/dev/null || sha256sum "$work/t.tgz"; } | awk '{print $1}') &&
+    [ -n "$want" ] && [ "$want" = "$got" ] &&
+    tar -xzf "$work/t.tgz" -C "$work" &&
+    [ -x "$work/$name/bin/harness-tui" ] && [ -f "$work/$name/libexec/harness-tui-bridge" ]; then
+    rm -rf "${root:?}/$latest"
+    mv "$work/$name" "$root/$latest"
+    rm -rf "$work"
+    touch "$stamp"
+    link=$HOME/.local/bin/graff-tui
+    case "$(readlink "$link" 2>/dev/null || true)" in
+      "$root"/*) ln -sfn "$root/$latest/bin/graff-tui" "$link" ;;
+    esac
+    HARNESS_TUI_UPDATED=1 exec "$root/$latest/bin/harness-tui" "$@"
+  fi
+  # A release's client can lag its publication; no stamp, so the next start retries.
+  rm -rf "$work"
+  echo "Couldn't update graff tui to $latest; starting $current." >&2
+}
+maybe_update "$@"
+
 bridge_bin=${HARNESS_TUI_BRIDGE_BIN:-$here/libexec/harness-tui-bridge}
 tui_bin=${HARNESS_TUI_BIN:-$here/libexec/harness-tui}
 

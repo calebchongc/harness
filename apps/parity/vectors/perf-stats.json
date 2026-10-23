@@ -44,7 +44,7 @@
     "max": 240
   },
   "sharingDefault": true,
-  "iosSharingDefault": false,
+  "iosSharingDefault": true,
   "batches": [
     {
       "name": "android batch: buckets, boundaries, clamping and an unknown metric",

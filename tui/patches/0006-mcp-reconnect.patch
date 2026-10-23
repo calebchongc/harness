@@ -1,0 +1,248 @@
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index 1aec8bbd45..83f7e5191b 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1231,7 +1231,7 @@ client_request_definitions! {
+     },
+ 
+     McpServerRefresh => "config/mcpServer/reload" {
+-        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
++        params: #[serde(skip_serializing_if = "Option::is_none")] Option<v2::McpServerRefreshParams>,
+         serialization: global("mcp-registry"),
+         response: v2::McpServerRefreshResponse,
+     },
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/mcp.rs b/codex-rs/app-server-protocol/src/protocol/v2/mcp.rs
+index e1ed3b624b..15d3d8e1ef 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/mcp.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/mcp.rs
+@@ -281,7 +281,16 @@ impl From<CoreMcpToolCallError> for McpToolCallError {
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+-pub struct McpServerRefreshParams {}
++pub struct McpServerRefreshParams {
++    /// Harness bridge: reload only this server (all when omitted).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional = nullable)]
++    pub name: Option<String>,
++    /// Harness bridge: switch `name` on or off instead of reloading it.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional = nullable)]
++    pub enabled: Option<bool>,
++}
+ 
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 796ecf2fc8..db98343a99 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1697,7 +1697,7 @@ impl MessageProcessor {
+                 Box::pin(self.mcp_processor.mcp_server_oauth_login(params)).await
+             }
+             ClientRequest::McpServerRefresh { params, .. } => {
+-                self.mcp_processor.mcp_server_refresh(params).await
++                self.mcp_processor.mcp_server_refresh(params.map(|_| ())).await
+             }
+             ClientRequest::McpServerStatusList { params, .. } => {
+                 self.mcp_processor
+diff --git a/codex-rs/tui/src/app/background_requests.rs b/codex-rs/tui/src/app/background_requests.rs
+index 69f2aeb458..644e0dc935 100644
+--- a/codex-rs/tui/src/app/background_requests.rs
++++ b/codex-rs/tui/src/app/background_requests.rs
+@@ -25,6 +25,8 @@ use codex_app_server_protocol::MarketplaceRemoveResponse;
+ use codex_app_server_protocol::MarketplaceUpgradeParams;
+ use codex_app_server_protocol::MarketplaceUpgradeResponse;
+ use codex_app_server_protocol::McpServerOauthLoginParams;
++use codex_app_server_protocol::McpServerRefreshParams;
++use codex_app_server_protocol::McpServerRefreshResponse;
+ use codex_app_server_protocol::RequestId;
+ 
+ use crate::hooks_rpc::fetch_hooks_list;
+@@ -67,6 +69,28 @@ impl App {
+         });
+     }
+ 
++    pub(super) fn reload_mcp_servers(
++        &self,
++        app_server: &AppServerSession,
++        name: Option<String>,
++        enabled: Option<bool>,
++        thread_id: Option<ThreadId>,
++    ) {
++        let request_handle = app_server.request_handle();
++        let app_event_tx = self.app_event_tx.clone();
++        tokio::spawn(async move {
++            let result = request_handle
++                .request_typed::<McpServerRefreshResponse>(ClientRequest::McpServerRefresh {
++                    request_id: RequestId::String(format!("mcp-reload-{}", Uuid::new_v4())),
++                    params: Some(McpServerRefreshParams { name, enabled }),
++                })
++                .await
++                .map(|_| ())
++                .map_err(|error| error.to_string());
++            app_event_tx.send(AppEvent::McpServersReloaded { result, thread_id });
++        });
++    }
++
+     pub(super) fn fetch_mcp_inventory(
+         &mut self,
+         app_server: &AppServerSession,
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 3866963064..3fcf7f011f 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -1554,6 +1554,25 @@ impl App {
+             AppEvent::FetchMcpInventory { detail, thread_id } => {
+                 self.fetch_mcp_inventory(app_server, detail, thread_id);
+             }
++            AppEvent::ReloadMcpServers {
++                name,
++                enabled,
++                thread_id,
++            } => {
++                self.reload_mcp_servers(app_server, name, enabled, thread_id);
++            }
++            AppEvent::McpServersReloaded { result, thread_id } => match result {
++                Ok(()) => self.fetch_mcp_inventory(
++                    app_server,
++                    McpServerStatusDetail::ToolsAndAuthOnly,
++                    thread_id,
++                ),
++                Err(error) => {
++                    self.chat_widget.clear_mcp_inventory_loading();
++                    self.chat_widget
++                        .add_error_message(format!("MCP reload failed: {error}"));
++                }
++            },
+             AppEvent::StartMcpLogin { name, thread_id } => {
+                 if self.pending_mcp_login_start.is_some() {
+                     self.chat_widget.add_info_message(
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index c77c55841d..58b37ccee9 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -1081,6 +1081,19 @@ pub(crate) enum AppEvent {
+         thread_id: ThreadId,
+     },
+ 
++    /// `/mcp reconnect [name]` and `/mcp enable|disable <name>` (Harness bridge).
++    ReloadMcpServers {
++        name: Option<String>,
++        enabled: Option<bool>,
++        thread_id: Option<ThreadId>,
++    },
++
++    /// The reload finished; on success the inventory is shown again.
++    McpServersReloaded {
++        result: Result<(), String>,
++        thread_id: Option<ThreadId>,
++    },
++
+     McpLoginStarted {
+         request_id: String,
+         result: Result<McpServerOauthLoginResponse, String>,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 021694a5c5..247f813d48 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -1574,6 +1574,23 @@ impl ChatWidget {
+     ///
+     /// The spinner lives in `active_cell` and is cleared by
+     /// [`clear_mcp_inventory_loading`] once the result arrives.
++    /// `/mcp reconnect` and `/mcp enable|disable`: the spinner stays until the
++    /// refreshed inventory replaces it.
++    pub(crate) fn reload_mcp_servers(&mut self, name: Option<String>, enabled: Option<bool>) {
++        self.flush_answer_stream_with_separator();
++        self.flush_active_cell();
++        self.transcript.active_cell = Some(Box::new(history_cell::new_mcp_inventory_loading(
++            self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
++        )));
++        self.bump_active_cell_revision();
++        self.request_redraw();
++        self.app_event_tx.send(AppEvent::ReloadMcpServers {
++            name,
++            enabled,
++            thread_id: self.thread_id(),
++        });
++    }
++
+     pub(crate) fn add_mcp_output(&mut self, detail: McpServerStatusDetail) {
+         self.flush_answer_stream_with_separator();
+         self.flush_active_cell();
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index 5546acb955..90ac87e572 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -804,8 +804,17 @@ impl ChatWidget {
+                 self.handle_ide_command_args(trimmed);
+             }
+             SlashCommand::Mcp => {
++                let mut words = trimmed.split_whitespace();
++                let verb = words.next().unwrap_or_default().to_ascii_lowercase();
++                let target = words.next().map(str::to_string);
+                 if trimmed.eq_ignore_ascii_case("verbose") {
+                     self.add_mcp_output(McpServerStatusDetail::Full);
++                } else if verb == "reconnect" {
++                    // No name, or `all`: every switched-on server.
++                    let name = target.filter(|n| !n.eq_ignore_ascii_case("all"));
++                    self.reload_mcp_servers(name, None);
++                } else if (verb == "enable" || verb == "disable") && target.is_some() {
++                    self.reload_mcp_servers(target, Some(verb == "enable"));
+                 } else if let Some((command, name)) = trimmed.split_once(' ')
+                     && command.eq_ignore_ascii_case("login")
+                     && !name.trim().is_empty()
+@@ -821,7 +830,10 @@ impl ChatWidget {
+                         );
+                     }
+                 } else {
+-                    self.add_error_message("Usage: /mcp [verbose | login <name>]".to_string());
++                    self.add_error_message(
++                        "Usage: /mcp [verbose | reconnect [name] | enable <name> | disable <name> | login <name>]"
++                            .to_string(),
++                    );
+                 }
+             }
+             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
+diff --git a/codex-rs/tui/src/history_cell/mcp.rs b/codex-rs/tui/src/history_cell/mcp.rs
+index 9f80e5e5d7..040cef2c59 100644
+--- a/codex-rs/tui/src/history_cell/mcp.rs
++++ b/codex-rs/tui/src/history_cell/mcp.rs
+@@ -700,6 +700,16 @@ pub(crate) fn new_mcp_tools_output_from_statuses(
+             ]
+             .into(),
+         );
++        // Why it is not connected (the server's own words when graff has them).
++        if let Some(error) = status.tools_error.as_ref().filter(|e| !e.is_empty()) {
++            lines.push(
++                vec![
++                    "    ".into(),
++                    error.clone().set_style(status_style(StatusTone::Failure)),
++                ]
++                .into(),
++            );
++        }
+         if matches!(detail, McpServerStatusDetail::ToolsAndAuthOnly) {
+             continue;
+         }
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+index 1c98b52cf3..dec3e5a039 100644
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -147,7 +147,7 @@ impl SlashCommand {
+             SlashCommand::Experimental => "toggle experimental features",
+             SlashCommand::AutoReview => "approve one retry of a recent auto-review denial",
+             SlashCommand::Memories => "configure memory use and generation",
+-            SlashCommand::Mcp => "list MCP tools; use /mcp verbose or /mcp login <name>",
++            SlashCommand::Mcp => "list MCP servers; /mcp reconnect [name], enable|disable <name>, login <name>",
+             SlashCommand::Apps => "manage apps",
+             SlashCommand::Plugins => "browse plugins",
+             SlashCommand::Logout => "log out of Codex",
+@@ -337,7 +337,6 @@ impl SlashCommand {
+                 | DebugConfig
+                 | Cd
+                 | Pets
+-                | Mcp
+                 | Apps
+                 | Plugins
+                 | Logout

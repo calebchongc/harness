@@ -18,19 +18,24 @@ use std::time::Duration;
 
 use harness_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, GRAFF_LOGIN_PROVIDERS, GraffLoginProvider, HarnessId,
+    AgentLoginStatus, CHATGPT_MANAGE_USAGE_URL, GRAFF_LOGIN_PROVIDERS, GraffLoginProvider,
+    HarnessId,
 };
 use harness_rpc::methods;
 
 use crate::codegraff_jobs::{CodegraffJob, job_active, job_summary};
 use crate::codegraff_sandboxes::{
-    CodegraffSandboxes, can_start, can_stop, sandbox_detail, sandbox_title, start_labels,
+    CREATE_COPY, TEMPORARY_COPY, TURN_OFF, TURN_OFF_HINT, can_keep_running, can_start, can_stop,
+    is_temporary, sandbox_detail, sandbox_title, selected_size, size_detail, size_title,
+    start_labels,
 };
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
+
+mod relay_callback;
 
 // ---------------------------------------------------------------------------
 // Pure: usage meters + labels
@@ -199,13 +204,71 @@ pub fn openai_login(snapshot: &AgentAccountsSnapshot) -> (bool, Option<String>) 
 /// A graff provider's display name for the sign-in dialog title.
 fn graff_provider_name(id: Option<&str>) -> &'static str {
     if id == Some("chatgpt-new") {
-        return "ChatGPT (new)";
+        return "ChatGPT";
     }
     GRAFF_LOGIN_PROVIDERS
         .iter()
         .find(|(provider, _)| Some(*provider) == id)
         .map(|(_, name)| *name)
         .unwrap_or("graff")
+}
+
+/// Where OpenAI API keys are made: the other way to use graff's ChatGPT
+/// models when plan usage is off.
+const OPENAI_API_KEYS_URL: &str = "https://platform.openai.com/api-keys";
+
+/// graff's ChatGPT (plan) sign-in as the Accounts row shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatgptPlanRow {
+    /// The listing hasn't loaded (or failed).
+    Unknown,
+    SignedOut,
+    /// Signed in with plan usage: ready.
+    Ready {
+        account: Option<String>,
+    },
+    /// Signed in, but plan usage wasn't granted: can't run on the plan.
+    PlanOff {
+        account: Option<String>,
+    },
+}
+
+impl ChatgptPlanRow {
+    /// Read the `chatgpt-new` row of graff's listing. Pure.
+    pub fn from_listing(rows: Option<&[GraffLoginProvider]>) -> Self {
+        let Some(rows) = rows else {
+            return Self::Unknown;
+        };
+        match rows.iter().find(|row| row.id == "chatgpt-new") {
+            Some(row) if row.signed_in => Self::Ready {
+                account: row.account.clone(),
+            },
+            Some(row) if row.plan_usage == Some(false) => Self::PlanOff {
+                account: row.account.clone(),
+            },
+            _ => Self::SignedOut,
+        }
+    }
+
+    /// The row's status line. Pure.
+    pub fn status(&self) -> String {
+        let signed_in_as = |account: &Option<String>| match account {
+            Some(account) => format!("Signed in as {account}"),
+            None => "Signed in".to_string(),
+        };
+        match self {
+            Self::Unknown => "Separate from Codex · graff login chatgpt-new".into(),
+            Self::SignedOut => "Not signed in · separate from Codex".into(),
+            Self::Ready { account } => {
+                format!("{} · using your ChatGPT plan", signed_in_as(account))
+            }
+            Self::PlanOff { account } => format!(
+                "{} · plan usage is off. Continue with ChatGPT and allow it, or use an \
+                 OpenAI API key (graff key set openai).",
+                signed_in_as(account)
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,9 +283,11 @@ enum LoginFlow {
         provider: Option<String>,
         reauthenticate: bool,
     },
-    /// Claude-style: open the URL, paste the code back.
+    /// Claude-style: open the URL, paste the code back. graff's relayed
+    /// ChatGPT sign-in uses it too: the "code" is the redirect address.
     PasteCode {
         harness: HarnessId,
+        provider: Option<String>,
         start: AgentLoginStart,
         submitting: bool,
         error: Option<SharedString>,
@@ -253,7 +318,9 @@ impl LoginFlow {
                 reauthenticate,
                 ..
             } => (*harness, provider.as_deref(), *reauthenticate),
-            LoginFlow::PasteCode { harness, .. } => (*harness, None, false),
+            LoginFlow::PasteCode {
+                harness, provider, ..
+            } => (*harness, provider.as_deref(), false),
         };
         match harness {
             HarnessId::Codex if reauthenticate => "Sign in to ChatGPT (Codex)".into(),
@@ -272,6 +339,9 @@ pub struct AccountsPage {
     /// Retargeted by the page-header device switcher (harness parity: the
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
     target_device: Option<String>,
+    /// Listens on this computer's loopback callback during a relayed sign-in.
+    relay_capture: Option<relay_callback::Capture>,
+    relay_capture_task: Option<Task<()>>,
     device_menu: popover::Popup<()>,
     snapshot: Loadable<AgentAccountsSnapshot>,
     codegraff_usage: Loadable<Option<CodegraffUsage>>,
@@ -282,14 +352,14 @@ pub struct AccountsPage {
     jobs_poll_task: Option<Task<()>>,
     /// Job id with an in-flight Cancel.
     cancelling_job: Option<String>,
-    /// Cloud sandboxes (`None` when signed out; `enabled: false` hides the card).
-    codegraff_sandboxes: Loadable<Option<CodegraffSandboxes>>,
-    sandboxes_task: Option<Task<()>>,
-    /// The sandbox with an in-flight Start / Stop / Delete, and which.
+    /// The sandbox with an in-flight Start / Turn off / Keep running / Delete, and which. The
+    /// list itself lives on [`AppState`], shared with the sidebar strip.
     sandbox_busy: Option<(String, &'static str)>,
     /// Delete asks for a second click.
     sandbox_confirm_delete: Option<String>,
     creating_sandbox: bool,
+    /// The size picked for the next cloud sandbox (`None`: the default one).
+    sandbox_size: Option<String>,
     /// Sign out of Codegraff is in flight.
     codegraff_signing_out: bool,
     /// Account id with an in-flight Switch/Forget.
@@ -299,6 +369,9 @@ pub struct AccountsPage {
     graff_task: Option<Task<()>>,
     /// Provider id with an in-flight sign-out.
     busy_graff: Option<String>,
+    /// The one-time "You're using your ChatGPT plan" confirmation after
+    /// graff's first ChatGPT sign-in on the shown device, until dismissed.
+    plan_confirmation: Option<SharedString>,
     login: Option<LoginFlow>,
     /// The sign-in link was just copied (the button reads "Copied").
     login_url_copied: bool,
@@ -326,6 +399,8 @@ impl AccountsPage {
             state,
             scroll: widgets::PageScroll::default(),
             target_device: None,
+            relay_capture: None,
+            relay_capture_task: None,
             device_menu: popover::Popup::default(),
             snapshot: Loadable::Idle,
             codegraff_usage: Loadable::Idle,
@@ -333,16 +408,16 @@ impl AccountsPage {
             jobs_task: None,
             jobs_poll_task: None,
             cancelling_job: None,
-            codegraff_sandboxes: Loadable::Idle,
-            sandboxes_task: None,
             sandbox_busy: None,
             sandbox_confirm_delete: None,
             creating_sandbox: false,
+            sandbox_size: None,
             codegraff_signing_out: false,
             busy_account: None,
             graff_logins: Loadable::Idle,
             graff_task: None,
             busy_graff: None,
+            plan_confirmation: None,
             login: None,
             login_url_copied: false,
             copy_task: None,
@@ -721,47 +796,38 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// The account's cloud sandboxes. They belong to this device's Codegraff sign-in, so the
-    /// call is never retargeted at another device.
+    /// Re-read the account's cloud sandboxes (kept on [`AppState`], which also keeps them
+    /// fresh while one runs). They belong to this device's Codegraff sign-in, so the call is
+    /// never retargeted at another device.
     fn load_codegraff_sandboxes(&mut self, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, cx| state.refresh_cloud_sandboxes(cx));
+    }
+
+    fn create_codegraff_sandbox(&mut self, temporary: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        if matches!(self.codegraff_sandboxes, Loadable::Idle) {
-            self.codegraff_sandboxes = Loadable::Loading;
-        }
-        self.sandboxes_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CODEGRAFF_SANDBOXES, serde_json::json!({}))
-                .await;
-            this.update(cx, |page, cx| {
-                page.codegraff_sandboxes = match result {
-                    Ok(value) => {
-                        match serde_json::from_value::<Option<CodegraffSandboxes>>(value) {
-                            Ok(list) => Loadable::Ready(list),
-                            Err(err) => Loadable::Error(err.to_string()),
-                        }
-                    }
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn create_codegraff_sandbox(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
+        let (method, params) = if temporary {
+            (
+                methods::CODEGRAFF_CREATE_TEMPORARY_SANDBOX,
+                serde_json::json!({}),
+            )
+        } else {
+            // Personal sizing belongs only to persistent Harness devices.
+            let size = self.state.read(cx).cloud_sandboxes().and_then(|list| {
+                selected_size(&list.sizes, self.sandbox_size.as_deref()).map(|s| s.id.clone())
+            });
+            let params = match size {
+                Some(size) => serde_json::json!({ "size": size }),
+                None => serde_json::json!({}),
+            };
+            (methods::CODEGRAFF_CREATE_SANDBOX, params)
         };
         self.creating_sandbox = true;
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CODEGRAFF_CREATE_SANDBOX, serde_json::json!({}))
-                .await;
+            let result = engine.client().call(method, params).await;
             this.update(cx, |page, cx| {
                 page.creating_sandbox = false;
                 if let Err(err) = result {
@@ -803,7 +869,8 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// `action`: `start` (wakes a paused sandbox and attaches Harness again), `stop`, `delete`.
+    /// `action`: `start` (wakes a paused sandbox, kept running, and attaches Harness again),
+    /// `stop` (Turn off: a pause), `keep-running-on`, `delete`.
     fn codegraff_sandbox_action(
         &mut self,
         id: String,
@@ -841,9 +908,7 @@ impl AccountsPage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let Loadable::Ready(Some(list)) = &self.codegraff_sandboxes else {
-            return None;
-        };
+        let list = self.state.read(cx).cloud_sandboxes()?.clone();
         if !list.enabled {
             return None;
         }
@@ -854,6 +919,17 @@ impl AccountsPage {
                 .as_ref()
                 .filter(|(id, _)| *id == sandbox.id)
                 .map(|(_, action)| *action);
+            let copy_id = is_temporary(sandbox).then(|| {
+                let id = sandbox.id.clone();
+                widgets::ghost_action(theme)
+                    .id(("codegraff-sandbox-copy-id", ix))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip("Use this ID with sandbox API/tools."))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                    }))
+                    .child("Copy ID")
+            });
             let start = can_start(sandbox).then(|| {
                 let id = sandbox.id.clone();
                 widgets::ghost_action(theme)
@@ -871,11 +947,32 @@ impl AccountsPage {
                         start_labels(sandbox).0
                     })
             });
+            let keep_running = can_keep_running(sandbox).then(|| {
+                let id = sandbox.id.clone();
+                widgets::ghost_action(theme)
+                    .id(("codegraff-sandbox-keep-running", ix))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip(
+                        "Keep it running until you turn it off, billed per second from your Codegraff credit.",
+                    ))
+                    .when(busy.is_some(), |el| el.opacity(0.5))
+                    .when(busy.is_none(), |el| {
+                        el.on_click(cx.listener(move |page, _, _, cx| {
+                            page.codegraff_sandbox_action(id.clone(), "keep-running-on", cx)
+                        }))
+                    })
+                    .child(if busy == Some("keep-running-on") {
+                        "Keeping running…"
+                    } else {
+                        "Keep running"
+                    })
+            });
             let stop = can_stop(sandbox).then(|| {
                 let id = sandbox.id.clone();
                 widgets::ghost_action(theme)
                     .id(("codegraff-sandbox-stop", ix))
                     .hover(|s| widgets::ghost_hover(theme, s))
+                    .tooltip(widgets::text_tooltip(TURN_OFF_HINT))
                     .when(busy.is_some(), |el| el.opacity(0.5))
                     .when(busy.is_none(), |el| {
                         el.on_click(cx.listener(move |page, _, _, cx| {
@@ -883,9 +980,9 @@ impl AccountsPage {
                         }))
                     })
                     .child(if busy == Some("stop") {
-                        "Stopping…"
+                        TURN_OFF.1
                     } else {
-                        "Stop"
+                        TURN_OFF.0
                     })
             });
             let confirming = self.sandbox_confirm_delete.as_deref() == Some(sandbox.id.as_str());
@@ -936,11 +1033,76 @@ impl AccountsPage {
                                 .child(sandbox_detail(sandbox, now)),
                         ),
                 )
+                .children(copy_id)
                 .children(start)
+                .children(keep_running)
                 .children(stop)
                 .child(delete)
         });
         let creating = self.creating_sandbox;
+        let picked = selected_size(&list.sizes, self.sandbox_size.as_deref()).map(|s| s.id.clone());
+        // Standard / Large with what each is and costs; the default one preselected.
+        let size_choice = (!list.sizes.is_empty()).then(|| {
+            div()
+                .mt(px(8.0))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .children(list.sizes.iter().enumerate().map(|(ix, size)| {
+                    let selected = picked.as_deref() == Some(size.id.as_str());
+                    let id = size.id.clone();
+                    div()
+                        .id(("codegraff-sandbox-size", ix))
+                        .debug_selector(move || format!("codegraff-sandbox-size-{ix}"))
+                        .flex_none()
+                        .min_w(px(180.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(if selected {
+                            theme.accent.opacity(0.6)
+                        } else {
+                            theme.border
+                        })
+                        .bg(if selected {
+                            theme.accent_wash
+                        } else {
+                            crate::theme::ink(0.02)
+                        })
+                        .role(gpui::Role::RadioButton)
+                        .aria_label(SharedString::from(format!(
+                            "{} {}",
+                            size_title(size),
+                            size_detail(size)
+                        )))
+                        .when(!creating, |el| {
+                            el.cursor_pointer()
+                                .hover(|s| s.bg(crate::theme::ink(0.05)))
+                                .on_click(cx.listener(move |page, _, _, cx| {
+                                    page.sandbox_size = Some(id.clone());
+                                    cx.notify();
+                                }))
+                        })
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(size_title(size))),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(size_detail(size))),
+                        )
+                }))
+        });
         let create = div()
             .id("codegraff-sandbox-create-row")
             .px(px(20.0))
@@ -964,10 +1126,11 @@ impl AccountsPage {
                             .mt(px(2.0))
                             .text_size(crate::typography::ui_rems(11.5))
                             .text_color(theme.text_muted)
-                            .child(
-                                "A machine that keeps running Harness for you. It shows up in your devices, billed per second from your Codegraff credit.",
-                            ),
-                    ),
+                            .child(format!(
+                                "A machine that runs Harness for you and shows up in your devices. {CREATE_COPY}"
+                            )),
+                    )
+                    .children(size_choice),
             )
             .child(
                 widgets::ghost_action(theme)
@@ -975,7 +1138,7 @@ impl AccountsPage {
                     .hover(|s| widgets::ghost_hover(theme, s))
                     .when(creating, |el| el.opacity(0.5))
                     .when(!creating, |el| {
-                        el.on_click(cx.listener(|page, _, _, cx| page.create_codegraff_sandbox(cx)))
+                        el.on_click(cx.listener(|page, _, _, cx| page.create_codegraff_sandbox(false, cx)))
                     })
                     .child(if creating { "Creating…" } else { "Create" }),
             );
@@ -995,7 +1158,49 @@ impl AccountsPage {
                     widgets::section_card(theme)
                         .mt(px(8.0))
                         .children(rows)
-                        .child(create),
+                        .child(create)
+                        .child(
+                            div()
+                                .id("codegraff-temporary-sandbox-create-row")
+                                .px(px(20.0))
+                                .py(px(12.0))
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(widgets::row_title(theme, "Temporary sandbox"))
+                                        .child(
+                                            div()
+                                                .mt(px(2.0))
+                                                .text_size(crate::typography::ui_rems(11.5))
+                                                .text_color(theme.text_muted)
+                                                .child(TEMPORARY_COPY),
+                                        ),
+                                )
+                                .child(
+                                    widgets::ghost_action(theme)
+                                        .id("codegraff-temporary-sandbox-create")
+                                        .hover(|s| widgets::ghost_hover(theme, s))
+                                        .when(creating, |el| el.opacity(0.5))
+                                        .when(!creating, |el| {
+                                            el.on_click(cx.listener(|page, _, _, cx| {
+                                                page.create_codegraff_sandbox(true, cx)
+                                            }))
+                                        })
+                                        .child(if creating {
+                                            "Creating…"
+                                        } else {
+                                            "Create temporary"
+                                        }),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -1125,8 +1330,12 @@ impl AccountsPage {
         harness: HarnessId,
         provider: Option<&str>,
         reauthenticate: bool,
+        relay: bool,
     ) -> serde_json::Value {
         let mut params = serde_json::json!({ "harness": harness });
+        if relay {
+            params["relayBrowser"] = serde_json::json!(true);
+        }
         if reauthenticate {
             params["reauthenticate"] = serde_json::json!(true);
             if harness == HarnessId::Codex {
@@ -1141,6 +1350,34 @@ impl AccountsPage {
 
     fn start_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         self.begin_login(harness, None, false, cx);
+    }
+
+    /// A failed run's "Log in": show `target`'s logins and, for an agent with
+    /// a sign-in here (Claude Code, Codex, Cursor), start adding an account.
+    /// Other agents (graff's provider sign-ins among them) just land on the
+    /// page: the chat says which agent, not which of its providers.
+    pub(crate) fn sign_in(
+        &mut self,
+        target: Option<String>,
+        harness: Option<HarnessId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_target_device(target, cx);
+        if let Some(harness) = harness.filter(|harness| {
+            PROVIDERS
+                .iter()
+                .any(|(provider, _, _)| provider == harness)
+        }) {
+            self.start_login(harness, cx);
+        }
+        cx.notify();
+    }
+
+    /// The device whose logins are shown (`None`: this one), and the flow's
+    /// last error, for the shell's "Log in" tests.
+    #[cfg(test)]
+    pub(crate) fn sign_in_state(&self) -> (Option<&str>, Option<&str>) {
+        (self.target_device.as_deref(), self.error.as_deref())
     }
 
     /// graff's own sign-in for one provider (`xai`, `kimi`, `zai`).
@@ -1196,7 +1433,14 @@ impl AccountsPage {
             reauthenticate,
         });
         self.error = None;
-        let params = self.login_params(harness, provider.as_deref(), reauthenticate);
+        // ChatGPT's sign-in lands on the execution device's loopback callback,
+        // which a browser on this computer can't reach: relay it from here.
+        let relay = harness == HarnessId::Graff
+            && provider.as_deref() == Some("chatgpt-new")
+            && self.target_is_remote(cx);
+        self.relay_capture = None;
+        self.relay_capture_task = None;
+        let params = self.login_params(harness, provider.as_deref(), reauthenticate, relay);
         let mut cancel_params = self.params(serde_json::json!({}));
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -1211,6 +1455,7 @@ impl AccountsPage {
                 Ok(start)
                     if reauthenticate
                         && !(harness == HarnessId::Codex && start.is_safe_device_code())
+                        && !(relay && start.mode == AgentLoginMode::RelayBrowser)
                         && (start.mode != AgentLoginMode::HostBrowser
                             || !start.url.is_empty()
                             || start.code.is_some()
@@ -1235,15 +1480,20 @@ impl AccountsPage {
                             cx.open_url(&start.url);
                         }
                         match start.mode {
-                            AgentLoginMode::PasteCode => {
+                            AgentLoginMode::PasteCode | AgentLoginMode::RelayBrowser => {
+                                let relayed = start.mode == AgentLoginMode::RelayBrowser;
                                 page.code_input
                                     .update(cx, |input, cx| input.set_text("", cx));
                                 page.login = Some(LoginFlow::PasteCode {
                                     harness,
+                                    provider,
                                     start,
                                     submitting: false,
                                     error: None,
                                 });
+                                if relayed {
+                                    page.spawn_relay_capture(cx);
+                                }
                             }
                             AgentLoginMode::Browser
                             | AgentLoginMode::HostBrowser
@@ -1301,6 +1551,8 @@ impl AccountsPage {
                 match result {
                     Ok(_) => {
                         page.login = None;
+                        page.relay_capture = None;
+                        page.relay_capture_task = None;
                         page.load(force_usage_for(LoadTrigger::PostLogin), cx);
                     }
                     Err(err) => {
@@ -1318,6 +1570,46 @@ impl AccountsPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Whether the page shows another computer's logins.
+    fn target_is_remote(&self, cx: &gpui::App) -> bool {
+        let local = self.state.read(cx).local_device_id.clone();
+        self.target_device
+            .as_deref()
+            .is_some_and(|target| local.as_deref() != Some(target))
+    }
+
+    /// Catch the browser's loopback redirect for a relayed sign-in and send it
+    /// on. A busy port leaves the paste field as the way to finish.
+    fn spawn_relay_capture(&mut self, cx: &mut Context<Self>) {
+        let Some(LoginFlow::PasteCode { start, .. }) = &self.login else {
+            return;
+        };
+        let Some((port, path)) = relay_callback::callback_target(&start.url) else {
+            return;
+        };
+        let Some((capture, landed)) = relay_callback::start(port, path) else {
+            tracing::info!(
+                port,
+                "loopback port busy; relayed sign-in falls back to pasting"
+            );
+            return;
+        };
+        self.relay_capture = Some(capture);
+        self.relay_capture_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(landed) = landed.await else {
+                return;
+            };
+            this.update(cx, |page, cx| {
+                if matches!(page.login, Some(LoginFlow::PasteCode { .. })) {
+                    page.code_input
+                        .update(cx, |input, cx| input.set_text(landed, cx));
+                    page.submit_code(cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     /// The browser-wait poll loop: PollAgentLogin every 1.5s until Done/Error.
@@ -1340,15 +1632,27 @@ impl AccountsPage {
                     .call(methods::POLL_AGENT_LOGIN, params.clone())
                     .await;
                 let outcome = this.update(cx, |page, cx| {
-                    let Some(LoginFlow::Browser { message, error, .. }) = &mut page.login else {
+                    let Some(LoginFlow::Browser {
+                        message,
+                        error,
+                        provider,
+                        ..
+                    }) = &mut page.login
+                    else {
                         return true; // dialog dismissed — stop polling
                     };
+                    let chatgpt = provider.as_deref() == Some("chatgpt-new");
                     match result.as_ref().ok().and_then(|value| {
                         serde_json::from_value::<AgentLoginPoll>(value.clone()).ok()
                     }) {
                         Some(poll) => match poll.status {
                             AgentLoginStatus::Done => {
                                 page.login = None;
+                                // graff's first ChatGPT sign-in on this device
+                                // carries the one-time plan confirmation.
+                                if chatgpt && let Some(text) = poll.message {
+                                    page.plan_confirmation = Some(text.into());
+                                }
                                 page.load(force_usage_for(LoadTrigger::PostLogin), cx);
                                 cx.notify();
                                 true
@@ -1359,6 +1663,11 @@ impl AccountsPage {
                                         .unwrap_or_else(|| "Login failed".to_string())
                                         .into(),
                                 );
+                                // A sign-in without plan usage still landed:
+                                // the row should say plan usage is off.
+                                if chatgpt {
+                                    page.load_graff_logins(cx);
+                                }
                                 cx.notify();
                                 true
                             }
@@ -1399,6 +1708,8 @@ impl AccountsPage {
         self.login = None;
         self.poll_task = None;
         self.action_task = None;
+        self.relay_capture = None;
+        self.relay_capture_task = None;
         if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
             let params = self.params(serde_json::json!({ "loginId": login_id }));
             cx.spawn(async move |_, _| {
@@ -1656,25 +1967,115 @@ impl AccountsPage {
             .into_any_element()
     }
 
-    /// The new ChatGPT route is separate from legacy Codex and remains
-    /// available even if an account-list probe fails. Stored credentials are
-    /// not evidence that a token is valid; sign-in can always be requested.
-    /// The row reflects the same credential listing as the other graff rows,
-    /// so a completed sign-in (which reloads that listing) shows up here.
+    /// graff's ChatGPT (plan) sign-in, separate from legacy Codex. It stays
+    /// offered even if the listing fails. Ready means signed in with plan
+    /// usage; a sign-in without it says so and offers both ways forward (sign
+    /// in again and allow it, or an API key). OpenAI's UI guidelines: Manage
+    /// usage beside the plan, and a one-time confirmation after the first
+    /// sign-in. Token validity is checked when used, not here.
     fn render_chatgpt_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let signed_in = match &self.graff_logins {
-            Loadable::Ready(providers) => providers
-                .iter()
-                .any(|provider| provider.id == "chatgpt-new" && provider.signed_in),
-            _ => false,
+        let row = ChatgptPlanRow::from_listing(match &self.graff_logins {
+            Loadable::Ready(rows) => Some(rows.as_slice()),
+            _ => None,
+        });
+        let link = |id: &'static str, label: &'static str, url: &'static str| {
+            popover::btn_ghost(theme, label, id)
+                .id(id)
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded(px(6.0))
+                .text_size(crate::typography::ui_rems(11.5))
+                .on_click(move |_, _, cx| cx.open_url(url))
         };
-        let status = match &self.graff_logins {
-            Loadable::Ready(_) if signed_in => {
-                "Signed in on this device · separate from Codex · token validity checked when used"
-            }
-            Loadable::Ready(_) => "Not signed in · separate from Codex · graff login chatgpt-new",
-            _ => "Separate from Codex · graff login chatgpt-new · token validity checked when used",
+        let plan_links = match &row {
+            ChatgptPlanRow::Ready { .. } => Some(
+                div()
+                    .flex()
+                    .justify_end()
+                    .px(px(14.0))
+                    .pb(px(10.0))
+                    .child(link(
+                        "chatgpt-manage-usage",
+                        "Manage usage",
+                        CHATGPT_MANAGE_USAGE_URL,
+                    )),
+            ),
+            // Not ready, so no badge or sign-out on the row itself.
+            ChatgptPlanRow::PlanOff { .. } => Some(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(4.0))
+                    .px(px(14.0))
+                    .pb(px(10.0))
+                    .child(link(
+                        "chatgpt-use-api-key",
+                        "Use an API key",
+                        OPENAI_API_KEYS_URL,
+                    ))
+                    .child(
+                        popover::btn_ghost(theme, "Sign out", "chatgpt-plan-off-sign-out")
+                            .id("chatgpt-plan-off-sign-out")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .when(self.busy_graff.as_deref() == Some("chatgpt-new"), |el| {
+                                el.opacity(0.5)
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sign_out_graff("chatgpt-new".into(), cx);
+                            })),
+                    ),
+            ),
+            _ => None,
         };
+        let confirmation = self.plan_confirmation.clone().map(|title| {
+            div()
+                .px(px(20.0))
+                .py(px(12.0))
+                .border_t_1()
+                .border_color(theme.border)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::row_title(theme, title))
+                        .child(
+                            div()
+                                .mt(px(4.0))
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(
+                                    "graff's ChatGPT models now run on your plan and count \
+                                     toward its usage limits.",
+                                )),
+                        ),
+                )
+                .child(link(
+                    "chatgpt-confirm-manage-usage",
+                    "Manage usage",
+                    CHATGPT_MANAGE_USAGE_URL,
+                ))
+                .child(
+                    popover::btn_ghost(theme, "Got it", "chatgpt-confirm-dismiss")
+                        .id("chatgpt-confirm-dismiss")
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.plan_confirmation = None;
+                            cx.notify();
+                        })),
+                )
+        });
         div()
             .mt(px(24.0))
             .flex()
@@ -1689,7 +2090,7 @@ impl AccountsPage {
                             .size(px(16.0))
                             .text_color(theme.text_muted),
                     )
-                    .child(widgets::row_title(theme, "ChatGPT (new)")),
+                    .child(widgets::row_title(theme, "ChatGPT")),
             )
             .child(
                 widgets::section_card(theme)
@@ -1697,12 +2098,14 @@ impl AccountsPage {
                     .child(self.render_graff_row(
                         1000,
                         Some("chatgpt-new"),
-                        "ChatGPT (graff)",
-                        status.into(),
-                        signed_in,
+                        "ChatGPT",
+                        row.status(),
+                        matches!(row, ChatgptPlanRow::Ready { .. }),
                         theme,
                         cx,
-                    )),
+                    ))
+                    .children(plan_links)
+                    .children(confirmation),
             )
             .into_any_element()
     }
@@ -1767,22 +2170,17 @@ impl AccountsPage {
                     .iter()
                     .filter(|p| p.id != "chatgpt-new")
                     .map(|p| {
-                        let status = if p.signed_in {
-                            "Signed in on this device"
-                        } else {
-                            "Not signed in"
+                        let status = match (p.signed_in, &p.account) {
+                            (true, Some(account)) => format!("Signed in as {account}"),
+                            (true, None) => "Signed in on this device".to_string(),
+                            (false, _) => "Not signed in".to_string(),
                         };
-                        (
-                            Some(p.id.as_str()),
-                            p.name.as_str(),
-                            status.to_string(),
-                            p.signed_in,
-                        )
+                        (Some(p.id.as_str()), p.name.as_str(), status, p.signed_in)
                     })
                     .collect();
                 entries.insert(
                     entries.len().min(1),
-                    (None, "ChatGPT (legacy Codex)", openai, openai_signed_in),
+                    (None, "ChatGPT (old Codex)", openai, openai_signed_in),
                 );
                 div()
                     .children(entries.into_iter().enumerate().map(
@@ -2225,18 +2623,30 @@ impl AccountsPage {
                 start,
                 submitting,
                 error,
+                provider,
                 ..
             } => {
                 let submitting = *submitting;
+                let relayed = start.mode == AgentLoginMode::RelayBrowser;
+                let body = if provider.as_deref() == Some("anthropic") {
+                    "A browser window opened. Sign in to your Anthropic Console account and \
+                     pick a workspace, then paste the code Anthropic shows you below. graff \
+                     will run Claude models on that workspace's API credits."
+                } else if relayed {
+                    "A browser window opened on this computer. Sign in to ChatGPT there; \
+                     Harness catches the page it returns to and finishes the sign-in on the \
+                     computer shown above, which keeps the login. If the browser instead \
+                     shows a page that can't load (127.0.0.1…), copy its address and paste \
+                     it below."
+                } else {
+                    "A browser window opened. Sign in to the account you want to add, \
+                     approve access, then paste the code Anthropic shows you below. Your \
+                     current login is untouched until you switch."
+                };
                 div()
                     .flex()
                     .flex_col()
-                    .child(div().mt(px(8.0)).child(popover::dialog_body(
-                        &theme,
-                        "A browser window opened. Sign in to the account you want to add, \
-                         approve access, then paste the code Anthropic shows you below. Your \
-                         current login is untouched until you switch.",
-                    )))
+                    .child(div().mt(px(8.0)).child(popover::dialog_body(&theme, body)))
                     .child(url_link(
                         "login-open-url",
                         "Reopen the authorization page",
@@ -2275,10 +2685,10 @@ impl AccountsPage {
                             .child(
                                 popover::btn_primary(
                                     &theme,
-                                    if submitting {
-                                        "Verifying…"
-                                    } else {
-                                        "Add account"
+                                    match (submitting, relayed) {
+                                        (true, _) => "Verifying…",
+                                        (false, true) => "Finish sign-in",
+                                        (false, false) => "Add account",
                                     },
                                 )
                                 .id("login-submit-code")
@@ -2847,6 +3257,38 @@ mod tests {
     use super::*;
     use chrono::TimeDelta;
 
+    #[test]
+    fn chatgpt_row_is_ready_only_with_plan_usage() {
+        let row = |signed_in, plan_usage, account: Option<&str>| GraffLoginProvider {
+            id: "chatgpt-new".into(),
+            name: "ChatGPT".into(),
+            signed_in,
+            account: account.map(Into::into),
+            plan_usage,
+        };
+        assert_eq!(ChatgptPlanRow::from_listing(None), ChatgptPlanRow::Unknown);
+        assert_eq!(
+            ChatgptPlanRow::from_listing(Some(&[])),
+            ChatgptPlanRow::SignedOut
+        );
+        assert_eq!(
+            ChatgptPlanRow::from_listing(Some(&[row(false, None, None)])),
+            ChatgptPlanRow::SignedOut
+        );
+        let ready = ChatgptPlanRow::from_listing(Some(&[row(true, Some(true), Some("a@b.c"))]));
+        assert_eq!(
+            ready.status(),
+            "Signed in as a@b.c · using your ChatGPT plan"
+        );
+        let off = ChatgptPlanRow::from_listing(Some(&[row(false, Some(false), Some("a@b.c"))]));
+        assert!(matches!(off, ChatgptPlanRow::PlanOff { .. }));
+        assert!(
+            off.status()
+                .starts_with("Signed in as a@b.c · plan usage is off.")
+        );
+        assert!(off.status().contains("or use an"));
+    }
+
     fn job(value: serde_json::Value) -> CodegraffJob {
         serde_json::from_value(value).unwrap()
     }
@@ -3040,10 +3482,7 @@ mod tests {
         assert_eq!(graff(Some("xai")).title(), "Sign in to xAI");
         assert_eq!(graff(Some("kimi")).title(), "Sign in to Kimi");
         assert_eq!(graff(Some("zai")).title(), "Sign in to Z.AI");
-        assert_eq!(
-            graff(Some("chatgpt-new")).title(),
-            "Sign in to ChatGPT (new)"
-        );
+        assert_eq!(graff(Some("chatgpt-new")).title(), "Sign in to ChatGPT");
         assert_eq!(graff(None).title(), "Sign in to graff");
         assert_eq!(graff(Some("nope")).title(), "Sign in to graff");
         // The other harnesses keep their titles.

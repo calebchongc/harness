@@ -235,6 +235,14 @@ impl NativePage {
             pressed: std::cell::Cell::new(None),
         })
     }
+    /// A separate ephemeral helper/context: no website pages or login data.
+    pub fn new_document(window: &gpui::Window, tx: Sender<NativeEvent>) -> Result<Self, String> {
+        Self::new(window, &BrowserData::default(), tx)
+    }
+    pub fn load_html(&self, html: &str) -> Result<(), String> {
+        self.worker
+            .send(self.id, json!({"cmd":"load-html","html":html}))
+    }
     pub fn load(&self, url: &str) -> Result<(), String> {
         self.worker.send(self.id, json!({"cmd":"load","url":url}))
     }
@@ -319,7 +327,7 @@ impl super::BrowserSurface {
         native.update_frame(window);
         match event {
             NativeEvent::NewTab(url) => {
-                if self.presentation == Presentation::Live {
+                if self.presentation == Presentation::Live && self.preview_request.is_none() {
                     cx.emit(super::BrowserEvent::NewTab(Some(url)));
                 }
             }
@@ -343,6 +351,18 @@ impl super::BrowserSurface {
             }
             NativeEvent::Frame | NativeEvent::Changed => {
                 let mut page = native.state();
+                if let Some(document) = &self.document {
+                    page.url = Some(document.path.clone());
+                    #[cfg(feature = "browser-fixture")]
+                    let fixture_status = page.title.starts_with("preview:");
+                    #[cfg(not(feature = "browser-fixture"))]
+                    let fixture_status = false;
+                    if !fixture_status {
+                        page.title = document.title.clone();
+                    }
+                    page.can_back = false;
+                    page.can_forward = false;
+                }
                 if page.url.is_none() {
                     page.url = self.page.url.clone();
                 }

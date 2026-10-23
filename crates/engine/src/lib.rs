@@ -29,8 +29,10 @@ mod graff_logins;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+pub mod mcp_servers;
 mod model_catalogs;
 pub mod profile;
+pub mod agents_prepare;
 pub mod project_actions;
 pub mod registry;
 pub mod repos;
@@ -47,7 +49,7 @@ pub mod workspace_files;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership, lost_session_marker};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
@@ -263,6 +265,10 @@ impl EngineCore {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
+        }
+        match sessions.resume_after_restart() {
+            0 => {}
+            resumed => tracing::info!(resumed, "work cut short by the last shutdown resumed"),
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
@@ -867,14 +873,17 @@ impl Engine {
             tokens: Arc::new(auth.clone()),
         });
         core.previews.start(projects, preview_signaling).await;
-        // Installed desktop bundles use a public stable release feed, so
-        // update checks must also run for local-only, signed-out workspaces.
+        // Installed desktop bundles and managed servers use a public stable
+        // release feed, so update checks also run for local-only, signed-out
+        // workspaces.
+        let install = harness_update::detect_install();
         let check_updates =
-            edge_enabled || harness_update::detect_install().supports_desktop_update();
+            edge_enabled || install.supports_desktop_update() || install.checks_releases();
         if check_updates {
-            // Release checker: polls {edge}/releases hourly on the wall clock; headless
-            // installs with HARNESS_AUTO_UPDATE=1 apply + restart themselves — gated
-            // on quiescence so a restart never lands under a live run or open PTY.
+            // Release checker: polls the release feed hourly on the wall clock; managed
+            // headless installs apply + restart themselves (HARNESS_AUTO_UPDATE=0 opts
+            // out) — gated on quiescence so a restart never lands under a live run or
+            // open PTY.
             let quiescent: harness_update::QuiescentCheck = {
                 let sessions = core.sessions.clone();
                 let terminals = core.terminals.clone();
@@ -966,6 +975,9 @@ impl Engine {
                 if requested.is_some() {
                     tracing::info!("headless shutdown requested over IPC");
                 }
+            }
+            _ = harness_update::reexec_requested() => {
+                tracing::info!("update installed; stopping to restart into it");
             }
             _ = wait_for_signed_out(&mut auth_state), if workspace_scope == WorkspaceScope::Synced => {
                 // Edge transports observe the same auth signal and close at

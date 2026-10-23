@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 /// JSON-RPC error a handler can return.
+#[derive(Debug)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
@@ -65,7 +66,6 @@ impl RpcError {
             message,
         }
     }
-
 }
 
 /// Work that must run only after the response has been written, so a client
@@ -73,6 +73,7 @@ impl RpcError {
 pub type After = Option<BoxFuture<'static, ()>>;
 
 pub struct ThreadState {
+    pub history: crate::session_store::History,
     pub cwd: String,
     pub harness: HarnessId,
     pub model: Option<String>,
@@ -103,6 +104,7 @@ pub struct ThreadState {
 impl ThreadState {
     pub fn new(cwd: String, harness: HarnessId, model: Option<String>) -> Self {
         Self {
+            history: crate::session_store::History::default(),
             cwd,
             harness,
             model,
@@ -121,6 +123,7 @@ impl ThreadState {
 pub struct Conn {
     out: mpsc::UnboundedSender<Value>,
     pub registry: Arc<HarnessRegistry>,
+    pub sessions: crate::session_store::SessionStore,
     pub threads: Mutex<HashMap<String, ThreadState>>,
     /// The Harness engine this TUI shares chats with, when one is running.
     /// `None` runs agents in this process (standalone mode).
@@ -136,11 +139,13 @@ impl Conn {
     fn new(
         out: mpsc::UnboundedSender<Value>,
         registry: Arc<HarnessRegistry>,
+        sessions: crate::session_store::SessionStore,
         engine: Option<Arc<crate::engine::Engine>>,
     ) -> Self {
         Self {
             out,
             registry,
+            sessions,
             threads: Mutex::new(HashMap::new()),
             engine,
             mirrors: Mutex::new(HashMap::new()),
@@ -152,7 +157,15 @@ impl Conn {
     #[cfg(test)]
     pub fn for_test(registry: Arc<HarnessRegistry>) -> (Arc<Self>, mpsc::UnboundedReceiver<Value>) {
         let (out, rx) = mpsc::unbounded_channel();
-        (Arc::new(Self::new(out, registry, None)), rx)
+        (
+            Arc::new(Self::new(
+                out,
+                registry,
+                crate::session_store::SessionStore::memory(),
+                None,
+            )),
+            rx,
+        )
     }
 
     /// Ask the TUI something (a question for the user) and wait for its
@@ -214,7 +227,12 @@ pub async fn serve(
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut sink, mut source) = ws.split();
     let (out, mut outgoing) = mpsc::unbounded_channel::<Value>();
-    let conn = Arc::new(Conn::new(out, registry, engine));
+    let conn = Arc::new(Conn::new(
+        out,
+        registry,
+        crate::session_store::SessionStore::new(crate::config::codex_home().join("sessions")),
+        engine,
+    ));
 
     let writer = tokio::spawn(async move {
         while let Some(value) = outgoing.recv().await {
@@ -234,7 +252,10 @@ pub async fn serve(
             tracing::warn!("dropping non-JSON frame");
             continue;
         };
-        let method = message.get("method").and_then(Value::as_str).map(str::to_owned);
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         match (method, message.get("id").cloned()) {
             (Some(method), Some(id)) => {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);

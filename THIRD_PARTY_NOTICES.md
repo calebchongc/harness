@@ -7,6 +7,11 @@ Copyright (c) 2026 Wing. The original MIT license, including its permission
 and warranty notice, is retained verbatim in
 [`third_party/licenses/Zeron-MIT.txt`](third_party/licenses/Zeron-MIT.txt).
 The Harness license does not erase the MIT rights in that upstream material.
+The content-reference parser, HTML document wrapper, carousel and scoped design
+controls in `crates/ui/src/markdown/content_reference.rs` and
+`crates/ui/src/browser/{document.rs,visualize.js,visualize-controls.js}` also adapt
+Zeron's MIT-licensed design stack (zeronsh/zeron #933–#935, authored in the
+sheauhuu/zeron fork). The same retained MIT notice applies.
 
 The CodeGraff emblem and workshop/context illustrations reproduced in
 `docs/brand/` come from [justrach/codegraff](https://github.com/justrach/codegraff)

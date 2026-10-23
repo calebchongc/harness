@@ -67,10 +67,13 @@ fn offers_install(harness: HarnessId, installed: bool, can_install: bool) -> boo
 
 fn install_hint(harness: HarnessId, enabled: bool, can_install: bool) -> String {
     if harness == HarnessId::Antigravity {
+        // Harness talks to Google's ACP server, which the Antigravity app and
+        // the `agy` CLI don't include: say so, or "install Antigravity" reads
+        // as wrong to someone who already has it.
         return if can_install {
-            "Install Antigravity to enable"
+            "Needs Antigravity's ACP server (separate from the agy CLI) — click Install"
         } else {
-            "Set ANTIGRAVITY_ACP_EXECUTABLE to enable Antigravity"
+            "Needs Antigravity's ACP server (separate from the agy CLI) — set ANTIGRAVITY_ACP_EXECUTABLE to it"
         }
         .into();
     }
@@ -120,7 +123,7 @@ pub fn executable_override(harness: HarnessId) -> Option<&'static str> {
         HarnessId::Grok => Some("GROK_EXECUTABLE"),
         HarnessId::Hermes => Some("HERMES_EXECUTABLE"),
         HarnessId::Graff => Some("GRAFF_EXECUTABLE"),
-        HarnessId::Pi => Some("PI_ACP_EXECUTABLE"),
+        HarnessId::Pi => Some("PI_EXECUTABLE"),
         HarnessId::Opencode => Some("OPENCODE_EXECUTABLE"),
         HarnessId::Antigravity => Some("ANTIGRAVITY_ACP_EXECUTABLE"),
         HarnessId::Exo => Some("EXO_ACP_EXECUTABLE"),
@@ -449,7 +452,11 @@ impl HarnessesPage {
             _ => None,
         };
         let busy = current.is_none() || self.graff_compact_at_saving;
-        let mut choices = div().flex().flex_wrap().gap(px(6.0)).mt(px(12.0));
+        let mut choices = div().flex().flex_wrap().items_center().gap(px(6.0)).child(
+            div()
+                .text_color(theme.text_muted)
+                .child("Compact context at"),
+        );
         for (index, (value, label)) in CHOICES.into_iter().enumerate() {
             let selected = current == Some(value);
             let pill = if selected {
@@ -470,21 +477,21 @@ impl HarnessesPage {
             );
         }
         let custom = match current {
-            Some(Some(pct)) if !CHOICES.iter().any(|(v, _)| *v == Some(pct)) => Some(
-                widgets::page_subtitle(theme, format!("Currently {pct}%, set on this device."))
-                    .mt(px(8.0)),
-            ),
+            Some(Some(pct)) if !CHOICES.iter().any(|(v, _)| *v == Some(pct)) => {
+                Some(div().child(format!("Currently {pct}%, set on this device.")))
+            }
             _ => None,
         };
-        widgets::section_card(theme)
-            .mt(px(20.0))
-            .p(px(16.0))
-            .child(widgets::row_title(theme, "Graff compaction point"))
-            .child(widgets::page_subtitle(
-                theme,
-                "Graff compacts a conversation once it fills this much of the model's context window. Lower keeps each request smaller and cheaper; higher keeps more of the conversation word for word. Applies to Graff chats started after the change. To change one chat, type /compact-at 70 in it.",
-            ))
+        // Shown inside the graff row, where people look for graff settings.
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .mt(px(6.0))
             .child(choices)
+            .child(div().text_color(theme.text_muted).child(
+                "How full the context window gets before Graff compacts. Applies to new Graff chats; /compact-at 70 changes one chat.",
+            ))
             .children(custom)
             .into_any_element()
     }
@@ -1250,6 +1257,9 @@ impl HarnessesPage {
                         .child(SharedString::from(blurb(harness)))
                         .into_any_element(),
                 ];
+                if harness == HarnessId::Graff {
+                    meta.push(self.render_graff_compact_at(&theme, cx));
+                }
                 if harness == HarnessId::Graff && descriptor.can_install {
                     meta.push(
                         div()
@@ -1566,7 +1576,6 @@ impl Render for HarnessesPage {
         let titles = self.render_titles(&theme, cx);
         let screen_access = self.render_screen_access(&theme, cx);
         let graff_draft_subagents = self.render_graff_draft_subagents(&theme, cx);
-        let graff_compact_at = self.render_graff_compact_at(&theme, cx);
         let scrollbar = popover::rail(self, "harnesses-page-scrollbar", &theme, cx);
 
         div()
@@ -1608,7 +1617,6 @@ impl Render for HarnessesPage {
                             .children(screen_access)
                             .child(body)
                             .child(graff_draft_subagents)
-                            .child(graff_compact_at)
                             .child(titles),
                     ),
             )
@@ -1691,7 +1699,7 @@ fn install_visibility_and_hint_follow_target_capabilities() {
     assert_eq!(cli_name(HarnessId::Antigravity), "Antigravity");
     assert_eq!(
         install_hint(HarnessId::Antigravity, false, true),
-        "Install Antigravity to enable"
+        "Needs Antigravity's ACP server (separate from the agy CLI) — click Install"
     );
     assert!(
         install_hint(HarnessId::Antigravity, false, false).contains("ANTIGRAVITY_ACP_EXECUTABLE")

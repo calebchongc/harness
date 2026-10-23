@@ -590,6 +590,8 @@ mod tests {
             question: "Which?".into(),
             options: vec!["A".into(), "B".into()],
             multi_select: false,
+            prefill: None,
+            multiline: false,
         }];
         let reply = json!({ "answers": { "q1": { "answers": ["B"] } } });
         let answers = answers_from(&questions, &reply);
@@ -607,6 +609,8 @@ mod tests {
             question: "Which?".into(),
             options: vec!["A".into()],
             multi_select: false,
+            prefill: None,
+            multiline: false,
         };
         let v = question_json(&q);
         assert_eq!(v["options"][0]["label"], "A");

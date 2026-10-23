@@ -16,7 +16,7 @@ pub enum HarnessId {
     Hermes,
     /// codegraff's graff agent, driven over ACP (`graff acp`).
     Graff,
-    /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
+    /// The Pi coding agent (pi.dev), driven over its native JSONL RPC protocol.
     Pi,
     /// SST's opencode agent, driven natively over its own HTTP/SSE server
     /// protocol (`opencode serve` — the same wire the opencode desktop app
@@ -295,6 +295,21 @@ impl ToolCall {
         name == "Agent" || name.starts_with("Agent: ")
     }
 
+    /// A spawn that runs a whole WORKFLOW (claude's `Workflow` tool): its
+    /// children are agents reported through progress, so the chip shows a
+    /// progress summary. Marked by `subagent_type: "workflow"` on the input.
+    pub fn is_workflow_spawn(&self) -> bool {
+        let input = match self {
+            ToolCall::Unknown { input, .. } | ToolCall::Mcp { input, .. } => input.as_ref(),
+            _ => None,
+        };
+        self.is_subagent_spawn()
+            && input
+                .and_then(|i| i.get("subagent_type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("workflow")
+    }
+
     /// The model a subagent SPAWN was given, when the spawn named one.
     ///
     /// Read off the spawn's own input rather than the session's picked model:
@@ -378,6 +393,10 @@ pub struct UserInputQuestion {
     pub options: Vec<String>,
     #[serde(default)]
     pub multi_select: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<String>,
+    #[serde(default)]
+    pub multiline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -463,6 +482,12 @@ pub enum AgentEvent {
         name: String,
         mime_type: String,
     },
+    /// Atomic, bounded native visual source. The engine never evaluates it inline.
+    GeneratedVisual {
+        id: String,
+        title: String,
+        script: String,
+    },
     ReasoningDelta {
         text: String,
     },
@@ -519,6 +544,11 @@ pub enum AgentEvent {
     ContextUsage {
         tokens: Option<u64>,
         window: Option<u64>,
+    },
+    /// The agent's cumulative [`ContextSavings`], replacing the previous one.
+    #[serde(rename_all = "camelCase")]
+    ContextSavings {
+        savings: ContextSavings,
     },
     /// A Jev selection confirmed by the agent's live thought-level config
     /// update. Values are ACP ids (including MiMo's `none`/Off).
@@ -588,6 +618,26 @@ pub enum AgentEvent {
     UserMessage {
         text: String,
     },
+    /// A one-line status for a spawn chip ("1/3 agents · 26.6k tokens"),
+    /// only ever wrapped in [`AgentEvent::Subagent`]. Low-frequency by
+    /// contract — a driver emits it when the child's shape changes (a
+    /// workflow agent starting or settling), never per stream delta. The
+    /// engine stamps it onto the chip's `subagent_tail`; it is not part of
+    /// the subagent's own transcript.
+    #[serde(rename_all = "camelCase")]
+    SubagentProgress {
+        summary: String,
+    },
+    /// Work the agent left running past its turn: a background shell command,
+    /// monitor, agent or workflow. `running: true` when it starts, `false`
+    /// when it settles. Not part of the transcript; the engine keeps a parked
+    /// session alive while any is open, since stopping the agent process kills
+    /// that work (#517).
+    #[serde(rename_all = "camelCase")]
+    BackgroundTask {
+        id: String,
+        running: bool,
+    },
     /// An event belonging to a SUBAGENT's nested transcript, attributed to
     /// the spawning tool call (`parent_tool_use_id` = the parent-feed
     /// `ToolCall::id` that launched it). Never folded into the parent chat
@@ -632,6 +682,18 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn workflow_spawns_are_marked_by_subagent_type() {
+        let call = |name: &str, kind: &str| ToolCall::Unknown {
+            name: name.into(),
+            input: Some(serde_json::json!({ "subagent_type": kind })),
+        };
+        assert!(call("Agent: Repo scan", "workflow").is_workflow_spawn());
+        assert!(!call("Agent: scan", "general-purpose").is_workflow_spawn());
+        // Genus first: a non-spawn never answers, whatever it carries.
+        assert!(!call("Workflow", "workflow").is_workflow_spawn());
     }
 
     /// Drivers spell the key differently; the chip must not care which one
@@ -749,6 +811,38 @@ mod tests {
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub window: Option<u64>,
+    /// What the agent reported keeping out of its context (graff only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savings: Option<ContextSavings>,
+}
+
+/// graff's `_meta["codegraff/savings"]` on its context meter: cumulative,
+/// measured counts for the agent process, never an estimate of what another
+/// agent would have spent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavings {
+    /// Tool-result bytes kept in files instead of the conversation.
+    #[serde(default)]
+    pub handle_bytes: u64,
+    /// Estimated context tokens freed by compaction.
+    #[serde(default)]
+    pub compacted_tokens: u64,
+    /// Input tokens the provider served from its prompt cache.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+}
+
+impl ContextSavings {
+    /// Tool-result bytes as tokens, at the usual ~4 bytes per token.
+    pub fn handle_tokens(self) -> u64 {
+        self.handle_bytes / 4
+    }
+
+    /// Tokens that never had to sit in the model's context.
+    pub fn kept_out_tokens(self) -> u64 {
+        self.handle_tokens().saturating_add(self.compacted_tokens)
+    }
 }
 
 impl ContextUsage {
@@ -771,6 +865,19 @@ pub struct ToolProgressItem {
 #[cfg(test)]
 mod generated_image_tests {
     use super::*;
+
+    #[test]
+    fn generated_visual_event_round_trip() {
+        let event = AgentEvent::GeneratedVisual {
+            id: "show-visual:one".into(),
+            title: "Overview".into(),
+            script: "return function() return ui.text(\"Hello\") end".into(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "generatedVisual");
+        assert_eq!(value["title"], "Overview");
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
+    }
 
     #[test]
     fn generated_image_event_round_trip() {

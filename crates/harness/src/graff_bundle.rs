@@ -23,6 +23,9 @@ struct GitHubRelease {
     tag_name: String,
 }
 
+/// graff's executable name on this platform.
+const GRAFF_EXE: &str = if cfg!(windows) { "graff.exe" } else { "graff" };
+
 /// `Contents/Resources/bin/graff` next to the running executable, when this
 /// process is a bundled app that ships one.
 pub fn bundled() -> Option<PathBuf> {
@@ -38,7 +41,7 @@ pub fn bundled() -> Option<PathBuf> {
 
 /// Where the app keeps its own graff (whether or not it exists yet).
 pub fn managed_path() -> Option<PathBuf> {
-    crate::executable::home_dir().map(|home| home.join(".harness").join("bin").join("graff"))
+    crate::executable::home_dir().map(|home| home.join(".harness").join("bin").join(GRAFF_EXE))
 }
 
 /// `graff --version`'s dotted number as integers (`0.0.302.4` → [0,0,302,4]),
@@ -190,7 +193,41 @@ fn install_file(source: &Path, target: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::fs::rename(&staged, target)
+    replace_file(&staged, target)
+}
+
+/// Move `staged` over `target`. Windows refuses to replace an executable
+/// that is running (Harness keeps `graff acp` processes alive), but it lets
+/// one be renamed: move it aside first, put it back if the swap fails, and
+/// clear older moved-aside copies once they are no longer in use.
+fn replace_file(staged: &Path, target: &Path) -> std::io::Result<()> {
+    replace_file_with(staged, target, cfg!(windows))
+}
+
+fn replace_file_with(staged: &Path, target: &Path, move_aside: bool) -> std::io::Result<()> {
+    if !move_aside || !target.exists() {
+        return std::fs::rename(staged, target);
+    }
+    let dir = target.parent().expect("managed path has a parent");
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&format!("{name}.old-")) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let aside = dir.join(format!("{name}.old-{}", uuid::Uuid::new_v4()));
+    std::fs::rename(target, &aside)?;
+    if let Err(err) = std::fs::rename(staged, target) {
+        let _ = std::fs::rename(&aside, target);
+        return Err(err);
+    }
+    let _ = std::fs::remove_file(&aside);
+    Ok(())
 }
 
 /// codegraff's release asset for this machine (`graff-aarch64-macos.tar.gz`).
@@ -203,6 +240,7 @@ fn asset_name() -> Option<String> {
     let os = match std::env::consts::OS {
         "macos" => "macos",
         "linux" => "linux",
+        "windows" => "windows",
         _ => return None,
     };
     Some(format!("graff-{arch}-{os}.tar.gz"))
@@ -288,7 +326,20 @@ pub async fn latest_stable() -> anyhow::Result<String> {
 /// app bundle that ships graff, and no `GRAFF_EXECUTABLE` selects a custom
 /// binary (that graff is entirely the user's).
 pub fn managed_updates_allowed() -> bool {
-    bundled().is_some() && std::env::var_os("GRAFF_EXECUTABLE").is_none_or(|value| value.is_empty())
+    (bundled().is_some() || windows_managed_install())
+        && std::env::var_os("GRAFF_EXECUTABLE").is_none_or(|value| value.is_empty())
+}
+
+/// A Windows package installed from the release zip: `harness-update.json`
+/// beside `harness.exe` marks it as following the release feed (the same
+/// test Harness's own updater uses). It ships no graff, so the app keeps its
+/// own copy current, as the macOS app does.
+fn windows_managed_install() -> bool {
+    cfg!(windows)
+        && std::env::current_exe().ok().is_some_and(|exe| {
+            exe.file_name().is_some_and(|name| name == "harness.exe")
+                && exe.with_file_name("harness-update.json").is_file()
+        })
 }
 
 /// Whether the app should install graff updates itself. With
@@ -470,11 +521,11 @@ async fn install_release(
             anyhow::ensure!(status.success(), "couldn't unpack {asset}");
             // Release tarballs nest `graff-<target>/graff`; hand-repacked ones
             // put it at the root.
-            let nested = work.join(asset.trim_end_matches(".tar.gz")).join("graff");
+            let nested = work.join(asset.trim_end_matches(".tar.gz")).join(GRAFF_EXE);
             let binary = if nested.is_file() {
                 nested
             } else {
-                work.join("graff")
+                work.join(GRAFF_EXE)
             };
             anyhow::ensure!(binary.is_file(), "{asset} has no graff binary");
             let fetched = version_of(&binary)
@@ -540,6 +591,8 @@ async fn install_release(
     .await??;
     if matches!(outcome, UpdateOutcome::Updated { .. }) {
         crate::executable::invalidate_versions(&["graff"]);
+        // A new graff is the moment to bring its codedb up to date too.
+        crate::codedb_bundle::maybe_check_soon();
     }
     Ok(outcome)
 }
@@ -716,6 +769,33 @@ mod tests {
         let outcome = update_managed().await.unwrap();
         eprintln!("{outcome:?}");
         assert!(version_of(&managed_path().unwrap()).is_some());
+    }
+
+    #[test]
+    fn windows_style_swap_moves_the_old_binary_aside_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("graff.exe");
+        std::fs::write(&target, "old").unwrap();
+        // A copy left aside by an earlier swap (once its process exited).
+        let stale = dir.path().join("graff.exe.old-earlier");
+        std::fs::write(&stale, "older").unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, "new").unwrap();
+        replace_file_with(&staged, &target, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(!staged.exists());
+        assert!(!stale.exists(), "earlier moved-aside copy cleared");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["graff.exe".to_string()]);
+
+        // A failed swap puts the old binary back.
+        let missing = dir.path().join("not-there");
+        assert!(replace_file_with(&missing, &target, true).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
     }
 
     #[test]

@@ -1,5 +1,12 @@
 package harness.codegraff.android.ui.session
 
+import harness.codegraff.android.model.modelSelection
+import harness.codegraff.android.ui.components.rememberDeviceCatalog
+import harness.codegraff.android.model.Connection
+import harness.codegraff.android.model.ConnectivityRules
+import harness.codegraff.android.model.ConnectivityUi
+import harness.codegraff.android.ui.components.MiniSpinner
+
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.ui.semantics.Role
@@ -25,6 +32,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -110,6 +118,11 @@ fun SessionScreen(
     }
     LaunchedEffect(chatId) { model.markSeen(chatId) }
     DisposableEffect(chatId) { onDispose { model.markSeen(chatId) } }
+    // Live sync: hydrate the session doc and join its room while the screen is up.
+    DisposableEffect(chatId) {
+        model.attachSession(chatId)
+        onDispose { model.detachSession(chatId) }
+    }
 
     val status = state.liveStatus(chat)
     // This session's transcript is its own flow: a streamed token recomposes this screen, not Home.
@@ -159,8 +172,11 @@ fun SessionScreen(
                 },
             ) {
                 val sendState = false // sends are local in demo mode
-                if (tall || status == SessionStatus.Working || status == SessionStatus.Errored || sendState) {
-                    StatusStrip(chat, status, state)
+                val connectivity by model.connectivity.collectAsState()
+                if (tall || status == SessionStatus.Working || status == SessionStatus.Errored || sendState ||
+                    connectivity.state != Connection.Connected
+                ) {
+                    StatusStrip(chat, status, state, connectivity)
                 }
                 Box(Modifier.padding(bottom = 8.dp)) {
                     if (openRequest != null) {
@@ -203,19 +219,29 @@ fun SessionScreen(
  * reserves its height so the composer never shifts.
  */
 @Composable
-private fun StatusStrip(chat: Chat, status: SessionStatus?, state: WorkspaceState) {
+private fun StatusStrip(chat: Chat, status: SessionStatus?, state: WorkspaceState, connectivity: ConnectivityUi) {
     val p = Theme.palette
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(status) {
-        while (status == SessionStatus.Working) { now = System.currentTimeMillis(); delay(1000) }
+    // Ticks once a second only while something on the strip is timed: the elapsed counter or the reconnect countdown.
+    val timed = status == SessionStatus.Working || connectivity.state != Connection.Connected
+    LaunchedEffect(timed) {
+        while (timed) { now = System.currentTimeMillis(); delay(1000) }
     }
     Row(
         Modifier.fillMaxWidth().height(24.dp).padding(start = 26.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        when (status) {
-            SessionStatus.Working -> {
+        when {
+            connectivity.state == Connection.Offline -> {
+                Box(Modifier.size(5.dp).background(p.warning, CircleShape))
+                Text("Offline — sends are saved", style = sans(11f), color = p.textFaint)
+            }
+            connectivity.state == Connection.Reconnecting -> {
+                MiniSpinner()
+                Text(ConnectivityRules.reconnectingLabel(connectivity.retryAtMs, now), style = sans(11f), color = p.textFaint)
+            }
+            status == SessionStatus.Working -> {
                 WorkingSpinner()
                 val row = state.sessions[chat.id]
                 val startedAt = row?.startedAt ?: row?.updatedAt ?: now
@@ -223,7 +249,7 @@ private fun StatusStrip(chat: Chat, status: SessionStatus?, state: WorkspaceStat
                 Text("${Motion.flavourWord(Motion.flavourSeed(chat.id), elapsed)}…", style = sans(12f), color = p.textMuted)
                 Text(Motion.formatElapsed(elapsed), style = sans(11f), color = p.textFaint)
             }
-            SessionStatus.Errored -> Text("Run failed", style = sans(11f), color = p.danger)
+            status == SessionStatus.Errored -> Text("Run failed", style = sans(11f), color = p.danger)
             else -> {}
         }
     }
@@ -237,13 +263,20 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
     var attachments by remember(chat.id) { mutableStateOf(listOf<StagedAttachment>()) }
     var showModelPicker by remember { mutableStateOf(false) }
     var showTraitPicker by remember { mutableStateOf(false) }
-    var optionPicker by remember { mutableStateOf<harness.codegraff.android.model.ModelOptionInfo?>(null) }
-
     val harness = chat.config?.harness ?: "claude-code"
-    val models = HarnessCatalog.models(harness)
-    val currentModel = HarnessCatalog.resolve(chat.config?.model, models, harness)
-    val currentReasoning = if (currentModel.reasoningLevels.isEmpty()) null
-    else chat.config?.reasoning?.takeIf { it in currentModel.reasoningLevels } ?: HarnessCatalog.defaultReasoning(currentModel)
+    var optionPicker by remember(chat.id, chat.deviceId, harness, chat.config?.model) { mutableStateOf<harness.codegraff.android.model.ModelOptionInfo?>(null) }
+    val refreshKey = state.connected to state.hostStatus(chat.deviceId)
+    val harnessLoad = rememberDeviceCatalog(chat.deviceId, refreshKey,
+        initial = { model.cachedHarnesses(chat.deviceId) },
+        fetch = { model.listHarnesses(chat.deviceId) },
+    )
+    val modelLoad = rememberDeviceCatalog(chat.deviceId to harness, refreshKey,
+        initial = { model.cachedModels(chat.deviceId, harness) },
+        fetch = { model.listModels(chat.deviceId, harness) },
+    )
+    val selection = modelSelection(harness, chat.config?.model, chat.config?.reasoning, modelLoad.catalog, harnessLoad.catalog)
+    val currentModel = selection.model
+    val currentReasoning = selection.reasoning
 
     // The chat's queue: what was typed mid-turn waits here, and a row can be retyped in this composer.
     val queue by remember(chat.id) { model.queueFlow(chat.id) }.collectAsState(initial = model.queue(chat.id))
@@ -361,9 +394,24 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
                 contentAlignment = Alignment.CenterStart,
             ) { Text(if (dead) "Copy edit and stop editing" else "Stop editing", style = sans(12f), color = Theme.palette.textMuted) }
         }
+        // Pre-send honesty: one quiet caption, never a warning box. The send still works; it just queues.
+        if (model.chatDeliveryDegraded(chat)) {
+            val connectivity by model.connectivity.collectAsState()
+            Text(
+                ConnectivityRules.degradedCaption(connectivity.state), style = sans(11f), color = Theme.palette.textFaint,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+            )
+        }
+        if (selection.unavailable) {
+            Text(
+                "The selected agent or model is not available on this device. Select another model.",
+                style = sans(12f), color = Theme.palette.warning,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+            )
+        }
         ComposerShell(
             draft = draft, onDraftChange = { draft = it },
-            sendEnabled = true, showStop = runLive,
+            sendEnabled = editingId != null || selection.canSend, showStop = runLive,
             placeholder = if (editingId == null) "Message" else "Edit queued message",
             sendLabel = when {
                 editingId != null -> "Save queued message"
@@ -376,7 +424,9 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
             onSend = {
                 if (editingId != null) {
                     commitEdit()
-                } else {
+                } else if (selection.canSend) {
+                    // A genuinely unconfigured chat only acquires a default after its device supplies metadata.
+                    if (chat.config?.model.isNullOrBlank()) model.setChatConfig(chat.id, currentModel.id, currentReasoning)
                     model.send(chat.id, draft, attachments.map { it.uri.toString() })
                     draft = ""
                     attachments = emptyList()
@@ -400,7 +450,11 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
     if (showModelPicker) {
         ModelPickerSheet(
             harness = harness, modelId = currentModel.id, reasoning = chat.config?.reasoning,
-            lockedHarness = true, harnesses = emptyList(), catalogs = emptyMap(),
+            lockedHarness = true, harnesses = harnessLoad.catalog.items, catalogs = mapOf(harness to modelLoad.catalog.items),
+            loading = modelLoad.loading || harnessLoad.loading,
+            confirmedHarnesses = harnessLoad.catalog.isLive,
+            confirmedCatalogs = if (modelLoad.catalog.isLive) setOf(harness) else emptySet(),
+            onRetry = { modelLoad.retry(); harnessLoad.retry() },
             onPick = { _, picked, reasoning -> model.setChatConfig(chat.id, picked.id, reasoning) },
             onDismiss = { showModelPicker = false },
         )

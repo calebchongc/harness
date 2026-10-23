@@ -113,6 +113,18 @@ case "$first" in
   esac
   ;;
 
+*scenario:steer-image*)
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer-image"}'
+  # The steer line must carry the attached image as a base64 block.
+  read -r steer || exit 1
+  seen=no
+  case "$steer" in *'"type":"image"'*)
+    case "$steer" in *'"media_type":"image/png"'*) seen=yes ;; esac ;;
+  esac
+  emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"steer-image:$seen\"}}}"
+  emit '{"type":"result","subtype":"success","result":"steered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-steer-image"}'
+  ;;
+
 *scenario:steer*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer"}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
@@ -121,6 +133,23 @@ case "$first" in
   content=$(printf '%s\n' "$steer" | sed 's/.*"content":"\([^"]*\)".*/\1/')
   emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"steered:$content\"}}}"
   emit '{"type":"result","subtype":"success","result":"steered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-steer"}'
+  ;;
+
+*scenario:turn-interrupt*)
+  # The interrupt control request ends the turn and the process keeps
+  # serving stdin, like the real CLI with background tasks still running.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-turn"}'
+  emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"first pid=$$\"}}}"
+  read -r ctl || exit 1
+  case "$ctl" in *'"subtype":"interrupt"'*) ;; *) exit 3 ;; esac
+  rid=$(printf '%s\n' "$ctl" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\"}}"
+  emit '{"type":"result","subtype":"error_during_execution","errors":["[ede_diagnostic] aborted"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-turn"}'
+  read -r next || exit 0
+  content=$(printf '%s\n' "$next" | sed 's/.*"content":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"again pid=$$ $content\"}}}"
+  emit '{"type":"result","subtype":"success","result":"again","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-turn"}'
+  read -r _ || exit 0
   ;;
 
 *scenario:interrupt*)

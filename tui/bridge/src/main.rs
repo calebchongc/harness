@@ -8,9 +8,12 @@
 mod config;
 mod engine;
 mod engine_threads;
+mod mcp;
 mod methods;
 mod mirror;
 mod models;
+mod session_store;
+mod sessions;
 mod tools;
 mod turn;
 mod wire;

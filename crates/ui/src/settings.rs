@@ -19,11 +19,15 @@ use harness_proto::{AuthState, WorkspaceScope};
 pub mod accounts;
 pub mod appearance;
 pub mod archived;
+pub mod mcp;
 pub mod composer;
 pub mod devices;
 pub mod files;
+pub mod github_ci;
 pub mod harnesses;
 pub mod notifications;
+pub mod project_folders;
+pub mod search;
 pub mod shortcuts;
 pub mod widgets;
 
@@ -732,10 +736,15 @@ pub struct UiSettings {
     pub sidebar_show_project_icon: bool,
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
+    /// The Archived accordion below the active session list.
+    pub sidebar_show_archived: bool,
     /// The last selected space — restored on boot when the row still exists;
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
+    /// New Project defaults and successful-add history, keyed by host device.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub project_folders_by_device: HashMap<String, project_folders::ProjectFolderPreference>,
     /// Last successfully launched Action per project in this viewport.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub last_project_action_by_space_id: std::collections::HashMap<String, String>,
@@ -881,6 +890,10 @@ pub struct UiSettings {
     pub new_thread_composer_background: Option<NewThreadComposerBackground>,
     /// Non-destructive treatment composited inside the artwork's fade mask.
     pub new_thread_background_effect: NewThreadBackgroundEffect,
+    /// Snap animations to rest. Defaults to following the OS.
+    pub reduce_motion: crate::motion::ReduceMotion,
+    /// Also snap animations while the main window is not focused.
+    pub pause_animations_in_background: bool,
     /// The graff engine update card's dismissed version — re-raised only when
     /// a newer stable exists.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -905,7 +918,9 @@ impl Default for UiSettings {
             sidebar_show_project_icon: true,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
+            sidebar_show_archived: true,
             last_space_id: None,
+            project_folders_by_device: HashMap::new(),
             last_project_action_by_space_id: std::collections::HashMap::new(),
             open_tabs: None,
             space_filter: None,
@@ -965,6 +980,8 @@ impl Default for UiSettings {
             surface: harness_theme::SurfacePreference::default(),
             new_thread_composer_background: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
+            reduce_motion: crate::motion::ReduceMotion::System,
+            pause_animations_in_background: false,
             graff_notice_dismissed: None,
             legacy_accent_color: None,
         }
@@ -1015,11 +1032,13 @@ pub enum ShortcutId {
     NextSession,
     PrevSession,
     ArchiveSession,
+    CloseTabWithoutArchiving,
+    ReopenClosedTab,
     JumpSession(usize),
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 15 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 17 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -1035,6 +1054,8 @@ impl ShortcutId {
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
         ShortcutId::ArchiveSession,
+        ShortcutId::CloseTabWithoutArchiving,
+        ShortcutId::ReopenClosedTab,
         ShortcutId::JumpSession(0),
         ShortcutId::JumpSession(1),
         ShortcutId::JumpSession(2),
@@ -1062,12 +1083,14 @@ impl ShortcutId {
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::SplitTerminal => "Split terminal right",
             ShortcutId::SplitTerminalDown => "Split terminal down",
-            ShortcutId::NewSession => "New session",
+            ShortcutId::NewSession => "New chat",
             ShortcutId::NewProject => "New project",
             ShortcutId::OpenModelPicker => "Open model picker",
             ShortcutId::NextSession => "Next tab or session",
             ShortcutId::PrevSession => "Previous tab or session",
             ShortcutId::ArchiveSession => "Archive session",
+            ShortcutId::CloseTabWithoutArchiving => "Close tab without archiving",
+            ShortcutId::ReopenClosedTab => "Reopen closed tab",
             ShortcutId::JumpSession(slot) => JUMP_LABELS.get(slot).copied().unwrap_or(""),
         }
     }
@@ -1095,7 +1118,8 @@ impl ShortcutId {
             ShortcutId::SplitTerminal => "mod-shift-d",
             ShortcutId::SplitTerminalDown if mac => "mod-shift-d",
             ShortcutId::SplitTerminalDown => "mod-alt-shift-d",
-            ShortcutId::NewSession => "mod-n",
+            ShortcutId::NewSession if mac => "mod-t",
+            ShortcutId::NewSession => "mod-shift-t",
             ShortcutId::NewProject => "mod-shift-n",
             ShortcutId::OpenModelPicker => "mod-/",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
@@ -1116,6 +1140,10 @@ impl ShortcutId {
             // Mod+A is the composer's Select all, so archiving takes the
             // shifted combo.
             ShortcutId::ArchiveSession => "mod-shift-a",
+            ShortcutId::CloseTabWithoutArchiving => "mod-alt-w",
+            // Off macOS Ctrl+Shift+T already opens a new tab.
+            ShortcutId::ReopenClosedTab if mac => "mod-shift-t",
+            ShortcutId::ReopenClosedTab => "mod-alt-shift-t",
             ShortcutId::JumpSession(slot) => JUMP_DEFAULTS.get(slot).copied().unwrap_or(""),
         }
     }
@@ -1150,6 +1178,8 @@ pub struct KeymapConfig {
     pub next_session: String,
     pub prev_session: String,
     pub archive_session: String,
+    pub close_tab_without_archiving: String,
+    pub reopen_closed_tab: String,
     /// One combo per jump slot, in slot order. A list rather than nine fields:
     /// [`UiSettings::load`] discards the WHOLE file on a parse error, so a
     /// fixed-length array would let one malformed entry reset every unrelated
@@ -1216,6 +1246,8 @@ impl Default for KeymapConfig {
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
             archive_session: ShortcutId::ArchiveSession.default_combo().into(),
+            close_tab_without_archiving: ShortcutId::CloseTabWithoutArchiving.default_combo().into(),
+            reopen_closed_tab: ShortcutId::ReopenClosedTab.default_combo().into(),
             jump_session: JUMP_DEFAULTS.iter().map(|c| (*c).to_string()).collect(),
         }
     }
@@ -1239,6 +1271,8 @@ impl KeymapConfig {
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
             ShortcutId::ArchiveSession => &self.archive_session,
+            ShortcutId::CloseTabWithoutArchiving => &self.close_tab_without_archiving,
+            ShortcutId::ReopenClosedTab => &self.reopen_closed_tab,
             ShortcutId::JumpSession(slot) => self
                 .jump_session
                 .get(slot)
@@ -1264,6 +1298,8 @@ impl KeymapConfig {
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
             ShortcutId::ArchiveSession => self.archive_session = combo,
+            ShortcutId::CloseTabWithoutArchiving => self.close_tab_without_archiving = combo,
+            ShortcutId::ReopenClosedTab => self.reopen_closed_tab = combo,
             ShortcutId::JumpSession(slot) => {
                 if slot < JUMP_SLOTS {
                     if self.jump_session.len() < JUMP_SLOTS {
@@ -1583,6 +1619,19 @@ impl UiSettings {
                             settings.entry("codeFontSize").or_insert(legacy);
                         }
                     }
+                    // Replace the retired new-session default with the unified
+                    // new-tab shortcut, without changing custom bindings.
+                    if let Some(keymap) = value
+                        .get_mut("keymap")
+                        .and_then(serde_json::Value::as_object_mut)
+                        && keymap.get("newSession").and_then(serde_json::Value::as_str)
+                            == Some("mod-n")
+                    {
+                        keymap.insert(
+                            "newSession".into(),
+                            serde_json::json!(ShortcutId::NewSession.default_combo()),
+                        );
+                    }
                     if let Some(keymap) = value
                         .get_mut("keymap")
                         .and_then(serde_json::Value::as_object_mut)
@@ -1865,6 +1914,8 @@ mod tests {
             loaded.new_thread_background_effect,
             NewThreadBackgroundEffect::None
         );
+        assert_eq!(loaded.reduce_motion, crate::motion::ReduceMotion::System);
+        assert!(!loaded.pause_animations_in_background);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
         for sound in [
@@ -2335,7 +2386,15 @@ mod tests {
             sidebar_show_project_label: false,
             sidebar_show_harness: false,
             sidebar_show_branch: false,
+            sidebar_show_archived: false,
             last_space_id: Some("space-1".into()),
+            project_folders_by_device: HashMap::from([(
+                "local".into(),
+                project_folders::ProjectFolderPreference {
+                    override_path: Some("~/Projects".into()),
+                    parent_counts: HashMap::from([("/projects".into(), 3)]),
+                },
+            )]),
             last_project_action_by_space_id: std::collections::HashMap::from([(
                 "space-1".into(),
                 "dev".into(),
@@ -2451,6 +2510,8 @@ mod tests {
                 name: "background.png".into(),
             }),
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
+            reduce_motion: crate::motion::ReduceMotion::On,
+            pause_animations_in_background: true,
             graff_notice_dismissed: Some("0.0.9".into()),
             legacy_accent_color: None,
         };
@@ -2461,6 +2522,8 @@ mod tests {
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInHarness": false"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
+        assert!(json.contains(r#""reduceMotion": "on""#));
+        assert!(json.contains(r#""pauseAnimationsInBackground": true"#));
         assert!(json.contains(r#""terminalFontFamily": "installed:Menlo""#));
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
         assert!(json.contains(r#""codeFontFamily": "geist""#));
@@ -2555,10 +2618,12 @@ mod tests {
         assert!(settings.sidebar_compact);
         assert!(settings.sidebar_show_project_icon);
         assert!(settings.sidebar_show_project_label);
+        assert!(settings.sidebar_show_archived);
         let customized = UiSettings {
             sidebar_compact: false,
             sidebar_show_project_icon: false,
             sidebar_show_project_label: false,
+            sidebar_show_archived: false,
             sidebar_organization: SidebarOrganization::ByProject,
             ..settings
         };
@@ -3103,7 +3168,10 @@ mod tests {
             keymap.get(ShortcutId::PrevSession),
             format!("{ctrl}-shift-tab")
         );
-        assert_eq!(keymap.get(ShortcutId::NewSession), "mod-n");
+        assert_eq!(
+            keymap.get(ShortcutId::NewSession),
+            ShortcutId::NewSession.default_combo()
+        );
         assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-a");
         keymap.set(ShortcutId::ToggleSidebar, "mod-shift-x".into());
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
@@ -3113,6 +3181,42 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-y");
         keymap.reset(ShortcutId::ArchiveSession);
         assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-a");
+    }
+
+    #[test]
+    fn close_tab_without_archiving_shortcut_is_platform_aware_and_rebindable() {
+        let id = ShortcutId::CloseTabWithoutArchiving;
+        assert_eq!(platform_combo_on(true, id.default_combo_on(true)), "cmd-alt-w");
+        assert_eq!(platform_combo_on(false, id.default_combo_on(false)), "ctrl-alt-w");
+        let mut keymap: KeymapConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(keymap.get(id), "mod-alt-w");
+        keymap.set(id, "mod-alt-x".into());
+        let saved = serde_json::to_string(&keymap).unwrap();
+        let restored: KeymapConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.get(id), "mod-alt-x");
+        keymap.reset(id);
+        assert_eq!(keymap.get(id), "mod-alt-w");
+    }
+
+    #[test]
+    fn reopen_closed_tab_shortcut_avoids_the_new_tab_key_on_each_platform() {
+        let id = ShortcutId::ReopenClosedTab;
+        assert_eq!(
+            platform_combo_on(true, id.default_combo_on(true)),
+            "cmd-shift-t"
+        );
+        assert_eq!(
+            platform_combo_on(false, id.default_combo_on(false)),
+            "ctrl-alt-shift-t"
+        );
+        for mac in [true, false] {
+            assert_ne!(
+                id.default_combo_on(mac),
+                ShortcutId::NewSession.default_combo_on(mac)
+            );
+        }
+        let keymap: KeymapConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(keymap.get(id), id.default_combo());
     }
 
     #[test]
