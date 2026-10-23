@@ -680,6 +680,193 @@ mod tests {
         assert_eq!(refreshed.sound_since(&stale, false), None);
     }
 
+    // Mirror the caller's baseline-before-output contract, including updates
+    // whose decisions are suppressed or discarded by output settings.
+    fn observe_session(
+        previous: &mut SessionNotificationState,
+        session: &Session,
+        now: chrono::DateTime<chrono::Utc>,
+        archived: bool,
+        send_pending: bool,
+    ) -> Option<Sound> {
+        let current = SessionNotificationState::new(session, archived, now);
+        let previous = std::mem::replace(previous, current.clone());
+        current.sound_since(&previous, send_pending)
+    }
+
+    #[test]
+    fn consecutive_suppressed_markers_never_replay_but_next_human_completion_chimes() {
+        use harness_proto::SessionStatus::Idle;
+        let now = chrono::Utc::now();
+        let mut previous = baseline(Indicator::Working, None);
+        let mut session = session(Idle, None, false);
+        session.updated_at = now;
+        for (turn, peer_only, archived, pending) in [
+            ("archived-human", false, true, false),
+            ("archived-peer", true, true, false),
+            ("restored-peer", true, false, false),
+            ("pending-human", false, false, true),
+        ] {
+            session.last_completed_turn = Some(turn.into());
+            session.last_completed_peer_only = peer_only;
+            assert_eq!(
+                observe_session(&mut previous, &session, now, archived, pending),
+                None,
+                "suppressed marker {turn}"
+            );
+            // Clearing suppression without a new marker must stay silent.
+            assert_eq!(
+                observe_session(&mut previous, &session, now, false, false),
+                None,
+                "replayed marker {turn}"
+            );
+        }
+        session.last_completed_turn = Some("next-human".into());
+        session.last_completed_peer_only = false;
+        assert_eq!(
+            observe_session(&mut previous, &session, now, false, false),
+            Some(Sound::Done)
+        );
+    }
+
+    #[test]
+    fn freshness_boundary_and_pending_send_consume_markers_without_delayed_completion() {
+        use harness_proto::SessionStatus::{Idle, Working};
+        let now = chrono::Utc::now();
+        let stale_ms = harness_proto::view::SESSION_STALE_MS;
+        for age_ms in [stale_ms - 1, stale_ms, stale_ms + 1] {
+            for pending in [false, true] {
+                let mut previous = baseline(Indicator::Working, None);
+                let mut session = session(Idle, Some("completion"), false);
+                session.updated_at = now - chrono::Duration::milliseconds(age_ms);
+                assert_eq!(
+                    observe_session(&mut previous, &session, now, false, pending),
+                    (age_ms <= stale_ms && !pending).then_some(Sound::Done),
+                    "age={age_ms}, pending={pending}"
+                );
+                // A fresh heartbeat and clearing send-pending cannot revive
+                // a completion that was stale, pending, or already heard.
+                session.status = Working;
+                session.updated_at = now;
+                assert_eq!(
+                    observe_session(&mut previous, &session, now, false, false),
+                    None
+                );
+                session.last_completed_turn = Some("next-completion".into());
+                assert_eq!(
+                    observe_session(&mut previous, &session, now, false, false),
+                    Some(Sound::Done)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coalesced_working_and_heartbeat_use_the_completed_turns_peer_only_flag() {
+        use harness_proto::SessionStatus::{Idle, Working};
+        let now = chrono::Utc::now();
+        let mut previous = baseline(Indicator::Working, None);
+        // A queued turn is already Working, but the marker still belongs to
+        // a human completion and must produce its chime.
+        let mut session = session(Working, Some("human"), false);
+        session.updated_at = now;
+        assert_eq!(
+            observe_session(&mut previous, &session, now, false, false),
+            Some(Sound::Done)
+        );
+        session.updated_at = now + chrono::Duration::seconds(1);
+        let later = session.updated_at;
+        assert_eq!(
+            observe_session(&mut previous, &session, later, false, false),
+            None
+        );
+
+        session.last_completed_turn = Some("peer".into());
+        session.last_completed_peer_only = true;
+        assert_eq!(
+            observe_session(&mut previous, &session, later, false, false),
+            None
+        );
+        // Starting a human turn and its heartbeat retain the completed turn's
+        // peer-only flag rather than making the old marker eligible again.
+        session.started_at = Some(later);
+        assert_eq!(
+            observe_session(&mut previous, &session, later, false, false),
+            None
+        );
+        session.status = Idle;
+        session.last_completed_turn = Some("next-human".into());
+        session.last_completed_peer_only = false;
+        assert_eq!(
+            observe_session(&mut previous, &session, later, false, false),
+            Some(Sound::Done)
+        );
+    }
+
+    #[test]
+    fn archived_peer_questions_and_errors_remain_actionable_once() {
+        use harness_proto::SessionStatus::{AwaitingInput, Errored, Working};
+        let now = chrono::Utc::now();
+        for archived in [false, true] {
+            for pending in [false, true] {
+                for peer_only in [false, true] {
+                    for (status, expected) in
+                        [(AwaitingInput, Sound::Request), (Errored, Sound::Attention)]
+                    {
+                        let mut previous = baseline(Indicator::Working, Some("old"));
+                        // A coalesced marker change cannot take priority over
+                        // the actionable question or failure.
+                        let mut session = session(status, Some("new"), peer_only);
+                        session.updated_at = now;
+                        assert_eq!(
+                            observe_session(&mut previous, &session, now, archived, pending),
+                            Some(expected),
+                            "status={status:?}, peer_only={peer_only}, archived={archived}, pending={pending}"
+                        );
+                        assert_eq!(
+                            observe_session(&mut previous, &session, now, archived, false),
+                            None
+                        );
+                        // Resolving the actionable state must not replay its
+                        // coalesced completion, including after restoring.
+                        session.status = Working;
+                        assert_eq!(
+                            observe_session(&mut previous, &session, now, false, false),
+                            None
+                        );
+                        session.status = status;
+                        assert_eq!(
+                            observe_session(&mut previous, &session, now, archived, pending),
+                            Some(expected)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discarded_output_decisions_are_consumed_before_outputs_are_reenabled() {
+        use harness_proto::SessionStatus::{AwaitingInput, Errored, Idle};
+        let now = chrono::Utc::now();
+        for (status, expected) in [
+            (Idle, Sound::Done),
+            (AwaitingInput, Sound::Request),
+            (Errored, Sound::Attention),
+        ] {
+            let mut previous = baseline(Indicator::Working, None);
+            let mut session = session(status, Some("finished"), false);
+            session.updated_at = now;
+            // Outputs may discard this decision, but not the baseline update.
+            let discarded = observe_session(&mut previous, &session, now, false, false);
+            assert_eq!(discarded, Some(expected));
+            assert_eq!(
+                observe_session(&mut previous, &session, now, false, false),
+                None
+            );
+        }
+    }
+
     #[test]
     fn background_chimes_ride_on_the_notification_so_focus_applies() {
         // Background with a banner: the system notification carries the

@@ -95,6 +95,7 @@ pub fn start(conn: &Arc<Conn>, params: Value) -> (Result<Value, RpcError>, After
         (
             harness,
             RunRequest {
+                turn_origin: Default::default(),
                 prompt,
                 harness: Some(harness),
                 model,

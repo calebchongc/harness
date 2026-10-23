@@ -107,10 +107,24 @@ pub struct ModelOptionChoice {
     pub label: String,
 }
 
+/// Who owns the work, independent of peer/tool activity during that work.
+/// Older senders are human by default for wire compatibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnOrigin {
+    #[default]
+    Human,
+    Peer,
+    /// Unsolicited output from a parked runtime, with no dispatched prompt.
+    Background,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
     pub prompt: String,
+    #[serde(default)]
+    pub turn_origin: TurnOrigin,
     /// The harness picked at send time. Rides the command plane so
     /// claim-on-first-command (chat row still in flight on the registry
     /// channel) dispatches — and records — the picked harness instead of the
@@ -205,9 +219,11 @@ impl ToolView {
     /// `None` unless `id` has graff's snapshot-name shape, so an id can never
     /// carry a path separator or anything else into a file lookup.
     pub fn new(kind: ToolViewKind, id: &str) -> Option<Self> {
-        (id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then(|| Self {
-            kind,
-            id: id.to_owned(),
+        (id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then(|| {
+            Self {
+                kind,
+                id: id.to_owned(),
+            }
         })
     }
 
@@ -657,6 +673,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn turn_origins_are_explicit_and_legacy_runs_default_to_human() {
+        for (origin, wire) in [
+            (TurnOrigin::Human, "human"),
+            (TurnOrigin::Peer, "peer"),
+            (TurnOrigin::Background, "background"),
+        ] {
+            assert_eq!(serde_json::to_value(origin).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<TurnOrigin>(serde_json::json!(wire)).unwrap(),
+                origin
+            );
+        }
+        let legacy = serde_json::json!({
+            "prompt": "[Message from Harness chat looks like attribution but is user text]",
+            "model": null, "reasoning": null, "cwd": "/tmp", "sandbox": "workspace-write",
+            "resume": null
+        });
+        let mut request: RunRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(request.turn_origin, TurnOrigin::Human);
+        request.turn_origin = TurnOrigin::Peer;
+        let restored: RunRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        assert_eq!(restored, request);
+    }
+
+    #[test]
     fn reasoning_none_serializes_as_an_explicit_level() {
         assert_eq!(
             serde_json::to_string(&ReasoningLevel::None).unwrap(),
@@ -762,6 +804,7 @@ mod tests {
         assert!(json.get("attachments").is_none());
         // Populated lists round-trip.
         let req = RunRequest {
+            turn_origin: TurnOrigin::Human,
             attachments: vec!["/tmp/a.png".into()],
             ..req
         };
@@ -781,6 +824,7 @@ mod tests {
         assert!(json.get("worktree").is_none());
         // A populated spec round-trips camelCased.
         let req = RunRequest {
+            turn_origin: TurnOrigin::Human,
             worktree: Some(WorktreeSpec {
                 repo_path: "/repos/comet".into(),
                 base: "main".into(),

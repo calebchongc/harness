@@ -8960,6 +8960,7 @@ impl Composer {
                     .is_some();
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
+                        turn_origin: Default::default(),
                         prompt: content.clone(),
                         harness: resolved.harness,
                         model: resolved.model.clone(),

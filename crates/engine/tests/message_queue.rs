@@ -92,6 +92,8 @@ impl Harness for HeldHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        // Publishing readiness must mean completion signals have a receiver.
+        let mut finish = self.finish.subscribe();
         self.prompts.lock().unwrap().push(request.prompt.clone());
         self.requests.lock().unwrap().push(request.clone());
         let answer = self.asks.then(|| {
@@ -107,7 +109,6 @@ impl Harness for HeldHarness {
                 multi_select: false,
             }])
         });
-        let mut finish = self.finish.subscribe();
         let mut steering = controls.steering;
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
             harness: HarnessId::Mock,
@@ -544,6 +545,7 @@ async fn a_steer_command_holds_for_an_agent_that_takes_no_mid_turn_prompt() {
         .queue_command(
             CHAT,
             SessionCommandPayload::Steer {
+                turn_origin: Default::default(),
                 prompt: "and also this".into(),
                 message_id: Some("m-steer".into()),
             },
@@ -593,6 +595,7 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
             .queue_command(&harness_doc::SessionCommandEntry {
                 id: format!("remote-command-{i}"),
                 payload: SessionCommandPayload::Steer {
+                    turn_origin: Default::default(),
                     prompt: prompt.clone(),
                     message_id: Some(format!("remote-message-{i}")),
                 },
@@ -662,16 +665,16 @@ async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
 
     harness.finish.send(()).unwrap();
     wait_for(
-        || user_messages(&core).iter().any(|m| m == "first queued"),
-        "first queued turn",
+        || prompts.lock().unwrap().iter().any(|m| m == "first queued"),
+        "first queued turn to reach the harness",
     )
     .await;
     assert_eq!(queue_texts(&core), vec!["second queued"]);
     assert!(!user_messages(&core).iter().any(|m| m == "second queued"));
     harness.finish.send(()).unwrap();
     wait_for(
-        || user_messages(&core).iter().any(|m| m == "second queued"),
-        "second queued turn",
+        || prompts.lock().unwrap().iter().any(|m| m == "second queued"),
+        "second queued turn to reach the harness",
     )
     .await;
     assert!(queue_texts(&core).is_empty());

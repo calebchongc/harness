@@ -246,6 +246,7 @@ async fn turn(core: &EngineCore, cwd: &std::path::Path, live: bool, second: bool
             CHAT,
             HarnessId::Codex,
             RunRequest {
+                turn_origin: Default::default(),
                 prompt: prompt.into(),
                 harness: None,
                 model: live

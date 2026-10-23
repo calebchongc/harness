@@ -164,6 +164,7 @@ fn send_full(
 ) -> String {
     let payload = SessionCommandPayload::Run {
         request: RunRequest {
+            turn_origin: Default::default(),
             prompt: text.into(),
             harness: Some(harness),
             model: None,

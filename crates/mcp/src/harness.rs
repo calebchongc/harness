@@ -10,16 +10,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use tokio::sync::Mutex;
 use harness_doc::{
     SessionCommandPayload, SessionMessageEntry, TranscriptFrame, apply_transcript_frame,
 };
 use harness_proto::{
     Chat, Device, HarnessId, Model, ReasoningLevel, Session, SessionStatus, Space, SteeringMode,
+    TurnOrigin,
 };
 use harness_rpc::{RpcClient, RpcError, RpcSubscription, connect_ws, methods};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 /// First-item wait for a watch snapshot. Localhost; the engine answers
 /// watch attaches in milliseconds unless it is still assembling stores.
@@ -302,6 +303,12 @@ impl Harness {
         chat_id: &str,
         payload: &SessionCommandPayload,
     ) -> anyhow::Result<String> {
+        let mut payload = payload.clone();
+        match &mut payload {
+            SessionCommandPayload::Run { request, .. } => request.turn_origin = TurnOrigin::Peer,
+            SessionCommandPayload::Steer { turn_origin, .. } => *turn_origin = TurnOrigin::Peer,
+            _ => {}
+        }
         let command = serde_json::to_value(payload).context("serialize command")?;
         let reply = self
             .call(
@@ -352,7 +359,8 @@ impl Harness {
         let reply = self
             .call(
                 methods::QUEUE_MESSAGE,
-                json!({ "chatId": chat_id, "text": text, "holdForTurnEnd": true }),
+                json!({ "chatId": chat_id, "text": text, "holdForTurnEnd": true,
+                    "turnOrigin": TurnOrigin::Peer, "peerChatId": self.origin.chat_id }),
             )
             .await?;
         Ok(reply
@@ -653,7 +661,11 @@ mod tests {
         struct Service(tokio::sync::watch::Sender<()>);
         #[async_trait::async_trait]
         impl harness_rpc::RpcService for Service {
-            async fn handle(&self, method: &str, _: Value) -> Result<harness_rpc::RpcReply, RpcError> {
+            async fn handle(
+                &self,
+                method: &str,
+                _: Value,
+            ) -> Result<harness_rpc::RpcReply, RpcError> {
                 let first = if method == methods::WATCH_DOC_MESSAGES {
                     json!({"reset": []})
                 } else {

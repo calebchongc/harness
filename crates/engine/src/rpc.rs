@@ -171,6 +171,10 @@ struct QueueMessageParams {
     /// supports mid-turn steering.
     #[serde(default)]
     hold_for_turn_end: bool,
+    #[serde(default)]
+    turn_origin: harness_proto::TurnOrigin,
+    #[serde(default)]
+    peer_chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,7 +636,11 @@ enum MutateParams {
     /// The desktop's appearance mode and light/dark theme ids, published to
     /// the registry so phones can match the desktop.
     #[serde(rename_all = "camelCase")]
-    SetAppearance { mode: String, light: String, dark: String },
+    SetAppearance {
+        mode: String,
+        light: String,
+        dark: String,
+    },
     /// Full-config replace on the chat row (harness `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -1109,7 +1117,11 @@ impl EngineRpc {
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatArchived { chat_id, archived, archive_requested_at } => {
+            MutateParams::SetChatArchived {
+                chat_id,
+                archived,
+                archive_requested_at,
+            } => {
                 match archive_requested_at.filter(|_| archived) {
                     Some(at) => self.workspace.archive_chat_at(&chat_id, at),
                     None => self.workspace.set_chat_archived(&chat_id, archived),
@@ -2076,11 +2088,13 @@ impl RpcService for EngineRpc {
                 let p: QueueMessageParams = parse_params(params)?;
                 let id = self
                     .doc_host
-                    .queue_message_with_behavior(
+                    .queue_message_with_origin(
                         &p.chat_id,
                         &p.text,
                         p.attachments,
                         p.hold_for_turn_end,
+                        p.turn_origin,
+                        p.peer_chat_id,
                     )
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "id": id }))
@@ -3171,7 +3185,9 @@ impl RpcService for EngineRpc {
                     .cwd
                     .as_deref()
                     .and_then(harness_proto::graff_worktree::GraffWorktree::from_path)
-                    .ok_or_else(|| RpcError::Failed("This chat isn't in a Graff worktree".into()))?;
+                    .ok_or_else(|| {
+                        RpcError::Failed("This chat isn't in a Graff worktree".into())
+                    })?;
                 let result = harness_adapters::run_graff_worktree_action(
                     std::path::Path::new(&tree.root),
                     &tree.name,
@@ -3531,6 +3547,21 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_message_decodes_structural_origin_without_attribution() {
+        let human: QueueMessageParams = serde_json::from_value(serde_json::json!({
+            "chatId": "chat", "text": "legacy"
+        }))
+        .unwrap();
+        assert_eq!(human.turn_origin, harness_proto::TurnOrigin::Human);
+        let peer: QueueMessageParams = serde_json::from_value(serde_json::json!({
+            "chatId": "chat", "text": "ordinary follow-up", "turnOrigin": "peer"
+        }))
+        .unwrap();
+        assert_eq!(peer.turn_origin, harness_proto::TurnOrigin::Peer);
+        assert!(peer.peer_chat_id.is_none());
+    }
 
     // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
     #[cfg(unix)]

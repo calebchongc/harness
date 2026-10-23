@@ -2819,9 +2819,9 @@ impl Shell {
                     .iter()
                     .map(|s| {
                         let chat = state.chats.iter().find(|c| c.id == s.chat_id);
-                        // Archived chats and peer-only turns consume their
-                        // completion silently (#499).
-                        let archived = chat.is_some_and(|c| c.archived);
+                        // Unknown/deleted chats fail closed too. Still observe
+                        // their markers so restore cannot replay a late finish.
+                        let archived = chat.is_none_or(|c| c.archived);
                         let status = crate::sound::SessionNotificationState::new(s, archived, now);
                         let send_pending = state.send_pending(&s.chat_id, now);
                         let title = chat.and_then(|c| c.title.clone());

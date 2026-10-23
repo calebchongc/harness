@@ -97,6 +97,7 @@ fn entry(role: MessageRole, text: &str, id: &str) -> SessionMessageEntry {
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         // Even a request pinned to the source harness must not reach it —
         // and its source-agent model pick must not reach graff.

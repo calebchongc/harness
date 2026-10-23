@@ -9,20 +9,20 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use harness_doc::SessionCommandPayload;
 use harness_proto::{
     Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
     Space, UserInputAnswer,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::turn_replies::{REPLIES_TRUNCATED_NOTE, turn_replies};
 
 mod peer_messages;
 mod rooms;
-use crate::harness::{HarnessInfo, TurnOutcome, Harness, session_for, short};
+use crate::harness::{Harness, HarnessInfo, TurnOutcome, session_for, short};
 
 /// Default and ceiling for the blocking waits.
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
@@ -1089,6 +1089,7 @@ impl Tools {
                     .or_else(|| space.map(|s| s.path.clone()))
                     .unwrap_or_else(|| "~".into());
                 let request = RunRequest {
+                    turn_origin: harness_proto::TurnOrigin::Peer,
                     prompt: text,
                     harness: Some(harness),
                     model: config.as_ref().and_then(|c| c.model.clone()),
@@ -1122,6 +1123,7 @@ impl Tools {
                     .queue_command(
                         &chat.id,
                         &SessionCommandPayload::Steer {
+                            turn_origin: harness_proto::TurnOrigin::Peer,
                             prompt: text,
                             message_id: Some(uuid::Uuid::new_v4().to_string()),
                         },
@@ -1264,8 +1266,8 @@ mod tests {
     use crate::harness::Origin;
     use async_trait::async_trait;
     use futures::StreamExt;
-    use std::sync::Mutex;
     use harness_rpc::{RpcError, RpcReply, RpcService, memory_client, methods};
+    use std::sync::Mutex;
 
     /// A fixed little workspace: one device, one project, one chat with a
     /// two-message transcript. Writes are recorded for assertions.
@@ -1387,7 +1389,11 @@ mod tests {
                                 "stripped": 0
                             })
                         }
-                        _ => return Ok(RpcReply::Value(json!({ "status": 404, "body": { "error": "not_found" } }))),
+                        _ => {
+                            return Ok(RpcReply::Value(
+                                json!({ "status": 404, "body": { "error": "not_found" } }),
+                            ));
+                        }
                     };
                     RpcReply::Value(json!({ "status": 200, "body": body }))
                 }
@@ -1401,10 +1407,16 @@ mod tests {
         let world = Arc::new(World::default());
         let tools = tools(
             world.clone(),
-            Origin { chat_id: Some("chat-beta-2".into()), device_id: Some("dev-local".into()) },
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: Some("dev-local".into()),
+            },
         );
         let posted = tools
-            .call("post_room", json!({ "room": "build", "text": "@alpha tests are green" }))
+            .call(
+                "post_room",
+                json!({ "room": "build", "text": "@alpha tests are green" }),
+            )
             .await
             .unwrap();
         assert_eq!(posted["seq"], 3);
@@ -1471,6 +1483,50 @@ mod tests {
         assert_eq!(read["returned"], 1);
         assert_eq!(read["olderRemaining"], 1);
         assert_eq!(read["messages"][0]["id"], "a1");
+    }
+
+    #[tokio::test]
+    async fn every_send_mode_is_peer_even_without_sender_metadata() {
+        for sender in [None, Some("chat-beta-2")] {
+            for mode in ["auto", "run", "steer", "queue"] {
+                let world = Arc::new(World::default());
+                let tools = tools(
+                    world.clone(),
+                    Origin {
+                        chat_id: sender.map(str::to_owned),
+                        device_id: None,
+                    },
+                );
+                tools
+                    .call(
+                        "send_message",
+                        json!({
+                            "chat": "alpha", "text": "ordinary follow-up", "mode": mode
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let writes = world.writes.lock().unwrap();
+                let (method, params) = writes.last().unwrap();
+                let (origin, text) = if method == methods::QUEUE_MESSAGE {
+                    assert_eq!(params["holdForTurnEnd"], true);
+                    assert_eq!(params["peerChatId"].as_str(), sender);
+                    (&params["turnOrigin"], &params["text"])
+                } else if params["command"]["kind"] == "run" {
+                    (
+                        &params["command"]["request"]["turnOrigin"],
+                        &params["command"]["request"]["prompt"],
+                    )
+                } else {
+                    (
+                        &params["command"]["turnOrigin"],
+                        &params["command"]["prompt"],
+                    )
+                };
+                assert_eq!(origin, "peer");
+                assert!(text.as_str().unwrap().ends_with("ordinary follow-up"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1673,6 +1729,7 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+        assert_eq!(writes[2].1["command"]["request"]["turnOrigin"], "peer");
     }
 
     #[tokio::test]
