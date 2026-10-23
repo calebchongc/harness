@@ -952,8 +952,7 @@ final class AppModel {
     func archivedMatches(in spaceId: String?, query: String) -> [Chat] {
         let archived = archivedChats(in: spaceId)
         guard !query.isEmpty else { return archived }
-        return HomeFilter.apply(archived, query: query, status: .all,
-                                indicator: { _ in .idle }, names: homeFilterNames)
+        return HomeFilter.apply(archived, query: query, names: homeFilterNames)
     }
 
     func homeFilterNames(_ chat: Chat) -> HomeFilter.Names {
