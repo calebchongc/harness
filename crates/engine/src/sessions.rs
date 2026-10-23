@@ -143,6 +143,10 @@ struct RunHandle {
     /// parks on that turn's `Done{Interrupted}` instead of ending the run,
     /// keeping the agent process and its background tasks (#364).
     turn_interrupted: Arc<std::sync::atomic::AtomicBool>,
+    /// Why the engine last interrupted this run (an `interrupt_for` reason,
+    /// or "question dismissed"). The run task takes it when the turn ends,
+    /// to explain a stop that landed right after an answer (#149).
+    stop_reason: Arc<Mutex<Option<String>>>,
 }
 
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
@@ -729,6 +733,7 @@ impl SessionsEngine {
                 visual_tx,
                 harness: harness.clone(),
                 turn_interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_reason: Arc::new(Mutex::new(None)),
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -880,6 +885,7 @@ impl SessionsEngine {
             return Ok(true);
         }
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
+            *lock(&h.stop_reason) = Some(reason.to_owned());
             (
                 h.run_id.clone(),
                 h.interrupt_token.clone(),
@@ -931,6 +937,7 @@ impl SessionsEngine {
             .get(chat_id)
             .filter(|h| h.steerable)
             .map(|h| {
+                *lock(&h.stop_reason) = Some(reason.to_owned());
                 (
                     h.run_id.clone(),
                     h.harness.clone(),
@@ -1000,6 +1007,7 @@ impl SessionsEngine {
             return false;
         };
         tracing::info!(chat = %chat_id, run = %run.run_id, reason = "question dismissed", "interrupting run");
+        *lock(&run.stop_reason) = Some("question dismissed".to_owned());
         // Publish cancellation before waking the adapter, as in interrupt().
         // Dropping the resolver communicates cancellation, not an empty answer.
         let _ = run.cancel.send(true);
@@ -2461,6 +2469,27 @@ fn append_delta(pending: &mut AgentEvent, next: &AgentEvent) -> bool {
         ) if held == next_id => append_delta(held_event, next_event),
         _ => false,
     }
+}
+
+/// The notice for a turn that ended right after its question was answered,
+/// before the agent did anything with the answer (#149), naming the engine's
+/// reason when it stopped the run. None for a dismissed question: ending the
+/// turn is what the user asked for.
+fn stopped_after_answer(reason: Option<&str>) -> Option<String> {
+    let why = match reason {
+        Some("question dismissed") => return None,
+        Some("stop") => "Stop was requested",
+        Some("send now") => "a queued message was sent now",
+        Some("engine shutdown") => "the app shut down",
+        Some("space deleted") => "the chat's space was deleted",
+        Some(reason) if reason.starts_with("replace") => "the run was replaced",
+        Some(_) => "the run was interrupted",
+        None => "the agent ended the turn",
+    };
+    Some(format!(
+        "Stopped right after your answer, before the agent continued: {why}. \
+         Send a message to continue the task."
+    ))
 }
 
 /// The terminal Done that ends a self-continued chain past its cap (#341).
@@ -3928,6 +3957,26 @@ async fn drive_run(
                 }
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
             };
+            // A turn that stops with an answered question as its last part
+            // never acted on the answer. Say so, and why, or the transcript
+            // ends on the resolved question as if the task went on (#149).
+            let stop_reason = lock(&inner.runs)
+                .get(&chat_id)
+                .filter(|h| h.run_id == run_id)
+                .and_then(|h| lock(&h.stop_reason).take());
+            if message_status == MessageStatus::Aborted
+                && matches!(
+                    folded.last(),
+                    Some(MessagePart::Input { resolved: true, .. })
+                )
+                && let Some(message) = stopped_after_answer(stop_reason.as_deref())
+            {
+                folded.push(MessagePart::Error {
+                    id: format!("e{}", folded.len()),
+                    message,
+                    reauth: None,
+                });
+            }
             // No dangling chips: a run that ends for ANY reason (completed,
             // errored, interrupted) terminally resolves its input parts — an
             // unresolved question must not outlive the run that asked it
