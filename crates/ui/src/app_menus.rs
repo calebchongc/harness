@@ -29,11 +29,15 @@ actions!(
         Minimize,
         Zoom,
         CloseTab,
+        CloseTabWithoutArchiving,
         CloseWindow,
         AppearanceSystem,
         AppearanceLight,
         AppearanceDark,
         ClearBrowsingData,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
     ]
 );
 
@@ -60,12 +64,41 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
     cx.on_action(close_tab);
+    cx.on_action(|_: &CloseTabWithoutArchiving, cx| {
+        cx.defer(|cx| close_active_tab_with_archive(false, cx));
+    });
     cx.on_action(close_window);
     // Appearance. Each verb persists and repaints every window; see
     // `appearance::set_mode`.
     cx.on_action(|_: &AppearanceSystem, cx| appearance::set_mode(AppearanceMode::System, cx));
     cx.on_action(|_: &AppearanceLight, cx| appearance::set_mode(AppearanceMode::Light, cx));
     cx.on_action(|_: &AppearanceDark, cx| appearance::set_mode(AppearanceMode::Dark, cx));
+    // Text size, like a browser's zoom keys: steps through the sizes Settings
+    // offers, persisted the same way.
+    cx.on_action(|_: &IncreaseFontSize, cx| change_font_size(cx, |size| size.stepped(1)));
+    cx.on_action(|_: &DecreaseFontSize, cx| change_font_size(cx, |size| size.stepped(-1)));
+    cx.on_action(|_: &ResetFontSize, cx| change_font_size(cx, |_| Default::default()));
+}
+
+fn change_font_size(
+    cx: &mut App,
+    next: impl FnOnce(crate::typography::UiFontSize) -> crate::typography::UiFontSize + 'static,
+) {
+    // Harness is single-window; without a key window (tests, a window that
+    // lost focus) the first one still takes the size.
+    let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
+        return;
+    };
+    // A key binding dispatches this while its window is mid-update, so the
+    // window can't be borrowed here; apply the size once the event is done.
+    cx.defer(move |cx| {
+        handle
+            .update(cx, |_, window, cx| {
+                let size = next(crate::typography::font_size(cx));
+                crate::typography::set_font_size(size, window, cx);
+            })
+            .ok();
+    });
 }
 
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
@@ -123,23 +156,36 @@ fn close_tab(_: &CloseTab, cx: &mut App) {
 /// window ends the app's session for every chat, so a stray ⌘W in an empty
 /// chat must not take running agents down with it (⌘⇧W closes the window).
 fn close_active_tab(cx: &mut App) {
+    close_active_tab_with_archive(true, cx);
+}
+
+fn close_active_tab_with_archive(archive: bool, cx: &mut App) {
     if let Some(window) = cx
         .active_window()
         .and_then(|window| window.downcast::<shell::Shell>())
     {
-        close_tab_in(window, cx);
+        close_tab_in_with_archive(window, archive, cx);
     }
 }
 
 pub(crate) fn close_tab_in(window: gpui::WindowHandle<shell::Shell>, cx: &mut App) {
+    close_tab_in_with_archive(window, true, cx);
+}
+
+fn close_tab_in_with_archive(
+    window: gpui::WindowHandle<shell::Shell>,
+    archive: bool,
+    cx: &mut App,
+) {
     window
         .update(cx, |shell, window, cx| {
             // The right pane's active surface (the tab the user just opened),
             // then the focused split pane or chat tab, Ghostty-style, then
             // the chat itself, back to a new session.
-            let _ = shell.close_active_surface(window, cx)
-                || shell.close_focused_chat_pane(window, cx)
-                || shell.close_chat_to_new_session(cx);
+            if shell.close_active_surface(window, cx) {
+                return;
+            }
+            shell.close_chat_view_with_archive(archive, window, cx);
         })
         .ok();
 }
@@ -184,6 +230,13 @@ fn app_key_bindings(macos: bool) -> Vec<KeyBinding> {
         shell::OpenSettings,
         None,
     )];
+    let primary = if macos { "cmd" } else { "ctrl" };
+    bindings.extend([
+        KeyBinding::new(&format!("{primary}-="), IncreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}-+"), IncreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}--"), DecreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}-0"), ResetFontSize, None),
+    ]);
     if macos {
         bindings.extend([
             KeyBinding::new("cmd-q", Quit, None),
@@ -257,6 +310,10 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("Appearance: System", AppearanceSystem),
         MenuItem::action("Appearance: Light", AppearanceLight),
         MenuItem::action("Appearance: Dark", AppearanceDark),
+        MenuItem::separator(),
+        MenuItem::action("Bigger Text", IncreaseFontSize),
+        MenuItem::action("Smaller Text", DecreaseFontSize),
+        MenuItem::action("Actual Size", ResetFontSize),
     ]));
     if macos {
         // Standard Window menu; macOS appends the open-window list itself.
@@ -265,6 +322,7 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::action("Zoom", Zoom),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Reopen Closed Tab", shell::ReopenClosedChatTab),
             MenuItem::action("Close Window", CloseWindow),
         ]));
     }
@@ -366,7 +424,10 @@ mod tests {
             vec![
                 AppearanceSystem.name(),
                 AppearanceLight.name(),
-                AppearanceDark.name()
+                AppearanceDark.name(),
+                IncreaseFontSize.name(),
+                DecreaseFontSize.name(),
+                ResetFontSize.name(),
             ]
         );
     }
@@ -407,6 +468,32 @@ mod tests {
         assert_eq!(find(&other, Quit.name()), None);
         // Off macOS the same close-the-innermost-thing action needs a key too.
         assert_eq!(find(&other, CloseTab.name()), Some(combo("ctrl-shift-w")));
+
+        // Text size: the browser zoom keys, Cmd on macOS and Ctrl elsewhere.
+        let all = |bindings: &[KeyBinding], name: &str| -> Vec<Keystroke> {
+            bindings
+                .iter()
+                .filter(|binding| binding.action().name() == name)
+                .flat_map(|binding| binding.keystrokes().iter().map(|ks| ks.inner().clone()))
+                .collect()
+        };
+        for (bindings, primary) in [(&macos, "cmd"), (&other, "ctrl")] {
+            assert_eq!(
+                all(bindings, IncreaseFontSize.name()),
+                vec![
+                    Keystroke::parse(&format!("{primary}-=")).unwrap(),
+                    Keystroke::parse(&format!("{primary}-+")).unwrap()
+                ]
+            );
+            assert_eq!(
+                all(bindings, DecreaseFontSize.name()),
+                vec![Keystroke::parse(&format!("{primary}--")).unwrap()]
+            );
+            assert_eq!(
+                all(bindings, ResetFontSize.name()),
+                vec![Keystroke::parse(&format!("{primary}-0")).unwrap()]
+            );
+        }
     }
 }
 

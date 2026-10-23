@@ -564,6 +564,31 @@ async fn turn_failed_maps_to_errored_done() {
 }
 
 #[tokio::test]
+async fn signed_out_codex_asks_for_sign_in_instead_of_retry_errors() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:signed-out"), controls).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "the 401 retries and the final 401 are not error rows: {events:?}"
+    );
+    let tail: Vec<_> = events.iter().rev().take(2).rev().collect();
+    assert_eq!(
+        tail,
+        [
+            &AgentEvent::ReauthRequired {
+                provider: harness_proto::ReauthProvider::Codex
+            },
+            &AgentEvent::Done {
+                status: DoneStatus::Errored,
+                result: None,
+                error: None,
+                session_id: Some("th-1".into()),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn resume_falls_back_to_fresh_thread() {
     let (controls, _steer, _token) = controls("Yes");
     let mut req = request("scenario:resumed");

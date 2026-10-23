@@ -1,6 +1,7 @@
 package harness.codegraff.android.ui.session
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -30,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -79,44 +82,52 @@ fun QuestionPanel(
             .glass(shape).border(1.dp, p.hairline(0.05f), shape).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(question.header.uppercase(), style = sans(10.5f, FontWeight.Medium).copy(letterSpacing = 1.sp), color = p.textMuted.opacity(0.6f))
-            Spacer(Modifier.weight(1f))
-            if (questions.size > 1) {
-                Text(
-                    "${page + 1}/${questions.size}", style = sans(10f), color = p.textMuted,
-                    modifier = Modifier.height(20.dp).background(p.ink(0.06f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp),
-                )
+        // The question and its options scroll inside a cap, so a long question
+        // leaves the transcript above it readable and Submit on screen.
+        val promptScroll = remember(page) { ScrollState(0) }
+        Column(
+            Modifier.heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.4f).dp).verticalScroll(promptScroll),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(question.header.uppercase(), style = sans(10.5f, FontWeight.Medium).copy(letterSpacing = 1.sp), color = p.textMuted.opacity(0.6f))
+                Spacer(Modifier.weight(1f))
+                if (questions.size > 1) {
+                    Text(
+                        "${page + 1}/${questions.size}", style = sans(10f), color = p.textMuted,
+                        modifier = Modifier.height(20.dp).background(p.ink(0.06f), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp),
+                    )
+                }
             }
-        }
-        Text(question.question, style = sans(15f, FontWeight.Medium), color = p.text)
-        if (question.multiSelect == true) Text("Select one or more options.", style = sans(12f), color = p.textMuted)
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            question.options.forEachIndexed { ix, option ->
-                val isPicked = typed[question.id].isNullOrEmpty() && option in picked[question.id].orEmpty()
-                val rowShape = RoundedCornerShape(12.dp)
-                Row(
-                    Modifier.fillMaxWidth().clip(rowShape)
-                        .background(if (isPicked) p.ink(0.09f) else p.ink(0.025f), rowShape)
-                        .border(1.dp, if (isPicked) p.ink(0.16f) else androidx.compose.ui.graphics.Color.Transparent, rowShape)
-                        .clickable(role = Role.Button) {
-                            typed.remove(question.id)
-                            if (question.multiSelect == true) {
-                                val set = picked[question.id].orEmpty()
-                                picked[question.id] = if (option in set) set - option else set + option
-                            } else {
-                                picked[question.id] = setOf(option)
-                                autoAdvance = (autoAdvance ?: 0) + 1
+            Text(question.question, style = sans(15f, FontWeight.Medium), color = p.text)
+            if (question.multiSelect == true) Text("Select one or more options.", style = sans(12f), color = p.textMuted)
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                question.options.forEachIndexed { ix, option ->
+                    val isPicked = typed[question.id].isNullOrEmpty() && option in picked[question.id].orEmpty()
+                    val rowShape = RoundedCornerShape(12.dp)
+                    Row(
+                        Modifier.fillMaxWidth().clip(rowShape)
+                            .background(if (isPicked) p.ink(0.09f) else p.ink(0.025f), rowShape)
+                            .border(1.dp, if (isPicked) p.ink(0.16f) else androidx.compose.ui.graphics.Color.Transparent, rowShape)
+                            .clickable(role = Role.Button) {
+                                typed.remove(question.id)
+                                if (question.multiSelect == true) {
+                                    val set = picked[question.id].orEmpty()
+                                    picked[question.id] = if (option in set) set - option else set + option
+                                } else {
+                                    picked[question.id] = setOf(option)
+                                    autoAdvance = (autoAdvance ?: 0) + 1
+                                }
                             }
-                        }
-                        .padding(horizontal = 14.dp, vertical = 10.dp).heightIn(min = 28.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Text(option, style = sans(13.5f, FontWeight.Medium), color = p.text, modifier = Modifier.weight(1f))
-                    if (ix < 9) {
-                        Box(Modifier.size(22.dp).background(p.ink(0.06f), RoundedCornerShape(6.dp)), contentAlignment = Alignment.Center) {
-                            Text("${ix + 1}", style = sans(11f), color = p.textMuted)
+                            .padding(horizontal = 14.dp, vertical = 10.dp).heightIn(min = 28.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(option, style = sans(13.5f, FontWeight.Medium), color = p.text, modifier = Modifier.weight(1f))
+                        if (ix < 9) {
+                            Box(Modifier.size(22.dp).background(p.ink(0.06f), RoundedCornerShape(6.dp)), contentAlignment = Alignment.Center) {
+                                Text("${ix + 1}", style = sans(11f), color = p.textMuted)
+                            }
                         }
                     }
                 }

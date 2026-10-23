@@ -29,8 +29,10 @@ mod graff_logins;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+pub mod mcp_servers;
 mod model_catalogs;
 pub mod profile;
+pub mod agents_prepare;
 pub mod project_actions;
 pub mod registry;
 pub mod repos;
@@ -47,7 +49,7 @@ pub mod workspace_files;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership, lost_session_marker};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
@@ -263,6 +265,10 @@ impl EngineCore {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
+        }
+        match sessions.resume_after_restart() {
+            0 => {}
+            resumed => tracing::info!(resumed, "work cut short by the last shutdown resumed"),
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);

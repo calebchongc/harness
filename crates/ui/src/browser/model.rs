@@ -105,6 +105,12 @@ pub fn allowed_navigation(address: &str) -> bool {
     })
 }
 
+/// In-memory previews may load only the wrapper and its opaque srcdoc frame.
+/// The inherited CSP separately denies subresources, network and workers.
+pub fn allowed_document_navigation(address: &str) -> bool {
+    matches!(address, "about:blank" | "about:srcdoc")
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Presentation {
     #[default]

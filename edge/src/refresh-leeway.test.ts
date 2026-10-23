@@ -96,6 +96,30 @@ describe("refresh leeway", () => {
     );
   });
 
+  it("still answers a repeat long after two minutes while the successor is unused (a laptop that slept)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const upstream = codegraff();
+    const room = leeway();
+    const credential = await issueRefreshCredential(baseEnv, "42", "cg_rt_1");
+    const first = (await (await ask(room, credential)).json()) as { refreshToken: string };
+    vi.setSystemTime(Date.now() + 6 * 60 * 60 * 1000);
+    const late = await ask(room, credential);
+    expect(late.status).toBe(200);
+    expect(((await late.json()) as { refreshToken: string }).refreshToken).toBe(first.refreshToken);
+    expect(upstream.calls).toBe(1);
+  });
+
+  it("stops answering a repeat once the successor has been used", async () => {
+    const upstream = codegraff();
+    const room = leeway();
+    const credential = await issueRefreshCredential(baseEnv, "42", "cg_rt_1");
+    const first = (await (await ask(room, credential)).json()) as { refreshToken: string };
+    expect((await ask(room, first.refreshToken)).status).toBe(200); // the device moved on
+    const replayed = await ask(room, credential);
+    expect(replayed.status).toBe(401); // the old credential reaches CodeGraff's reuse check again
+    expect(upstream.calls).toBe(3);
+  });
+
   it("stops answering a repeat once the leeway has passed", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const upstream = codegraff();

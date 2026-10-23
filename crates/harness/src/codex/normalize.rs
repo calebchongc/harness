@@ -122,6 +122,30 @@ pub(crate) fn turn_error_message(params: &Value) -> Option<String> {
         })
 }
 
+/// Whether a Codex error (an `error` notification's `error`, or a failed
+/// turn's) is OpenAI rejecting the request's credentials: HTTP 401 in the
+/// typed `codexErrorInfo` (any variant carrying `httpStatusCode`, or the bare
+/// `unauthorized`) on OpenAI's own routes. A signed-out codex reaches
+/// api.openai.com with no bearer; an unrenewable ChatGPT login is rejected
+/// by chatgpt.com. A 401 from a custom provider in the user's config.toml
+/// is that provider's key, which `codex login` cannot fix, so it stays an
+/// error.
+pub(crate) fn rejected_sign_in(error: &Value) -> bool {
+    let unauthorized = match error.get("codexErrorInfo") {
+        Some(Value::String(kind)) => kind == "unauthorized",
+        Some(Value::Object(info)) => info
+            .values()
+            .any(|v| v.get("httpStatusCode").and_then(Value::as_u64) == Some(401)),
+        _ => false,
+    };
+    unauthorized
+        && ["message", "additionalDetails"].iter().any(|key| {
+            error.get(*key).and_then(Value::as_str).is_some_and(|text| {
+                text.contains("://api.openai.com/") || text.contains("://chatgpt.com/backend-api/")
+            })
+        })
+}
+
 /// `thread/tokenUsage/updated` → a [`AgentEvent::Usage`] snapshot of the LAST
 /// turn's tokens (held by the session loop, emitted before `Done`).
 pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
@@ -1014,6 +1038,41 @@ mod tests {
         );
         assert_eq!(turn_error_message(&json!({"turn": {"id": "t"}})), None);
         assert_eq!(turn_error_message(&json!({"turn": {"error": null}})), None);
+    }
+
+    #[test]
+    fn rejected_sign_in_is_a_typed_401_on_openai_routes() {
+        // Captured from codex-cli 0.159.2's app server with an empty CODEX_HOME.
+        let missing = "unexpected status 401 Unauthorized: Missing bearer or basic authentication \
+                       in header, url: https://api.openai.com/v1/responses, cf-ray: a4a4";
+        assert!(rejected_sign_in(&json!({
+            "message": missing,
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}},
+            "additionalDetails": null,
+        })));
+        assert!(rejected_sign_in(&json!({
+            "message": "Reconnecting... 2/5",
+            "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 401}},
+            "additionalDetails": missing.replace("https://", "wss://"),
+        })));
+        assert!(rejected_sign_in(&json!({
+            "message": "401: url: https://chatgpt.com/backend-api/codex/responses",
+            "codexErrorInfo": "unauthorized",
+        })));
+        for error in [
+            // Another status on the same route.
+            json!({"message": missing, "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 500}}}),
+            // Prose alone is not the typed contract.
+            json!({"message": missing}),
+            json!({"message": missing, "codexErrorInfo": "other"}),
+            // A custom provider's key is not a codex sign-in.
+            json!({
+                "message": "unexpected status 401 Unauthorized, url: https://llm.example.com/v1/responses",
+                "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}},
+            }),
+        ] {
+            assert!(!rejected_sign_in(&error), "{error}");
+        }
     }
 }
 

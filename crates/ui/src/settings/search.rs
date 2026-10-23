@@ -69,6 +69,21 @@ const ENTRIES: &[SettingsEntry] = &[
         "permission capture privacy screen",
     ),
     entry(
+        S::Mcp,
+        "MCP servers",
+        "mcp server servers tools reconnect connect plugin integration oauth sign in enable disable",
+    ),
+    entry(
+        S::GithubCi,
+        "Run GitHub Actions on Codegraff",
+        "github actions ci runner runners workflow runs-on codegraff connect install budget repository repositories jobs",
+    ),
+    entry(
+        S::Agents,
+        "Cloud sandboxes",
+        "cloud sandbox harness cloud machine size standard large vcpu memory price hourly turn off",
+    ),
+    entry(
         S::Agents,
         "Sign in to agent accounts",
         "login logout signin signout account credentials api key",

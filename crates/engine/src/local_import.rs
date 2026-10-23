@@ -270,9 +270,12 @@ impl LocalImporter {
                 available_chats += 1;
             }
         }
+        let same_folder = self.target_projects_by_folder()?;
         let mut available_spaces = 0;
         for space in registry.read_spaces()? {
-            if self.inner.workspace.space(&space.id)?.is_none() {
+            if self.inner.workspace.space(&space.id)?.is_none()
+                && !same_folder.contains_key(&(space.device_id.clone(), space.path.clone()))
+            {
                 available_spaces += 1;
             }
         }
@@ -314,9 +317,24 @@ impl LocalImporter {
             .into_iter()
             .filter(|chat| !matches!(self.inner.workspace.chat(&chat.id), Ok(Some(_))))
             .collect();
+        // The same folder on the same device can already be a project here
+        // under another id (both profiles registered it). Importing the source
+        // row would duplicate the project and split its chats, so its chats
+        // join the existing project instead.
+        let same_folder = self.target_projects_by_folder()?;
+        let mut remap: std::collections::HashMap<String, String> = Default::default();
         let pending_spaces: Vec<_> = spaces
             .into_iter()
             .filter(|space| !matches!(self.inner.workspace.space(&space.id), Ok(Some(_))))
+            .filter(|space| {
+                match same_folder.get(&(space.device_id.clone(), space.path.clone())) {
+                    Some(existing) => {
+                        remap.insert(space.id.clone(), existing.clone());
+                        false
+                    }
+                    None => true,
+                }
+            })
             .collect();
         let skipped_chats = total_chats - pending_chats.len();
         let skipped_spaces = total_spaces - pending_spaces.len();
@@ -345,7 +363,11 @@ impl LocalImporter {
                 chat_id: chat.id.clone(),
                 title: chat.title.clone(),
             });
-            match self.import_chat(&source_store, chat, &source_journals) {
+            let mut chat = chat.clone();
+            if let Some(target) = chat.space_id.as_ref().and_then(|id| remap.get(id)) {
+                chat.space_id = Some(target.clone());
+            }
+            match self.import_chat(&source_store, &chat, &source_journals) {
                 Ok(journal) => {
                     imported_chats += 1;
                     if journal {
@@ -393,6 +415,19 @@ impl LocalImporter {
 
     /// Copy one chat: doc snapshot (born-chat2 shape), journal files, row.
     /// Returns whether a journal file was copied.
+    /// This profile's projects keyed by (device, folder).
+    fn target_projects_by_folder(
+        &self,
+    ) -> Result<std::collections::HashMap<(String, String), String>, EngineError> {
+        Ok(self
+            .inner
+            .workspace
+            .read_spaces()?
+            .into_iter()
+            .map(|space| ((space.device_id, space.path), space.id))
+            .collect())
+    }
+
     fn import_chat(
         &self,
         source_store: &DocsStore,
