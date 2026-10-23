@@ -68,15 +68,8 @@ impl SavedSession {
         }
         ThreadState {
             history: self.history,
-            cwd: self.cwd,
-            harness: self.harness,
-            model: self.model,
             resume: self.resume,
-            interrupt: None,
-            turn_id: None,
-            steer: None,
-            steers: Default::default(),
-            steerable: false,
+            ..ThreadState::new(self.cwd, self.harness, self.model)
         }
     }
 }
