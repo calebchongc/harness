@@ -37,7 +37,6 @@ pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
 pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
 mod appearance;
 mod sidebar_pins;
-mod sidebar_sections;
 pub use appearance::{APPEARANCE_STATE_ID, SyncedAppearance};
 
 /// Snapshot row id in the local `DocsStore` for the persisted registry state.
@@ -1335,7 +1334,6 @@ impl RegistryDoc {
 
     pub fn sidebar_preferences(&self) -> Option<SidebarPreferences> {
         self.sidebar_pins_initialized().then(|| SidebarPreferences {
-            sections: self.sidebar_sections(),
             pinned_session_ids: self
                 .ordered_sidebar_pins()
                 .into_iter()
