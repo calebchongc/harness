@@ -9,14 +9,14 @@
 #include <unistd.h>
 #include <webkit2/webkit2.h>
 
-#define MAX_COMMAND (1024 * 1024)
+#define MAX_COMMAND (4 * 1024 * 1024)
 #define MAX_DIMENSION 8192
 
 typedef struct {
     guint id;
     GtkWidget *window;
     WebKitWebView *web;
-    gboolean visible, dirty;
+    gboolean visible, dirty, document;
     gchar *error;
     guint width, height;
     double scale;
@@ -198,12 +198,13 @@ static gboolean policy(WebKitWebView *web, WebKitPolicyDecision *decision,
         WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(
             WEBKIT_NAVIGATION_POLICY_DECISION(decision));
         const char *uri = webkit_uri_request_get_uri(webkit_navigation_action_get_request(action));
-        if (!allowed(uri)) {
+        gboolean internal_document = !strcmp(uri, "about:blank") || !strcmp(uri, "about:srcdoc");
+        if (p->document ? !internal_document : !allowed(uri)) {
             webkit_policy_decision_ignore(decision);
             return TRUE;
         }
         if (type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
-            if (webkit_navigation_action_is_user_gesture(action))
+            if (!p->document && webkit_navigation_action_is_user_gesture(action))
                 send_packet('N', p->id, uri, strlen(uri));
             webkit_policy_decision_ignore(decision);
             return TRUE;
@@ -213,6 +214,11 @@ static gboolean policy(WebKitWebView *web, WebKitPolicyDecision *decision,
 }
 static gboolean permission(WebKitWebView *web, WebKitPermissionRequest *request, Page *p) {
     webkit_permission_request_deny(request);
+    return TRUE;
+}
+static gboolean file_chooser(WebKitWebView *web, WebKitFileChooserRequest *request, Page *p) {
+    if (!p->document) return FALSE;
+    webkit_file_chooser_request_cancel(request);
     return TRUE;
 }
 static JsonBuilder *menu_builder(double x, double y) {
@@ -249,7 +255,7 @@ static gboolean context_menu(WebKitWebView *web, WebKitContextMenu *menu, GdkEve
     JsonBuilder *b = menu_builder(x / p->scale, y / p->scale);
     if (webkit_hit_test_result_context_is_link(hit)) {
         p->context_link = g_strdup(webkit_hit_test_result_get_link_uri(hit));
-        menu_item(b, "Open link in new tab", "open-link", allowed(p->context_link), FALSE);
+        menu_item(b, "Open link in new tab", "open-link", !p->document && allowed(p->context_link), FALSE);
         menu_item(b, "Copy link address", "copy-link", TRUE, FALSE);
     }
     menu_item(b, "Copy", "copy",
@@ -324,6 +330,7 @@ static Page *new_page(guint id) {
     g_signal_connect(p->web, "web-process-terminated", G_CALLBACK(terminated), p);
     g_signal_connect(p->web, "decide-policy", G_CALLBACK(policy), p);
     g_signal_connect(p->web, "permission-request", G_CALLBACK(permission), p);
+    g_signal_connect(p->web, "run-file-chooser", G_CALLBACK(file_chooser), p);
     g_signal_connect(p->web, "context-menu", G_CALLBACK(context_menu), p);
     g_signal_connect(p->web, "show-option-menu", G_CALLBACK(option_menu), p);
     gtk_widget_show_all(p->window);
@@ -470,6 +477,28 @@ static void evaluated(GObject *web, GAsyncResult *result, gpointer data) {
     g_clear_object(&v);
     g_clear_error(&error);
 }
+// Preconnect bypasses CSP. Disable native speculative-load features before
+// loading any untrusted document; old hosts fail closed for previews only.
+static gboolean isolate_speculative_loads(WebKitSettings *settings) {
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+    WebKitFeatureList *features = webkit_settings_get_all_features();
+    gboolean found = FALSE, disabled = TRUE;
+    for (gsize i = 0; i < webkit_feature_list_get_length(features); i++) {
+        WebKitFeature *feature = webkit_feature_list_get(features, i);
+        const char *key = webkit_feature_get_identifier(feature);
+        if (!strcmp(key, "LinkPreconnect") || !strcmp(key, "LinkPreconnectEarlyHintsEnabled") ||
+            !strcmp(key, "LinkPrefetchEnabled") || !strcmp(key, "SpeculationRulesPrefetchEnabled")) {
+            webkit_settings_set_feature_enabled(settings, feature, FALSE);
+            disabled &= !webkit_settings_get_feature_enabled(settings, feature);
+            found |= !strcmp(key, "LinkPreconnect");
+        }
+    }
+    webkit_feature_list_unref(features);
+    return found && disabled;
+#else
+    return FALSE;
+#endif
+}
 static void command(JsonObject *o) {
     guint id = number(o, "id");
     const char *cmd = string(o, "cmd");
@@ -487,8 +516,24 @@ static void command(JsonObject *o) {
     }
     if (!strcmp(cmd, "load")) {
         const char *url = string(o, "url");
+        if (p->document) return;
         if (allowed(url))
             webkit_web_view_load_uri(p->web, url);
+    } else if (!strcmp(cmd, "load-html")) {
+        p->document = TRUE;
+        WebKitSettings *settings = webkit_web_view_get_settings(p->web);
+        // CSP does not constrain WebRTC data channels/STUN. Disable it in
+        // WebKit itself, not with a script the document could bypass.
+        if (!g_object_class_find_property(G_OBJECT_GET_CLASS(settings), "enable-webrtc") ||
+            !g_object_class_find_property(G_OBJECT_GET_CLASS(settings), "enable-dns-prefetching") ||
+            !isolate_speculative_loads(settings)) {
+            g_free(p->error);
+            p->error = g_strdup("This WebKitGTK cannot isolate preview networking. Open the source file instead.");
+            state(p);
+            return;
+        }
+        g_object_set(settings, "enable-webrtc", FALSE, "enable-dns-prefetching", FALSE, NULL);
+        webkit_web_view_load_html(p->web, string(o, "html"), "about:blank");
     } else if (!strcmp(cmd, "dismiss-menu")) {
         if (p->options) {
             webkit_option_menu_close(p->options);
@@ -503,7 +548,7 @@ static void command(JsonObject *o) {
             g_clear_object(&p->options);
         }
     } else if (!strcmp(cmd, "open-link")) {
-        if (p->context_link && allowed(p->context_link))
+        if (!p->document && p->context_link && allowed(p->context_link))
             send_packet('N', p->id, p->context_link, strlen(p->context_link));
     } else if (!strcmp(cmd, "copy-link")) {
         if (p->context_link)

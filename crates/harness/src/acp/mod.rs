@@ -40,6 +40,7 @@ pub mod graff_client;
 mod graff_models;
 pub use graff_models::{ModelMismatch, parse_model_mismatch};
 pub mod graff_login;
+pub mod graff_mcp;
 pub mod graff_worktree;
 mod normalize;
 mod prompt_images;
@@ -545,6 +546,22 @@ fn exo_bridge_programs() -> Vec<PathBuf> {
 /// it for now: graff trusts client-provided servers without a consent
 /// prompt and frames room deliveries as advisory peer mail; other ACP agents
 /// would ask the person before every room call.
+/// `session/cancel` params. With the engine's reason, `_meta` says whether the
+/// user asked (graff blames the user only then, codegraff#1611); without one
+/// the cancel stays bare, as before.
+fn cancel_params(session_id: &str, reason: Option<&str>) -> Value {
+    match reason {
+        Some(reason) => json!({
+            "sessionId": session_id,
+            "_meta": {
+                "graff/cancelSource": if crate::interrupt_reason::by_user(reason) { "user" } else { "client" },
+                "graff/cancelReason": reason,
+            },
+        }),
+        None => json!({ "sessionId": session_id }),
+    }
+}
+
 fn harness_mcp_servers(harness: HarnessId, origin: Option<&crate::RunOrigin>) -> Value {
     let (HarnessId::Graff, Some(origin), Some(program)) =
         (harness, origin, exo_bridge_programs().into_iter().next())
@@ -880,7 +897,7 @@ fn antigravity_spec() -> AcpAgentSpec {
         extra_paths: Vec::new,
         cli_executable: "agy_acp_server",
         cli_extra_paths: Vec::new,
-        install_hint: "Install Antigravity to enable, or set ANTIGRAVITY_ACP_EXECUTABLE to its ACP server",
+        install_hint: "Antigravity's ACP server is not installed (the agy CLI does not include it): install it from Settings, or set ANTIGRAVITY_ACP_EXECUTABLE to it",
         models: || {
             use ReasoningLevel::{High, Low, Medium};
             vec![
@@ -1729,7 +1746,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         .map(|a| a.as_slice())
         .unwrap_or_default();
 
-    let ladder: Vec<ReasoningLevel> = config_options
+    let mut ladder: Vec<ReasoningLevel> = config_options
         .iter()
         .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
         .and_then(|o| o.get("options").and_then(Value::as_array))
@@ -1740,6 +1757,10 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 .collect()
         })
         .unwrap_or_default();
+    // Agents advertise in either direction (Grok Build: highest first); the
+    // effort slider reads lowest to highest.
+    ladder.sort_unstable();
+    ladder.dedup();
     let wire_options: Vec<ModelOption> = config_options
         .iter()
         .filter_map(trait_from_config_option)
@@ -2163,6 +2184,9 @@ impl Harness for AcpHarness {
             .filter(|name| harness_proto::graff_worktree::valid_name(name));
         if let Some(name) = &graff_worktree {
             launch_args.extend(["-w".to_owned(), name.clone()]);
+            // "Send now" and other follow-ups rebuild the request from the
+            // chat row, already re-homed into the tree (codegraff#1693).
+            request.cwd = harness_proto::graff_worktree::launch_root(&request.cwd).to_owned();
         }
         let (scratch, mut child, stderr_tail) = self
             .spawn_agent(Some(&request.cwd), true, &launch_args)
@@ -3443,6 +3467,7 @@ async fn run_session(session: Session) {
         interrupt,
         origin,
     } = controls;
+    let origin_chat = origin.as_ref().map(|o| o.chat_id.clone());
     let request_input = std::sync::Arc::new(request_input);
     let mut clarification = clarification_resume::State::default();
 
@@ -4767,7 +4792,8 @@ async fn run_session(session: Session) {
                 interrupt_sent = true;
                 interrupted = true;
                 if turn.is_some() {
-                    client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
+                    let reason = origin_chat.as_deref().and_then(crate::interrupt_reason::take);
+                    client.notify("session/cancel", Some(cancel_params(&session_id, reason.as_deref())));
                     // Escalate if the agent doesn't wind down (stopReason
                     // "cancelled") within the grace periods.
                     if let Some(pid) = crate::process::signal_target(&child) {
@@ -4895,6 +4921,20 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancel_says_whether_the_user_asked() {
+        let stop = cancel_params("s1", Some("stop"));
+        assert_eq!(stop["_meta"]["graff/cancelSource"], "user");
+        let replace = cancel_params("s1", Some("replace: run died around the send"));
+        assert_eq!(replace["_meta"]["graff/cancelSource"], "client");
+        assert_eq!(
+            replace["_meta"]["graff/cancelReason"],
+            "replace: run died around the send"
+        );
+        // No engine reason (title runs, tests): the bare cancel, as before.
+        assert_eq!(cancel_params("s1", None), json!({ "sessionId": "s1" }));
+    }
 
     #[test]
     fn graff_child_keeps_the_selected_acp_workspace() {
@@ -5672,6 +5712,57 @@ mod tests {
             vec!["fast-mode"]
         );
         assert_eq!(models[0].options[0].default_choice, "off");
+    }
+
+    #[test]
+    fn advertised_thought_levels_order_from_lowest_to_highest() {
+        // Grok Build advertises `thought_level` highest first. A model without
+        // a catalog row (`grok-4.8` here) takes the advertised ladder, which
+        // must still read lowest to highest in the effort slider.
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "grok-4.8",
+                    "options": [
+                        { "value": "grok-4.8", "name": "Grok 4.8" },
+                        { "value": "grok-4.7", "name": "Grok 4.7" },
+                    ],
+                },
+                {
+                    "id": "reasoning_effort",
+                    "name": "Reasoning Effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "xhigh",
+                    "options": [
+                        { "value": "xhigh", "name": "Extra High" },
+                        { "value": "high", "name": "High" },
+                        { "value": "medium", "name": "Medium" },
+                        { "value": "low", "name": "Low" },
+                    ],
+                },
+            ],
+        });
+        let models = models_from_session(&response, &(grok_spec().models)());
+        let ladders = models
+            .iter()
+            .map(|m| (m.id.as_str(), m.reasoning_levels.clone()))
+            .collect::<Vec<_>>();
+        let ascending = vec![
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+        ];
+        assert_eq!(
+            ladders,
+            vec![("grok-4.8", ascending.clone()), ("grok-4.7", ascending)]
+        );
     }
 
     #[test]

@@ -194,6 +194,13 @@ pub struct Chat {
     /// chat sharing the same checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_context: Option<ConversationSourceContext>,
+    /// Set when the chat's latest accepted run could not observe its checkout
+    /// (not a repository, or inspection failed): `source_context` is then only
+    /// the last known one, not where the chat runs now, and nothing may treat
+    /// it as current (branch PRs, branch labels). Cleared by the next
+    /// successful capture. Written only by the host, never by row upserts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context_unavailable_at: Option<DateTime<Utc>>,
     pub config: Option<ChatConfig>,
     pub last_message_preview: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
@@ -300,6 +307,12 @@ pub struct Session {
     /// Interrupts, failures and liveness expiry never advance this marker.
     #[serde(default)]
     pub last_completed_turn: Option<String>,
+    /// `last_completed_turn` answered peer mail only (another chat's message
+    /// or a room delivery, no person's prompt): clients consume the marker
+    /// without a completion alert. Published with the marker; older hosts
+    /// omit it, which reads as an ordinary completion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_completed_peer_only: bool,
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
@@ -1017,6 +1030,9 @@ pub const GRAFF_LOGIN_PROVIDERS: &[(&str, &str)] = &[
     ("kimi", "Kimi"),
     ("zai", "Z.AI"),
     ("chatgpt-new", "ChatGPT"),
+    // An Anthropic Console account, through Anthropic's own `ant` CLI; graff
+    // spends that workspace's API credits (graff ADR 0281).
+    ("anthropic", "Anthropic Console"),
 ];
 
 /// Where a person manages their ChatGPT plan's usage (OpenAI's UI guidelines

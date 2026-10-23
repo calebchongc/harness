@@ -42,6 +42,10 @@ name = "reauth-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "error-cards-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "question-wrap-fixture"
 required-features = ["appshots-fixture"]
 
@@ -51,6 +55,14 @@ required-features = ["appshots-fixture"]
 
 [[example]]
 name = "readme-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "markdown-math-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "visuals-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
@@ -65,6 +77,10 @@ required-features = ["project-palette-fixture"]
 name = "sidebar-fixture"
 required-features = ["project-palette-fixture"]
 
+[[example]]
+name = "footer-fixture"
+required-features = ["appshots-fixture", "project-palette-fixture"]
+
 [dependencies]
 url = "2"
 harness-proto.workspace = true
@@ -76,6 +92,7 @@ harness-rpc.workspace = true
 harness-update.workspace = true
 harness-syntax.workspace = true
 harness-theme.workspace = true
+harness-visual.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true

@@ -4,6 +4,7 @@ members = [
     "crates/theme",
     "crates/proto",
     "crates/preview",
+    "crates/visual",
     "crates/doc",
     "crates/sync",
     "crates/harness",
@@ -21,7 +22,7 @@ members = [
 exclude = ["vendor/zui", "vendor/gpui-component", "tui"]
 
 [workspace.package]
-version = "0.2.114"
+version = "0.2.133"
 edition = "2024"
 license-file = "LICENSE"
 publish = false
@@ -29,6 +30,7 @@ publish = false
 [workspace.dependencies]
 harness-proto = { path = "crates/proto" }
 harness-preview = { path = "crates/preview" }
+harness-visual = { path = "crates/visual" }
 harness-doc = { path = "crates/doc" }
 harness-sync = { path = "crates/sync" }
 harness-adapters = { path = "crates/harness" }

@@ -52,6 +52,59 @@ struct RefreshRetry {
     generation: u64,
     failures: u32,
     failure: Option<RefreshFailure>,
+    /// The last refresh that failed without an answer (or was spared). Unlike
+    /// `failure`, an explicit Retry doesn't clear it: only a success does.
+    last_unanswered: Option<tokio::time::Instant>,
+    /// A rejection right after unanswered attempts was retried once already.
+    rejection_spared: bool,
+}
+
+/// How long the edge replays a rotated refresh's answer (`refresh-leeway.ts`).
+/// A rejection this soon after an unanswered attempt may be that rotation's
+/// lost answer, not a revoked session (#331).
+const REFRESH_REPLAY_WINDOW: Duration = Duration::from_secs(120);
+
+/// A refresh rejection's cause, from the edge's own `{error}` text, as a fixed
+/// category: logs name the kind, never the response body (#331).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshRejection {
+    /// The edge could not verify the refresh credential at all.
+    Invalid,
+    /// The credential belongs to another account's workspace.
+    Workspace,
+    /// The request itself was malformed.
+    Malformed,
+    /// CodeGraff refused the grant: revoked, or already rotated by an
+    /// attempt whose answer never arrived.
+    Rejected,
+    Unknown,
+}
+
+impl RefreshRejection {
+    fn from_reason(reason: &str) -> Self {
+        match reason {
+            "invalid refresh credential" => Self::Invalid,
+            "workspace does not belong to this account" => Self::Workspace,
+            "missing refreshToken" | "bad request" => Self::Malformed,
+            _ if reason.starts_with("CodeGraff rejected the grant") => Self::Rejected,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Workspace => "workspace",
+            Self::Malformed => "malformed",
+            Self::Rejected => "rejected",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Retrying cannot change these answers.
+    fn definite(self) -> bool {
+        matches!(self, Self::Invalid | Self::Workspace | Self::Malformed)
+    }
 }
 
 struct RefreshFailure {
@@ -367,6 +420,12 @@ struct PendingSignIn {
 #[derive(Clone)]
 pub struct Auth {
     inner: Arc<AuthInner>,
+}
+
+/// Present while this device was signed out by a rejected refresh rather
+/// than by the person; the app offers to sign back in until it is gone.
+pub fn lost_session_marker(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("signed-out.notice")
 }
 
 impl Auth {
@@ -700,6 +759,30 @@ impl Auth {
     pub fn sign_out(&self) {
         let mut sign_in = lock(&self.inner.sign_in);
         self.clear_session(&mut sign_in);
+        // Chosen, not lost: no "you've been signed out" notice.
+        self.set_lost_session(false);
+    }
+
+    /// Leave (or clear) the marker the app shows "You've been signed out"
+    /// from. A refresh the service rejected signs this device out without the
+    /// person asking, and the next launch opens the local workspace: without
+    /// the notice that reads as every chat having vanished.
+    fn set_lost_session(&self, lost: bool) {
+        if self.inner.config.sandbox_token_file.is_some() {
+            return;
+        }
+        let path = lost_session_marker(&self.inner.config.data_dir);
+        let outcome = if lost {
+            std::fs::write(&path, chrono::Utc::now().to_rfc3339())
+        } else {
+            match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+                _ => Ok(()),
+            }
+        };
+        if let Err(err) = outcome {
+            tracing::warn!(error = %err, "auth: failed to update the signed-out notice");
+        }
     }
 
     fn clear_session(&self, sign_in: &mut SignInLifecycle) {
@@ -962,6 +1045,7 @@ impl Auth {
             org_id: org_id.clone(),
         };
         self.persist(Some(&session));
+        self.set_lost_session(false);
         *lock(&self.inner.stored) = Some(session);
         self.retry_refresh();
         tracing::info!(email = %result.user.email, org = org_id.as_deref().unwrap_or("<none>"),
@@ -1038,6 +1122,15 @@ impl Auth {
         let result = self.refresh_locked(organization_id).await;
         let mut retry = lock(&self.inner.refresh_retry);
         // A Retry/sign-in/sign-out during the request invalidates its cooldown.
+        if organization_id.is_none() {
+            match &result {
+                Err(_) => retry.last_unanswered = Some(tokio::time::Instant::now()),
+                Ok(_) => {
+                    retry.last_unanswered = None;
+                    retry.rejection_spared = false;
+                }
+            }
+        }
         if retry.generation == generation {
             match &result {
                 Err(err) if organization_id.is_none() => {
@@ -1121,6 +1214,33 @@ impl Auth {
         let status = res.status().as_u16();
         if (400..500).contains(&status) && !matches!(status, 408 | 429) && organization_id.is_none()
         {
+            // Timeouts/rate limits are retryable. Other 4xx responses mean a
+            // rejected refresh (revoked session, deleted user), which retrying
+            // won't fix: degrade to SignedOut so every downstream retry loop
+            // quiets down. (Org-switch refreshes are exempt: a 4xx there means
+            // "not a member", not a dead session.)
+            // The edge's `{error}` names the cause (an invalid credential,
+            // CodeGraff's grant refusal, a workspace mismatch), which the
+            // status alone cannot tell apart.
+            let reason = res
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            let kind = RefreshRejection::from_reason(&reason);
+            // The lost-answer shape: attempts went unanswered, then the edge
+            // rejects the rotated token. Retry once before signing out; a
+            // definite cause, or a second rejection, still signs out.
+            let spare = !kind.definite() && {
+                let mut retry = lock(&self.inner.refresh_retry);
+                let recent = retry
+                    .last_unanswered
+                    .is_some_and(|at| at.elapsed() < REFRESH_REPLAY_WINDOW);
+                let spare = recent && !retry.rejection_spared;
+                retry.rejection_spared |= spare;
+                spare
+            };
             let mut sign_in = lock(&self.inner.sign_in);
             if sign_in.generation != generation
                 || lock(&self.inner.stored)
@@ -1129,16 +1249,24 @@ impl Auth {
             {
                 return Ok(None);
             }
-            // Timeouts/rate limits are retryable. Other 4xx responses mean a
-            // rejected refresh (revoked session,
-            // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
-            // there means "not a member", not a dead session.)
+            if spare {
+                tracing::warn!(
+                    status,
+                    kind = kind.as_str(),
+                    "auth: refresh rejected right after unanswered attempts; retrying once before signing out"
+                );
+                return Err(EngineError::Other(format!(
+                    "refresh rejected ({status}, {}); retrying once",
+                    kind.as_str()
+                )));
+            }
             tracing::warn!(
                 status,
-                "auth: refresh rejected — session revoked; signing out"
+                kind = kind.as_str(),
+                "auth: refresh rejected — signing out"
             );
             self.clear_session(&mut sign_in);
+            self.set_lost_session(true);
             return Ok(None);
         }
         if !res.status().is_success() {
@@ -1549,6 +1677,26 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_rejections_are_categorized_from_the_edge_text() {
+        for (reason, kind, definite) in [
+            ("invalid refresh credential", "invalid", true),
+            (
+                "workspace does not belong to this account",
+                "workspace",
+                true,
+            ),
+            ("missing refreshToken", "malformed", true),
+            ("CodeGraff rejected the grant (400)", "rejected", false),
+            ("", "unknown", false),
+            ("something new", "unknown", false),
+        ] {
+            let rejection = RefreshRejection::from_reason(reason);
+            assert_eq!(rejection.as_str(), kind, "{reason}");
+            assert_eq!(rejection.definite(), definite, "{reason}");
+        }
+    }
 
     #[test]
     fn oauth_transport_requires_tls_outside_loopback() {

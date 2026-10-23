@@ -25,6 +25,8 @@ struct NewSessionView: View {
     @State private var showTraitPicker = false
     @State private var showOptionPicker: ModelOptionInfo?
     @State private var showRefPicker = false
+    /// The last refused checkout from the ref picker (#424).
+    @State private var refFailure: RefCheckoutFailure?
     @State private var showCheckoutPicker = false
     @State private var attachments: [StagedAttachment] = []
     @State private var pickerItems: [PhotosPickerItem] = []
@@ -171,6 +173,7 @@ struct NewSessionView: View {
         }
         .background(Theme.bg.ignoresSafeArea())
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
+        .onChange(of: space?.id) { refFailure = nil }
         .navigationTitle("New session")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(removing: .title)  // the leading header owns the bar
@@ -286,8 +289,7 @@ struct NewSessionView: View {
                 set: { optionSelections[option.id] = $0 }
             ))
         }
-        .photosPicker(isPresented: $showPhotoPicker, selection: $pickerItems,
-                      maxSelectionCount: 8, matching: .images)
+        .themedPhotosPicker(isPresented: $showPhotoPicker, selection: $pickerItems)
         .onChange(of: draft) { _, new in
             DraftStore.save(new, for: DraftStore.newSessionKey(destination))
         }
@@ -319,6 +321,15 @@ struct NewSessionView: View {
                     .lineLimit(2)
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if let refFailure {
+                Text(refFailure.summary)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.danger)
+                    .lineLimit(2)
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("session-ref-error")
             }
             ComposerShell(
                 draft: $draft,
@@ -425,6 +436,7 @@ struct NewSessionView: View {
     /// base picks just record; a plain non-current ref in Local mode CHECKS
     /// OUT the space folder (it must never silently flip the mode).
     private func pickRef(_ row: RepoRef) async -> String? {
+        refFailure = nil
         if row.worktreePath != nil {
             selectedRef = row.name
             checkoutKind = .local
@@ -435,7 +447,10 @@ struct NewSessionView: View {
             return nil
         }
         guard let space else { return nil }
+        let kept = selectedRef
         let error = await model.switchSpaceRef(space: space, refName: row.name)
+        // Outlives the sheet: closing it mid-checkout must not lose the reason.
+        refFailure = error.map { RefCheckoutFailure(ref: row.name, reason: $0, kept: kept) }
         if error == nil {
             selectedRef = row.name
             if let reloaded = await model.listRefs(space: space) {
@@ -803,6 +818,15 @@ struct TraitPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var reasoning: String?
     let levels: [String]
+    @State private var initialReasoning: String?
+
+    init(reasoning: Binding<String?>, levels: [String]) {
+        self._reasoning = reasoning
+        self.levels = levels
+        self._initialReasoning = State(initialValue: reasoning.wrappedValue)
+    }
+
+    private var selectionChanged: Bool { reasoning != initialReasoning }
 
     var body: some View {
         NavigationStack {
@@ -822,18 +846,30 @@ struct TraitPickerSheet: View {
                 .padding(.bottom, 12)
             }
             .background(SheetStyle.panel)
-            .navigationTitle("Traits")
+            .navigationTitle("Reasoning")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
+                        if selectionChanged {
+                            Image(systemName: "checkmark.circle.fill")
+                                .renderingMode(.original)
+                                .resizable()
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(Theme.bg, Theme.text)
+                                .frame(width: 44, height: 44)
+                        } else {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
                     }
-                    .accessibilityLabel("Close")
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(selectionChanged ? "Done" : "Close")
+                    .accessibilityIdentifier("reasoning-picker-confirm")
                 }
+                .sharedBackgroundVisibility(selectionChanged ? .hidden : .automatic)
             }
         }
         .presentationDetents([.medium, .large])
@@ -974,8 +1010,9 @@ struct PickRow: View {
 
 /// Base-ref selector (the desktop footer's branch popover): branch rows with
 /// current-checkout / worktree markers. Picks that require a git checkout run
-/// inline — a spinner on the row, git's error surfaced in place on failure
-/// (dirty tree, held ref), success dismisses.
+/// inline — a spinner on the row, git's error pinned above the list on
+/// failure (dirty tree, held ref) with the old selection kept, success
+/// dismisses.
 struct RefPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     let refs: [RepoRef]
@@ -984,7 +1021,7 @@ struct RefPickerSheet: View {
     let onPick: (RepoRef) async -> String?
 
     @State private var switching: String?
-    @State private var error: String?
+    @State private var failure: RefCheckoutFailure?
     @State private var query = ""
 
     private var shownRefs: [RepoRef] {
@@ -1015,15 +1052,15 @@ struct RefPickerSheet: View {
                             row(ref)
                         }
                     }
-                    if let error {
-                        Text(error)
-                            .font(Theme.sans(12.5))
-                            .foregroundStyle(Theme.danger)
-                            .padding(.horizontal, 4)
-                            .padding(.top, 4)
-                    }
                 }
                 .padding(20)
+            }
+            // Pinned, not after the rows: a long list scrolled the old inline
+            // error out of the medium detent, so a refusal looked like a stall.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if let failure {
+                    failureBanner(failure)
+                }
             }
             .background(SheetStyle.panel)
             .navigationTitle("Select ref")
@@ -1055,18 +1092,63 @@ struct RefPickerSheet: View {
                 selected: ref.name == selected) {
             guard switching == nil else { return }
             UISelectionFeedbackGenerator().selectionChanged()
-            error = nil
+            failure = nil
             switching = ref.name
+            let kept = selected
             Task { @MainActor in
                 let result = await onPick(ref)
                 switching = nil
                 if let result {
-                    error = result
+                    let refused = RefCheckoutFailure(ref: ref.name, reason: result, kept: kept)
+                    failure = refused
+                    AccessibilityNotification.Announcement(refused.announcement).post()
                 } else {
                     dismiss()
                 }
             }
         }
+    }
+
+    private func failureBanner(_ failure: RefCheckoutFailure) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.danger)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(failure.title)
+                    .font(Theme.sans(13.5, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                Text(failure.reason)
+                    .font(Theme.sans(12.5))
+                    .foregroundStyle(Theme.danger)
+                    .lineLimit(6)
+                    .textSelection(.enabled)
+                Text(failure.keptNote)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("ref-checkout-error")
+            Button {
+                self.failure = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.textMuted)
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss error")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(Theme.danger.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.danger.opacity(0.25), lineWidth: 1))
+        .padding(.horizontal, 20)
+        .padding(.top, 8)
+        .background(SheetStyle.panel)
     }
 
     private func subtitle(for ref: RepoRef) -> String? {
