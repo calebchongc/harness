@@ -1213,6 +1213,32 @@ mod pinned_session_tests {
             assert_eq!(cx.debug_bounds("chat-time-archived").unwrap(), time);
         }
 
+        // Hiding Archived removes the whole shelf without changing its chats
+        // or disclosure state; showing it again restores both.
+        assert!(cx.debug_bounds("archived-toggle").is_some());
+        for visible in [false, true, false, true] {
+            shell.update(cx, |shell, cx| {
+                let open = shell.archived_open;
+                shell.activate_sidebar_view_row(SidebarViewRow::ShowArchived, cx);
+                assert_eq!(shell.settings.sidebar_show_archived, visible);
+                assert_eq!(shell.archived_open, open);
+                assert!(
+                    shell
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .any(|chat| chat.id == "archived" && chat.archived)
+                );
+            });
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert_eq!(cx.debug_bounds("archived-toggle").is_some(), visible);
+            assert_eq!(cx.debug_bounds("chat-archived").is_some(), visible);
+        }
+
         // Sessions owns all unpinned rows, including their keyboard traversal.
         for open in [false, true] {
             let toggle = cx.debug_bounds("sessions-toggle").unwrap().center();
@@ -1945,6 +1971,7 @@ enum SidebarViewRow {
     Created,
     ShowBranch,
     ShowHarness,
+    ShowArchived,
 }
 
 impl SidebarViewRow {
@@ -1959,9 +1986,9 @@ impl SidebarViewRow {
 }
 
 const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
-    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..9)];
+    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..10)];
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 9] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 10] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
@@ -1971,6 +1998,7 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 9] = [
     SidebarViewRow::ShowHarness,
     SidebarViewRow::ShowProjectIcon,
     SidebarViewRow::ShowProjectLabel,
+    SidebarViewRow::ShowArchived,
 ];
 
 // list items stay tightly related at 2px, while section boundaries use 12px
@@ -3187,6 +3215,9 @@ impl Shell {
             SidebarViewRow::ShowHarness => {
                 self.settings.sidebar_show_harness = !self.settings.sidebar_show_harness
             }
+            SidebarViewRow::ShowArchived => {
+                self.settings.sidebar_show_archived = !self.settings.sidebar_show_archived
+            }
         }
         self.schedule_save(cx);
         if row.closes_submenu() {
@@ -3354,6 +3385,7 @@ impl Shell {
             "Harness",
             "Project icon",
             "Location",
+            "Archived",
         ];
         let icons = [
             icons::LAPTOP,
@@ -3365,6 +3397,7 @@ impl Shell {
             icons::BOT,
             icons::PROJECT_DEFAULT,
             icons::FOLDER,
+            icons::ARCHIVE_MINIMALISTIC,
         ];
         let selected = [
             organization == SidebarOrganization::ByDevice,
@@ -3376,6 +3409,7 @@ impl Shell {
             show_harness,
             self.settings.sidebar_show_project_icon,
             self.settings.sidebar_show_project_label,
+            self.settings.sidebar_show_archived,
         ];
         let values = [
             labels[selected[..3].iter().position(|v| *v).unwrap_or(0)].to_string(),
@@ -4924,6 +4958,9 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if !self.settings.sidebar_show_archived {
+            return None;
+        }
         const INITIAL: usize = 10;
         const PAGE: usize = 25;
         let now = Utc::now();
@@ -4996,6 +5033,7 @@ impl Shell {
         let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
         let header = sidebar_disclosure_header(theme, label, chevron)
             .id("archived-toggle")
+            .debug_selector(|| "archived-toggle".into())
             .on_click(cx.listener(move |this, _, _, cx| {
                 let was_open = this.archived_open;
                 this.begin_sidebar_disclosure_motion(

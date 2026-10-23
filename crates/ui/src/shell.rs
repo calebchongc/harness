@@ -18,8 +18,8 @@ use chrono::Utc;
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
     IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Subscription, Task, Window,
-    WindowControlArea, actions, div, prelude::*, px,
+    MouseUpEvent, NavigationDirection, Pixels, Point, Render, SharedString, Subscription, Task,
+    Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -1509,6 +1509,33 @@ enum ShellEscapeOutcome {
     Ignored,
 }
 
+/// The harness a subagent tab opened from `chat_id` belongs to: the chat's
+/// configured harness, or — for a spawn chip inside a subagent transcript,
+/// whose `chat_id` is that subagent's doc — the parent subagent tab's.
+fn subagent_tab_harness<'a>(
+    chats: &[harness_proto::Chat],
+    mut open_tabs: impl Iterator<Item = (&'a str, Option<harness_proto::HarnessId>)>,
+    chat_id: &str,
+) -> Option<harness_proto::HarnessId> {
+    chats
+        .iter()
+        .find(|chat| chat.id == chat_id)
+        .and_then(|chat| chat.config.as_ref().map(|config| config.harness))
+        .or_else(|| {
+            open_tabs
+                .find(|(doc_id, _)| *doc_id == chat_id)
+                .and_then(|(_, harness)| harness)
+        })
+}
+
+/// An idle subagent tab's leading icon: its harness's brand mark (tinted with
+/// the brand color when it has one), else the generic bot glyph.
+fn subagent_tab_icon(
+    harness: Option<harness_proto::HarnessId>,
+) -> (&'static str, Option<gpui::Hsla>) {
+    harness.map_or((icons::BOT, None), crate::pickers::harness_brand_icon)
+}
+
 fn resolve_shell_escape(
     key: &str,
     blocking_overlay: bool,
@@ -1731,6 +1758,8 @@ struct OrgGateUi {
 /// read-only transcript entity whose drop tears the view down.
 struct SubagentTab {
     doc_id: String,
+    /// The originating conversation's harness: the idle tab wears its icon.
+    harness: Option<harness_proto::HarnessId>,
     title: SharedString,
     transcript: Entity<Transcript>,
     /// Keeps a frozen-blob fetch alive (it falls back to a live doc watch).
@@ -4182,6 +4211,13 @@ impl Shell {
         }
         self.subagent_seq += 1;
         let id = self.subagent_seq;
+        let harness = subagent_tab_harness(
+            &self.state.read(cx).chats,
+            self.subagent_tabs
+                .values()
+                .map(|tab| (tab.doc_id.as_str(), tab.harness)),
+            &chat_id,
+        );
         // A live subagent follows its streaming end (main-transcript feel);
         // a frozen one reads top-down.
         let transcript =
@@ -4204,6 +4240,7 @@ impl Shell {
             id,
             SubagentTab {
                 doc_id,
+                harness,
                 title: title.into(),
                 transcript,
                 _fetch: fetch,
@@ -9703,6 +9740,15 @@ impl Shell {
             cx.notify();
             return true;
         }
+        // Settings → Archived's "Delete all archived sessions?" dialog.
+        if matches!(self.route, Route::Settings(SettingsSection::Archived))
+            && self
+                .archived_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx)))
+        {
+            return true;
+        }
         if self.spaces_menu.is_open() {
             self.close_spaces_menu(cx);
             return true;
@@ -11370,6 +11416,13 @@ impl Shell {
         for (ix, (surface, title, dirty, detail)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let file_identity_path = detail.as_ref().cloned().unwrap_or_else(|| title.clone());
+            // Idle subagent tabs wear their harness's brand mark.
+            let subagent_icon = match surface {
+                RightSurface::Subagent(id) => Some(subagent_tab_icon(
+                    self.subagent_tabs.get(&id).and_then(|tab| tab.harness),
+                )),
+                _ => None,
+            };
             let icon_path = match surface {
                 RightSurface::File(_) => icons::DOCUMENT,
                 RightSurface::Diff(id) => self
@@ -11383,12 +11436,13 @@ impl Shell {
                         }
                     })
                     .unwrap_or(icons::LIST),
-                RightSurface::Subagent(_) => icons::BOT,
+                RightSurface::Subagent(_) => subagent_icon.map_or(icons::BOT, |(path, _)| path),
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::Picker => icons::PLUS,
             };
-            // A live subagent tab swaps its icon for the mini working
+            let brand_color = subagent_icon.and_then(|(_, color)| color);
+            // A live subagent tab swaps its harness icon for the mini working
             // spinner (the history fetch button's in-flight recipe) — the
             // doc's streaming tail entry IS the run's liveness, so the swap
             // settles by itself when the subagent finishes.
@@ -11551,12 +11605,15 @@ impl Shell {
                                     .when(!is_active, |icon| icon.opacity(0.78))
                                     .into_any_element()
                                 } else {
+                                    // Brand-colored marks keep their color;
+                                    // monochrome ones follow the tab tone.
+                                    let tone = brand_color.unwrap_or(theme.text_muted);
                                     icon(icon_path)
                                         .size(px(12.0))
                                         .text_color(if is_active {
-                                            theme.text_muted
+                                            tone
                                         } else {
-                                            theme.text_muted.opacity(0.7)
+                                            tone.opacity(0.7)
                                         })
                                         .into_any_element()
                                 }),
@@ -12766,6 +12823,16 @@ impl Render for Shell {
                     }
                 }),
             )
+            // Mouse side buttons walk the same history as the titlebar
+            // back/forward arrows (the browser surface keeps them to itself).
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.navigate_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
+            )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
             .map(stale_input::coalesce_late_layout_commands)
             .on_key_down(cx.listener(Self::on_key_down))
@@ -13655,6 +13722,55 @@ mod tests {
     fn right_pane_takeover_consumes_the_chat_column() {
         assert_eq!(right_pane_takeover_width(1200.0, 256.0), 944.0);
         assert_eq!(1200.0 - 256.0 - 944.0, 0.0);
+    }
+
+    #[test]
+    fn idle_subagent_tabs_wear_their_originating_harness_icon() {
+        use harness_proto::HarnessId;
+        let mut parent: harness_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "parent", "deviceId": "local", "archived": false, "createdAt": Utc::now(),
+        }))
+        .unwrap();
+        parent.config = Some(harness_proto::ChatConfig {
+            harness: HarnessId::Codex,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+        });
+        let mut unconfigured = parent.clone();
+        unconfigured.id = "unconfigured".into();
+        unconfigured.config = None;
+        let chats = [parent, unconfigured];
+        let open_tabs = || [("sub-doc", Some(HarnessId::Codex)), ("bare-doc", None)].into_iter();
+
+        // Opened from a conversation: that conversation's harness.
+        assert_eq!(
+            subagent_tab_harness(&chats, open_tabs(), "parent"),
+            Some(HarnessId::Codex)
+        );
+        // Nested spawn chip: its chat id is the parent subagent's doc.
+        assert_eq!(
+            subagent_tab_harness(&chats, open_tabs(), "sub-doc"),
+            Some(HarnessId::Codex)
+        );
+        assert_eq!(subagent_tab_harness(&chats, open_tabs(), "bare-doc"), None);
+        assert_eq!(
+            subagent_tab_harness(&chats, open_tabs(), "unconfigured"),
+            None
+        );
+        assert_eq!(subagent_tab_harness(&chats, open_tabs(), "missing"), None);
+
+        assert_eq!(
+            subagent_tab_icon(Some(HarnessId::Codex)),
+            crate::pickers::harness_brand_icon(HarnessId::Codex)
+        );
+        assert_eq!(
+            subagent_tab_icon(Some(HarnessId::ClaudeCode)).1,
+            Some(crate::icons::claude_brand())
+        );
+        // Unknown origin keeps the generic glyph.
+        assert_eq!(subagent_tab_icon(None), (icons::BOT, None));
     }
 
     #[test]
@@ -14667,6 +14783,71 @@ mod exit_regressions {
                 assert!(!shell.settings_search.as_ref().unwrap().focus_pending);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn mouse_side_buttons_walk_the_route_history(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            // Past the setup splash, so the pointer reaches the shell.
+            state.connection = ConnectionStatus::Ready;
+            state
+        });
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    codegraff_client_id: None,
+                    default_harness: harness_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        shell.update(cx, |shell, cx| {
+            shell.open_settings(SettingsSection::Devices, cx);
+            shell.open_settings(SettingsSection::Files, cx);
+        });
+        let press = |cx: &mut gpui::VisualTestContext, direction| {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            let point = gpui::point(px(400.0), px(300.0));
+            let button = MouseButton::Navigate(direction);
+            cx.simulate_mouse_down(point, button, gpui::Modifiers::default());
+            cx.simulate_mouse_up(point, button, gpui::Modifiers::default());
+        };
+        let route = |cx: &mut gpui::VisualTestContext| shell.read_with(cx, |shell, _| shell.route);
+        press(cx, NavigationDirection::Back);
+        assert_eq!(route(cx), Route::Settings(SettingsSection::Devices));
+        press(cx, NavigationDirection::Back);
+        assert_eq!(route(cx), Route::Chat);
+        // Nothing further back: the button is a no-op, like the arrow.
+        press(cx, NavigationDirection::Back);
+        assert_eq!(route(cx), Route::Chat);
+        press(cx, NavigationDirection::Forward);
+        assert_eq!(route(cx), Route::Settings(SettingsSection::Devices));
+        press(cx, NavigationDirection::Forward);
+        assert_eq!(route(cx), Route::Settings(SettingsSection::Files));
     }
 
     #[gpui::test]
