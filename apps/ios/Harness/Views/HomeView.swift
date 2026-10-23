@@ -26,6 +26,8 @@ struct HomeView: View {
     @State private var pendingNewSession: NewSessionTarget?
     @State private var showSettings = false
     @State private var showProfile = false
+    /// A session whose Delete is waiting on its confirmation.
+    @State private var pendingDelete: Chat?
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
     // Start with Time each launch; a saved grouping can hide recent sessions
@@ -389,6 +391,7 @@ struct HomeView: View {
         .searchable(text: $searchText,
                     placement: phoneArrangement == nil ? .automatic : .navigationBarDrawer(displayMode: .always),
                     prompt: "Search sessions")
+        .sessionDeleteConfirmation(pending: $pendingDelete, onDelete: delete)
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 10)
         .contentMargins(.top, 2, for: .scrollContent)
@@ -813,7 +816,25 @@ struct HomeView: View {
                 Label("Archive", systemImage: "archivebox")
             }
             .tint(Theme.surfaceRaised)
+            // No destructive role: SwiftUI would slide the row out before the
+            // confirmation is answered.
+            Button {
+                pendingDelete = chat
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            .tint(Theme.danger)
+            .accessibilityIdentifier("session-delete")
         }
+    }
+
+    /// The confirmed Delete: gone from the list, and from the detail if it
+    /// was showing there.
+    private func delete(_ chat: Chat) {
+        withAnimation(Motion.resort) {
+            model.delete(chatId: chat.id)
+        }
+        path.removeAll { $0 == .chat(chat.id) }
     }
 }
 
@@ -955,7 +976,30 @@ struct ChatRow: View {
     }
 }
 
+/// The desktop's "Delete session?" dialog, word for word.
+enum SessionDeletion {
+    static let title = "Delete session?"
+
+    static func message(title: String) -> String {
+        "\u{201C}\(title)\u{201D} will be permanently deleted. This can\u{2019}t be undone."
+    }
+}
+
 extension View {
+    /// Ask before a row's Delete goes through; `pending` is the session asked about.
+    func sessionDeleteConfirmation(pending: Binding<Chat?>, onDelete: @escaping (Chat) -> Void) -> some View {
+        alert(SessionDeletion.title,
+              isPresented: Binding(get: { pending.wrappedValue != nil },
+                                   set: { if !$0 { pending.wrappedValue = nil } }),
+              presenting: pending.wrappedValue) { chat in
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { onDelete(chat) }
+                .accessibilityIdentifier("session-delete-confirm")
+        } message: { chat in
+            Text(SessionDeletion.message(title: chat.displayTitle))
+        }
+    }
+
     func sessionPinAction(chat: Chat, model: AppModel) -> some View {
         swipeActions(edge: .leading, allowsFullSwipe: true) {
             let pinned = model.isPinned(chatId: chat.id)

@@ -929,11 +929,22 @@ final class WorkspaceStore {
         updateChat(chatId, set: ["config": value])
     }
 
-    /// Tombstone a chat (and its session-status row) in one batch. The
-    /// per-chat session doc remains — this removes the index entry only.
+    /// Tombstone a chat (and its session-status row) in one batch, so it
+    /// leaves every list at once, offline too. Then ask the chat's host for
+    /// the same `Mutate {op: deleteChat}` the desktop sends, which also drops
+    /// the host's copy of the session doc; an unreachable host still gets
+    /// the tombstone through sync.
     func deleteChat(chatId: String) {
+        let host = chats.first(where: { $0.id == chatId })?.deviceId
         doc.deleteRows([("chats", chatId), ("sessions", chatId)])
         afterLocalWrite()
+        guard let host, !host.isEmpty else { return }
+        let relay = relay(for: host)
+        Task {
+            struct OkReply: Decodable { var ok: Bool? }
+            let _: OkReply? = try? await relay.call(method: "Mutate",
+                                                    params: ["op": "deleteChat", "chatId": chatId])
+        }
     }
 
     /// Hard-delete a space and cascade to its chats: ONE batch tombstones the

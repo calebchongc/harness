@@ -959,6 +959,15 @@ final class AppModel {
     func archive(chatId: String) { setArchived(chatId: chatId, archived: true) }
     func unarchive(chatId: String) { setArchived(chatId: chatId, archived: false) }
 
+    /// Delete a session for good, everywhere (the desktop's Delete session).
+    func delete(chatId: String) {
+        if let demo {
+            demo.chats.removeAll { $0.id == chatId }
+            return
+        }
+        workspace?.deleteChat(chatId: chatId)
+    }
+
     func rename(chatId: String, title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let chat = chat(id: chatId), chat.title != trimmed else { return }

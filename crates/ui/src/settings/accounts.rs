@@ -1292,6 +1292,34 @@ impl AccountsPage {
         self.begin_login(harness, None, false, cx);
     }
 
+    /// A failed run's "Log in": show `target`'s logins and, for an agent with
+    /// a sign-in here (Claude Code, Codex, Cursor), start adding an account.
+    /// Other agents (graff's provider sign-ins among them) just land on the
+    /// page: the chat says which agent, not which of its providers.
+    pub(crate) fn sign_in(
+        &mut self,
+        target: Option<String>,
+        harness: Option<HarnessId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_target_device(target, cx);
+        if let Some(harness) = harness.filter(|harness| {
+            PROVIDERS
+                .iter()
+                .any(|(provider, _, _)| provider == harness)
+        }) {
+            self.start_login(harness, cx);
+        }
+        cx.notify();
+    }
+
+    /// The device whose logins are shown (`None`: this one), and the flow's
+    /// last error, for the shell's "Log in" tests.
+    #[cfg(test)]
+    pub(crate) fn sign_in_state(&self) -> (Option<&str>, Option<&str>) {
+        (self.target_device.as_deref(), self.error.as_deref())
+    }
+
     /// graff's own sign-in for one provider (`xai`, `kimi`, `zai`).
     fn start_graff_login(&mut self, provider: &str, cx: &mut Context<Self>) {
         self.begin_login(HarnessId::Graff, Some(provider.to_string()), false, cx);
