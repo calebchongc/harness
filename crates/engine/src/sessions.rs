@@ -1621,6 +1621,13 @@ impl Inner {
         fresh_start: bool,
         completed_turn: Option<String>,
     ) {
+        // An errored turn is not a turn boundary (#466): pause queued delivery
+        // before the status watcher can read Errored as "send the next row".
+        if status == SessionStatus::Errored
+            && let Some(host) = self.doc_host()
+        {
+            host.pause_queue_after_failure(chat_id);
+        }
         let now = Utc::now();
         let session = {
             let mut statuses = lock(&self.statuses);
