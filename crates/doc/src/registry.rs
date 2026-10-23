@@ -1309,6 +1309,10 @@ impl RegistryDoc {
             ("deviceId", json!(session.device_id)),
             ("status", serde_json::to_value(session.status)?),
             ("lastCompletedTurn", json!(session.last_completed_turn)),
+            (
+                "lastCompletedPeerOnly",
+                json!(session.last_completed_peer_only),
+            ),
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
         ]);
@@ -1483,6 +1487,10 @@ impl RegistryDoc {
                     ("deviceId", json!(session.device_id)),
                     ("status", serde_json::to_value(session.status)?),
                     ("lastCompletedTurn", json!(session.last_completed_turn)),
+                    (
+                        "lastCompletedPeerOnly",
+                        json!(session.last_completed_peer_only),
+                    ),
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                 ]),

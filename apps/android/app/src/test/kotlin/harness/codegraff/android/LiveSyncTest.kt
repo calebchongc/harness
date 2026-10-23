@@ -35,7 +35,9 @@ import harness.codegraff.android.model.ChatIndicator
 import harness.codegraff.android.model.Connection
 import harness.codegraff.android.model.ConnectivityRules
 import harness.codegraff.android.model.ConnectivityUi
-import harness.codegraff.android.model.HarnessCatalog
+import harness.codegraff.android.model.Space
+import harness.codegraff.android.model.modelSelection
+import kotlinx.coroutines.CancellationException
 import harness.codegraff.android.model.HostNotice
 import harness.codegraff.android.model.HostStatus
 import harness.codegraff.android.model.MessagePart
@@ -80,22 +82,28 @@ private class FakeCore : MobileCoreInterface {
         "new-chat".also { calls += "create $deviceId $spaceId $cwd ${config.harness} $branch" }
     override suspend fun addSpace(deviceId: String, path: String, gitDetected: Boolean) = "new-space".also { calls += "space $deviceId $path $gitDetected" }
     var reachable = true
+    var emptyCatalogs = false
+    var cancelFolders = false
     override suspend fun agentDescriptors(deviceId: String) = listOf(AgentDescriptorRecord("graff", true, false, true))
     override fun backgrounded() { calls += "background" }
     override suspend fun createWorktree(deviceId: String, spaceId: String, repoPath: String, branch: String) = "/wt"
     override suspend fun listFolders(deviceId: String, path: String?): FolderListingRecord {
+        if (cancelFolders) throw CancellationException("canceled")
         if (!reachable) throw RelayException.HostOffline()
         return FolderListingRecord(path ?: "/Users/me", listOf(FolderEntryRecord("repo", true, true)), false)
     }
     override suspend fun listHarnesses(deviceId: String): List<HarnessInfoRecord> {
         if (!reachable) throw RelayException.Timeout()
-        return listOf(HarnessInfoRecord("pi", "Pi", null, null))
+        return if (emptyCatalogs) emptyList() else listOf(HarnessInfoRecord("pi", "Pi", null, null))
     }
     override suspend fun listModels(deviceId: String, harness: String): List<ModelInfoRecord> {
         if (!reachable) throw RelayException.Timeout()
-        return listOf(ModelInfoRecord("m-live", "Live model", null, listOf("low"), emptyList()))
+        return if (emptyCatalogs) emptyList() else listOf(ModelInfoRecord("m-live", "Live model", null, listOf("low"), emptyList()))
     }
-    override suspend fun listRefs(deviceId: String, repoPath: String) = listOf(RepoRefRecord("main", true, null))
+    override suspend fun listRefs(deviceId: String, repoPath: String): List<RepoRefRecord> {
+        if (!reachable) throw RelayException.Timeout()
+        return if (emptyCatalogs) emptyList() else listOf(RepoRefRecord("main", true, null))
+    }
     var compactAt: UByte? = null
     override suspend fun graffCompactAt(deviceId: String): UByte? {
         if (!reachable) throw RelayException.Timeout()
@@ -272,16 +280,49 @@ class LiveSyncTest {
     }
 
     @Test
-    fun relayAnswersReachTheScreensAndAnUnreachableComputerFallsBack() = runTest(dispatcher) {
+    fun relayFailuresUseOnlyThatDeviceAndAgentsCachedMetadata() = runTest(dispatcher) {
         val (model, core, _) = live()
         assertEquals("repo", model.listFolders("mac", null)!!.entries.single().name)
-        assertEquals(listOf("pi"), model.listHarnesses("mac").map { it.id })
-        assertEquals("m-live", model.listModels("mac", "graff").single().id)
+        assertEquals(listOf("pi"), model.listHarnesses("mac").items.map { it.id })
+        assertEquals("m-live", model.listModels("mac", "graff").items.single().id)
         core.reachable = false
         assertEquals(null, model.listFolders("mac", "/x"))
-        assertEquals("the last answer is kept", listOf("pi"), model.listHarnesses("mac").map { it.id })
-        assertEquals("never reached: the static catalog", HarnessCatalog.harnesses, model.listHarnesses("other"))
-        assertEquals(HarnessCatalog.models("codex"), model.listModels("other", "codex"))
+        val cached = model.listHarnesses("mac")
+        assertEquals(listOf("pi"), cached.items.map { it.id })
+        assertFalse(cached.isLive)
+        assertEquals("m-live", model.listModels("mac", "graff").items.single().id)
+        assertTrue(model.listHarnesses("other").items.isEmpty())
+        assertTrue(model.listModels("other", "graff").items.isEmpty())
+        assertTrue(model.listModels("mac", "codex").items.isEmpty())
+    }
+
+    @Test
+    fun successfulEmptyRepliesClearCachesAndBlockKnownUnavailableSelections() = runTest(dispatcher) {
+        val (model, core, _) = live()
+        val space = Space("s", "mac", "/r", gitDetected = true)
+        model.listHarnesses("mac")
+        model.listModels("mac", "pi")
+        model.listRefs(space)
+        core.emptyCatalogs = true
+        val agents = model.listHarnesses("mac")
+        val models = model.listModels("mac", "pi")
+        val refs = model.listRefs(space)
+        assertTrue(agents.isLive && agents.items.isEmpty())
+        assertTrue(models.isLive && models.items.isEmpty())
+        assertTrue(refs.isLive && refs.items.isEmpty())
+        assertFalse(modelSelection("pi", "saved-model", "max", models, agents).canSend)
+        core.reachable = false
+        assertTrue(model.listHarnesses("mac").items.isEmpty())
+        assertTrue(model.listModels("mac", "pi").items.isEmpty())
+        assertTrue(model.listRefs(space).items.isEmpty())
+        assertTrue(modelSelection("pi", "saved-model", "max", model.listModels("mac", "pi"), model.listHarnesses("mac")).canSend)
+    }
+
+    @Test
+    fun canceledFolderRequestsAreNotRecastAsAnOfflineReply() = runTest(dispatcher) {
+        val (model, core, _) = live()
+        core.cancelFolders = true
+        assertTrue(runCatching { model.listFolders("mac", null) }.exceptionOrNull() is CancellationException)
     }
 
     @Test

@@ -23,6 +23,7 @@ pub mod change_requests;
 pub mod changes;
 pub(crate) mod chatgpt_plan;
 pub mod codegraff_jobs;
+pub mod codegraff_runners;
 pub mod codegraff_sandboxes;
 mod comment_ui;
 pub mod comments;

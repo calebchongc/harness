@@ -107,16 +107,30 @@ impl Shell {
         // split layout), unless a deep link or manual pick already landed.
         if !self.boot_restored && self.state.read(cx).chats_synced {
             self.boot_restored = true;
+            let has_draft = {
+                let composer = self.composer.read(cx);
+                !composer.input.read(cx).is_empty()
+                    || !composer.staged().is_empty()
+                    || !composer.staged_appshots().is_empty()
+            };
+            if has_draft && self.state.read(cx).selected_chat.is_none() {
+                // Content entered before sync is new-session intent too.
+                self.state.update(cx, |state, _| state.auto_selected = true);
+            }
             let restore = {
                 let state = self.state.read(cx);
-                let live = |id: &str| state.chats.iter().any(|c| c.id == id && !c.archived);
+                // Saved views may reference archived conversations. Only
+                // automatic recency fallback should filter them out.
+                let live = |id: &str| state.chats.iter().any(|c| c.id == id);
                 (state.selected_chat.is_none() && !state.auto_selected).then(|| {
                     (
                         self.settings.last_chat_id.clone().filter(|id| live(id)),
                         self.settings
                             .chat_layout
                             .as_ref()
-                            .and_then(|saved| chat_split::ChatSplit::from_saved(saved, live)),
+                            .and_then(|saved| chat_split::ChatSplit::from_saved(saved, |id| {
+                                live(id) && self.settings.last_chat_id.as_deref() != Some(id)
+                            })),
                         chat_tabs::restore_chat_tabs(
                             &self.settings.chat_tabs,
                             self.settings.chat_tab,
@@ -155,6 +169,10 @@ impl Shell {
                     });
                     return;
                 }
+            } else {
+                // Persist the manual selection/draft's actual layout, not
+                // the rejected saved layout that could return next launch.
+                self.sync_chat_panes(cx);
             }
         }
         let first = {
@@ -176,6 +194,9 @@ impl Shell {
 
     /// Replace the current tab/pane's session, as `/resume` requests.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if chat_split::existing_chat_selection(Some(chat_id.clone()), self.state.read(cx)).is_none() {
+            return;
+        }
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
@@ -191,7 +212,19 @@ impl Shell {
         if !matches!(self.route, Route::Chat) || self.state.read(cx).selected_chat.is_none() {
             return false;
         }
+        self.remember_closed_chat_tab(
+            self.chat_tab,
+            chat_tabs::ChatTab {
+                id: self.chat_tab_id,
+                split: self.chat_split.clone(),
+                selected: self.state.read(cx).selected_chat.clone(),
+                project: self.settings.space_filter.clone(),
+                draft: Some(self.current_canvas_draft(cx)),
+            },
+        );
+        self.chat_tab_id = uuid::Uuid::new_v4();
         self.open_new_session(cx);
+        self.remember_last_tab_canvas(cx);
         true
     }
 

@@ -799,6 +799,8 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
+    /// The account's Codegraff cloud sandboxes ([`cloud_sandboxes`]).
+    cloud_sandboxes: cloud_sandboxes::CloudSandboxesState,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -812,6 +814,8 @@ impl gpui::EventEmitter<TranscriptTextChanged> for AppState {}
 
 #[cfg(test)]
 mod deep_link_tests;
+
+pub mod cloud_sandboxes;
 
 fn is_text_append(frame: &TranscriptFrame) -> bool {
     matches!(frame, TranscriptFrame::Delta { upsert, append, remove, .. }
@@ -876,6 +880,7 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            cloud_sandboxes: Default::default(),
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -2079,6 +2084,7 @@ impl AppState {
         self.transfers.clear();
         self.local_device_id = None;
         self.update = None;
+        self.reset_cloud_sandboxes();
         cx.notify();
     }
 
@@ -2214,6 +2220,8 @@ impl AppState {
                 self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
             }
         }
+        // A cloud sandbox left running keeps costing credit: show it from the start.
+        self.refresh_cloud_sandboxes(cx);
         cx.notify();
     }
 
@@ -2380,6 +2388,8 @@ impl AppState {
             self.focus_chat_sync(id, cx);
         }
         if self.selected_chat == chat_id {
+            // An explicit pick of the already-blank boot canvas is intent too.
+            self.auto_selected = true;
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
                 self.mark_chat_seen(&id, cx);
@@ -3905,6 +3915,7 @@ mod tests {
     ) -> Session {
         Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
@@ -4185,6 +4196,7 @@ mod tests {
         let now = Utc::now();
         let mut row = Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,
@@ -4216,6 +4228,7 @@ mod tests {
         let now = Utc::now();
         state.sessions = vec![Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,

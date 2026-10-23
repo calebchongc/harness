@@ -26,6 +26,8 @@ struct HomeView: View {
     @State private var pendingNewSession: NewSessionTarget?
     @State private var showSettings = false
     @State private var showProfile = false
+    /// A session whose Delete is waiting on its confirmation.
+    @State private var pendingDelete: Chat?
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
     // Start with Time each launch; a saved grouping can hide recent sessions
@@ -34,7 +36,6 @@ struct HomeView: View {
     @AppStorage("homeCollapsedGroups") private var collapsedGroupsRaw = ""
     // Not persisted: a filter left on across launches reads as lost sessions.
     @State private var searchText = ""
-    @State private var statusFilter: HomeStatusFilter = .all
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private var selectedSpace: Space? {
@@ -370,11 +371,8 @@ struct HomeView: View {
             List {
                 sessionsSection
                 // The desktop's archived shelf sits under the active list,
-                // scoped by the same space filter and search. Archived sessions
-                // are never running or waiting, so a status filter hides it.
-                if statusFilter == .all {
-                    ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
-                }
+                // scoped by the same space filter and search.
+                ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
             }
             // In a split the list shrinks as the session opens below it, and the opened row was left cut in
             // half at the divider. Once the panes settle, bring the whole row into view.
@@ -389,6 +387,7 @@ struct HomeView: View {
         .searchable(text: $searchText,
                     placement: phoneArrangement == nil ? .automatic : .navigationBarDrawer(displayMode: .always),
                     prompt: "Search sessions")
+        .sessionDeleteConfirmation(pending: $pendingDelete, onDelete: delete)
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 10)
         .contentMargins(.top, 2, for: .scrollContent)
@@ -682,8 +681,7 @@ struct HomeView: View {
 
     @ViewBuilder private var sessionsSection: some View {
         let scoped = selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats
-        let chats = HomeFilter.apply(scoped, query: searchText, status: statusFilter,
-                                     indicator: model.indicator(for:), names: model.homeFilterNames)
+        let chats = HomeFilter.apply(scoped, query: searchText, names: model.homeFilterNames)
         let grouping = HomeGroupBy(rawValue: groupByRaw) ?? .none
         if showSplitOffer {
             Section {
@@ -697,21 +695,19 @@ struct HomeView: View {
         }
         if !scoped.isEmpty {
             Section {
-                HStack(spacing: 6) {
-                    HomeStatusChips(selection: $statusFilter, counts: statusCounts(scoped))
-                    groupPill
-                }
+                groupPill
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 6, trailing: 16))
             }
             .listSectionSeparator(.hidden)
             // What's running or waiting, above the history. Hidden while
-            // searching or filtering so it never competes with a query.
+            // searching so it never competes with a query.
             let now = NowStrip.active(in: scoped, model: model)
             // Not in the phone split: the list beside the open session already shows what is running or
             // waiting, and the cards would take most of a narrow pane.
-            if statusFilter == .all, searchText.isEmpty, !now.isEmpty, phoneArrangement == nil {
+            if searchText.isEmpty, !now.isEmpty, phoneArrangement == nil {
                 Section {
                     NowStrip(chats: now) { open(.chat($0)) }
                         .listRowBackground(Color.clear)
@@ -723,7 +719,7 @@ struct HomeView: View {
         }
         if chats.isEmpty {
             // A search can still hit the archived shelf below.
-            let archivedHit = statusFilter == .all && !searchText.isEmpty
+            let archivedHit = !searchText.isEmpty
                 && !model.archivedMatches(in: selectedSpace?.id, query: searchText).isEmpty
             if !archivedHit {
                 Section {
@@ -766,17 +762,6 @@ struct HomeView: View {
         }
     }
 
-    private func statusCounts(_ chats: [Chat]) -> [HomeStatusFilter: Int] {
-        var counts: [HomeStatusFilter: Int] = [:]
-        for chat in chats {
-            let indicator = model.indicator(for: chat)
-            for filter in HomeStatusFilter.allCases where filter.matches(indicator) {
-                counts[filter, default: 0] += 1
-            }
-        }
-        return counts
-    }
-
     /// Collapsed section ids, persisted (comma-separated).
     private var collapsedGroups: Set<String> {
         Set(collapsedGroupsRaw.split(separator: ",").map(String.init))
@@ -813,7 +798,25 @@ struct HomeView: View {
                 Label("Archive", systemImage: "archivebox")
             }
             .tint(Theme.surfaceRaised)
+            // No destructive role: SwiftUI would slide the row out before the
+            // confirmation is answered.
+            Button {
+                pendingDelete = chat
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            .tint(Theme.danger)
+            .accessibilityIdentifier("session-delete")
         }
+    }
+
+    /// The confirmed Delete: gone from the list, and from the detail if it
+    /// was showing there.
+    private func delete(_ chat: Chat) {
+        withAnimation(Motion.resort) {
+            model.delete(chatId: chat.id)
+        }
+        path.removeAll { $0 == .chat(chat.id) }
     }
 }
 
@@ -864,7 +867,8 @@ struct ChatRow: View {
     /// spinner too — no fake progress on a send that hasn't left.
     private func sendBadge(_ state: SendState) -> (label: String, color: Color)? {
         switch state {
-        case .failed: return ("Failed", Theme.danger)
+        case .failed: return ("Not delivered", Theme.danger)
+        case .waiting: return ("Waiting", Theme.warning)
         case .queued: return ("Queued", Theme.warning)
         case .sending: return nil
         }
@@ -954,7 +958,30 @@ struct ChatRow: View {
     }
 }
 
+/// The desktop's "Delete session?" dialog, word for word.
+enum SessionDeletion {
+    static let title = "Delete session?"
+
+    static func message(title: String) -> String {
+        "\u{201C}\(title)\u{201D} will be permanently deleted. This can\u{2019}t be undone."
+    }
+}
+
 extension View {
+    /// Ask before a row's Delete goes through; `pending` is the session asked about.
+    func sessionDeleteConfirmation(pending: Binding<Chat?>, onDelete: @escaping (Chat) -> Void) -> some View {
+        alert(SessionDeletion.title,
+              isPresented: Binding(get: { pending.wrappedValue != nil },
+                                   set: { if !$0 { pending.wrappedValue = nil } }),
+              presenting: pending.wrappedValue) { chat in
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { onDelete(chat) }
+                .accessibilityIdentifier("session-delete-confirm")
+        } message: { chat in
+            Text(SessionDeletion.message(title: chat.displayTitle))
+        }
+    }
+
     func sessionPinAction(chat: Chat, model: AppModel) -> some View {
         swipeActions(edge: .leading, allowsFullSwipe: true) {
             let pinned = model.isPinned(chatId: chat.id)

@@ -180,6 +180,84 @@ pub fn autolinked_text(
     )
 }
 
+/// Verbatim text in `color` that joins the transcript's text selection under
+/// `key` (drag-select across lines, Cmd+C), with bare `http(s)://` URLs as
+/// links like [`autolinked_text`]. A click on a link only activates it when
+/// this text holds no selection, so selecting across a URL never navigates.
+pub(crate) fn selectable_autolinked_text(
+    key: std::sync::Arc<str>,
+    text: SharedString,
+    font: gpui::Font,
+    color: Hsla,
+    ui: Option<LinkUi>,
+    theme: &Theme,
+) -> AnyElement {
+    let ranges = super::parser::bare_url_ranges(&text);
+    let run = |len: usize, link: bool| TextRun {
+        len,
+        font: font.clone(),
+        color,
+        background_color: None,
+        // Monochrome like Markdown links: the text color with an underline.
+        underline: link.then_some(UnderlineStyle {
+            color: Some(theme.text_muted),
+            thickness: px(1.0),
+            wavy: false,
+        }),
+        strikethrough: None,
+    };
+    let mut runs = Vec::with_capacity(ranges.len() * 2 + 1);
+    let mut at = 0;
+    for range in &ranges {
+        if range.start > at {
+            runs.push(run(range.start - at, false));
+        }
+        runs.push(run(range.len(), true));
+        at = range.end;
+    }
+    if at < text.len() || runs.is_empty() {
+        runs.push(run(text.len() - at, false));
+    }
+    let styled = StyledText::new(text.clone()).with_runs(runs);
+    let layout = styled.layout().clone();
+    let wash = selection_wash(theme);
+    let paint_key = key.clone();
+    let paint_text = text.clone();
+    let paint_layout = layout.clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_text_selection_with_wash(window, &paint_key, &paint_text, &paint_layout, wash);
+        },
+    )
+    .absolute()
+    .size_full();
+    let child = div()
+        .relative()
+        .child(underlay)
+        .child(styled)
+        .into_any_element();
+    if ranges.is_empty() {
+        return child;
+    }
+    let links = ranges
+        .into_iter()
+        .map(|range| {
+            let url = &text[range.clone()];
+            (range, LinkTarget::new(url, url))
+        })
+        .collect();
+    super::link_interaction::LinkRanges {
+        id: SharedString::from(key.to_string()),
+        child,
+        layout,
+        selection_key: Some(key),
+        links,
+        ui,
+    }
+    .into_any_element()
+}
+
 pub fn activate_link(
     target: LinkTarget,
     action: LinkAction,
@@ -1322,7 +1400,7 @@ fn paint_text_selection_with_wash(
     register_selection_listeners(window, key, text, layout, None);
 }
 
-fn selectable_text_element(
+pub(crate) fn selectable_text_element(
     key: std::sync::Arc<str>,
     text: SharedString,
     runs: Vec<TextRun>,

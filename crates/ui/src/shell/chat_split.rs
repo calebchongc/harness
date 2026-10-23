@@ -14,9 +14,15 @@ use crate::pickers::CanvasDraft;
 mod opening;
 
 #[cfg(test)]
+mod archived_tests;
+#[cfg(test)]
+mod archived_session_tests;
+#[cfg(test)]
 mod sidebar_tests;
 #[cfg(test)]
 mod interaction_tests;
+#[cfg(test)]
+mod drop_tests;
 
 /// Every pane holds another engine doc watch; Ghostty-scale grids aren't
 /// the point of a chat column.
@@ -259,8 +265,8 @@ impl ChatSplit {
     }
 
     /// Empty the panes whose chat is gone from the chats list. `archived(id)`
-    /// is `None` when the list lacks the chat, else whether it is archived.
-    /// An archived chat's pane simply closes; a missing chat is remembered,
+    /// is `None` when the list lacks the chat, else whether it was archived
+    /// while shown. That pane simply closes; a missing chat is remembered,
     /// because a list can lack a chat only briefly and emptying the pane for
     /// good turned it into a new-session canvas (user report, 2026-09-29).
     pub fn prune(&mut self, archived: impl Fn(&str) -> Option<bool>) {
@@ -310,19 +316,32 @@ impl ChatSplit {
         {
             return None;
         }
-        let total: f32 = saved.shares.iter().sum();
+        // Finite f32 weights can still overflow when summed. Normalize in
+        // f64, then reject ratios that cannot represent visible f32 panes.
+        let total: f64 = saved.shares.iter().map(|share| f64::from(*share)).sum();
+        let shares: Vec<f32> = saved
+            .shares
+            .iter()
+            .map(|share| (f64::from(*share) / total) as f32)
+            .collect();
+        if shares.iter().any(|share| *share <= 0.0) {
+            return None;
+        }
         let mut projects = saved.projects.clone();
         projects.resize(len, None);
+        let mut seen = std::collections::HashSet::new();
         Some(Self {
             axis: if saved.vertical { SplitAxis::Vertical } else { SplitAxis::Horizontal },
             panes: saved
                 .panes
                 .iter()
                 .enumerate()
-                .map(|(ix, pane)| pane.clone().filter(|id| ix != saved.focus && live(id)))
+                .map(|(ix, pane)| {
+                    pane.clone().filter(|id| ix != saved.focus && live(id) && seen.insert(id.clone()))
+                })
                 .collect(),
             focus: saved.focus,
-            shares: saved.shares.iter().map(|s| s / total).collect(),
+            shares,
             projects,
             drafts: vec![None; len],
             vanished: vec![None; len],
@@ -393,6 +412,12 @@ pub(super) struct PeerChatView {
     _events: Subscription,
 }
 
+/// Validate a reference from an existing view, not a newly created session.
+/// Archived rows are valid; an incomplete initial list is not deletion proof.
+pub(super) fn existing_chat_selection(selected: Option<String>, state: &AppState) -> Option<String> {
+    selected.filter(|id| !state.chats_synced || state.chats.iter().any(|chat| chat.id == *id))
+}
+
 impl Shell {
     fn chat_split_active(&self) -> bool {
         matches!(self.route, Route::Chat) && self.chat_split.is_some()
@@ -425,6 +450,7 @@ impl Shell {
         let Some(target) = split.focus_pane(ix, selected.clone()) else {
             return false;
         };
+        let target = existing_chat_selection(target, self.state.read(cx));
         // Each pane keeps its own workspace and composer picks: park the
         // live ones in the pane being left and bring the target pane's back.
         split.projects[from] = self.settings.space_filter.clone();
@@ -472,6 +498,27 @@ impl Shell {
         self.focus_composer(cx);
         cx.notify();
         true
+    }
+
+    /// Files dropped on unfocused pane `ix`: focus it, then attach them to
+    /// its session (or canvas) exactly as a drop on the focused column does.
+    fn drop_paths_on_pane(
+        &mut self,
+        ix: usize,
+        mut paths: Vec<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        paths.retain(|path| !path.as_os_str().is_empty());
+        if paths.is_empty() || !self.select_chat_pane(ix, cx) {
+            return;
+        }
+        // Synchronize the selected composer, including queued-message editing,
+        // before staging. Selection observers may not have run in this event.
+        self.composer
+            .update(cx, |composer, cx| composer.add_paths(paths, cx));
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
     }
 
     pub(super) fn cycle_chat_pane(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -552,6 +599,26 @@ impl Shell {
         self.close_focused_chat_view(window, cx)
     }
 
+    /// The two explicit close shortcuts share view/history handling, not their
+    /// archive policy. Include the final session-to-canvas close in both.
+    pub(crate) fn close_chat_view_with_archive(
+        &mut self,
+        archive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let closing = self.state.read(cx).selected_chat.clone();
+        let closed = self.close_focused_chat_pane_without_archiving(window, cx)
+            || self.close_chat_to_new_session(cx);
+        if closed
+            && archive
+            && let Some(chat_id) = closing
+        {
+            self.archive_closed_session_explicitly(chat_id, window, cx);
+        }
+        closed
+    }
+
     /// [`Self::close_focused_chat_pane`], plus what it did to the session.
     pub(super) fn close_focused_chat_pane_archiving(
         &mut self,
@@ -571,6 +638,13 @@ impl Shell {
             // One pane left: close its tab while others remain.
             return self.close_chat_tab(window, cx);
         }
+        if self
+            .chat_split
+            .as_ref()
+            .is_some_and(|split| split.panes.len() > 1)
+        {
+            self.remember_closed_chat_pane(cx);
+        }
         let Some(split) = self.chat_split.as_mut() else {
             return false;
         };
@@ -578,6 +652,7 @@ impl Shell {
             self.chat_split = None;
             return false;
         };
+        let target = existing_chat_selection(target, self.state.read(cx));
         let project = split.projects[split.focus].clone();
         let draft = split.drafts[split.focus].take().filter(|_| target.is_none());
         if split.panes.len() == 1 {
@@ -612,8 +687,23 @@ impl Shell {
         }
         if state.chats_synced {
             let chat = |id: &str| state.chats.iter().find(|c| c.id == id);
-            split.prune(|id| chat(id).map(|c| c.archived));
-            split.restore_returned(|id| chat(id).is_some_and(|c| !c.archived));
+            // Archived since the pane last saw it live: the pane closes. One
+            // that was archived when it entered the pane is being read, and
+            // emptying its pane turned it into a new session (#489). A pane a
+            // reopen is unarchiving stays either way.
+            let unarchiving = &self.chat_tab_unarchiving;
+            let live = &self.chat_split_live;
+            split.prune(|id| {
+                chat(id).map(|c| c.archived && live.contains(id) && !unarchiving.contains_key(id))
+            });
+            split.restore_returned(|id| {
+                chat(id).is_some_and(|c| !c.archived || unarchiving.contains_key(id))
+            });
+            self.chat_split_live = split
+                .peer_chats()
+                .filter(|id| chat(id).is_some_and(|c| !c.archived))
+                .map(str::to_owned)
+                .collect();
         }
         self.sync_chat_panes(cx);
     }
@@ -820,6 +910,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let drop_target = self.attachment_drop_target(Some(ix), cx);
         let title: SharedString = chat_id
             .and_then(|id| {
                 self.state
@@ -948,6 +1039,16 @@ impl Shell {
             )
             // Ghostty dims unfocused splits.
             .child(div().flex_1().min_h_0().flex().flex_col().opacity(0.8).child(body))
+            // Every visible pane takes dropped files, not just the focused
+            // one; the drop focuses the pane it lands on (#488).
+            .child(attachment_drop_veil(("chat-peer-pane-drop", ix), theme))
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+                    if this.attachment_drop_is_current(&drop_target, cx) {
+                        this.drop_paths_on_pane(ix, paths.paths().to_vec(), window, cx);
+                    }
+                }),
+            )
             // Finish the original click/selection before moving this entity
             // into the active outlet. Capturing observes consumed child events;
             // deferring lets their click handlers act on the still-mounted view.
@@ -976,6 +1077,37 @@ impl Shell {
             }))
             .into_any_element()
     }
+}
+
+/// The "Drop to attach" veil over a conversation column, focused or not. It
+/// shows while OS files are dragged over it; the focused column also adds
+/// its workspace file drags.
+pub(super) fn attachment_drop_veil(
+    id: impl Into<gpui::ElementId>,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .opacity(0.0)
+        .bg(theme.scrim().opacity(0.4 / 0.6))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(crate::typography::ui_rems(13.0))
+        .text_color(theme.text)
+        // GPUI matches these styles against the active payload's concrete
+        // TypeId. Resize markers therefore cannot reveal this overlay, even
+        // after an external drag exits without another move event.
+        .drag_over::<gpui::ExternalPaths>(|style, paths, _, _| {
+            if paths.paths().iter().any(|path| !path.as_os_str().is_empty()) {
+                style.opacity(1.0)
+            } else {
+                style
+            }
+        })
+        .child("Drop to attach")
 }
 
 /// Pane glyph: which part of the split a card or row badge stands for.
@@ -1073,6 +1205,8 @@ impl Shell {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.chat_split.as_ref().is_some_and(|s| s.focus == ix) {
+                            this.composer
+                                .update(cx, |composer, cx| composer.reveal_pending_question(cx));
                             window.focus(&this.composer.focus_handle(cx), cx);
                         } else {
                             this.focus_chat_pane(ix, window, cx);

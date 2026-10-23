@@ -827,6 +827,15 @@ impl Tools {
                 short(&chat.id)
             );
         }
+        // Archived chats are out of the active collaboration set (#498). The
+        // engine refuses the delivery too; this answers before any send.
+        if chat.archived && self.from_chat() {
+            anyhow::bail!(
+                "no message was sent to chat {}: {}",
+                short(&chat.id),
+                harness_proto::peer_mail::ARCHIVED_REFUSAL
+            );
+        }
         let (spaces, sessions, harnesses) = tokio::try_join!(
             self.harness.spaces(),
             self.harness.sessions(),
@@ -1297,6 +1306,11 @@ mod tests {
                         "id": "chat-beta-2", "deviceId": "dev-local", "title": "Beta",
                         "archived": false, "spaceId": "space-1",
                         "createdAt": "2026-09-02T00:00:00Z"
+                    },
+                    {
+                        "id": "chat-gamma-3", "deviceId": "dev-local", "title": "Gamma",
+                        "archived": true, "spaceId": "space-1",
+                        "createdAt": "2026-08-30T00:00:00Z"
                     }
                 ])),
                 methods::WATCH_SESSIONS => stream(json!([])),
@@ -1500,6 +1514,54 @@ mod tests {
         assert_eq!(params["command"]["request"]["cwd"], "/repo/comet");
         assert_eq!(params["command"]["request"]["harness"], "claude-code");
         assert_eq!(params["command"]["request"]["model"], "opus");
+    }
+
+    #[tokio::test]
+    async fn archived_chats_are_out_of_peer_discovery_and_refuse_peer_sends() {
+        let world = Arc::new(World::default());
+        let peer = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        let listed = peer.call("list_chats", json!({})).await.unwrap();
+        assert!(
+            listed["chats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|chat| chat["title"] != "Gamma"),
+            "{listed}"
+        );
+        for mode in ["auto", "run", "steer", "queue"] {
+            let err = peer
+                .call(
+                    "send_message",
+                    json!({ "chat": "Gamma", "text": "status?", "mode": mode }),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.contains("archived"), "{mode}: {err}");
+            assert!(err.contains("no message was sent"), "{mode}: {err}");
+        }
+        assert!(
+            world.writes.lock().unwrap().is_empty(),
+            "nothing was queued"
+        );
+
+        // A person driving the server from outside any chat may still reprompt
+        // (and so restore) it.
+        let person = tools(world.clone(), Origin::default());
+        person
+            .call(
+                "send_message",
+                json!({ "chat": "Gamma", "text": "pick this back up" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(world.writes.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
