@@ -75,6 +75,18 @@ fn close_buttons_never_ask(cx: &mut gpui::TestAppContext) {
         })
         .unwrap();
     assert_eq!(chosen(cx), (false, false));
+
+    // A tab's ✕ closes the whole tab without asking either.
+    let (_dir, window) = fixture(cx, false, Some(false));
+    window
+        .update(cx, |shell, window, cx| {
+            assert!(shell.close_chat_tab_at(1, window, cx));
+            // One tab left: the strip collapses.
+            assert!(shell.chat_tabs.is_empty());
+            assert!(!shell.archive_choice_prompt);
+        })
+        .unwrap();
+    assert_eq!(chosen(cx), (false, false));
 }
 
 #[gpui::test]
