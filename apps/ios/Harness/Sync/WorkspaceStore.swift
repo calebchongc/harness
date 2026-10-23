@@ -696,6 +696,46 @@ final class WorkspaceStore {
                                             params: ["pct": pct.map { $0 as Any } ?? NSNull()])
     }
 
+    /// CodegraffSandboxes on the target device: the cloud sandboxes and sizes of
+    /// the Codegraff account its engine is signed in with (nil while signed out).
+    func codegraffSandboxes(deviceId: String) async throws -> CodegraffSandboxes? {
+        try await relay(for: deviceId).call(method: "CodegraffSandboxes", params: [:],
+                                            timeoutSeconds: 30)
+    }
+
+    /// CodegraffCreateSandbox: `size` is a personal size id from the list (the
+    /// default one when nil). The engine boots the machine and sets Harness up in
+    /// it before it answers, which takes minutes.
+    func createCodegraffSandbox(deviceId: String, size: String?) async throws {
+        var params: [String: Any] = [:]
+        if let size { params["size"] = size }
+        let _: JSONValue = try await relay(for: deviceId).call(method: "CodegraffCreateSandbox",
+                                                               params: params, timeoutSeconds: 6 * 60,
+                                                               retry: false)
+    }
+
+    /// CodegraffSandboxAction on one sandbox. A start wakes the machine and sets
+    /// Harness up again, so it gets the create's deadline.
+    func codegraffSandboxAction(deviceId: String, id: String, action: CloudSandboxAction) async throws {
+        let timeout: UInt64 = action == .start ? 6 * 60 : 60
+        let _: JSONValue = try await relay(for: deviceId).call(method: "CodegraffSandboxAction",
+                                                               params: ["id": id, "action": action.rawValue],
+                                                               timeoutSeconds: timeout)
+    }
+
+    /// CodegraffGithubRunners on the target device (nil while signed out;
+    /// `available: false` from a gateway without runners).
+    func codegraffGithubRunners(deviceId: String) async throws -> GithubRunners? {
+        try await relay(for: deviceId).call(method: "CodegraffGithubRunners", params: [:],
+                                            timeoutSeconds: 30)
+    }
+
+    /// CodegraffGithubRunnerAction: budgets, concurrency, one repository, or a disconnect.
+    func codegraffGithubRunnerAction(deviceId: String, action: GithubRunnerAction) async throws {
+        let _: JSONValue = try await relay(for: deviceId).call(method: "CodegraffGithubRunnerAction",
+                                                               params: action.params, timeoutSeconds: 30)
+    }
+
     /// ListRefs on the target device — branches with current/worktree markers
     /// (default branch first, per the engine's ordering).
     func listRefs(deviceId: String, repoPath: String) async -> [RepoRef]? {
