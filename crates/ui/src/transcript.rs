@@ -3978,7 +3978,16 @@ impl Transcript {
 
     /// Change only the feed/presentation role, not the chat or its interaction
     /// state. In particular, keep folds, the viewport, and pending selection.
+    ///
+    /// The link owner follows the role: a peer's links belong to its pinned
+    /// chat, while the primary's follow whichever chat it shows (`link_ui`
+    /// fills a `None` owner from `chat_id`). A promoted peer that kept its
+    /// fixed owner would have its links rejected as a stale source once the
+    /// primary moved to another chat (#456).
     pub(crate) fn set_split_source(&mut self, peer: Option<String>) {
+        if let Some(link) = self.workspace_link.as_mut() {
+            link.source_session = peer.clone();
+        }
         self.doc_live = peer.is_some();
         self.retain_on_deselect = peer.is_none();
         if peer.is_some() {

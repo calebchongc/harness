@@ -15,7 +15,16 @@ impl Render for InteractionPanes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.0.update(cx, |shell, cx| {
             let theme = Theme::of(cx).clone();
-            let split = shell.chat_split.as_ref().unwrap();
+            let Some(split) = shell.chat_split.as_ref() else {
+                // The split closed: one ordinary transcript pane remains.
+                return div()
+                    .w(px(480.0))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .pt(px(Theme::TITLEBAR_HEIGHT))
+                    .child(div().flex_1().min_h_0().child(shell.transcript.clone()));
+            };
             let (focus, len, axis) = (split.focus, split.panes.len(), split.axis);
             div()
                 .size_full()
@@ -486,6 +495,202 @@ fn promoted_peer_links_still_work_after_focus_moves_away_and_back(cx: &mut gpui:
             },
         );
     }
+}
+
+/// How a promoted peer transcript ends up showing another chat as primary.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+enum PromotedPrimaryPath {
+    /// ⌘W on the promoted pane: the split closes and the same entity shows
+    /// the remaining chat in a single pane.
+    ClosePane,
+    /// Close as above, then pick a third chat in the single pane.
+    CloseThenNavigate,
+    /// Keep the split and pick a third chat in the promoted (focused) pane.
+    NavigateInSplit,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+enum LinkGesture {
+    Click,
+    OpenInHarness,
+    OpenExternal,
+}
+
+/// Show `entries` as the selected chat's replayed transcript.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn show_primary_chat(
+    shell: &Entity<Shell>,
+    chat: &str,
+    entries: Vec<SessionMessageEntry>,
+    cx: &mut gpui::VisualTestContext,
+) {
+    shell.update(cx, |shell, cx| {
+        shell.state.update(cx, |state, cx| {
+            if state.selected_chat.as_deref() != Some(chat) {
+                state.select_chat(Some(chat.into()), cx);
+            }
+            state.transcript = entries;
+            state.transcript_replayed = true;
+            state.transcript_revision += 1;
+            cx.notify();
+        });
+        shell.on_state_changed(&shell.state.clone(), cx);
+    });
+    draw(cx);
+}
+
+/// #456: a peer transcript is created with its chat as a fixed link owner.
+/// Promoting it keeps the entity (selection, folds, scroll) as the primary
+/// transcript, which then follows the selection to other chats. Its links
+/// must belong to the chat it now shows, not to the pane it came from.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui::test]
+fn promoted_peer_transcript_links_follow_the_chat_it_shows_after_navigation(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    let mut failures = Vec::new();
+    for path in [
+        PromotedPrimaryPath::ClosePane,
+        PromotedPrimaryPath::CloseThenNavigate,
+        PromotedPrimaryPath::NavigateInSplit,
+    ] {
+        for gesture in [
+            LinkGesture::Click,
+            LinkGesture::OpenInHarness,
+            LinkGesture::OpenExternal,
+        ] {
+            let url = format!("https://example.com/promoted/{path:?}/{gesture:?}");
+            with_panes(
+                cx,
+                vec![reply("[Peer docs](https://example.com/peer-docs)")],
+                |shell, peer, _current, cx| {
+                    shell.update(cx, |shell, cx| {
+                        shell.state.update(cx, |state, _| {
+                            state.chats.push(
+                                serde_json::from_value(serde_json::json!({
+                                    "id": "other", "deviceId": "local", "title": "Session",
+                                    "archived": false, "createdAt": Utc::now(),
+                                }))
+                                .unwrap(),
+                            );
+                        });
+                    });
+                    prepare_link_panes(&shell, false, true, cx);
+                    // Promote the peer entity into the primary pane.
+                    shell.update(cx, |shell, cx| {
+                        assert!(shell.select_chat_pane(0, cx));
+                        shell.on_state_changed(&shell.state.clone(), cx);
+                    });
+                    draw(cx);
+                    shell.read_with(cx, |shell, _| {
+                        assert_eq!(shell.active_chat, "peer");
+                        assert_eq!(shell.transcript.entity_id(), peer.entity_id());
+                    });
+                    let mut link = reply(&format!("[Docs]({url})"));
+                    link.id = "nav-link".into();
+                    let shown = match path {
+                        PromotedPrimaryPath::ClosePane => "current",
+                        PromotedPrimaryPath::CloseThenNavigate
+                        | PromotedPrimaryPath::NavigateInSplit => "other",
+                    };
+                    if !matches!(path, PromotedPrimaryPath::NavigateInSplit) {
+                        cx.update(|window, cx| {
+                            shell.update(cx, |shell, cx| {
+                                assert!(
+                                    shell.close_focused_chat_pane_without_archiving(window, cx)
+                                );
+                            })
+                        });
+                        draw(cx);
+                        shell.read_with(cx, |shell, _| assert!(shell.chat_split.is_none()));
+                    }
+                    show_primary_chat(&shell, shown, vec![link], cx);
+                    let owner = shell.read_with(cx, |shell, cx| {
+                        assert_eq!(shell.active_chat, shown, "{path:?}");
+                        assert_eq!(
+                            shell.transcript.entity_id(),
+                            peer.entity_id(),
+                            "{path:?}: the promoted entity is still the primary transcript"
+                        );
+                        assert!(shell.browsers.is_empty());
+                        shell
+                            .transcript
+                            .read(cx)
+                            .link_ui()
+                            .and_then(|link| link.source_session)
+                    });
+                    let previous_url = cx.opened_url();
+                    if !render::selection_test_entries()
+                        .iter()
+                        .any(|(key, _, _)| key == "nav-link#text.0:0")
+                    {
+                        let keys: Vec<_> = render::selection_test_entries()
+                            .into_iter()
+                            .map(|(key, text, _)| (key, text))
+                            .collect();
+                        panic!(
+                            "{path:?}/{gesture:?}: link row not painted; owner {owner:?}; \
+                             registered {keys:?}"
+                        );
+                    }
+                    match gesture {
+                        LinkGesture::Click => {
+                            cx.simulate_click(
+                                text_point(&peer, "nav-link#text.0:0"),
+                                Default::default(),
+                            );
+                        }
+                        LinkGesture::OpenInHarness | LinkGesture::OpenExternal => {
+                            open_peer_link_menu(&peer, "nav-link#text.0:0", cx);
+                            let label = if matches!(gesture, LinkGesture::OpenInHarness) {
+                                "Open in Harness"
+                            } else {
+                                "Open in external browser"
+                            };
+                            let row = cx
+                                .debug_bounds(label)
+                                .unwrap_or_else(|| panic!("{path:?}/{gesture:?}: painted {label}"));
+                            cx.simulate_click(row.center(), Default::default());
+                        }
+                    }
+                    draw(cx);
+                    let routed = if matches!(gesture, LinkGesture::OpenExternal) {
+                        cx.opened_url().as_deref() == Some(url.as_str())
+                    } else {
+                        let opened = shell.read_with(cx, |shell, cx| {
+                            shell.browsers.len() == 1
+                                && shell
+                                    .right_tabs
+                                    .get(shown)
+                                    .is_some_and(|tabs| tabs.len() == 1)
+                                && shell.right_pane_open(cx)
+                                && shell.browsers[&shell.browser_seq]
+                                    .read(cx)
+                                    .page
+                                    .url
+                                    .as_deref()
+                                    == Some(url.as_str())
+                        });
+                        opened && cx.opened_url() == previous_url
+                    };
+                    if !routed || owner.as_deref() != Some(shown) {
+                        failures.push(format!(
+                            "{path:?}/{gesture:?}: showing {shown:?}, link owner {owner:?}, \
+                             routed={routed}"
+                        ));
+                    }
+                },
+            );
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "links in a promoted peer transcript were rejected:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

@@ -779,9 +779,6 @@ pub struct UiSettings {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chat_tabs: Vec<SavedChatTab>,
     pub chat_tab: usize,
-    /// Custom sidebar organization, isolated between account profiles on this device.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub sidebar_sections_by_profile: HashMap<String, Vec<SidebarSection>>,
     /// Device-local pins for local profiles; synced profiles use registry pins.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sidebar_pinned_session_ids_by_profile: HashMap<String, Vec<String>>,
@@ -931,7 +928,6 @@ impl Default for UiSettings {
             chat_tabs: Vec::new(),
             chat_tab: 0,
             sidebar_pinned_session_ids_by_profile: HashMap::new(),
-            sidebar_sections_by_profile: HashMap::new(),
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
@@ -1779,8 +1775,6 @@ fn min_or(value: f32, min: f32, default: f32) -> f32 {
     }
 }
 
-pub use harness_proto::SidebarSection;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2430,7 +2424,6 @@ mod tests {
                 SavedChatTab::default(),
             ],
             chat_tab: 1,
-            sidebar_sections_by_profile: HashMap::new(),
             sidebar_pinned_session_ids_by_profile: HashMap::from([
                 (
                     "local".to_string(),
