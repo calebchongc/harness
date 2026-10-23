@@ -6082,6 +6082,18 @@ impl Composer {
         cx.notify();
     }
 
+    /// Typed-but-unsent text, staged files or captures in any chat's
+    /// composer. All of it lives in memory only, so an automatic app restart
+    /// waits until there is none. (A question being answered keeps its
+    /// session AwaitingInput, which blocks the restart on its own.)
+    pub(crate) fn has_unsent_input(&self, cx: &App) -> bool {
+        !self.input.read(cx).text().trim().is_empty()
+            || self.queue_edit_draft.is_some()
+            || self.drafts.values().any(|text| !text.trim().is_empty())
+            || self.attachments.values().any(|stage| !stage.is_empty())
+            || self.appshots.values().any(|shots| !shots.is_empty())
+    }
+
     /// Staged attachments for the chat the composer is showing.
     pub(crate) fn staged(&self) -> &[StagedAttachment] {
         self.attachments

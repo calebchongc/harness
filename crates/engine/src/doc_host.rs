@@ -874,6 +874,30 @@ impl ChatDocHandle {
         Ok(stamped)
     }
 
+    /// Restart recovery for a run a graceful shutdown settled: append `note`
+    /// to the chat's last entry when it is this device's assistant entry the
+    /// shutdown left `aborted` (with an open question, when
+    /// `require_open_question`). Same part id as [`Self::mark_abandoned_streams`],
+    /// so the two never stack. Returns whether the entry carries the note.
+    pub fn note_restart(&self, note: &str, require_open_question: bool) -> Result<bool, DocError> {
+        let entries = self.doc.read_entries()?;
+        let Some(entry) = entries.last().filter(|e| {
+            e.role == MessageRole::Assistant
+                && e.status == Some(MessageStatus::Aborted)
+                && e.device_id == self.device_id
+                && (!require_open_question || crate::sessions::has_open_question(e))
+        }) else {
+            return Ok(false);
+        };
+        let noted =
+            self.doc
+                .append_error_part(&entry.id, &format!("{}-recovery", entry.id), note)?;
+        if noted {
+            self.publish_messages();
+        }
+        Ok(noted)
+    }
+
     fn publish_messages(&self) {
         let _import = lock(&self.transcript_import);
         self.publish_messages_locked();

@@ -330,10 +330,22 @@ impl InstallKind {
 
     /// Install and arrange a relaunch. The UI must quit after this succeeds.
     pub fn apply_desktop(&self, staged: &Path) -> anyhow::Result<()> {
+        self.apply_desktop_relaunching(staged, Relaunch::Foreground)
+    }
+
+    /// [`Self::apply_desktop`], choosing how the new version opens: an
+    /// automatic restart while the person works in another app reopens
+    /// Harness behind it instead of taking focus (macOS; elsewhere the
+    /// platform decides).
+    pub fn apply_desktop_relaunching(
+        &self,
+        staged: &Path,
+        relaunch: Relaunch,
+    ) -> anyhow::Result<()> {
         match self {
             Self::MacApp { bundle } => {
                 apply_mac_app(staged, bundle)?;
-                relaunch_app_after_exit(bundle);
+                relaunch_app_after_exit_with(bundle, relaunch);
                 Ok(())
             }
             #[cfg(windows)]
@@ -658,18 +670,41 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How a relaunched app comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relaunch {
+    /// In front, as if the person opened it.
+    Foreground,
+    /// Behind the app the person is using (`open -g`): an automatic restart
+    /// must not take focus from someone working elsewhere.
+    Background,
+}
+
+/// The relauncher's shell script: wait for `pid` to exit, then open `bundle`.
+fn relaunch_script(pid: u32, bundle: &Path, relaunch: Relaunch) -> String {
+    let flags = match relaunch {
+        Relaunch::Foreground => "",
+        Relaunch::Background => "-g ",
+    };
+    format!(
+        "while /bin/kill -0 {pid} 2>/dev/null; do sleep 0.2; done; /usr/bin/open {flags}\"{}\"",
+        bundle.display()
+    )
+}
+
 /// Detached relauncher: waits for THIS process to exit, then `open`s the bundle.
 /// (Opening before exit would race the single-instance engine lock and the IPC
 /// port.) The caller quits the app after this returns.
 pub fn relaunch_app_after_exit(bundle: &Path) {
+    relaunch_app_after_exit_with(bundle, Relaunch::Foreground);
+}
+
+/// [`relaunch_app_after_exit`], choosing whether the app comes back in front.
+pub fn relaunch_app_after_exit_with(bundle: &Path, relaunch: Relaunch) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        let pid = std::process::id();
-        let script = format!(
-            "while /bin/kill -0 {pid} 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"{}\"",
-            bundle.display()
-        );
+        let script = relaunch_script(std::process::id(), bundle, relaunch);
         let mut command = std::process::Command::new("/bin/sh");
         command
             .args(["-c", &script])
@@ -682,7 +717,7 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
         }
     }
     #[cfg(not(unix))]
-    let _ = bundle;
+    let _ = (bundle, relaunch);
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1081,16 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_background_relaunch_reopens_the_app_without_taking_focus() {
+        let bundle = Path::new("/Applications/Harness.app");
+        let front = relaunch_script(42, bundle, Relaunch::Foreground);
+        let back = relaunch_script(42, bundle, Relaunch::Background);
+        assert!(front.starts_with("while /bin/kill -0 42 2>/dev/null"));
+        assert!(front.ends_with("/usr/bin/open \"/Applications/Harness.app\""));
+        assert!(back.ends_with("/usr/bin/open -g \"/Applications/Harness.app\""));
+    }
 
     #[test]
     fn desktop_auto_update_defaults_on_and_honours_off_values() {
