@@ -5,6 +5,27 @@ use super::*;
 
 const RESTORE_JOB: &str = "prompt-restore";
 
+/// Saved receipts must satisfy the registry wire HLC format before their
+/// strings can safely participate in lexicographic ordering.
+fn valid_restore_clock(clock: &str) -> bool {
+    let Some((ms, rest)) = clock.split_once('-') else {
+        return false;
+    };
+    let Some((counter, device)) = rest.split_once('-') else {
+        return false;
+    };
+    ms.len() == 13
+        && ms.bytes().all(|byte| byte.is_ascii_digit())
+        && counter.len() == 6
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
+        && (1..=128).contains(&device.len())
+        && device
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+#[cfg(test)]
+mod crash_edges;
 #[cfg(test)]
 mod tests;
 
@@ -12,6 +33,9 @@ mod tests;
 pub(super) struct PromptRestore {
     chat_id: String,
     clock: String,
+    /// Archive revision from a detached sender's snapshot, if one was known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive_basis: Option<String>,
     #[serde(default)]
     accepted: bool,
 }
@@ -22,13 +46,34 @@ impl DocHost {
         chat_id: &str,
         submission_id: &str,
     ) -> Result<PromptRestore, EngineError> {
-        let clock = self.workspace().map_or_else(
-            || harness_doc::encode_hlc(now_ms(), 1, &self.inner.config.device_id),
-            |workspace| workspace.chat_prompt_clock(chat_id),
-        );
+        let (clock, archive_basis) = if let Some(workspace) = self.workspace() {
+            (workspace.chat_prompt_clock(chat_id), None)
+        } else if let Some(bytes) = self
+            .inner
+            .store
+            .load_snapshot(harness_doc::REGISTRY_DOC_ID)?
+        {
+            // Startup can accept a prompt before the workspace is wired. A
+            // wall-only clock can be older than its durable archive revision.
+            let mut registry =
+                harness_doc::RegistryDoc::from_bytes(&bytes, &self.inner.config.device_id)
+                    .map_err(|error| {
+                        EngineError::Other(format!(
+                            "restore registry snapshot load failed: {error}"
+                        ))
+                    })?;
+            let basis = registry.chat_archive_clock(chat_id);
+            (registry.chat_prompt_clock(chat_id), basis)
+        } else {
+            (
+                harness_doc::encode_hlc(now_ms(), 1, &self.inner.config.device_id),
+                None,
+            )
+        };
         let receipt = PromptRestore {
             chat_id: chat_id.into(),
             clock,
+            archive_basis,
             accepted: false,
         };
         self.inner.store.schedule_sync_job_with_cursor(
@@ -76,7 +121,11 @@ impl DocHost {
         let Some(workspace) = self.workspace() else {
             return;
         };
-        match workspace.restore_chat_on_send(&receipt.chat_id, &receipt.clock) {
+        match workspace.restore_chat_on_send(
+            &receipt.chat_id,
+            &receipt.clock,
+            receipt.archive_basis.as_deref(),
+        ) {
             Ok(true) => self.cancel_prompt_restore(submission_id),
             Ok(false) => {} // Metadata will arrive independently of the prompt.
             Err(error) => {
@@ -100,8 +149,22 @@ impl DocHost {
                 let Some((_, data)) = self.inner.store.sync_job(&id, RESTORE_JOB)? else {
                     continue;
                 };
-                let receipt: PromptRestore = serde_json::from_str(&data)
-                    .map_err(|error| EngineError::Other(error.to_string()))?;
+                let receipt: PromptRestore = match serde_json::from_str(&data) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        tracing::warn!(submission = %id, %error, "invalid prompt restoration receipt; skipped");
+                        continue;
+                    }
+                };
+                if !valid_restore_clock(&receipt.clock)
+                    || receipt
+                        .archive_basis
+                        .as_deref()
+                        .is_some_and(|basis| !valid_restore_clock(basis))
+                {
+                    tracing::warn!(submission = %id, "invalid prompt restoration clock; skipped");
+                    continue;
+                }
                 // Do not cold-open unknown metadata on every scheduler tick.
                 if workspace.chat(&receipt.chat_id)?.is_none() {
                     continue;
