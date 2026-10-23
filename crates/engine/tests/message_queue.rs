@@ -414,8 +414,14 @@ async fn restart_restores_the_queue_frozen_until_an_explicit_send() {
     // that task time to prove the restored row stays frozen.
     assert_eq!(queue_texts(&after), vec!["after restart"]);
     tokio::time::sleep(Duration::from_millis(250)).await;
+    // The turn the quit cut short is resumed on its own (#482); the queued
+    // follow-up is not: it stays frozen until an explicit send.
     assert!(
-        after_prompts.lock().unwrap().is_empty(),
+        !after_prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "after restart"),
         "startup must not dispatch a recovered queue"
     );
     assert_eq!(queue_texts(&after), vec!["after restart"]);

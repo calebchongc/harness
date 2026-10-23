@@ -17,7 +17,7 @@ use harness_doc::{MessagePart, SessionCommandPayload, SessionCommandStatus};
 use harness_engine::{EngineCore, HarnessRegistry};
 use harness_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    SteeringMode, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 const CHAT: &str = "chat-branch-drift";
@@ -56,15 +56,37 @@ impl Harness for FakeAgent {
             prompts.push(request.prompt.clone());
             prompts.len()
         };
-        let events: Vec<Result<AgentEvent, HarnessError>> = vec![
-            Ok(AgentEvent::SessionStarted {
+        let mut events: Vec<Result<AgentEvent, HarnessError>> =
+            vec![Ok(AgentEvent::SessionStarted {
                 harness: HarnessId::Graff,
                 model: "test-model".into(),
                 tools: vec![],
                 cwd: request.cwd.clone(),
                 session_id: "sess-drift".into(),
                 assistant_message_id: format!("a-{turn}"),
-            }),
+            })];
+        // `shell: <command>` runs the command in the chat's folder as the
+        // agent's own tool call, the way an agent renames its branch.
+        if let Some(command) = request.prompt.strip_prefix("shell: ") {
+            let status = std::process::Command::new("sh")
+                .args(["-c", command])
+                .current_dir(&request.cwd)
+                .status()
+                .unwrap();
+            events.push(Ok(AgentEvent::ToolCall {
+                id: format!("tool-{turn}"),
+                call: ToolCall::Exec {
+                    command: command.into(),
+                },
+            }));
+            events.push(Ok(AgentEvent::ToolResult {
+                id: format!("tool-{turn}"),
+                is_error: !status.success(),
+                output: None,
+                diff: None,
+            }));
+        }
+        events.extend([
             Ok(AgentEvent::TextDelta { text: "ok".into() }),
             Ok(AgentEvent::Done {
                 status: DoneStatus::Completed,
@@ -72,7 +94,7 @@ impl Harness for FakeAgent {
                 error: None,
                 session_id: Some("sess-drift".into()),
             }),
-        ];
+        ]);
         Ok(futures::stream::iter(events).boxed())
     }
 }
@@ -357,6 +379,58 @@ async fn a_drifted_checkout_asks_before_the_chat_continues() {
     assert!(resumed.ends_with("ninth\n\ntenth"), "{resumed}");
     assert!(!resumed.contains("eighth"), "{resumed}");
     assert_eq!(context_branch(&core), "zeta");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_chats_own_branch_rename_does_not_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cwd) = test_repo(tmp.path());
+    let data = tmp.path().join("data");
+    let (core, prompts) = engine(&data);
+    create_chat(&core, &cwd);
+    send(&core, "m1", "establish alpha", &cwd);
+    wait_turn(&core, &prompts, 1).await;
+
+    // The agent renames its branch while preparing a PR, and commits there.
+    send(
+        &core,
+        "m2",
+        "shell: git branch -m feature/renamed && git -c user.name=T -c user.email=t@t commit -q --allow-empty -m pr",
+        &cwd,
+    );
+    wait_turn(&core, &prompts, 2).await;
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "feature/renamed");
+
+    // The follow-up goes straight out, and the chat follows the new name.
+    send(&core, "m3", "follow-up", &cwd);
+    wait_turn(&core, &prompts, 3).await;
+    assert!(open_question(&core).is_none());
+    assert_eq!(prompts.lock().unwrap()[2], "follow-up", "no drift note");
+    assert_eq!(context_branch(&core), "feature/renamed");
+    let chat = core.workspace.chat(CHAT).unwrap().unwrap();
+    assert_eq!(chat.branch.as_deref(), Some("feature/renamed"));
+
+    // A rename the chat did not run, from outside Harness, still asks.
+    git(&repo, &["branch", "-m", "outside"]);
+    send(&core, "m4", "fourth", &cwd);
+    let (request_id, question) = wait_question(&core).await;
+    assert_eq!(question.options[0], "Continue on outside");
+    answer(&core, &request_id, "Continue on outside");
+    wait_turn(&core, &prompts, 4).await;
+
+    // A rename followed by a real switch is a switch.
+    send(
+        &core,
+        "m5",
+        "shell: git branch -m renamed-again && git switch -q -c side",
+        &cwd,
+    );
+    wait_turn(&core, &prompts, 5).await;
+    send(&core, "m6", "sixth", &cwd);
+    let (_, question) = wait_question(&core).await;
+    assert_eq!(question.options[0], "Continue on side");
+    assert_eq!(prompts.lock().unwrap().len(), 5, "held behind the question");
     core.shutdown().await;
 }
 

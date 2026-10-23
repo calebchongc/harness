@@ -1113,7 +1113,13 @@ impl EngineRpc {
                 match archive_requested_at.filter(|_| archived) {
                     Some(at) => self.workspace.archive_chat_at(&chat_id, at),
                     None => self.workspace.set_chat_archived(&chat_id, archived),
-                }.map_err(failed).map(drop)
+                }
+                .map_err(failed)?;
+                // A person's restore lets peer mail held while archived out (#498).
+                if !archived {
+                    self.doc_host.kick_queue(&chat_id);
+                }
+                Ok(())
             }
             MutateParams::ChangeSidebarPin { change } => {
                 self.workspace.change_sidebar_pin(&change).map_err(failed)
@@ -1701,8 +1707,13 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&sandboxes)
             }
             methods::CODEGRAFF_CREATE_SANDBOX => {
+                let size = params
+                    .get("size")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|size| !size.is_empty());
                 let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
-                    .create_sandbox()
+                    .create_sandbox(size)
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&sandbox)
@@ -1717,9 +1728,32 @@ impl RpcService for EngineRpc {
                     Some("start") => auth.start_sandbox(id).await,
                     Some("stop") => auth.stop_sandbox(id).await,
                     Some("delete") => auth.delete_sandbox(id).await,
+                    Some("keep-running-on") => {
+                        auth.set_sandbox_keep_running(id, true).await.map(drop)
+                    }
+                    Some("keep-running-off") => {
+                        auth.set_sandbox_keep_running(id, false).await.map(drop)
+                    }
                     _ => Err("unknown sandbox action".into()),
                 }
                 .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CODEGRAFF_GITHUB_RUNNERS => {
+                let runners = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runners()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&runners)
+            }
+            methods::CODEGRAFF_GITHUB_RUNNER_ACTION => {
+                let action: crate::codegraff_auth::RunnerAction =
+                    serde_json::from_value(params.clone())
+                        .map_err(|e| RpcError::Failed(format!("bad GitHub CI action: {e}")))?;
+                crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runner_action(action)
+                    .await
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::ROOM_REQUEST => {
@@ -1998,16 +2032,28 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Prompts first: watch_queue's publish then fills both.
+                let prompts = handle.watch_pending_prompts();
                 let rx = handle.watch_queue();
                 Ok(RpcReply::Stream(
-                    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
-                        if !first {
-                            rx.changed().await.ok()?;
-                        }
-                        let items = rx.borrow_and_update().clone();
-                        let value = serde_json::json!({ "items": items });
-                        Some((value, (rx, false)))
-                    })
+                    futures::stream::unfold(
+                        (rx, prompts, true),
+                        |(mut rx, mut prompts, first)| async move {
+                            if !first {
+                                tokio::select! {
+                                    changed = rx.changed() => changed.ok()?,
+                                    changed = prompts.changed() => changed.ok()?,
+                                }
+                            }
+                            let items = rx.borrow_and_update().clone();
+                            let pending = prompts.borrow_and_update().clone();
+                            let value = serde_json::json!({
+                                "items": items,
+                                "pendingPrompts": pending,
+                            });
+                            Some((value, (rx, prompts, false)))
+                        },
+                    )
                     .boxed(),
                 ))
             }

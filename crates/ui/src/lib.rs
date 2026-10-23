@@ -12,6 +12,7 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — harness pulse loader, gradient spinner, boot splash.
 
+mod agent_message;
 pub mod app_menus;
 pub mod appearance;
 pub mod appshots;
@@ -22,6 +23,7 @@ pub mod change_requests;
 pub mod changes;
 pub(crate) mod chatgpt_plan;
 pub mod codegraff_jobs;
+pub mod codegraff_runners;
 pub mod codegraff_sandboxes;
 mod comment_ui;
 pub mod comments;

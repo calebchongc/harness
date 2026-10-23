@@ -295,24 +295,33 @@ impl Rewritten<'_> {
 
 pub(crate) fn rewrite(source: &str) -> Option<Rewritten<'_>> {
     let references = source.contains(CITATION) || source.contains(VISUALIZE);
-    let math = source.contains("\\(") || source.contains("\\[") || source.contains("$$");
+    let math = source.contains("\\(") || source.contains("\\[") || source.contains('$');
     if !references && !math {
         return None;
     }
     // Ask the same CommonMark parser which regions are literal. In particular,
     // an unclosed code fence must stay literal throughout streaming.
-    let protected: Vec<_> = Parser::new_ext(source, super::parser::options())
-        .into_offset_iter()
-        .filter_map(|(event, range)| match event {
-            Event::Code(_)
-            | Event::Html(_)
-            | Event::InlineHtml(_)
-            | Event::Start(
-                Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Link { .. } | Tag::Image { .. },
-            ) => Some(range),
-            _ => None,
-        })
+    let parser = Parser::new_ext(source, super::parser::options());
+    // Definitions emit no events. Protect their destinations and titles too:
+    // placeholders inserted there cannot be expanded from a Text event later.
+    let mut protected: Vec<_> = parser
+        .reference_definitions()
+        .iter()
+        .map(|(_, definition)| definition.span.clone())
         .collect();
+    protected.extend(
+        parser
+            .into_offset_iter()
+            .filter_map(|(event, range)| match event {
+                Event::Code(_)
+                | Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::Start(
+                    Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Link { .. } | Tag::Image { .. },
+                ) => Some(range),
+                _ => None,
+            }),
+    );
     let mut text = String::new();
     let mut placeholder = PLACEHOLDER.to_owned();
     while source.contains(&placeholder) {
@@ -385,6 +394,9 @@ pub(crate) fn rewrite(source: &str) -> Option<Rewritten<'_>> {
         at = end;
     }
     if math {
+        // A dollar in a directive payload must not consume an adjacent math
+        // opener before overlap resolution drops the directive's inner span.
+        protected.extend(spans.iter().map(|(range, _)| range.clone()));
         for span in super::math::spans(source, &protected) {
             spans.push((
                 span.range,
