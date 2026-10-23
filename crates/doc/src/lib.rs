@@ -14,6 +14,7 @@ pub mod parts;
 pub mod queue;
 pub mod rebuild;
 pub mod registry;
+pub mod restart_note;
 pub mod schema;
 pub mod transcript_delta;
 pub mod workspace;

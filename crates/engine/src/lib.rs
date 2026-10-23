@@ -261,6 +261,7 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        sessions.note_boot_version();
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
@@ -535,12 +536,15 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
-        self.previews.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        // Runs first: recording what this shutdown cuts short (so the next
+        // boot resumes it) must not wait behind anything else. A caller with
+        // a deadline (the app quitting, a service stop) can be cut off later.
         self.sessions.shutdown().await;
+        self.previews.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();
