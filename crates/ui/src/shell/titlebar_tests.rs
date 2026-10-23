@@ -374,3 +374,132 @@ fn titlebar_arrows_walk_open_tabs_not_route_history(cx: &mut gpui::TestAppContex
     cx.update(|window, cx| window.draw(cx).clear());
     assert!(cx.debug_bounds("nav-back").is_none() && cx.debug_bounds("nav-forward").is_none());
 }
+
+#[gpui::test]
+fn update_control_lives_in_the_titlebar_and_later_stops_the_countdown(
+    cx: &mut gpui::TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        gpui_base::init(cx);
+        cx.set_global(Theme::default());
+        crate::app_menus::init(cx);
+        crate::history::init(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            cx,
+        );
+        settings::init(settings::UiSettings::default(), dir.path(), cx);
+    });
+    let (shell, cx) = cx.add_window_view(|_, cx| {
+        let state = cx.new(|_| AppState::new());
+        let mut shell = Shell::new(
+            state,
+            EngineBootConfig {
+                data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                codegraff_client_id: None,
+                default_harness: harness_proto::HarnessId::Mock,
+            },
+            cx,
+        );
+        shell.debug_gate = Some(GatePhase::Ready);
+        shell
+    });
+    cx.update(|window, cx| window.draw(cx).clear());
+    assert!(
+        cx.debug_bounds("titlebar-update").is_none(),
+        "no update, no control"
+    );
+    assert_eq!(
+        shell.read_with(cx, |shell, cx| shell.titlebar_update_slot(cx)),
+        0.0
+    );
+
+    shell.update(cx, |shell, cx| {
+        shell.install = harness_update::InstallKind::MacApp {
+            bundle: PathBuf::from("/nonexistent/Harness.app"),
+        };
+        shell.update_flow = UpdateFlow::Ready(StagedUpdate {
+            path: PathBuf::from("/nonexistent/staged"),
+            version: "9.9.9".into(),
+        });
+        // The heads-up is counting down (no watcher runs in this test).
+        shell.app_update.countdown_started = Some(std::time::Instant::now());
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear());
+    assert!(cx.debug_bounds("titlebar-update").is_some());
+    assert_eq!(
+        shell.read_with(cx, |shell, cx| shell.titlebar_update_slot(cx)),
+        TITLEBAR_ACTION_SLOT_WIDTH
+    );
+    assert!(cx.debug_bounds("app-update-countdown").is_some());
+
+    let later = cx.debug_bounds("app-update-later").unwrap();
+    cx.simulate_click(later.center(), Default::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, _| {
+        assert_eq!(shell.app_update.postponed.as_deref(), Some("9.9.9"));
+        assert!(shell.app_update.countdown_started.is_none());
+        assert!(
+            matches!(shell.update_flow, UpdateFlow::Ready(_)),
+            "Later keeps the update staged for quit"
+        );
+    });
+    cx.update(|window, cx| window.draw(cx).clear());
+    assert!(cx.debug_bounds("app-update-countdown").is_none());
+    assert!(cx.debug_bounds("titlebar-update").is_some());
+
+    // Settings → Devices sees the same flow, and its button does what the
+    // titlebar click does: here, try the (nonexistent) staged install, which
+    // fails into a retry instead of starting another download.
+    {
+        use crate::settings::devices::{SharedUpdatePhase, UpdatePhase};
+        assert_eq!(
+            cx.update(|_, cx| cx.global::<SharedUpdatePhase>().0.clone()),
+            UpdatePhase::Ready("9.9.9".into())
+        );
+        cx.update(|window, cx| window.dispatch_action(Box::new(StartAppUpdate), cx));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                matches!(shell.update_flow, UpdateFlow::Failed(_)),
+                "the version card's button restarts into the staged update"
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(matches!(
+            cx.update(|_, cx| cx.global::<SharedUpdatePhase>().0.clone()),
+            UpdatePhase::Failed(_)
+        ));
+        assert!(
+            !dir.path().join("app-update-relaunch.json").exists(),
+            "a failed install leaves no relaunch marker"
+        );
+    }
+
+    // A new-session prompt parked in another tab is unsent work too.
+    shell.update(cx, |shell, cx| {
+        assert!(!shell.has_unsent_composer_input(cx));
+        shell.chat_tabs = vec![
+            chat_tabs::ChatTab::default(),
+            chat_tabs::ChatTab {
+                draft: Some(crate::pickers::CanvasDraft {
+                    input: Some(crate::pickers::CanvasInput {
+                        text: "half-written prompt".into(),
+                        stage: Vec::new(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+        assert!(shell.has_unsent_composer_input(cx));
+    });
+}

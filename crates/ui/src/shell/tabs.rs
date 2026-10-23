@@ -343,7 +343,9 @@ impl Shell {
         // session is selected (`render_titlebar_cluster`) — this row budgets
         // one button slot so the title never sits under it.
         let sidebar_now = self.sidebar_now();
-        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+        // The update control, when shown, takes the next slot after it.
+        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx)
+            + self.titlebar_update_slot(cx);
 
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control

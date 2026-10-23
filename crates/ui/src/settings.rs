@@ -925,6 +925,10 @@ pub struct UiSettings {
     /// a newer stable exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graff_notice_dismissed: Option<String>,
+    /// Restart into a downloaded Harness update on its own once nothing would
+    /// be interrupted. Off, a staged update waits for a click or for quit.
+    /// `HARNESS_AUTO_UPDATE=0` turns every automatic step off regardless.
+    pub restart_to_install_updates: bool,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -1010,6 +1014,7 @@ impl Default for UiSettings {
             reduce_motion: crate::motion::ReduceMotion::System,
             pause_animations_in_background: false,
             graff_notice_dismissed: None,
+            restart_to_install_updates: true,
             legacy_accent_color: None,
         }
     }
@@ -2579,6 +2584,7 @@ mod tests {
             reduce_motion: crate::motion::ReduceMotion::On,
             pause_animations_in_background: true,
             graff_notice_dismissed: Some("0.0.9".into()),
+            restart_to_install_updates: false,
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
@@ -2594,6 +2600,19 @@ mod tests {
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
         assert!(json.contains(r#""codeFontFamily": "geist""#));
         assert!(json.contains(r#""codeFontSize": 11.0"#));
+        assert!(json.contains(r#""restartToInstallUpdates": false"#));
+    }
+
+    #[test]
+    fn restart_to_install_updates_defaults_on_and_round_trips() {
+        let legacy: UiSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.restart_to_install_updates);
+        let off: UiSettings =
+            serde_json::from_str(r#"{"restartToInstallUpdates": false}"#).unwrap();
+        assert!(!off.restart_to_install_updates);
+        let dir = tempfile::tempdir().unwrap();
+        off.save(dir.path()).unwrap();
+        assert!(!UiSettings::load(dir.path()).restart_to_install_updates);
     }
 
     #[test]

@@ -63,8 +63,11 @@ use crate::terminal::panel::{
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workspace_links::resolve_workspace_file_link;
+use app_update::{AppUpdateUi, StagedUpdate};
+pub use app_update::{UpdateRelaunch, UpdateRelaunched, take_relaunch_marker};
 
 mod actions_ui;
+mod app_update;
 mod appearance_sync;
 mod archive_choice;
 mod chat_split;
@@ -1420,12 +1423,14 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
-/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
+/// In-app update lifecycle (desktop installs; see `shell/app_update.rs`).
+#[derive(Debug, Clone, PartialEq)]
 enum UpdateFlow {
     Idle,
     Downloading,
-    /// Staged bundle ready to swap in — one click restarts into it.
-    Ready(PathBuf),
+    /// Staged bundle ready to swap in — one click restarts into it, and it
+    /// restarts on its own in a quiet window.
+    Ready(StagedUpdate),
     Failed(SharedString),
 }
 
@@ -1844,7 +1849,7 @@ enum PendingExit {
     CloseWindow,
     Quit,
     RuntimeChange,
-    InstallUpdate(PathBuf),
+    InstallUpdate(StagedUpdate),
     Relaunch,
 }
 
@@ -2088,13 +2093,15 @@ pub struct Shell {
     graff_notice_highlights: Vec<SharedString>,
     _graff_notice_task: Option<Task<()>>,
     graff_update_task: Option<Task<()>>,
-    /// Version whose update strip the user dismissed (advisory installs only —
-    /// a newer release shows the strip again).
+    /// Version whose update control the user dismissed (advisory installs
+    /// only — a newer release shows it again).
     update_dismissed: Option<String>,
+    /// The automatic restart into a staged update and the confirmation after.
+    app_update: AppUpdateUi,
     /// This device was signed out by a rejected refresh, not by the person
     /// (the engine's `signed-out.notice`): offer to sign back in.
     lost_session: bool,
-    /// How this binary was installed — decides the strip's click behavior.
+    /// How this binary was installed — decides the update control's click.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: harness_update::InstallKind,
     org: Option<OrgGateUi>,
@@ -2441,7 +2448,7 @@ impl Shell {
             ConnectionStatus::Connecting => SplashPhase::Visible,
             ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
         };
-        Self {
+        let mut this = Self {
             state,
             sidebar_pane,
             transcript,
@@ -2575,6 +2582,7 @@ impl Shell {
             _graff_notice_task: graff_notice_task,
             graff_update_task: None,
             update_dismissed: None,
+            app_update: AppUpdateUi::new(),
             lost_session: false,
             install: harness_update::detect_install(),
             org: None,
@@ -2639,7 +2647,9 @@ impl Shell {
             _composer_events: composer_events,
             _transcript_events: transcript_events,
             _transcript_invalidation: transcript_invalidation,
-        }
+        };
+        this.observe_update_input(cx);
+        this
     }
 
     /// Route a completed viewer-side capture only after its source window is
@@ -4522,8 +4532,18 @@ impl Shell {
             && let UpdateFlow::Ready(staged) =
                 std::mem::replace(&mut self.update_flow, UpdateFlow::Idle)
         {
-            if let Err(err) = self.install.install_on_exit(&staged) {
-                tracing::error!(error = %err, "install on quit failed");
+            match self.install.install_on_exit(&staged.path) {
+                // The next launch confirms the version it came back on.
+                Ok(()) => {
+                    let marker = UpdateRelaunch {
+                        version: staged.version,
+                        background: false,
+                    };
+                    if let Err(err) = app_update::write_relaunch_marker(&self.data_dir, &marker) {
+                        tracing::warn!(error = %err, "couldn't record the installed update");
+                    }
+                }
+                Err(err) => tracing::error!(error = %err, "install on quit failed"),
             }
         }
     }
@@ -4867,6 +4887,7 @@ impl Shell {
             target.archive_on_close_chosen = current.archive_on_close_chosen;
             target.reduce_motion = current.reduce_motion;
             target.pause_animations_in_background = current.pause_animations_in_background;
+            target.restart_to_install_updates = current.restart_to_install_updates;
         });
     }
 
@@ -6521,7 +6542,9 @@ impl Shell {
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
-                    .pl(px(self.title_bar_content_start()))
+                    .pl(px(
+                        self.title_bar_content_start() + self.titlebar_update_slot(cx)
+                    ))
                     .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)));
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region("settings-header-titlebar", bar, cx)
@@ -6716,6 +6739,7 @@ impl Shell {
                         cx.listener(|this, _, window, cx| this.new_chat_tab(None, window, cx)),
                     ))
             }))
+            .children(self.render_update_control(&theme, cx))
             .into_any_element()
     }
 
@@ -8522,10 +8546,6 @@ impl Shell {
             .when_some(self.render_connection_pill(theme, cx), |el, pill| {
                 el.child(pill)
             })
-            // Update strip (above the user menu; below the lists).
-            .when_some(self.render_update_strip(theme, cx), |el, strip| {
-                el.child(strip)
-            })
             .when_some(self.render_signed_out_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
@@ -8610,79 +8630,6 @@ impl Shell {
                 )
                 .into_any_element(),
         )
-    }
-
-    /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`harness update`); click dismisses it for that version.
-    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = self.state.read(cx).update.clone()?;
-        if !status.update_available {
-            return None;
-        }
-        let latest = status.latest_version.clone()?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
-        let desktop_update = self.install.supports_desktop_update();
-
-        let (label, clickable): (SharedString, bool) = if desktop_update {
-            match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => {
-                    if harness_update::desktop_auto_update_enabled() {
-                        (
-                            "Update ready — restart now or it installs on quit".into(),
-                            true,
-                        )
-                    } else {
-                        ("Update ready — restart to apply".into(), true)
-                    }
-                }
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-            }
-        } else {
-            (
-                format!("Update available — v{latest} · run `harness update`").into(),
-                true,
-            )
-        };
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
-        let tone = if failed { theme.danger } else { theme.accent };
-        // Follow the selected spectrum with a low-emphasis glass tint rather
-        // than painting the bright text accent as a solid slab.
-        let (chip_bg, chip_bg_hover) = if failed {
-            (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
-        } else {
-            (theme.accent_wash, theme.accent.opacity(0.16))
-        };
-
-        let mut strip = div()
-            .id("update-strip")
-            .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
-            // SPACE_SM padding — doubling it read as a hole (user report).
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(chip_bg)
-            .flex()
-            .flex_row()
-            .items_center()
-            .text_size(crate::typography::ui_rems(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(tone)
-            .child(div().flex_1().min_w_0().child(label));
-        if clickable {
-            strip = strip
-                .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
-        }
-        Some(strip.into_any_element())
     }
 
     /// The graff engine card: bottom-right, floating over the content, until
@@ -9029,9 +8976,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
+    /// The titlebar update control: Idle → download; Ready → swap +
+    /// relaunch; Failed → retry; advisory installs → dismiss for this version.
+    fn on_update_control_click(&mut self, cx: &mut Context<Self>) {
         if !self.install.supports_desktop_update() {
             self.update_dismissed = self
                 .state
@@ -9066,7 +9013,8 @@ impl Shell {
     }
 
     /// Fetch the manifest and stage the new Harness desktop bundle under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
+    /// (tokio — reqwest); the titlebar control turns Ready when done, and
+    /// the quiet-window watcher takes over from there.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
@@ -9074,7 +9022,13 @@ impl Shell {
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
             let manifest = harness_update::fetch_latest(&edge_url).await?;
-            install.stage_desktop(&edge_url, &manifest, &data_dir).await
+            let path = install
+                .stage_desktop(&edge_url, &manifest, &data_dir)
+                .await?;
+            anyhow::Ok(StagedUpdate {
+                path,
+                version: manifest.version,
+            })
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let outcome = match download.await {
@@ -9084,7 +9038,10 @@ impl Shell {
             };
             this.update(cx, |shell, cx| {
                 shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
+                    Ok(staged) => {
+                        shell.watch_for_quiet_restart(cx);
+                        UpdateFlow::Ready(staged)
+                    }
                     Err(message) => {
                         tracing::warn!(%message, "update download failed");
                         // Remember the version so the auto-download doesn't
@@ -9120,20 +9077,11 @@ impl Shell {
         crate::app_menus::quit_after_save(cx);
     }
 
-    fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
+    fn apply_staged_update(&mut self, staged: StagedUpdate, cx: &mut Context<Self>) {
         if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
             return;
         }
-        match self.install.apply_desktop(&staged) {
-            Ok(()) => {
-                crate::app_menus::quit_after_save(cx);
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
-                cx.notify();
-            }
-        }
+        self.install_and_relaunch(staged, harness_update::Relaunch::Foreground, cx);
     }
 
     /// Scope-aware sidebar identity and account menu. Local runtimes advertise
@@ -10254,7 +10202,11 @@ impl Shell {
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
             overlays.push(sync);
         }
-        if let Some(card) = self.render_graff_notice(&theme, cx) {
+        // One bottom-right card at a time: the restart heads-up (or the
+        // "Updated" confirmation) wins over the engine card for its moment.
+        if let Some(card) = self.render_app_update_card(&theme, cx) {
+            overlays.push(card);
+        } else if let Some(card) = self.render_graff_notice(&theme, cx) {
             overlays.push(card);
         }
 
@@ -12815,6 +12767,7 @@ impl Render for Shell {
             self.button_layout_sub =
                 Some(cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()));
         }
+        self.publish_update_phase(cx);
         // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
@@ -12879,6 +12832,9 @@ impl Render for Shell {
             .id("shell-root")
             .track_focus(&self.shortcut_focus)
             .child(div().track_focus(&self.unfocused))
+            // Stamps pointer input for the automatic update restart's
+            // "stepped away" check.
+            .child(self.app_update.input_probe())
             .relative()
             .flex()
             .flex_row()
@@ -13000,9 +12956,13 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ReopenClosedChatTab, window, cx| {
                 this.reopen_closed_chat_tab(window, cx);
             }))
+            // Settings → Devices' version card: the titlebar control's click
+            // (download, retry, or restart into the staged update).
             .on_action(cx.listener(|this, _: &StartAppUpdate, _, cx| {
-                if matches!(this.update_flow, UpdateFlow::Idle | UpdateFlow::Failed(_)) {
-                    this.on_update_strip_click(cx);
+                if this.install.supports_desktop_update()
+                    && !matches!(this.update_flow, UpdateFlow::Downloading)
+                {
+                    this.on_update_control_click(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NextChatTab, window, cx| this.cycle_chat_tab(true, window, cx)))
@@ -13542,7 +13502,10 @@ mod tests {
         // In flight or staged — the strip owns the flow now.
         for flow in [
             UpdateFlow::Downloading,
-            UpdateFlow::Ready(PathBuf::from("/tmp/staged")),
+            UpdateFlow::Ready(StagedUpdate {
+                path: PathBuf::from("/tmp/staged"),
+                version: "1.1.0".into(),
+            }),
         ] {
             assert!(!should_auto_download(&available, &flow, true, true, None));
         }
@@ -17350,7 +17313,13 @@ mod exit_regressions {
                         Some(PendingExit::RuntimeChange)
                     ));
                     assert!(shell.runtime_change_task.is_none());
-                    shell.apply_staged_update(PathBuf::from("must-not-install"), cx);
+                    shell.apply_staged_update(
+                        StagedUpdate {
+                            path: PathBuf::from("must-not-install"),
+                            version: "9.9.9".into(),
+                        },
+                        cx,
+                    );
                     assert!(matches!(
                         shell.pending_exit,
                         Some(PendingExit::InstallUpdate(_))
@@ -18020,6 +17989,63 @@ mod shortcut_focus_regressions {
 /// Native visual QA uses the production shell with isolated fixture data.
 #[cfg(feature = "appshots-fixture")]
 impl Shell {
+    /// App update QA (`examples/app-update-fixture.rs`): put the titlebar
+    /// control, the restart heads-up, the "Updated" confirmation or the
+    /// Settings toggle on screen for a desktop install, without a download
+    /// or the quiet-window watcher.
+    pub fn fixture_app_update(&mut self, stage: &str, cx: &mut Context<Self>) {
+        let desktop = stage != "advisory";
+        self.install = if desktop {
+            harness_update::InstallKind::MacApp {
+                bundle: PathBuf::from("/tmp/Harness.app"),
+            }
+        } else {
+            harness_update::InstallKind::Unmanaged
+        };
+        let available = stage != "updated";
+        self.state.update(cx, |state, _| {
+            state.update = Some(harness_update::UpdateStatus {
+                current_version: "0.2.134".into(),
+                latest_version: Some("0.2.135".into()),
+                update_available: available,
+                checked_at: None,
+                error: None,
+            })
+        });
+        let staged = StagedUpdate {
+            path: PathBuf::from("/tmp/staged-update"),
+            version: "0.2.135".into(),
+        };
+        self.update_flow = match stage {
+            "manual" | "advisory" | "updated" => UpdateFlow::Idle,
+            "downloading" => UpdateFlow::Downloading,
+            "failed" => UpdateFlow::Failed("couldn't reach the release server".into()),
+            _ => UpdateFlow::Ready(staged),
+        };
+        self.app_update.watch = None;
+        self.app_update.countdown_started = (stage == "countdown").then(|| {
+            std::time::Instant::now()
+                .checked_sub(Duration::from_millis(2_500))
+                .unwrap_or_else(std::time::Instant::now)
+        });
+        self.app_update.updated_to = None;
+        if stage == "updated" {
+            self.show_updated_confirmation("0.2.135".into(), cx);
+        }
+        if stage == "settings" {
+            self.open_settings(SettingsSection::Devices, cx);
+            if self.devices_page.is_none() {
+                let state = self.state.clone();
+                self.devices_page = Some(cx.new(|cx| DevicesPage::new(state, cx)));
+            }
+            if let Some(page) = self.devices_page.clone() {
+                page.update(cx, |page, cx| page.fixture_desktop_update(cx));
+            }
+        } else if matches!(self.route, Route::Settings(_)) {
+            self.close_settings(cx);
+        }
+        cx.notify();
+    }
     pub fn fixture_readme_agents_settings(&mut self, cx: &mut Context<Self>) {
         self.open_settings(SettingsSection::Harnesses, cx);
     }
