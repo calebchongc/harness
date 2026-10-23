@@ -450,16 +450,41 @@ pub fn transcript_compact_mode(cx: &App) -> bool {
         .unwrap_or_default()
 }
 
-/// Whether closing a session's tab or pane archives it.
+/// Whether closing a session's tab or pane with ⌘W or its ✕ archives it.
 pub fn archive_sessions_on_close(cx: &App) -> bool {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.archive_sessions_on_close)
         .unwrap_or_default()
 }
 
+/// Whether the user has picked what ⌘W does to a session; until then the
+/// first ⌘W close asks (`shell/archive_choice.rs`).
+pub fn archive_on_close_chosen(cx: &App) -> bool {
+    cx.try_global::<SettingsStore>()
+        .is_some_and(|store| store.current.archive_on_close_chosen)
+}
+
+/// The close shortcut the menu binds (`app_menus::key_bindings`: ⌘W, or
+/// Ctrl+Shift+W off macOS) and the configured close-without-archiving one,
+/// as badges ("⌘W", "⌥⌘W").
+pub fn close_shortcut_badges(cx: &App) -> (String, String) {
+    let close = if cfg!(target_os = "macos") {
+        "mod-w"
+    } else {
+        "ctrl-shift-w"
+    };
+    let close_only = with_current(cx, |current| {
+        badge_combo(current.keymap.get(ShortcutId::CloseTabWithoutArchiving))
+    });
+    (badge_combo(close), close_only)
+}
+
+/// The Settings toggle and the first-close question both land here, so
+/// either one counts as the choice.
 pub fn set_archive_sessions_on_close(enabled: bool, cx: &mut App) {
     update(SavePolicy::Immediate, cx, |settings| {
         settings.archive_sessions_on_close = enabled;
+        settings.archive_on_close_chosen = true;
     });
 }
 
@@ -764,10 +789,15 @@ pub struct UiSettings {
     /// The split chat layout at quit; launch restores it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_layout: Option<SavedChatLayout>,
-    /// Closing a session's tab or pane also archives the session (off by
-    /// default). Quitting or closing the window never does.
+    /// Closing a session's tab or pane with ⌘W or its ✕ button also archives
+    /// the session (off by default). The close-without-archiving shortcut
+    /// (⌘⌥W) never does, and neither does quitting or closing the window.
     #[serde(alias = "archiveSessionsOnTabClose")]
     pub archive_sessions_on_close: bool,
+    /// The user has chosen [`Self::archive_sessions_on_close`], in Settings or
+    /// by answering the question the first ⌘W close asks. A file that already
+    /// has the setting on counts as chosen.
+    pub archive_on_close_chosen: bool,
     /// The Settings section last viewed — reopened by the generic entry points
     /// (⌘, the account menu, the palette). Kept as a string so an unknown or
     /// malformed value falls back to the default section instead of costing
@@ -924,6 +954,7 @@ impl Default for UiSettings {
             last_chat_id: None,
             chat_layout: None,
             archive_sessions_on_close: false,
+            archive_on_close_chosen: false,
             settings_section: None,
             chat_tabs: Vec::new(),
             chat_tab: 0,
@@ -1751,6 +1782,8 @@ impl UiSettings {
             self.accent = harness_theme::AccentSelection::Preset(accent.into());
         }
         self.legacy_accent_color = None;
+        // Turning archive-on-close on was a choice; don't ask about it again.
+        self.archive_on_close_chosen |= self.archive_sessions_on_close;
         self
     }
 
@@ -1887,6 +1920,35 @@ mod tests {
                 UiSettings::load(dir.path()).archive_sessions_on_close,
                 enabled
             );
+        }
+    }
+
+    #[test]
+    fn archive_on_close_choice_persists_and_counts_an_enabled_setting() {
+        assert!(!UiSettings::default().archive_on_close_chosen);
+        let dir = tempfile::tempdir().unwrap();
+        use serde_json::json;
+        for (file, chosen) in [
+            (json!({}), false),
+            (json!({ "archiveSessionsOnClose": false }), false),
+            // Already on before the question existed: never asked.
+            (json!({ "archiveSessionsOnClose": true }), true),
+            (json!({ "archiveSessionsOnTabClose": true }), true),
+            (
+                json!({ "archiveSessionsOnClose": false, "archiveOnCloseChosen": true }),
+                true,
+            ),
+        ] {
+            std::fs::write(UiSettings::path(dir.path()), file.to_string()).unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(loaded.archive_on_close_chosen, chosen, "{file}");
+            loaded.save(dir.path()).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(UiSettings::path(dir.path())).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved["archiveOnCloseChosen"], chosen, "{file}");
+            assert_eq!(UiSettings::load(dir.path()).archive_on_close_chosen, chosen);
         }
     }
 
@@ -2414,6 +2476,7 @@ mod tests {
                 projects: vec![Some("space-1".into()), None],
             }),
             archive_sessions_on_close: true,
+            archive_on_close_chosen: true,
             settings_section: Some("appearance".into()),
             chat_tabs: vec![
                 SavedChatTab {

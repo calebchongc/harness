@@ -599,22 +599,26 @@ impl Shell {
         self.close_focused_chat_view(window, cx)
     }
 
-    /// The two explicit close shortcuts share view/history handling, not their
-    /// archive policy. Include the final session-to-canvas close in both.
+    /// The two close shortcuts share view/history handling, not their archive
+    /// policy: ⌘W (`may_archive`) follows the archive-on-close setting like
+    /// the ✕ buttons, and ⌘⌥W never archives. Include the final
+    /// session-to-canvas close in both.
     pub(crate) fn close_chat_view_with_archive(
         &mut self,
-        archive: bool,
+        may_archive: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A close that went ahead some other way answers nothing.
+        self.archive_choice_prompt = false;
         let closing = self.state.read(cx).selected_chat.clone();
         let closed = self.close_focused_chat_pane_without_archiving(window, cx)
             || self.close_chat_to_new_session(cx);
         if closed
-            && archive
+            && may_archive
             && let Some(chat_id) = closing
         {
-            self.archive_closed_session_explicitly(chat_id, window, cx);
+            self.archive_closed_session(chat_id, window, cx);
         }
         closed
     }

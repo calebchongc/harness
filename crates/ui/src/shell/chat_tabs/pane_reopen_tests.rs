@@ -74,7 +74,9 @@ fn reopen_closed_pane_with_changed_axis_keeps_history_and_surviving_panes(
         .unwrap();
 }
 
-fn mutations(requests: &mut tokio::sync::mpsc::Receiver<String>) -> Vec<serde_json::Value> {
+pub(in crate::shell) fn mutations(
+    requests: &mut tokio::sync::mpsc::Receiver<String>,
+) -> Vec<serde_json::Value> {
     let mut result = Vec::new();
     while let Ok(request) = requests.try_recv() {
         let request: serde_json::Value = serde_json::from_str(&request).unwrap();
@@ -85,7 +87,7 @@ fn mutations(requests: &mut tokio::sync::mpsc::Receiver<String>) -> Vec<serde_js
     result
 }
 
-fn reply(
+pub(in crate::shell) fn reply(
     runtime: &tokio::runtime::Runtime,
     replies: &tokio::sync::mpsc::Sender<String>,
     request: &serde_json::Value,
@@ -110,7 +112,9 @@ fn reopen_closed_pane_and_tab_archive_shortcut_matrix(cx: &mut gpui::TestAppCont
     let _guard = runtime.enter();
     for scope in ["pane", "tab", "last session"] {
         for preference in [false, true] {
-            for archive in [false, true] {
+            for cmd_w in [false, true] {
+                // ⌘W follows the archive-on-close setting; ⌘⌥W never archives.
+                let archive = cmd_w && preference;
                 for completed in [false, true] {
                     let (_dir, window) = fixture(cx, false, None);
                     cx.update(|cx| settings::set_archive_sessions_on_close(preference, cx));
@@ -136,12 +140,12 @@ fn reopen_closed_pane_and_tab_archive_shortcut_matrix(cx: &mut gpui::TestAppCont
                             shell.park_chat_tab(cx)
                         })
                         .unwrap();
-                    press(cx, window, if archive { "mod-w" } else { "mod-alt-w" });
+                    press(cx, window, if cmd_w { "mod-w" } else { "mod-alt-w" });
                     let closing = mutations(&mut requests);
                     assert_eq!(
                         closing.len(),
                         usize::from(archive),
-                        "{scope}: close archive={archive}, preference={preference}"
+                        "{scope}: close cmd_w={cmd_w}, preference={preference}"
                     );
                     if archive {
                         assert_eq!(
@@ -202,7 +206,7 @@ fn reopen_closed_pane_and_tab_archive_shortcut_matrix(cx: &mut gpui::TestAppCont
                     }
                     window.update(cx, |shell, window, cx| {
                         assert_eq!(shell.park_chat_tab(cx), original,
-                            "{scope}: archive={archive}, preference={preference}, completed={completed}");
+                            "{scope}: cmd_w={cmd_w}, preference={preference}, completed={completed}");
                         assert!(shell.chat_tab_unarchiving.is_empty());
                         assert!(shell.state.read(cx).chats.iter().all(|chat| !chat.archived));
                         window.remove_window();
@@ -296,7 +300,11 @@ fn reopen_closed_pane_finds_its_tab_after_switching_and_reordering(cx: &mut gpui
         .unwrap();
 }
 
-fn press(cx: &mut gpui::TestAppContext, window: gpui::WindowHandle<Shell>, combo: &str) {
+pub(in crate::shell) fn press(
+    cx: &mut gpui::TestAppContext,
+    window: gpui::WindowHandle<Shell>,
+    combo: &str,
+) {
     let combo = match combo {
         "mod-shift-t" => crate::settings::ShortcutId::ReopenClosedTab.default_combo(),
         "mod-alt-w" => crate::settings::ShortcutId::CloseTabWithoutArchiving.default_combo(),
@@ -333,6 +341,8 @@ fn reopen_closed_pane_after_cmd_d_and_both_close_shortcuts(cx: &mut gpui::TestAp
         for close_key in ["mod-w", "mod-alt-w"] {
             for focus in [0, 1] {
                 let (_dir, window) = fixture(cx, false, None);
+                // Already chosen, so ⌘W closes instead of asking first.
+                cx.update(|cx| settings::set_archive_sessions_on_close(false, cx));
                 press(cx, window, split_key);
                 let original = window
                     .update(cx, |shell, window, cx| {

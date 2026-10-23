@@ -14,7 +14,7 @@ mod header_tests;
 #[cfg(test)]
 pub(super) mod navigation_tests;
 #[cfg(test)]
-mod pane_reopen_tests;
+pub(super) mod pane_reopen_tests;
 #[cfg(test)]
 mod reopen_tests;
 #[cfg(test)]
@@ -754,35 +754,17 @@ impl Shell {
             || self.chat_in_other_tab(chat_id).is_some()
     }
 
-    /// The shared archive path for explicit pane and tab closes. Keep unfinished
-    /// work and sessions still visible elsewhere; no archive runs on window exit.
+    /// The shared archive path for pane and tab closes by ⌘W or a ✕ button,
+    /// under the archive-on-close setting (⌘⌥W never enters this path). Keep
+    /// unfinished work and sessions still visible elsewhere; no archive runs
+    /// on window exit.
     pub(super) fn archive_closed_session(
         &mut self,
         chat_id: String,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> CloseArchive {
-        self.archive_closed_session_impl(chat_id, window, false, cx)
-    }
-
-    /// Cmd+W explicitly archives; Cmd+Option+W never enters this path.
-    pub(crate) fn archive_closed_session_explicitly(
-        &mut self,
-        chat_id: String,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> CloseArchive {
-        self.archive_closed_session_impl(chat_id, window, true, cx)
-    }
-
-    fn archive_closed_session_impl(
-        &mut self,
-        chat_id: String,
-        window: &Window,
-        explicit: bool,
-        cx: &mut Context<Self>,
-    ) -> CloseArchive {
-        if !explicit && !settings::archive_sessions_on_close(cx) {
+        if !settings::archive_sessions_on_close(cx) {
             return CloseArchive::Off;
         }
         if self.chat_still_open(&chat_id, cx)

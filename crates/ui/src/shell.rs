@@ -66,6 +66,7 @@ use crate::workspace_links::resolve_workspace_file_link;
 
 mod actions_ui;
 mod appearance_sync;
+mod archive_choice;
 mod chat_split;
 mod chat_tabs;
 mod cloud_sandbox_strip;
@@ -2000,6 +2001,8 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// The first ⌘W close is asking whether to archive (`archive_choice.rs`).
+    archive_choice_prompt: bool,
     /// Global confirmation/error dialog for the Changes-pane trash action. The
     /// RPC task is retained separately so rerenders do not cancel it.
     discard_working_tree: Option<DiscardWorkingTreeFlow>,
@@ -2526,6 +2529,7 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            archive_choice_prompt: false,
             discard_working_tree: None,
             discard_working_tree_task: None,
             space_menu: popover::Popup::default(),
@@ -4860,6 +4864,7 @@ impl Shell {
             }
             target.skills_in_slash_menu = current.skills_in_slash_menu;
             target.archive_sessions_on_close = current.archive_sessions_on_close;
+            target.archive_on_close_chosen = current.archive_on_close_chosen;
             target.reduce_motion = current.reduce_motion;
             target.pause_animations_in_background = current.pause_animations_in_background;
         });
@@ -9714,6 +9719,9 @@ impl Shell {
         {
             return true;
         }
+        if self.dismiss_archive_choice(cx) {
+            return true;
+        }
         if self.rename_dialog.is_some() {
             self.rename_dialog = None;
             cx.notify();
@@ -10174,6 +10182,10 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+        }
+
+        if let Some(dialog) = self.render_archive_choice_dialog(viewport, &theme, cx) {
+            overlays.push(dialog);
         }
 
         if let Some(flow) = self.discard_working_tree.clone() {
@@ -15808,6 +15820,8 @@ mod exit_regressions {
             )
         });
         let windows = |cx: &mut TestAppContext| cx.update(|cx| cx.windows().len());
+        // Already chosen, so ⌘W closes instead of asking first.
+        cx.update(|cx| settings::set_archive_sessions_on_close(false, cx));
         // A fresh, unprompted chat (the new-session canvas): nothing closes.
         cx.update(|cx| crate::app_menus::close_tab_in(window, cx));
         assert_eq!(windows(cx), 1, "⌘W on a new chat closed the app (#55)");
@@ -18008,6 +18022,15 @@ mod shortcut_focus_regressions {
 impl Shell {
     pub fn fixture_readme_agents_settings(&mut self, cx: &mut Context<Self>) {
         self.open_settings(SettingsSection::Harnesses, cx);
+    }
+
+    /// Close-and-archive QA (`examples/archive-choice-fixture.rs`).
+    pub fn fixture_archived_settings(&mut self, open: bool, cx: &mut Context<Self>) {
+        if open {
+            self.open_settings(SettingsSection::Archived, cx);
+        } else {
+            self.close_settings(cx);
+        }
     }
 
     pub fn fixture_appshots_settings(&mut self, open: bool, cx: &mut Context<Self>) {
