@@ -99,6 +99,12 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
     fn steering_mode(&self) -> SteeringMode;
+    /// Whether steers deliver [`SteerMessage::attachments`] to the live run.
+    /// When true, the engine routes a send with images into a steerable run
+    /// instead of replacing it (and its process).
+    fn steers_attachments(&self) -> bool {
+        false
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     /// Whether the agent's own CLI is present on this device — the settings
     /// gate for enabling the harness. Version probes are cached by executable identity.
@@ -119,6 +125,16 @@ pub trait Harness: Send + Sync {
     /// Unlike deterministic_turn_end, this need not cover autonomous activity.
     fn authoritative_prompt_end(&self) -> bool {
         self.deterministic_turn_end()
+    }
+    /// Interrupt only the current turn of `chat_id`'s live run, keeping the
+    /// agent process and its background work (subagents, monitors, background
+    /// shells) alive for the next turn. The turn ends with
+    /// `Done { status: Interrupted }` and the run stays open. Returns false
+    /// when the harness can't do that or has no live turn for the chat; the
+    /// caller then cancels the whole run ([`RunControls::interrupt`]).
+    fn interrupt_turn(&self, chat_id: &str) -> bool {
+        let _ = chat_id;
+        false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
@@ -189,6 +205,7 @@ pub mod graff_bundle;
 mod graff_beta;
 pub(crate) mod executable;
 pub mod install;
+pub mod interrupt_reason;
 pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;

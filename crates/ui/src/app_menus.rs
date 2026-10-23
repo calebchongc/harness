@@ -29,6 +29,7 @@ actions!(
         Minimize,
         Zoom,
         CloseTab,
+        CloseTabWithoutArchiving,
         CloseWindow,
         AppearanceSystem,
         AppearanceLight,
@@ -63,6 +64,9 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
     cx.on_action(close_tab);
+    cx.on_action(|_: &CloseTabWithoutArchiving, cx| {
+        cx.defer(|cx| close_active_tab_with_archive(false, cx));
+    });
     cx.on_action(close_window);
     // Appearance. Each verb persists and repaints every window; see
     // `appearance::set_mode`.
@@ -152,23 +156,36 @@ fn close_tab(_: &CloseTab, cx: &mut App) {
 /// window ends the app's session for every chat, so a stray ⌘W in an empty
 /// chat must not take running agents down with it (⌘⇧W closes the window).
 fn close_active_tab(cx: &mut App) {
+    close_active_tab_with_archive(true, cx);
+}
+
+fn close_active_tab_with_archive(archive: bool, cx: &mut App) {
     if let Some(window) = cx
         .active_window()
         .and_then(|window| window.downcast::<shell::Shell>())
     {
-        close_tab_in(window, cx);
+        close_tab_in_with_archive(window, archive, cx);
     }
 }
 
 pub(crate) fn close_tab_in(window: gpui::WindowHandle<shell::Shell>, cx: &mut App) {
+    close_tab_in_with_archive(window, true, cx);
+}
+
+fn close_tab_in_with_archive(
+    window: gpui::WindowHandle<shell::Shell>,
+    archive: bool,
+    cx: &mut App,
+) {
     window
         .update(cx, |shell, window, cx| {
             // The right pane's active surface (the tab the user just opened),
             // then the focused split pane or chat tab, Ghostty-style, then
             // the chat itself, back to a new session.
-            let _ = shell.close_active_surface(window, cx)
-                || shell.close_focused_chat_pane(window, cx)
-                || shell.close_chat_to_new_session(cx);
+            if shell.close_active_surface(window, cx) {
+                return;
+            }
+            shell.close_chat_view_with_archive(archive, window, cx);
         })
         .ok();
 }
@@ -305,6 +322,7 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::action("Zoom", Zoom),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Reopen Closed Tab", shell::ReopenClosedChatTab),
             MenuItem::action("Close Window", CloseWindow),
         ]));
     }

@@ -1,5 +1,8 @@
 #[path = "browser-fixture/transcript_links.rs"]
 mod transcript_links;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "browser-fixture/html_preview.rs"]
+mod html_preview;
 #[cfg(target_os = "macos")]
 #[path = "browser-fixture/saved_views.rs"]
 mod saved_views;
@@ -201,6 +204,12 @@ fn main() -> anyhow::Result<()> {
         cx.spawn(async move |cx| {
             let run: anyhow::Result<()> = async {
                 pause(cx, 1200).await;
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if std::env::var_os("HARNESS_HTML_PREVIEW_FIXTURE_ONLY").is_some() {
+                    html_preview::exercise(window, cx).await?;
+                    std::fs::write(output.join("result.txt"), "PASS: native isolated HTML preview; controls, state reset, origin/storage/host-API isolation and blocked network/navigation.\n")?;
+                    return Ok(());
+                }
                 if std::env::var_os("HARNESS_TRANSCRIPT_LINK_FIXTURE_ONLY").is_some() {
                     return transcript_links::exercise(window, state.clone(), &_origin, &output, cx).await;
                 }

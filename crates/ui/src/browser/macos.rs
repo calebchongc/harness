@@ -16,12 +16,13 @@ use objc2_app_kit::{
     NSColor, NSEvent, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::{
-    NSDictionary, NSError, NSKeyValueChangeKey, NSKeyValueObservingOptions, NSObject,
-    NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSString,
+    NSArray, NSDictionary, NSError, NSKeyValueChangeKey, NSKeyValueObservingOptions, NSObject,
+    NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSString, NSURL,
 };
 use objc2_web_kit::{
-    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
-    WKNavigationResponse, WKNavigationResponsePolicy, WKWebView,
+    WKFrameInfo, WKMediaCaptureType, WKNavigation, WKNavigationAction, WKNavigationActionPolicy,
+    WKNavigationDelegate, WKNavigationResponse, WKNavigationResponsePolicy, WKOpenPanelParameters,
+    WKPermissionDecision, WKSecurityOrigin, WKUIDelegate, WKWebView,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -184,6 +185,7 @@ struct ObserverState {
     /// A saved-view page of this kind: it may load only its own
     /// `graff-view:` frame and the inline frames its kind needs.
     view: Option<ToolViewKind>,
+    document: Cell<bool>,
 }
 
 define_class!(
@@ -199,12 +201,31 @@ define_class!(
             self.changed();
         }
     }
+    // Installed only for in-memory previews. Do not permit a file picker or
+    // permission prompt to punch through the document's scripts-only boundary.
+    unsafe impl WKUIDelegate for Observer {
+        #[unsafe(method(webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:))]
+        fn upload(&self, _view: &WKWebView, _parameters: &WKOpenPanelParameters,
+            _frame: &WKFrameInfo, completion: &block2::Block<dyn Fn(*mut NSArray<NSURL>)>) {
+            completion.call((std::ptr::null_mut(),));
+        }
+        #[unsafe(method(webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:))]
+        fn media_permission(&self, _view: &WKWebView, _origin: &WKSecurityOrigin,
+            _frame: &WKFrameInfo, _kind: WKMediaCaptureType,
+            decision: &block2::Block<dyn Fn(WKPermissionDecision)>) {
+            decision.call((WKPermissionDecision::Deny,));
+        }
+    }
     unsafe impl WKNavigationDelegate for Observer {
         #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
         fn policy(&self, _view: &WKWebView, action: &WKNavigationAction, decision: &block2::Block<dyn Fn(WKNavigationActionPolicy)>) {
             let url = unsafe { action.request().URL() }.and_then(|u| u.absoluteString()).map(|u| u.to_string()).unwrap_or_default();
             let main_frame = unsafe { action.targetFrame() }.is_some_and(|frame| unsafe { frame.isMainFrame() });
-            let allowed = match self.ivars().view { Some(kind) => allowed_view_navigation(kind, &url, main_frame), None => allowed_navigation(&url) };
+            let allowed = if self.ivars().document.get() {
+                super::model::allowed_document_navigation(&url)
+            } else {
+                match self.ivars().view { Some(kind) => allowed_view_navigation(kind, &url, main_frame), None => allowed_navigation(&url) }
+            };
             if allowed && main_frame {
                 *self.ivars().requested_url.borrow_mut() = Some(url.clone());
             }
@@ -250,13 +271,19 @@ define_class!(
 );
 
 impl Observer {
-    fn new(tx: Sender, view: Option<ToolViewKind>, mtm: MainThreadMarker) -> Retained<Self> {
+    fn new(
+        tx: Sender,
+        view: Option<ToolViewKind>,
+        document: bool,
+        mtm: MainThreadMarker,
+    ) -> Retained<Self> {
         let object = mtm.alloc().set_ivars(ObserverState {
             tx,
             pending: Cell::new(false),
             error: RefCell::new(None),
             requested_url: RefCell::new(None),
             view,
+            document: Cell::new(document),
         });
         unsafe { msg_send![super(object), init] }
     }
@@ -352,7 +379,7 @@ fn view_response(address: &str) -> wry::http::Response<std::borrow::Cow<'static,
 impl NativePage {
     pub fn new(window: &Window, data: &BrowserData, tx: Sender) -> Result<Self, String> {
         let mtm = MainThreadMarker::new().ok_or("Browser must be created on the main thread")?;
-        Self::build(window, data, data.configuration(mtm), None, tx, mtm)
+        Self::build(window, data, data.configuration(mtm), None, false, tx, mtm)
     }
 
     /// A saved tool view: its own throwaway website data, pages served only
@@ -364,7 +391,88 @@ impl NativePage {
             configuration
                 .setWebsiteDataStore(&objc2_web_kit::WKWebsiteDataStore::nonPersistentDataStore(mtm));
         }
-        Self::build(window, &BrowserData::default(), configuration, Some(kind), tx, mtm)
+        Self::build(
+            window,
+            &BrowserData::default(),
+            configuration,
+            Some(kind),
+            false,
+            tx,
+            mtm,
+        )
+    }
+
+    /// A preview never shares website cookies, scheme handlers or profiles.
+    pub fn new_document(window: &Window, tx: Sender) -> Result<Self, String> {
+        let mtm = MainThreadMarker::new().ok_or("Browser must be created on the main thread")?;
+        let configuration = unsafe { objc2_web_kit::WKWebViewConfiguration::new(mtm) };
+        unsafe {
+            configuration.setWebsiteDataStore(
+                &objc2_web_kit::WKWebsiteDataStore::nonPersistentDataStore(mtm),
+            );
+        }
+        // CSP does not cover WebRTC data-channel/STUN traffic. Fail closed if
+        // this WebKit lacks the native switch; JS API masking is bypassable.
+        let preferences = unsafe { configuration.preferences() };
+        if !preferences.respondsToSelector(sel!(_setPeerConnectionEnabled:))
+            || !preferences.respondsToSelector(sel!(_setDNSPrefetchingEnabled:))
+        {
+            return Err(
+                "This WebKit cannot isolate preview networking. Open the source file instead."
+                    .into(),
+            );
+        }
+        unsafe {
+            let _: () = msg_send![&*preferences, _setPeerConnectionEnabled: false];
+            let _: () = msg_send![&*preferences, _setDNSPrefetchingEnabled: false];
+        }
+        // Link preconnect bypasses CSP on WebKit. Disable speculative loads in
+        // native preferences before creating any page, including child realms.
+        let features_available: bool =
+            unsafe { msg_send![class!(WKPreferences), respondsToSelector: sel!(_features)] };
+        if !features_available
+            || !preferences.respondsToSelector(sel!(_setEnabled:forFeature:))
+            || !preferences.respondsToSelector(sel!(_isEnabledForFeature:))
+        {
+            return Err("This WebKit cannot isolate speculative preview networking.".into());
+        }
+        let features: Retained<NSArray<AnyObject>> =
+            unsafe { msg_send![class!(WKPreferences), _features] };
+        let mut preconnect_disabled = false;
+        for feature in &features {
+            let key: Retained<NSString> = unsafe { msg_send![&*feature, key] };
+            let key = key.to_string();
+            if matches!(
+                key.as_str(),
+                "LinkPreconnect"
+                    | "LinkPreconnectEarlyHintsEnabled"
+                    | "LinkPrefetchEnabled"
+                    | "SpeculationRulesPrefetchEnabled"
+            ) {
+                unsafe {
+                    let _: () = msg_send![&*preferences, _setEnabled: false, forFeature: &*feature];
+                    let enabled: bool = msg_send![&*preferences, _isEnabledForFeature: &*feature];
+                    if enabled {
+                        return Err(
+                            "This WebKit cannot disable speculative preview networking.".into()
+                        );
+                    }
+                }
+                preconnect_disabled |= key == "LinkPreconnect";
+            }
+        }
+        if !preconnect_disabled {
+            return Err("This WebKit has no isolated preview preconnect setting.".into());
+        }
+        Self::build(
+            window,
+            &BrowserData::default(),
+            configuration,
+            None,
+            true,
+            tx,
+            mtm,
+        )
     }
 
     fn build(
@@ -372,6 +480,7 @@ impl NativePage {
         data: &BrowserData,
         configuration: Retained<objc2_web_kit::WKWebViewConfiguration>,
         view_page: Option<ToolViewKind>,
+        document: bool,
         tx: Sender,
         mtm: MainThreadMarker,
     ) -> Result<Self, String> {
@@ -382,12 +491,15 @@ impl NativePage {
             .with_focused(false)
             .with_new_window_req_handler(move |url, _| {
                 // A view page never opens anything else.
-                if view_page.is_none() && allowed_navigation(&url) {
+                if view_page.is_none() && !document && allowed_navigation(&url) {
                     let _ = new_tab.try_send(NativeEvent::NewTab(url));
                 }
                 wry::NewWindowResponse::Deny
             })
             .with_download_started_handler(|_, _| false);
+        if document {
+            builder = builder.with_permission_handler(|_| wry::PermissionResponse::Deny);
+        }
         if view_page.is_some() {
             builder = builder.with_custom_protocol(VIEW_SCHEME.into(), |_, request| {
                 view_response(&request.uri().to_string())
@@ -432,9 +544,12 @@ impl NativePage {
         }
         clip.addSubview(&view);
 
-        let observer = Observer::new(tx.clone(), view_page, mtm);
+        let observer = Observer::new(tx.clone(), view_page, document, mtm);
         unsafe {
             view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*observer)));
+            if document {
+                view.setUIDelegate(Some(ProtocolObject::from_ref(&*observer)));
+            }
             for key in OBSERVED {
                 view.addObserver_forKeyPath_options_context(
                     &observer,
@@ -544,6 +659,12 @@ impl NativePage {
         host.observer.ivars().error.borrow_mut().take();
         *host.observer.ivars().requested_url.borrow_mut() = Some(url.into());
         host.web.load_url(url).map_err(|e| e.to_string())
+    }
+    pub fn load_html(&self, html: &str) -> Result<(), String> {
+        let host = self.0.borrow();
+        host.observer.ivars().document.set(true);
+        host.observer.ivars().error.borrow_mut().take();
+        host.web.load_html(html).map_err(|error| error.to_string())
     }
     pub fn reload(&self) {
         let host = self.0.borrow();

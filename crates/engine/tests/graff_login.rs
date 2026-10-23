@@ -109,7 +109,12 @@ async fn graff_provider_sign_ins_end_to_end() {
     let root = tempfile::tempdir().unwrap();
     let fake = fake_graff(root.path());
     // SAFETY: the only test in this binary, so nothing else reads env meanwhile.
-    unsafe { std::env::set_var("GRAFF_EXECUTABLE", &fake) };
+    unsafe {
+        std::env::set_var("GRAFF_EXECUTABLE", &fake);
+        // The provider catalog also reads Anthropic's configurable home.
+        // Never let this fixture inspect a real account from the caller's env.
+        std::env::set_var("ANTHROPIC_CONFIG_DIR", root.path().join("anthropic"));
+    };
     let (accounts, home) = test_accounts(root.path());
 
     // Nothing signed in yet, in provider order.
@@ -119,7 +124,8 @@ async fn graff_provider_sign_ins_end_to_end() {
             ("xai".into(), false),
             ("kimi".into(), false),
             ("zai".into(), false),
-            ("chatgpt-new".into(), false)
+            ("chatgpt-new".into(), false),
+            ("anthropic".into(), false)
         ]
     );
     let names: Vec<_> = accounts
@@ -127,7 +133,10 @@ async fn graff_provider_sign_ins_end_to_end() {
         .into_iter()
         .map(|r| r.name)
         .collect();
-    assert_eq!(names, ["xAI", "Kimi", "Z.AI", "ChatGPT"]);
+    assert_eq!(
+        names,
+        ["xAI", "Kimi", "Z.AI", "ChatGPT", "Anthropic Console"]
+    );
 
     // xAI: the link and code come back, graff's own opener is muted, and the
     // sign-in finishes once graff has written the credential.
@@ -146,7 +155,8 @@ async fn graff_provider_sign_ins_end_to_end() {
             ("xai".into(), true),
             ("kimi".into(), false),
             ("zai".into(), false),
-            ("chatgpt-new".into(), false)
+            ("chatgpt-new".into(), false),
+            ("anthropic".into(), false)
         ]
     );
     let opener =
@@ -190,7 +200,11 @@ async fn graff_provider_sign_ins_end_to_end() {
         poll.message.as_deref(),
         Some(harness_proto::CHATGPT_PLAN_CONFIRMATION)
     );
-    let chatgpt = accounts.list_graff_logins().pop().unwrap();
+    let chatgpt = accounts
+        .list_graff_logins()
+        .into_iter()
+        .find(|row| row.id == "chatgpt-new")
+        .unwrap();
     assert!(chatgpt.signed_in);
     assert_eq!(chatgpt.plan_usage, Some(true));
     assert_eq!(chatgpt.account.as_deref(), Some("fixture@example.com"));
@@ -217,7 +231,11 @@ async fn graff_provider_sign_ins_end_to_end() {
         poll.message.as_deref(),
         Some(harness_proto::CHATGPT_PLAN_OFF)
     );
-    let chatgpt = accounts.list_graff_logins().pop().unwrap();
+    let chatgpt = accounts
+        .list_graff_logins()
+        .into_iter()
+        .find(|row| row.id == "chatgpt-new")
+        .unwrap();
     assert!(!chatgpt.signed_in);
     assert_eq!(chatgpt.plan_usage, Some(false));
 

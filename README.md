@@ -19,6 +19,7 @@
 <p align="center">
   English · <a href="README.zh-CN.md">简体中文</a> ·
   <a href="README.de.md">Deutsch</a> ·
+  <a href="README.es.md">Español</a> ·
   <a href="README.hindi.md">हिन्दी</a> ·
   <a href="README.thai.md">ไทย</a> ·
   <a href="README.indo.md">Bahasa Indonesia</a> ·
@@ -70,6 +71,14 @@ Windows portable builds use `harness.exe`; keep `harness-update.json` beside
 it for in-app updates. See [Windows development](docs/reference/windows-development.md).
 The Linux sidebar browser needs the
 [browser runtime](docs/reference/linux-browser.md).
+
+### Arch Linux
+
+Download `harness-VERSION-linux-x86_64.pkg.tar.zst` (or `-aarch64`) from
+[Releases](https://github.com/justrach/harness/releases) and install with
+`sudo pacman -U ./harness-VERSION-linux-x86_64.pkg.tar.zst`. A Vulkan driver is
+required for rendering. Pacman installs are never self-updated — reinstall the
+new `.pkg.tar.zst` on each release.
 
 ## CodeGraff
 

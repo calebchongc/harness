@@ -38,6 +38,7 @@ struct TranscriptView: View {
         let runway = store.lastSubmittedMessageId
         let earlierErrors = Self.earlierReauthRows(rows)
         NativeTranscriptTable(rows: rows, hiddenRows: allRows.count - rows.count,
+            streaming: store.entries.last?.status == .streaming,
             scroll: scroll, runwayID: runway,
             expansionHeight: runway.flatMap { userExpansionHeights[$0] } ?? 0,
             bottomSpacing: verticalSizeClass == .compact ? 8 : 24,
@@ -173,8 +174,11 @@ struct TranscriptView: View {
             case .inputChip(let header, let resolved):
                 InputChipView(header: header, resolved: resolved)
             case .errorChip(let message, let reauth):
+                // A host-typed failure keeps its reconnect controls. Plain text that reads as signed out or
+                // out of usage is labelled, and says where to sign in: the phone has no sign-in for these.
+                let problem = reauth == nil ? RunErrors.providerProblem(message) : nil
                 VStack(alignment: .leading, spacing: 8) {
-                    ErrorChipView(message: message)
+                    ErrorChipView(message: message, problem: problem, hostName: hostName)
                     if let reauth {
                         reauthControls(reauth, row: row, earlier: earlier)
                     }
@@ -208,9 +212,10 @@ struct TranscriptGeometry: Equatable {
 final class ScrollState {
     var pinned = true
     var showJump = false
-    /// Tail window: only the newest `rowLimit` rows reach the table, so a long
-    /// transcript never lays out its full history at once. Scrolling near the
-    /// top grows it by `rowLimitStep`; jumping back to the bottom resets it.
+    /// Tail window: initially only the newest `rowLimit` rows reach the table.
+    /// While reading, retain its leading identity as new rows arrive rather
+    /// than evicting history under the reader. Scrolling near the top grows
+    /// it by `rowLimitStep`; jumping back to the bottom resets it.
     static let defaultRowLimit = 200
     static let rowLimitStep = 200
     var rowLimit = defaultRowLimit
@@ -222,6 +227,8 @@ final class ScrollState {
     @ObservationIgnored var userDragging = false
     @ObservationIgnored var distanceFromBottom: CGFloat = 0
     @ObservationIgnored private var movedAway = false
+    @ObservationIgnored private var windowStartID: String?
+    @ObservationIgnored private var windowRowCount = 0
 
     func observe(old: TranscriptGeometry, new: TranscriptGeometry) {
         distanceFromBottom = new.bottom
@@ -253,16 +260,33 @@ final class ScrollState {
         movedAway = false
     }
 
-    /// The newest `rowLimit` rows — older ones stay unbuilt (no layout, no
-    /// cells) until the user scrolls into them.
+    /// Older rows stay unbuilt until requested. A released reader owns the
+    /// current window's leading edge: appending a block (for example, the
+    /// paragraph after a closing code fence) must not delete a row at its
+    /// head and reindex every realized history cell. Grow only at the tail
+    /// until follow resumes, or toward the head when rowLimit grows.
     func tailWindow(_ rows: [TranscriptRow]) -> [TranscriptRow] {
-        rows.count > rowLimit ? Array(rows.suffix(rowLimit)) : rows
+        var start = max(0, rows.count - rowLimit)
+        if !pinned, let windowStartID,
+           let retained = rows.firstIndex(where: { $0.id == windowStartID }) {
+            start = min(start, retained)
+        }
+        // This is rendering bookkeeping, not observable view state. Retain
+        // an identity rather than an index so hydration/prepends cannot
+        // silently slide the reader's window either.
+        windowStartID = rows.isEmpty ? nil : rows[start].id
+        windowRowCount = rows.count - start
+        return start == 0 ? rows : Array(rows[start...])
     }
 
     /// Grow the window toward `total` rows; never below the default, never
     /// above the transcript's actual row count.
     func growRowLimit(total: Int) {
-        rowLimit = max(Self.defaultRowLimit, min(total, rowLimit + Self.rowLimitStep))
+        // Appends may have grown a reader's window past rowLimit already.
+        // Grow from its actual size so reaching the top always reveals older
+        // history instead of spending a step catching up with the live tail.
+        let current = pinned ? rowLimit : max(rowLimit, windowRowCount)
+        rowLimit = max(Self.defaultRowLimit, min(total, current + Self.rowLimitStep))
     }
 
     /// Grow the window just enough that transcript row `index` is inside it.
@@ -273,6 +297,8 @@ final class ScrollState {
 
     func resetRowLimit() {
         rowLimit = Self.defaultRowLimit
+        windowStartID = nil
+        windowRowCount = 0
     }
 }
 
@@ -731,27 +757,51 @@ struct ToolChipRow: View {
 
 // MARK: - Chips (transcript.rs ErrorChip / InputChip)
 
+/// Restacked like the desktop chip: the message wraps below the header
+/// instead of truncating, since the useful part of a provider or adapter
+/// error is rarely in its first few words.
+///
+/// A refusal that signing in fixes (signed out, a usage limit) is labelled so,
+/// like the desktop card, with where to sign in below the message.
 struct ErrorChipView: View {
     let message: String
+    var problem: ProviderProblem? = nil
+    var hostName = "the execution device"
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 10))
-                .foregroundStyle(Theme.dangerSoft.opacity(0.8))
-                .frame(width: 20, height: 20)
-                .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-            Text("Error")
-                .font(Theme.sans(12, weight: .medium))
-                .foregroundStyle(Theme.text)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dangerSoft.opacity(0.8))
+                    .frame(width: 20, height: 20)
+                    .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                Text(problem?.label ?? "Error")
+                    .font(Theme.sans(12, weight: .medium))
+                    .foregroundStyle(Theme.text)
+                    .accessibilityIdentifier("error-chip-label")
+                Spacer(minLength: 0)
+            }
             Text(message)
                 .font(Theme.sans(12))
                 .foregroundStyle(Theme.text.opacity(0.8))
-                .lineLimit(1)
-            Spacer(minLength: 0)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .padding(.leading, 28)
+            if let problem {
+                Text(problem.hint(hostName: hostName))
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.dangerSoft.opacity(0.9))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 28)
+                    .accessibilityIdentifier("error-chip-hint")
+            }
         }
         .padding(.horizontal, 8)
-        .frame(height: 34)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
         .background(Theme.danger.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.danger.opacity(0.16), lineWidth: 1))
     }

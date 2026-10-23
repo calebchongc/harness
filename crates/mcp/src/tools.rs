@@ -20,6 +20,7 @@ use harness_proto::{
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::turn_replies::{REPLIES_TRUNCATED_NOTE, turn_replies};
 
+mod peer_messages;
 mod rooms;
 use crate::harness::{HarnessInfo, TurnOutcome, Harness, session_for, short};
 
@@ -149,7 +150,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "send_message",
-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn when the harness supports it, and otherwise queues for the end of the turn. With wait=true, blocks until the turn finishes and returns the assistant's reply. From a chat, returns a status snapshot immediately: the recipient replies into your chat on its own, so end your turn.",
+            description: "Send an actionable question, blocker, or final requested result to a chat, not acknowledgements or progress updates. Use unmentioned room posts for progress (they wake nobody). Messages are attributed to your chat; peer reply chains are bounded and another send is refused while your earlier message is queued. mode 'auto' starts an idle chat, steers when supported, otherwise queues. With wait=true, terminal callers wait for the reply; from a chat it returns a status snapshot, so end your turn rather than polling.",
             input_schema: chat_key_schema(json!({
                 "text": { "type": "string" },
                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
@@ -195,11 +196,36 @@ fn catalog() -> Vec<ToolDef> {
             })),
         },
         ToolDef {
+            name: "rename_chat",
+            description: "Set a chat's sidebar title, for example after its task changed. It replaces the generated title, and the engine won't retitle the chat afterwards.",
+            input_schema: {
+                let mut schema = chat_key_schema(json!({
+                    "title": { "type": "string", "minLength": 1, "maxLength": 200 }
+                }));
+                schema["required"] = json!(["chat", "title"]);
+                schema
+            },
+        },
+        ToolDef {
             name: "archive_chat",
             description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.",
             input_schema: chat_key_schema(json!({
                 "archived": { "type": "boolean", "default": true }
             })),
+        },
+        ToolDef {
+            name: "show_visual",
+            description: "Publish a bounded native visual inline in this chat. Provide a short title and Luau source returning a render function, e.g. return function() return ui.text(\"Hello\") end. Native constructors: ui.column, row, text, stat, chart, button, toggle, slider, rule. No HTML, styling, files, or network. Setup and first render are validated in an isolated bounded runtime; source stays inline. This does not send a message or start another model run.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+                    "script": { "type": "string", "minLength": 1, "maxLength": 65536,
+                        "description": "Luau source, nonblank, at most 64 KiB UTF-8. Initialize state in locals and return function() return <node> end. DSL: ui.column{nodes...}, ui.row{nodes...}, ui.text('text'), ui.stat{label='Count',value=42}, ui.chart{label='Trend',values={1,2},labels={'A','B'}}, ui.button{label='Add',onClick=function() ... end}, ui.toggle{label='Enabled',value=false,onChange=function(value) ... end}, ui.slider{label='Target',value=3,min=0,max=10,onChange=function(value) ... end}, ui.rule{}. Only these properties; no CSS/style/HTML or external assets. Callbacks update locals; host re-renders without model calls. State is temporary and resets on reopen/eviction. Dense arrays and finite numbers only. Per render: 512 nodes, depth 24, 8 KiB total text, 256 chart values. Runtime: 16 MiB, 20 ms per setup/render/event. Keep handlers small; first-render validation does not test all interactions. Use clear labels, units and data provenance; label synthetic estimates. Mobile shows a title-only desktop notice." }
+                },
+                "required": ["title", "script"]
+            }),
         },
         ToolDef {
             name: "show_image",
@@ -300,6 +326,12 @@ struct ArchiveArgs {
 }
 
 #[derive(Deserialize)]
+struct RenameArgs {
+    chat: String,
+    title: String,
+}
+
+#[derive(Deserialize)]
 struct RespondArgs {
     chat: String,
     request_id: Option<String>,
@@ -320,6 +352,13 @@ struct AnswerArg {
 struct ShowImageArgs {
     path: String,
     caption: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShowVisualArgs {
+    title: String,
+    script: String,
 }
 
 fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
@@ -413,7 +452,7 @@ impl Tools {
         if self.harness.origin().chat_id.is_none() {
             // Without an injected origin chat there is no destination to
             // publish into; hide rather than offer an arbitrary selector.
-            tools.retain(|t| t.name != "show_image");
+            tools.retain(|t| !matches!(t.name, "show_image" | "show_visual"));
         }
         tools.extend(rooms::catalog());
         tools
@@ -441,8 +480,10 @@ impl Tools {
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "dismiss_input" => self.dismiss_input(parse(args)?).await,
+            "rename_chat" => self.rename_chat(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             "show_image" => self.show_image(parse(args)?).await,
+            "show_visual" => self.show_visual(parse(args)?).await,
             other if rooms::handles(other) => return self.call_room_tool(other, args).await,
             other => return Err(format!("unknown tool: {other}")),
         };
@@ -726,6 +767,7 @@ impl Tools {
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 room_gen: None,
+                source_context_unavailable_at: None,
             };
             let sent = self
                 .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
@@ -785,6 +827,15 @@ impl Tools {
                 short(&chat.id)
             );
         }
+        // Archived chats are out of the active collaboration set (#498). The
+        // engine refuses the delivery too; this answers before any send.
+        if chat.archived && self.from_chat() {
+            anyhow::bail!(
+                "no message was sent to chat {}: {}",
+                short(&chat.id),
+                harness_proto::peer_mail::ARCHIVED_REFUSAL
+            );
+        }
         let (spaces, sessions, harnesses) = tokio::try_join!(
             self.harness.spaces(),
             self.harness.sessions(),
@@ -797,7 +848,32 @@ impl Tools {
         let baseline = session_for(&sessions, &chat);
         let mode = args.mode.as_deref().unwrap_or("auto");
         let sent_at = now_millis();
-        let body = self.attribute(&chat, text).await;
+        let body = self.attribute(&chat, text).await?;
+        if let Some(origin) = self.harness.origin().chat_id.as_deref() {
+            let queue = self
+                .harness
+                .snapshot(
+                    harness_rpc::methods::WATCH_QUEUE,
+                    json!({ "chatId": chat.id }),
+                )
+                .await?;
+            let items = queue
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("WatchQueue: unexpected shape"))?;
+            if items.iter().any(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| peer_messages::from_sender(text, origin))
+            }) {
+                anyhow::bail!(
+                    "your earlier message is still queued in chat {}; no new message was sent. \
+                     Do not retry or send acknowledgements/progress; use an unmentioned room post \
+                     for progress and leave the pending question for the human",
+                    short(&chat.id)
+                );
+            }
+        }
         let mut result = json!({
             "chatId": chat.id,
             "title": chat.title,
@@ -825,6 +901,18 @@ impl Tools {
             .await_turn(&chat, None, false, self.wait_limit(args.timeout_secs), 0)
             .await?;
         Ok(json!({ "chatId": chat.id, "title": chat.title, "turn": turn }))
+    }
+
+    async fn rename_chat(&self, args: RenameArgs) -> anyhow::Result<Value> {
+        let title = args.title.trim();
+        if title.is_empty() {
+            anyhow::bail!("rename_chat needs a nonblank title");
+        }
+        let chat = self.harness.resolve_chat(&args.chat).await?;
+        self.harness
+            .mutate(json!({ "op": "renameChat", "chatId": chat.id, "title": title }))
+            .await?;
+        Ok(json!({ "chatId": chat.id, "previousTitle": chat.title, "title": title }))
     }
 
     async fn archive_chat(&self, args: ArchiveArgs) -> anyhow::Result<Value> {
@@ -925,13 +1013,15 @@ impl Tools {
     /// Prefix the sender's identity when this server speaks for a chat, so
     /// the receiving agent (and the human reading that transcript) can tell
     /// an agent-to-agent message from a typed one.
-    async fn attribute(&self, target: &Chat, text: &str) -> String {
+    async fn attribute(&self, target: &Chat, text: &str) -> anyhow::Result<String> {
         let Some(origin_id) = self.harness.origin().chat_id.as_deref() else {
-            return text.to_owned();
+            return Ok(text.to_owned());
         };
         if origin_id == target.id {
-            return text.to_owned();
+            return Ok(text.to_owned());
         }
+        let entries = self.harness.transcript(origin_id).await?;
+        let depth = peer_messages::next_depth(&render_entries(&entries, RenderOptions::default()))?;
         let title = match self.harness.resolve_chat(origin_id).await {
             Ok(chat) => chat.title,
             Err(_) => None,
@@ -942,10 +1032,7 @@ impl Tools {
             }
             _ => short(origin_id).to_owned(),
         };
-        format!(
-            "[Message from Harness chat {label}. Reply to it with the Harness `send_message` tool, chat {}.]\n\n{text}",
-            short(origin_id)
-        )
+        Ok(peer_messages::frame(&label, origin_id, depth, text))
     }
 
     /// Pick and perform the delivery the composer would.
@@ -1120,6 +1207,27 @@ impl Tools {
             .await
     }
 
+    async fn show_visual(&self, args: ShowVisualArgs) -> anyhow::Result<Value> {
+        let chat_id = self.harness.origin().chat_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "show_visual needs a chat context: this server is not running inside a chat"
+            )
+        })?;
+        harness_proto::visual::validate_visual(&args.title, &args.script)
+            .map_err(anyhow::Error::msg)?;
+        self.harness
+            .call(
+                harness_rpc::methods::SHOW_VISUAL,
+                json!({
+                    "chatId": chat_id,
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "title": args.title,
+                    "script": args.script,
+                }),
+            )
+            .await
+    }
+
     /// Whether this server speaks for a chat (an agent-to-agent caller).
     fn from_chat(&self) -> bool {
         self.harness.origin().chat_id.is_some()
@@ -1164,6 +1272,7 @@ mod tests {
     #[derive(Default)]
     struct World {
         writes: Mutex<Vec<(String, Value)>>,
+        queued: Mutex<Vec<Value>>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1197,9 +1306,15 @@ mod tests {
                         "id": "chat-beta-2", "deviceId": "dev-local", "title": "Beta",
                         "archived": false, "spaceId": "space-1",
                         "createdAt": "2026-09-02T00:00:00Z"
+                    },
+                    {
+                        "id": "chat-gamma-3", "deviceId": "dev-local", "title": "Gamma",
+                        "archived": true, "spaceId": "space-1",
+                        "createdAt": "2026-08-30T00:00:00Z"
                     }
                 ])),
                 methods::WATCH_SESSIONS => stream(json!([])),
+                methods::WATCH_QUEUE => stream(json!({ "items": *self.queued.lock().unwrap() })),
                 methods::LIST_HARNESSES => RpcReply::Value(json!([
                     { "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
                       "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true },
@@ -1222,6 +1337,15 @@ mod tests {
                         .unwrap()
                         .push((method.to_owned(), params));
                     RpcReply::Value(json!({ "commandId": "cmd-1", "id": "q-1" }))
+                }
+                methods::SHOW_VISUAL => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(
+                        json!({ "attached": true, "id": params["id"], "title": params["title"] }),
+                    )
                 }
                 methods::SHOW_IMAGE => {
                     self.writes
@@ -1384,9 +1508,134 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.ends_with("please review"));
+        assert!(prompt.contains("Relay depth: 1/4."));
+        assert!(prompt.contains("Do not send acknowledgements or progress updates."));
+        assert!(!prompt.contains("Reply to it with"));
         assert_eq!(params["command"]["request"]["cwd"], "/repo/comet");
         assert_eq!(params["command"]["request"]["harness"], "claude-code");
         assert_eq!(params["command"]["request"]["model"], "opus");
+    }
+
+    #[tokio::test]
+    async fn archived_chats_are_out_of_peer_discovery_and_refuse_peer_sends() {
+        let world = Arc::new(World::default());
+        let peer = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        let listed = peer.call("list_chats", json!({})).await.unwrap();
+        assert!(
+            listed["chats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|chat| chat["title"] != "Gamma"),
+            "{listed}"
+        );
+        for mode in ["auto", "run", "steer", "queue"] {
+            let err = peer
+                .call(
+                    "send_message",
+                    json!({ "chat": "Gamma", "text": "status?", "mode": mode }),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.contains("archived"), "{mode}: {err}");
+            assert!(err.contains("no message was sent"), "{mode}: {err}");
+        }
+        assert!(
+            world.writes.lock().unwrap().is_empty(),
+            "nothing was queued"
+        );
+
+        // A person driving the server from outside any chat may still reprompt
+        // (and so restore) it.
+        let person = tools(world.clone(), Origin::default());
+        person
+            .call(
+                "send_message",
+                json!({ "chat": "Gamma", "text": "pick this back up" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(world.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_updates_do_not_pile_up_behind_a_pending_message() {
+        let world = Arc::new(World::default());
+        world.queued.lock().unwrap().push(json!({
+            "id": "existing",
+            "text": "[Message from Harness chat Beta (chat-bet). Reply to it with Harness.]\n\nEarlier result"
+        }));
+        let peer = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        for mode in ["auto", "run", "steer", "queue"] {
+            let err = peer
+                .call(
+                    "send_message",
+                    json!({
+                        "chat": "alpha", "text": "Another acknowledgement", "mode": mode
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.contains("earlier message is still queued"), "{err}");
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+        assert_eq!(
+            world.queued.lock().unwrap().len(),
+            1,
+            "never discard earlier work"
+        );
+
+        // A human client is not silenced by the agent's pending update.
+        let human = tools(world.clone(), Origin::default());
+        human
+            .call(
+                "send_message",
+                json!({
+                    "chat": "alpha", "text": "Human instruction", "mode": "queue"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(world.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn another_senders_pending_message_does_not_block_peer_delivery() {
+        let world = Arc::new(World::default());
+        world.queued.lock().unwrap().push(json!({
+            "id": "existing", "text": peer_messages::frame("Other", "chat-other", 1, "result")
+        }));
+        let peer = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        peer.call(
+            "send_message",
+            json!({
+                "chat": "alpha", "text": "Requested result", "mode": "queue"
+            }),
+        )
+        .await
+        .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, methods::QUEUE_MESSAGE);
+        assert_eq!(writes[0].1["holdForTurnEnd"], true);
     }
 
     #[tokio::test]
@@ -1424,6 +1673,38 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+    }
+
+    #[tokio::test]
+    async fn rename_chat_retitles_an_existing_chat() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let renamed = tools
+            .call(
+                "rename_chat",
+                json!({ "chat": "alpha", "title": "  Release checklist  " }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed["chatId"], "chat-alpha-1");
+        assert_eq!(renamed["title"], "Release checklist");
+        {
+            let writes = world.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].1["op"], "renameChat");
+            assert_eq!(writes[0].1["chatId"], "chat-alpha-1");
+            assert_eq!(writes[0].1["title"], "Release checklist");
+        }
+        let err = tools
+            .call("rename_chat", json!({ "chat": "alpha", "title": "   " }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("nonblank title"), "{err}");
+        assert_eq!(
+            world.writes.lock().unwrap().len(),
+            1,
+            "a blank title writes nothing"
+        );
     }
 
     #[tokio::test]
@@ -1608,6 +1889,76 @@ mod tests {
             "dev-local"
         );
     }
+    #[tokio::test]
+    async fn show_visual_requires_origin_and_rejects_spoofed_or_unbounded_args() {
+        let world = Arc::new(World::default());
+        let no_chat = tools(world.clone(), Origin::default());
+        assert!(no_chat.has("show_visual"));
+        assert!(no_chat.list().iter().all(|t| t.name != "show_visual"));
+        assert!(
+            no_chat
+                .call("show_visual", json!({"title":"Title", "script":"source"}))
+                .await
+                .unwrap_err()
+                .contains("chat context")
+        );
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let def = tools
+            .list()
+            .into_iter()
+            .find(|t| t.name == "show_visual")
+            .unwrap();
+        assert_eq!(def.input_schema["additionalProperties"], false);
+        assert_eq!(def.input_schema["required"], json!(["title", "script"]));
+        for args in [
+            json!({"title":"Title", "script":"source", "chat":"other"}),
+            json!({"title":"Title", "script":"source", "chatId":"other"}),
+            json!({"title":"Title", "script":"source", "id":"spoof"}),
+            json!({"title":"Title", "script":"source", "targetDeviceId":"other"}),
+            json!({"title":" ", "script":"source"}),
+            json!({"title":"x".repeat(201), "script":"source"}),
+            json!({"title":"Title", "script":"\n\t"}),
+            json!({"title":"Title", "script":"é".repeat(32769)}),
+        ] {
+            assert!(tools.call("show_visual", args).await.is_err());
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn show_visual_injects_origin_and_uuid_and_preserves_source() {
+        let world = Arc::new(World::default());
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let title = "界".repeat(200);
+        let script = "é".repeat(32768);
+        let reply = tools
+            .call("show_visual", json!({"title":title, "script":script}))
+            .await
+            .unwrap();
+        assert_eq!(reply["attached"], true);
+        assert!(reply.get("script").is_none());
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        let (method, params) = &writes[0];
+        assert_eq!(method, methods::SHOW_VISUAL);
+        assert_eq!(params["chatId"], "chat-beta-2");
+        assert_eq!(params["title"], title);
+        assert_eq!(params["script"], script);
+        assert!(uuid::Uuid::parse_str(params["id"].as_str().unwrap()).is_ok());
+    }
+
     #[tokio::test]
     async fn show_image_requires_origin_chat() {
         let world = Arc::new(World::default());
