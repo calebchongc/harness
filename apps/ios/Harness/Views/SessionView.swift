@@ -3,6 +3,7 @@
 // marks the chat seen (the synced LWW marker behind the green dot everywhere).
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SessionView: View {
     @Environment(AppModel.self) private var model
@@ -35,6 +36,7 @@ struct SessionView: View {
 
     /// Follow intent belongs to the session, independent of composer focus.
     @State private var scroll = ScrollState()
+    @State private var attachmentDraft = AttachmentDraft()
     @State private var hostLink: HostLink?
     @State private var renamingSession = false
     @State private var renameChatId: String?
@@ -296,7 +298,8 @@ struct SessionView: View {
                             store.respondInput(requestId: requestId, answers: answers)
                         }
                     } else {
-                        ComposerView(store: store, chat: chat, runLive: status == .working)
+                        ComposerView(store: store, chat: chat, runLive: status == .working,
+                                     attachmentDraft: attachmentDraft)
                             .id(chat.id)
                     }
                 }
@@ -318,6 +321,37 @@ struct SessionView: View {
             }
         }
         .background(Theme.bg.ignoresSafeArea())
+        .overlay(alignment: .top) {
+            #if DEBUG
+            if model.demo != nil, ProcessInfo.processInfo.arguments.contains("-image-drop-fixture") {
+                ImageDropFixture()
+            }
+            #endif
+        }
+        .onDrop(of: [UTType.image], isTargeted: Binding(
+            get: { attachmentDraft.targeted },
+            set: { attachmentDraft.targeted = $0 }
+        )) { providers in
+            guard store.openInputRequest == nil else { return false }
+            return attachmentDraft.receive(providers)
+        }
+        .overlay {
+            if attachmentDraft.targeted, attachmentDraft.canImport, store.openInputRequest == nil {
+                RoundedRectangle(cornerRadius: 20)
+                    .strokeBorder(Theme.text.opacity(0.6), style: StrokeStyle(lineWidth: 2, dash: [8, 5]))
+                    .padding(8)
+                    .overlay(alignment: .bottom) {
+                        Text("Drop images to attach")
+                            .font(Theme.sans(14, weight: .medium))
+                            .foregroundStyle(Theme.text)
+                            .padding(12)
+                            .background(Theme.bg, in: Capsule())
+                            .padding(.bottom, 90)
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
         .overlay {
             GeometryReader { geometry in
                 // The bar stays opaque so the header never collides with rows
@@ -336,6 +370,9 @@ struct SessionView: View {
             }
             .allowsHitTesting(false)
             .accessibilityHidden(true)
+        }
+        .onChange(of: chatId) { _, _ in
+            attachmentDraft = AttachmentDraft()
         }
         .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
     }
