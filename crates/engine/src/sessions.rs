@@ -202,6 +202,84 @@ const SHOW_IMAGE_ATTACH_ERROR: &str = "show_image could not attach the file; use
 /// stopped: the conversation resumes, but those processes are gone.
 const RESTART_BACKGROUND_NOTE: &str = "Harness restarted (quit or update) while background work you started was still running, and the restart stopped it. Check what was in progress, then start again whatever still needs to finish.";
 
+/// The interrupt reason a graceful shutdown stops runs with.
+const SHUTDOWN_REASON: &str = "engine shutdown";
+
+/// Auto-resume budget shared by crash and restart recovery: at most this many
+/// revivals in a row (a completed turn resets it), so a run that crashes the
+/// engine can't revive itself in a boot loop.
+const MAX_AUTO_RESUME: u32 = 3;
+/// Only work cut short within this window is picked back up on its own.
+const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
+
+/// What boot recovery does with a run that died mid-stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashRecovery {
+    /// Re-send the last prompt on the same harness session.
+    Resume,
+    /// The run was parked on a question still open in the transcript: leave
+    /// it answerable. Re-sending would only ask the same question again.
+    AwaitAnswer,
+    /// Too old, out of revivals, or nothing to re-send: settle it.
+    Settle,
+}
+
+/// Boot recovery's decision for one crashed run. `abandoned_age_ms` is the age
+/// of its streaming entry (`None`: none was left streaming);
+/// `awaiting_answer`: that entry holds an open question.
+fn crash_recovery_plan(
+    abandoned_age_ms: Option<i64>,
+    awaiting_answer: bool,
+    has_prompt: bool,
+    attempts: u32,
+) -> CrashRecovery {
+    if awaiting_answer {
+        CrashRecovery::AwaitAnswer
+    } else if abandoned_age_ms.is_some_and(|age| age < RESUME_FRESH_MS)
+        && has_prompt
+        && attempts < MAX_AUTO_RESUME
+    {
+        CrashRecovery::Resume
+    } else {
+        CrashRecovery::Settle
+    }
+}
+
+/// The chat's last user prompt, with its entry id (resumes re-send it under
+/// the same id, so the transcript never shows it twice).
+fn last_user_prompt(entries: &[SessionMessageEntry]) -> Option<(String, String)> {
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.role == MessageRole::User)
+        .and_then(|e| {
+            e.parts.iter().find_map(|p| match p {
+                MessagePart::Text { text, .. } => Some((e.id.clone(), text.clone())),
+                _ => None,
+            })
+        })
+}
+
+/// Whether a run stopped for `reason` leaves its unanswered question open:
+/// only a shutdown does, so the question is still there to answer after the
+/// restart. Any other end resolves it (nothing could deliver the answer).
+fn keeps_question_open(reason: Option<&str>) -> bool {
+    reason == Some(SHUTDOWN_REASON)
+}
+
+/// Whether `entry` holds a question still waiting on the user's answer.
+pub(crate) fn has_open_question(entry: &SessionMessageEntry) -> bool {
+    entry.parts.iter().any(|p| {
+        matches!(
+            p,
+            MessagePart::Input {
+                resolved: false,
+                ..
+            }
+        )
+    })
+}
+
 struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
@@ -249,6 +327,10 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// The version this boot updated Harness to, when the last boot recorded
+    /// an older one (`RunJournal::note_boot_version`). Names the update in
+    /// the note on a run the restart cut short.
+    boot_update: OnceLock<Option<String>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -306,6 +388,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                boot_update: OnceLock::new(),
             }),
         }
     }
@@ -1113,17 +1196,40 @@ impl SessionsEngine {
         })?
     }
 
+    /// Record the version this engine boots as (once per boot, before
+    /// recovery): a restart into a newer version is an update, and the note
+    /// on a run it cut short says so.
+    pub fn note_boot_version(&self) {
+        self.updated_to();
+    }
+
+    /// The version this boot updated Harness to, if it was an update.
+    fn updated_to(&self) -> Option<&str> {
+        self.inner
+            .boot_update
+            .get_or_init(|| {
+                let current = env!("CARGO_PKG_VERSION");
+                self.inner
+                    .journal
+                    .note_boot_version(current)
+                    .map(|_| current.to_owned())
+            })
+            .as_deref()
+    }
+
     /// Boot recovery: for every journal whose last event is not `Done` (a run died
     /// mid-stream), stamp this device's abandoned `streaming` doc entries `aborted`
-    /// with a VISIBLE "Run interrupted by engine restart" error part, close the
-    /// journal with a synthetic `Done{interrupted}` — and then PICK THE RUN BACK
-    /// UP: a fresh crashed turn with revival budget left is re-dispatched against
-    /// the remembered harness session (harness: "not just eulogized";
-    /// `MAX_AUTO_RESUME` = 3 consecutive revivals, fresh = crashed < 12h ago).
+    /// with a visible note saying why, close the journal with a synthetic
+    /// `Done{interrupted}` — and then PICK THE RUN BACK UP: a fresh crashed turn
+    /// with revival budget left is re-dispatched against the remembered harness
+    /// session (harness: "not just eulogized"; `MAX_AUTO_RESUME` = 3 consecutive
+    /// revivals, fresh = crashed < 12h ago).
+    ///
+    /// A run that died parked on a question is not re-sent: the agent would
+    /// only ask the same question again, beside the first. Its question stays
+    /// answerable, and the answer continues the run on the same harness
+    /// session (`RespondInput`'s dead-run fallback in the doc host).
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
-        const MAX_AUTO_RESUME: u32 = 3;
-        const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
-
         let stale = self.inner.journal.stale_sessions()?;
         let mut recovered = 0usize;
         for chat_id in stale {
@@ -1139,51 +1245,44 @@ impl SessionsEngine {
                 self.inner
                     .remember_harness_session(&chat_id, &session_id, &cwd);
             }
+            let entries = handle.doc().read_entries().unwrap_or_default();
             // The revival prompt: the last user message (idempotent re-dispatch
             // under the SAME id — `write_user_message` dedupes by id, so the
             // transcript never shows a duplicate).
-            let prompt = handle.doc().read_entries().ok().and_then(|entries| {
-                entries
-                    .iter()
-                    .rev()
-                    .find(|e| e.role == MessageRole::User)
-                    .and_then(|e| {
-                        e.parts.iter().find_map(|p| match p {
-                            MessagePart::Text { text, .. } => Some((e.id.clone(), text.clone())),
-                            _ => None,
-                        })
-                    })
-            });
+            let prompt = last_user_prompt(&entries);
             let attempts = self.inner.journal.resume_attempts(&chat_id);
-            let fresh = handle
-                .doc()
-                .read_entries()
-                .ok()
-                .and_then(|entries| {
-                    entries
-                        .iter()
-                        .rev()
-                        .find(|e| e.status == Some(MessageStatus::Streaming))
-                        .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
-                })
-                .unwrap_or(false);
-            let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
-
-            let note = if will_resume {
-                "Run interrupted by engine restart — resuming"
-            } else {
-                "Run interrupted by engine restart"
+            let abandoned = entries
+                .iter()
+                .rev()
+                .find(|e| e.status == Some(MessageStatus::Streaming));
+            let plan = crash_recovery_plan(
+                abandoned.map(|e| now_ms() - e.created_at),
+                abandoned
+                    .is_some_and(|e| e.device_id == self.inner.device_id && has_open_question(e)),
+                prompt.is_some(),
+                attempts,
+            );
+            let note = match plan {
+                CrashRecovery::AwaitAnswer => harness_doc::restart_note::AWAITING_ANSWER.to_owned(),
+                CrashRecovery::Resume => harness_doc::restart_note::resuming(self.updated_to()),
+                CrashRecovery::Settle => harness_doc::restart_note::NOT_RESUMED.to_owned(),
             };
+            let will_resume = plan == CrashRecovery::Resume;
+            // This boot handles the chat: a shutdown marker left beside it
+            // (a quit that didn't finish settling) must not pick it up again.
+            if plan != CrashRecovery::Settle {
+                self.inner.journal.clear_restart_resume(&chat_id);
+            }
             let done = AgentEvent::Done {
                 status: DoneStatus::Interrupted,
                 result: None,
-                error: Some(note.into()),
+                error: Some(note.clone()),
                 session_id: None,
             };
             self.inner.publish(&chat_id, &done);
-            let stamped = handle.mark_abandoned_streams(note)?.len();
+            let stamped = handle.mark_abandoned_streams(&note)?.len();
             self.set_status(&chat_id, SessionStatus::Idle, false);
-            tracing::info!(chat = %chat_id, stamped, will_resume, attempts, "recovered stale session journal");
+            tracing::info!(chat = %chat_id, stamped, ?plan, attempts, "recovered stale session journal");
             recovered += 1;
 
             if !will_resume {
@@ -1243,6 +1342,13 @@ impl SessionsEngine {
                 tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
                 return;
             };
+            // The session being resumed belongs to the harness that started
+            // it. A row without a config (its debounced write never landed)
+            // would otherwise pick up the engine default: a graff run resumed
+            // on another agent, or the reverse, starts a fresh conversation.
+            if request.harness.is_none() {
+                request.harness = sessions.inner.journal_harness(&chat_id);
+            }
             request.prompt = prompt_text;
             request.resume = None; // dispatch re-injects the remembered session
             request.attachments = Vec::new();
@@ -1276,16 +1382,12 @@ impl SessionsEngine {
     /// to check it and start again what still needs to finish. Same budget as
     /// crash recovery: fresh (< 12 h) and at most 3 revivals in a row.
     pub fn resume_after_restart(&self) -> usize {
-        const MAX_AUTO_RESUME: u32 = 3;
-        const RESUME_FRESH: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+        use crate::run_journal::RestartResume;
+        const RESUME_FRESH: std::time::Duration =
+            std::time::Duration::from_millis(RESUME_FRESH_MS as u64);
         let mut resumed = 0;
         for (chat_id, kind, at) in self.inner.journal.take_restart_resumes() {
             if lock(&self.inner.runs).contains_key(&chat_id) {
-                continue;
-            }
-            let fresh = at.elapsed().is_ok_and(|age| age < RESUME_FRESH);
-            if !fresh || self.inner.journal.resume_attempts(&chat_id) >= MAX_AUTO_RESUME {
-                tracing::info!(chat = %chat_id, ?kind, fresh, "restart resume skipped");
                 continue;
             }
             let Ok(handle) = self.doc_handle(&chat_id) else {
@@ -1295,35 +1397,46 @@ impl SessionsEngine {
                 self.inner
                     .remember_harness_session(&chat_id, &session_id, &cwd);
             }
+            // Parked on a question: nothing to re-send. The question stays
+            // answerable (the shutdown left it open), and its answer
+            // continues the run on the same session; say so beside it.
+            if kind == RestartResume::Question {
+                if let Err(err) =
+                    handle.note_restart(harness_doc::restart_note::AWAITING_ANSWER, true)
+                {
+                    tracing::warn!(chat = %chat_id, error = %err, "restart note failed");
+                }
+                continue;
+            }
+            let fresh = at.elapsed().is_ok_and(|age| age < RESUME_FRESH);
+            if !fresh || self.inner.journal.resume_attempts(&chat_id) >= MAX_AUTO_RESUME {
+                tracing::info!(chat = %chat_id, ?kind, fresh, "restart resume skipped");
+                if kind == RestartResume::Turn {
+                    let _ = handle.note_restart(harness_doc::restart_note::NOT_RESUMED, false);
+                }
+                continue;
+            }
             let (user_id, prompt_text) = match kind {
-                crate::run_journal::RestartResume::Turn => {
-                    let last = handle.doc().read_entries().ok().and_then(|entries| {
-                        entries
-                            .iter()
-                            .rev()
-                            .find(|e| e.role == MessageRole::User)
-                            .and_then(|e| {
-                                e.parts.iter().find_map(|p| match p {
-                                    MessagePart::Text { text, .. } => {
-                                        Some((e.id.clone(), text.clone()))
-                                    }
-                                    _ => None,
-                                })
-                            })
-                    });
+                RestartResume::Turn => {
+                    let last = handle
+                        .doc()
+                        .read_entries()
+                        .ok()
+                        .and_then(|entries| last_user_prompt(&entries));
                     let Some(last) = last else { continue };
+                    let note = harness_doc::restart_note::resuming(self.updated_to());
+                    if let Err(err) = handle.note_restart(&note, false) {
+                        tracing::warn!(chat = %chat_id, error = %err, "restart note failed");
+                    }
                     last
                 }
-                crate::run_journal::RestartResume::Background => {
-                    (new_id(), RESTART_BACKGROUND_NOTE.to_owned())
-                }
+                RestartResume::Background => (new_id(), RESTART_BACKGROUND_NOTE.to_owned()),
+                RestartResume::Question => unreachable!("handled above"),
             };
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let what = match kind {
-                crate::run_journal::RestartResume::Turn => "resumed a turn cut short by a restart",
-                crate::run_journal::RestartResume::Background => {
-                    "resumed a session whose background work a restart stopped"
-                }
+                RestartResume::Turn => "resumed a turn cut short by a restart",
+                _ => "resumed a session whose background work a restart stopped",
             };
             self.spawn_resume(chat_id, user_id, prompt_text, attempt, what);
             resumed += 1;
@@ -1335,32 +1448,37 @@ impl SessionsEngine {
     /// Work the shutdown cuts short is recorded first, so the next boot picks
     /// it back up ([`Self::resume_after_restart`]): a running turn, or a
     /// parked session whose agent still had background work going. A chat
-    /// waiting on the user's answer stays waiting (#482, #517).
+    /// waiting on the user's answer stays waiting (#482, #517): its question
+    /// stays open in the transcript, and answering it after the restart
+    /// continues the run on the same harness session.
+    ///
+    /// Every run is interrupted at once, so the whole drain takes one
+    /// interrupt's bounded settle wait, however many chats are running: the
+    /// app quitting into an update, or a service stop, waits on this.
     pub async fn shutdown(&self) {
+        use crate::run_journal::RestartResume;
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in &chats {
-            let working = self
-                .session_status(chat_id)
-                .is_some_and(|s| s.status == SessionStatus::Working);
+            let status = self.session_status(chat_id).map(|s| s.status);
             let background = lock(&self.inner.background_open)
                 .get(chat_id)
                 .is_some_and(|open| *open > 0);
-            let kind = if working {
-                Some(crate::run_journal::RestartResume::Turn)
-            } else if background {
-                Some(crate::run_journal::RestartResume::Background)
-            } else {
-                None
+            let kind = match status {
+                Some(SessionStatus::Working) => Some(RestartResume::Turn),
+                Some(SessionStatus::AwaitingInput) => Some(RestartResume::Question),
+                _ if background => Some(RestartResume::Background),
+                _ => None,
             };
             if let Some(kind) = kind {
                 self.inner.journal.note_restart_resume(chat_id, kind);
             }
         }
-        for chat_id in chats {
-            if let Err(err) = self.interrupt_for(&chat_id, "engine shutdown").await {
+        futures::future::join_all(chats.iter().map(|chat_id| async move {
+            if let Err(err) = self.interrupt_for(chat_id, SHUTDOWN_REASON).await {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
-        }
+        }))
+        .await;
     }
 
     fn is_live(&self, chat_id: &str, run_id: &str) -> bool {
@@ -1970,6 +2088,16 @@ impl Inner {
             }
         }
         found
+    }
+
+    /// The harness the chat's journal last started a session on: which agent
+    /// a recovered run belongs to when the chat row has no config yet.
+    fn journal_harness(&self, chat_id: &str) -> Option<HarnessId> {
+        let events = self.journal.replay(chat_id, 0).ok()?;
+        events.into_iter().rev().find_map(|(_, event)| match event {
+            AgentEvent::SessionStarted { harness, .. } => Some(harness),
+            _ => None,
+        })
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
@@ -3981,9 +4109,14 @@ async fn drive_run(
             // errored, interrupted) terminally resolves its input parts — an
             // unresolved question must not outlive the run that asked it
             // (its resolver died with the run; an answer could never land).
-            for part in folded.iter_mut() {
-                if let MessagePart::Input { resolved, .. } = part {
-                    *resolved = true;
+            // Except a shutdown (quit, update): the question stays open, and
+            // its answer after the restart lands through `RespondInput`'s
+            // dead-run fallback as the next turn on the same session.
+            if !keeps_question_open(stop_reason.as_deref()) {
+                for part in folded.iter_mut() {
+                    if let MessagePart::Input { resolved, .. } = part {
+                        *resolved = true;
+                    }
                 }
             }
             // A Done landing on a PARKED session with nothing streamed (the
@@ -4199,6 +4332,55 @@ mod tests {
         assert!(!super::same_dir(&real_resolved, &s(&other)));
         assert!(super::same_dir("/no/such/dir", "/no/such/dir"));
         assert!(!super::same_dir("/no/such/dir", "/no/such/other"));
+    }
+
+    #[test]
+    fn crash_recovery_never_resends_a_run_parked_on_a_question() {
+        use super::{CrashRecovery, MAX_AUTO_RESUME, RESUME_FRESH_MS, crash_recovery_plan};
+        let minute = 60_000;
+        assert_eq!(
+            crash_recovery_plan(Some(minute), false, true, 0),
+            CrashRecovery::Resume
+        );
+        // Waiting on the user: re-sending would ask the same question again.
+        assert_eq!(
+            crash_recovery_plan(Some(minute), true, true, 0),
+            CrashRecovery::AwaitAnswer
+        );
+        // The question stays answerable however old it is.
+        assert_eq!(
+            crash_recovery_plan(Some(RESUME_FRESH_MS + minute), true, true, MAX_AUTO_RESUME),
+            CrashRecovery::AwaitAnswer
+        );
+        assert_eq!(
+            crash_recovery_plan(Some(RESUME_FRESH_MS + minute), false, true, 0),
+            CrashRecovery::Settle
+        );
+        assert_eq!(
+            crash_recovery_plan(Some(minute), false, true, MAX_AUTO_RESUME),
+            CrashRecovery::Settle
+        );
+        assert_eq!(
+            crash_recovery_plan(Some(minute), false, false, 0),
+            CrashRecovery::Settle
+        );
+        assert_eq!(
+            crash_recovery_plan(None, false, true, 0),
+            CrashRecovery::Settle
+        );
+    }
+
+    #[test]
+    fn only_a_shutdown_leaves_a_question_open() {
+        assert!(super::keeps_question_open(Some(super::SHUTDOWN_REASON)));
+        for reason in [
+            None,
+            Some("stop"),
+            Some("question dismissed"),
+            Some("send now"),
+        ] {
+            assert!(!super::keeps_question_open(reason), "{reason:?}");
+        }
     }
 
     #[tokio::test]

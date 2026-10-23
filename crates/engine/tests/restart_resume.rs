@@ -656,7 +656,8 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     .await;
 
     let entries = entries_now(&core);
-    // The aborted entry SAYS why it ended — and that the run is resuming.
+    // The aborted entry SAYS why it ended — and, calmly, that the run is
+    // being picked back up.
     let aborted = entries
         .iter()
         .find(|e| e.status == Some(MessageStatus::Aborted))
@@ -665,9 +666,9 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         aborted.parts.iter().any(|p| matches!(
             p,
             MessagePart::Error { message, .. }
-                if message.contains("engine restart") && message.contains("resuming")
+                if *message == harness_doc::restart_note::resuming(None)
         )),
-        "aborted entry carries the visible interruption note"
+        "aborted entry carries the visible restart note"
     );
     // Re-dispatch reuses the original user message id — never a duplicate.
     assert_eq!(

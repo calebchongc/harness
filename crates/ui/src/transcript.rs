@@ -1337,6 +1337,12 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+    /// Harness restarted under the run, and the run picks itself back up (or
+    /// continues once its open question is answered): a neutral notice, not
+    /// a failure ([`harness_doc::restart_note::is_calm`]).
+    RestartNotice {
+        message: SharedString,
+    },
     /// Only the typed upstream auth signal offers a login action.
     ReauthRequired {
         message: SharedString,
@@ -2020,6 +2026,11 @@ pub fn rows_for_entry(
                                     },
                                     None if crate::chatgpt_plan::is_usage_limit_error(message) => {
                                         RowKind::PlanUsageLimit {
+                                            message: single_line(message).into(),
+                                        }
+                                    }
+                                    None if harness_doc::restart_note::is_calm(message) => {
+                                        RowKind::RestartNotice {
                                             message: single_line(message).into(),
                                         }
                                     }
@@ -8062,6 +8073,7 @@ impl Transcript {
                 restored,
             } => self.render_model_mismatch(&row.id, requested, restored.as_ref(), &theme, cx),
             RowKind::PlanUsageLimit { message } => plan_usage_limit_card(&row.id, message, &theme),
+            RowKind::RestartNotice { message } => restart_notice_chip(message.clone(), &theme),
         };
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
@@ -9369,6 +9381,53 @@ fn error_chip(
                 })
                 .overflow_hidden()
                 .w_full(),
+        )
+        .into_any_element()
+}
+
+/// Harness restarted under this run and it carries on: the question chip's
+/// neutral one-line frame with a restart glyph, never the error chip's red.
+fn restart_notice_chip(message: SharedString, theme: &Theme) -> AnyElement {
+    div()
+        .py(px(4.0))
+        .w_full()
+        .child(
+            div()
+                .h(px(34.0))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .overflow_hidden()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(crate::theme::hairline(0.08))
+                .bg(crate::theme::ink(0.045))
+                .px(px(8.0))
+                .text_size(px(12.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(20.0))
+                        .rounded(px(6.0))
+                        .bg(crate::theme::ink(0.09))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            crate::icons::icon(crate::icons::RESTART)
+                                .size(px(12.0))
+                                .text_color(theme.text_muted),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_color(theme.text.opacity(0.9))
+                        .child(message),
+                ),
         )
         .into_any_element()
 }
@@ -14519,6 +14578,44 @@ mod tests {
                 .iter()
                 .any(|row| matches!(&row.kind, RowKind::ErrorChip { message } if message.as_ref() == "boom")),
             "other errors stay plain chips"
+        );
+    }
+
+    #[test]
+    fn a_run_picked_back_up_after_a_restart_reads_as_a_notice_not_an_error() {
+        let resuming = harness_doc::restart_note::resuming(Some("0.2.135"));
+        let entry = assistant(
+            "a1",
+            MessageStatus::Aborted,
+            vec![
+                MessagePart::Error {
+                    id: "e1".into(),
+                    message: resuming.clone(),
+                    reauth: None,
+                },
+                MessagePart::Error {
+                    id: "e2".into(),
+                    message: harness_doc::restart_note::NOT_RESUMED.into(),
+                    reauth: None,
+                },
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, true, &mut parse);
+        let visible = compact_visible(&rows);
+        assert!(
+            visible.iter().any(|row| matches!(
+                &row.kind,
+                RowKind::RestartNotice { message } if message.as_ref() == resuming
+            )),
+            "a resuming run gets the calm notice"
+        );
+        assert!(
+            visible.iter().any(|row| matches!(
+                &row.kind,
+                RowKind::ErrorChip { message }
+                    if message.as_ref() == harness_doc::restart_note::NOT_RESUMED
+            )),
+            "a run that won't resume keeps the error"
         );
     }
 
