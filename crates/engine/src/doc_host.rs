@@ -5572,6 +5572,15 @@ impl DocHost {
                 .await
             }
             SessionCommandPayload::Interrupt {} => {
+                // Which device's Stop this was, and how old: the agent only
+                // learns "the user cancelled" (#149).
+                tracing::info!(
+                    chat = %chat_id,
+                    command = %entry.id,
+                    issued_by = %entry.issued_by,
+                    age_ms = now_ms().saturating_sub(entry.issued_at),
+                    "stop requested by command"
+                );
                 self.interrupt_and_pause_queue(sessions, handle).await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
