@@ -155,6 +155,9 @@ fn close_tab(_: &CloseTab, cx: &mut App) {
 /// ⌘W: close the innermost thing open and never the window. Closing the
 /// window ends the app's session for every chat, so a stray ⌘W in an empty
 /// chat must not take running agents down with it (⌘⇧W closes the window).
+/// A closed session is archived when archive-on-close is on; the first ⌘W
+/// that would close one asks which the user wants (`shell/archive_choice.rs`).
+/// ⌘⌥W closes the same way without archiving or asking.
 fn close_active_tab(cx: &mut App) {
     close_active_tab_with_archive(true, cx);
 }
@@ -185,7 +188,11 @@ fn close_tab_in_with_archive(
             if shell.close_active_surface(window, cx) {
                 return;
             }
-            shell.close_chat_view_with_archive(archive, window, cx);
+            if archive {
+                shell.close_chat_view_by_shortcut(window, cx);
+            } else {
+                shell.close_chat_view_with_archive(false, window, cx);
+            }
         })
         .ok();
 }

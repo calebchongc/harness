@@ -599,22 +599,26 @@ impl Shell {
         self.close_focused_chat_view(window, cx)
     }
 
-    /// The two explicit close shortcuts share view/history handling, not their
-    /// archive policy. Include the final session-to-canvas close in both.
+    /// The two close shortcuts share view/history handling, not their archive
+    /// policy: ⌘W (`may_archive`) follows the archive-on-close setting like
+    /// the ✕ buttons, and ⌘⌥W never archives. Include the final
+    /// session-to-canvas close in both.
     pub(crate) fn close_chat_view_with_archive(
         &mut self,
-        archive: bool,
+        may_archive: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A close that went ahead some other way answers nothing.
+        self.archive_choice_prompt = false;
         let closing = self.state.read(cx).selected_chat.clone();
         let closed = self.close_focused_chat_pane_without_archiving(window, cx)
             || self.close_chat_to_new_session(cx);
         if closed
-            && archive
+            && may_archive
             && let Some(chat_id) = closing
         {
-            self.archive_closed_session_explicitly(chat_id, window, cx);
+            self.archive_closed_session(chat_id, window, cx);
         }
         closed
     }
@@ -1053,8 +1057,18 @@ impl Shell {
             // into the active outlet. Capturing observes consumed child events;
             // deferring lets their click handlers act on the still-mounted view.
             // Every mouse button activates, and a text selection is no veto.
-            .capture_any_mouse_up(cx.listener(move |this, _, _, cx| {
-                if cx.has_active_drag() {
+            // But a release here is not a new interaction if its press began
+            // elsewhere (for example, selecting in the active pane across us).
+            .capture_any_mouse_down(cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                this.chat_pane_press = Some((ix, event.button));
+            }))
+            .on_mouse_down_out(cx.listener(move |this, _, _, _| {
+                if this.chat_pane_press.is_some_and(|(pane, _)| pane == ix) {
+                    this.chat_pane_press = None;
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+                if this.chat_pane_press.take() != Some((ix, event.button)) || cx.has_active_drag() {
                     return;
                 }
                 let tab = this.chat_tab;

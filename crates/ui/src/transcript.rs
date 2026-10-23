@@ -1170,7 +1170,10 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
         },
     };
     let (_, header_detail) = tool_chip_content(call);
-    let header_only = single_line(&text) == header_detail
+    // A collapsed `Run` preview may shorten a long path (#367); the full
+    // command must then stay one expand away even when it fits the header.
+    let header_only = (single_line(&text) == header_detail
+        && !matches!(call, ToolCall::Exec { command } if command_has_long_path(command)))
         || matches!(call, ToolCall::Unknown { input: None, .. });
     if header_only
         && text.trim().lines().count() <= 1
@@ -2569,6 +2572,33 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
 // literal newline breaks gpui's ellipsis logic and would be a cursor move in a
 // cell grid).
 pub use harness_proto::view::{single_line, tool_chip_content};
+
+use harness_proto::view::{PreviewPathAnchors, command_has_long_path, compact_command_paths};
+
+/// The home directory collapsed previews shorten paths against (`~`).
+fn preview_home_dir() -> Option<&'static str> {
+    static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        std::env::home_dir()
+            .and_then(|home| home.to_str().map(str::to_owned))
+            .filter(|home| !home.is_empty())
+    })
+    .as_deref()
+}
+
+/// A tool chip's collapsed label and one-line detail. A `Run` detail has its
+/// long filepaths shortened (#367) so the executable and the command stay in
+/// view; the expanded invocation, copy and execution keep the original.
+pub fn collapsed_chip_content(
+    call: &ToolCall,
+    anchors: PreviewPathAnchors<'_>,
+) -> (&'static str, String) {
+    let (label, detail) = tool_chip_content(call);
+    match call {
+        ToolCall::Exec { .. } => (label, compact_command_paths(&detail, anchors)),
+        _ => (label, detail),
+    }
+}
 
 /// Analytic expanded-chips height — no measurement needed for the fold tween.
 pub fn chips_height(count: usize) -> f32 {
@@ -3978,7 +4008,16 @@ impl Transcript {
 
     /// Change only the feed/presentation role, not the chat or its interaction
     /// state. In particular, keep folds, the viewport, and pending selection.
+    ///
+    /// The link owner follows the role: a peer's links belong to its pinned
+    /// chat, while the primary's follow whichever chat it shows (`link_ui`
+    /// fills a `None` owner from `chat_id`). A promoted peer that kept its
+    /// fixed owner would have its links rejected as a stale source once the
+    /// primary moved to another chat (#456).
     pub(crate) fn set_split_source(&mut self, peer: Option<String>) {
+        if let Some(link) = self.workspace_link.as_mut() {
+            link.source_session = peer.clone();
+        }
         self.doc_live = peer.is_some();
         self.retain_on_deselect = peer.is_none();
         if peer.is_some() {
@@ -8388,6 +8427,11 @@ impl Transcript {
     ) -> AnyElement {
         let mut fold = self.folds.get(row_id).copied().unwrap_or_default();
         let file_opener = self.tool_file_opener(cx);
+        let workspace = self.workspace_root(cx);
+        let preview_paths = PreviewPathAnchors {
+            workspace: workspace.as_deref(),
+            home: preview_home_dir(),
+        };
         // Agent/spawn chips never fold: they are their own row, always open,
         // no "Called N tools" header — a running subagent stays visible.
         // Compact mode is the exception: EVERYTHING sits under the one work
@@ -8878,6 +8922,7 @@ impl Transcript {
                             connector_reveal,
                             continuation_reveal,
                             file_opener.as_ref(),
+                            preview_paths,
                             theme,
                             cx.entity_id(),
                             cx,
@@ -8938,6 +8983,7 @@ impl Transcript {
                                 tool,
                                 open,
                                 file_opener.as_ref(),
+                                preview_paths,
                                 theme,
                                 cx.entity_id(),
                                 cx,
@@ -9669,6 +9715,7 @@ fn chip_header_row(
     tool: &ToolItem,
     trail: Option<ChipTrail>,
     file_opener: Option<&ToolFileOpener>,
+    preview_paths: PreviewPathAnchors<'_>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -9676,7 +9723,7 @@ fn chip_header_row(
     let (label, mut detail) = match tool.kind {
         ToolItemKind::Thought => ("Thought process", String::new()),
         ToolItemKind::Note => ("Wrote", note_chip_detail(tool)),
-        ToolItemKind::Call => tool_chip_content(&tool.call),
+        ToolItemKind::Call => collapsed_chip_content(&tool.call, preview_paths),
     };
     if is_agent_tool(tool) {
         if let Some(suffix) = match tool.subagent_status {
@@ -10019,6 +10066,7 @@ fn chip_header(
     tool: &ToolItem,
     open: bool,
     file_opener: Option<&ToolFileOpener>,
+    preview_paths: PreviewPathAnchors<'_>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -10027,6 +10075,7 @@ fn chip_header(
         tool,
         Some(ChipTrail::Chevron { open }),
         file_opener,
+        preview_paths,
         theme,
         view,
         cx,
@@ -10244,6 +10293,7 @@ fn tool_chip(
     connector_reveal: f32,
     continuation_reveal: f32,
     file_opener: Option<&ToolFileOpener>,
+    preview_paths: PreviewPathAnchors<'_>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -10291,7 +10341,15 @@ fn tool_chip(
                         .top(px(4.0 * (1.0 - content_reveal)))
                         .opacity(content_reveal)
                 })
-                .child(chip_header_row(tool, None, file_opener, theme, view, cx)),
+                .child(chip_header_row(
+                    tool,
+                    None,
+                    file_opener,
+                    preview_paths,
+                    theme,
+                    view,
+                    cx,
+                )),
         )
         .into_any_element()
 }
@@ -10348,6 +10406,7 @@ fn link_chip(
                     tool,
                     Some(ChipTrail::OpenArrow),
                     None,
+                    PreviewPathAnchors::default(),
                     theme,
                     view,
                     cx,
@@ -17791,6 +17850,7 @@ mod tests {
                             &self.tool,
                             false,
                             Some(&self.opener),
+                            PreviewPathAnchors::default(),
                             &theme,
                             cx.entity_id(),
                             cx,
@@ -17973,6 +18033,79 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn collapsed_run_preview_shortens_long_paths_but_keeps_the_command() {
+        // #367: the collapsed `Run` row showed the executable's full path, so
+        // a long one pushed `pwsh.exe -Command "git status"` off the row.
+        let command = r#""C:\Users\ExampleUser\.cache\agent-runtime\dependencies\native\powershell\pwsh.exe" -Command "git status""#;
+        let call = ToolCall::Exec {
+            command: command.into(),
+        };
+        assert_eq!(
+            collapsed_chip_content(&call, PreviewPathAnchors::default()),
+            (
+                "Run",
+                r#""…\powershell\pwsh.exe" -Command "git status""#.to_string()
+            )
+        );
+        // The expanded invocation is still the original, byte for byte.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&call) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<String>(),
+            command
+        );
+
+        // Inside the chat's folder a path reads relative; under home, `~`.
+        let anchors = PreviewPathAnchors {
+            workspace: Some("/Users/example/projects/demo"),
+            home: Some("/Users/example"),
+        };
+        let call = ToolCall::Exec {
+            command: "cat /Users/example/projects/demo/application/src/settings.rs".into(),
+        };
+        assert_eq!(
+            collapsed_chip_content(&call, anchors).1,
+            "cat application/src/settings.rs"
+        );
+        // It fits the header, but the header no longer shows the full path,
+        // so the full command stays one expand away.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&call) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<String>(),
+            "cat /Users/example/projects/demo/application/src/settings.rs"
+        );
+        assert_eq!(
+            collapsed_chip_content(
+                &ToolCall::Exec {
+                    command: "/Users/example/.cache/tools/runtime/bin/node build.js".into()
+                },
+                anchors
+            )
+            .1,
+            "~/.cache/tools/runtime/bin/node build.js"
+        );
+
+        // Short commands and other tools are untouched.
+        for call in [
+            ToolCall::Exec {
+                command: "/bin/zsh -lc 'git status'".into(),
+            },
+            ToolCall::Search {
+                pattern: "needle".into(),
+                path: Some("/Users/example/projects/demo/application/src".into()),
+            },
+        ] {
+            assert_eq!(
+                collapsed_chip_content(&call, anchors),
+                tool_chip_content(&call)
+            );
+        }
     }
 
     #[test]

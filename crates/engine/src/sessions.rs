@@ -143,6 +143,10 @@ struct RunHandle {
     /// parks on that turn's `Done{Interrupted}` instead of ending the run,
     /// keeping the agent process and its background tasks (#364).
     turn_interrupted: Arc<std::sync::atomic::AtomicBool>,
+    /// Why the engine last interrupted this run (an `interrupt_for` reason,
+    /// or "question dismissed"). The run task takes it when the turn ends,
+    /// to explain a stop that landed right after an answer (#149).
+    stop_reason: Arc<Mutex<Option<String>>>,
 }
 
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
@@ -729,6 +733,7 @@ impl SessionsEngine {
                 visual_tx,
                 harness: harness.clone(),
                 turn_interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_reason: Arc::new(Mutex::new(None)),
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -880,6 +885,7 @@ impl SessionsEngine {
             return Ok(true);
         }
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
+            *lock(&h.stop_reason) = Some(reason.to_owned());
             (
                 h.run_id.clone(),
                 h.interrupt_token.clone(),
@@ -931,6 +937,7 @@ impl SessionsEngine {
             .get(chat_id)
             .filter(|h| h.steerable)
             .map(|h| {
+                *lock(&h.stop_reason) = Some(reason.to_owned());
                 (
                     h.run_id.clone(),
                     h.harness.clone(),
@@ -1000,6 +1007,7 @@ impl SessionsEngine {
             return false;
         };
         tracing::info!(chat = %chat_id, run = %run.run_id, reason = "question dismissed", "interrupting run");
+        *lock(&run.stop_reason) = Some("question dismissed".to_owned());
         // Publish cancellation before waking the adapter, as in interrupt().
         // Dropping the resolver communicates cancellation, not an empty answer.
         let _ = run.cancel.send(true);
@@ -2463,6 +2471,27 @@ fn append_delta(pending: &mut AgentEvent, next: &AgentEvent) -> bool {
     }
 }
 
+/// The notice for a turn that ended right after its question was answered,
+/// before the agent did anything with the answer (#149), naming the engine's
+/// reason when it stopped the run. None for a dismissed question: ending the
+/// turn is what the user asked for.
+fn stopped_after_answer(reason: Option<&str>) -> Option<String> {
+    let why = match reason {
+        Some("question dismissed") => return None,
+        Some("stop") => "Stop was requested",
+        Some("send now") => "a queued message was sent now",
+        Some("engine shutdown") => "the app shut down",
+        Some("space deleted") => "the chat's space was deleted",
+        Some(reason) if reason.starts_with("replace") => "the run was replaced",
+        Some(_) => "the run was interrupted",
+        None => "the agent ended the turn",
+    };
+    Some(format!(
+        "Stopped right after your answer, before the agent continued: {why}. \
+         Send a message to continue the task."
+    ))
+}
+
 /// The terminal Done that ends a self-continued chain past its cap (#341).
 fn runaway_chain_done(resumes: u32, elapsed: std::time::Duration) -> AgentEvent {
     let minutes = elapsed.as_secs().div_ceil(60).max(1);
@@ -2495,6 +2524,8 @@ async fn drive_run(
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
+    let workspace = inner.doc_host().and_then(|host| host.workspace().cloned());
+    let mut chat_changes = workspace.as_ref().map(|workspace| workspace.watch_chats());
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
@@ -2782,13 +2813,44 @@ async fn drive_run(
     // long stretch of work is expected and the chain's streaming cap is off.
     let mut task_woken_turn = false;
 
+    let chat_archived = || {
+        workspace.as_ref().is_some_and(|workspace| {
+            workspace.chat(&chat_id).ok().flatten().is_some_and(|chat| chat.archived)
+        })
+    };
     let mut final_completed_turn = None;
     let final_status = loop {
+        // Archive is a runtime boundary, not just a sidebar filter. Retire a
+        // parked child so native peer discovery and idle wakes disappear too.
+        // Finish an active human turn first. Unconfirmed human prompts are
+        // recovered below; peer prompts must not cross this boundary. Read
+        // the registry directly so late output cannot beat watch publication.
+        if idle_since.is_some() && chat_archived() {
+            if let Some(token) = lock(&inner.runs)
+                .get(&chat_id)
+                .filter(|handle| handle.run_id == run_id)
+                .map(|handle| handle.interrupt_token.clone())
+            {
+                token.cancel();
+            }
+            break SessionStatus::Idle;
+        }
         let mut event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
         } else {
             let raw_event = tokio::select! {
                 biased;
+                changed = async {
+                    match chat_changes.as_mut() {
+                        Some(chats) => chats.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        chat_changes = None;
+                    }
+                    continue;
+                }
                 changed = cancel_rx.changed(), if !interrupted => {
                     let _ = changed;
                     interrupted = true;
@@ -3102,6 +3164,13 @@ async fn drive_run(
             };
             event
         };
+
+        // Polling the stream (or preparing image output) can yield while an
+        // archive arrives. Do not let that frame unpark the runtime before the
+        // next loop's retirement check, even if its watch update is delayed.
+        if idle_since.is_some() && chat_archived() {
+            continue;
+        }
 
         // A queued explicit image never publishes once the run was cancelled
         // between its import and this fold turn: drop the event, reject the
@@ -3888,6 +3957,26 @@ async fn drive_run(
                 }
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
             };
+            // A turn that stops with an answered question as its last part
+            // never acted on the answer. Say so, and why, or the transcript
+            // ends on the resolved question as if the task went on (#149).
+            let stop_reason = lock(&inner.runs)
+                .get(&chat_id)
+                .filter(|h| h.run_id == run_id)
+                .and_then(|h| lock(&h.stop_reason).take());
+            if message_status == MessageStatus::Aborted
+                && matches!(
+                    folded.last(),
+                    Some(MessagePart::Input { resolved: true, .. })
+                )
+                && let Some(message) = stopped_after_answer(stop_reason.as_deref())
+            {
+                folded.push(MessagePart::Error {
+                    id: format!("e{}", folded.len()),
+                    message,
+                    reauth: None,
+                });
+            }
             // No dangling chips: a run that ends for ANY reason (completed,
             // errored, interrupted) terminally resolves its input parts — an
             // unresolved question must not outlive the run that asked it
@@ -4065,6 +4154,10 @@ async fn drive_run(
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
                     break;
                 };
+                if host.refuses_peer_mail(&chat, &steer.prompt) {
+                    tracing::info!(chat = %chat, "discarding archived peer steer before redelivery");
+                    continue;
+                }
                 if let Err(err) = host
                     .dispatch_with_source_context(
                         &engine,

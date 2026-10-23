@@ -5510,10 +5510,13 @@ fn slash_error_message(err: &RpcError, skill: bool) -> SharedString {
 struct PromptHistoryNav {
     back: usize,
     draft: String,
+    /// Stable while browsing: live transcript appends/replays must not move
+    /// the cursor or invalidate an index. A new browse sees the latest rows.
+    prompts: Vec<String>,
 }
 
-/// The session's sent prompts, oldest first: user rows' text without
-/// attachment references, skipping attachment-only sends and repeats.
+/// The session's human prompts, oldest first: user rows' text without
+/// attachment references, skipping agent deliveries, attachment-only sends and repeats.
 fn session_prompts(transcript: &[SessionMessageEntry]) -> Vec<String> {
     let mut prompts: Vec<String> = Vec::new();
     for entry in transcript
@@ -6990,7 +6993,11 @@ impl Composer {
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
-        if self.wizard_active() {
+        let input = self.input.read(cx);
+        let recalling = input.history_entry.as_deref() == Some(input.text());
+        // Recalling a command or mention is navigation, not fresh typing.
+        // Popups would take the next Up/Down away from prompt history.
+        if self.wizard_active() || recalling {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
@@ -8000,13 +8007,7 @@ impl Composer {
                     wizard,
                 );
             } else {
-                let mut old_text = self.input.read(cx).text().to_string();
-                // Leaving mid-recall keeps the real draft, not the recalled prompt.
-                if let Some(nav) = self.prompt_history.take()
-                    && self.input.read(cx).history_entry.as_deref() == Some(old_text.as_str())
-                {
-                    old_text = nav.draft;
-                }
+                let old_text = self.take_prompt_draft(cx);
                 if old_text.is_empty() {
                     self.drafts.remove(&self.current_key);
                 } else {
@@ -8071,10 +8072,8 @@ impl Composer {
                     .is_some_and(|w| w.request_id == request_id);
                 if !same {
                     if self.wizard.is_none() {
-                        self.drafts.insert(
-                            self.current_key.clone(),
-                            self.input.read(cx).text().to_string(),
-                        );
+                        let draft = self.take_prompt_draft(cx);
+                        self.drafts.insert(self.current_key.clone(), draft);
                     }
                     self.reset_mention(None, cx);
                     self.wizard_drafts.retain(|(chat, request), _| {
@@ -8259,6 +8258,17 @@ impl Composer {
         cx.notify();
     }
 
+    /// End recall when another editor borrows the composer, preserving the
+    /// displaced draft unless the user actually edited the recalled prompt.
+    pub(crate) fn take_prompt_draft(&mut self, cx: &App) -> String {
+        let input = self.input.read(cx);
+        let text = input.text().to_string();
+        match self.prompt_history.take() {
+            Some(nav) if input.history_entry.as_deref() == Some(text.as_str()) => nav.draft,
+            _ => text,
+        }
+    }
+
     /// Up (`-1`) / Down (`1`) through this session's earlier prompts. The
     /// transcript is the history, so it survives reopening the session and
     /// never mixes sessions. Past the newest prompt the unsent draft returns.
@@ -8267,29 +8277,33 @@ impl Composer {
             return;
         }
         // `set_text` (a send, a draft swap) ends recall inside the input.
-        if self.input.read(cx).history_entry.is_none() {
+        let input = self.input.read(cx);
+        if input.history_entry.as_deref() != Some(input.text()) {
             self.prompt_history = None;
         }
-        let prompts = session_prompts(&self.state.read(cx).transcript);
         let next = match (&self.prompt_history, delta < 0) {
-            (None, true) if !prompts.is_empty() => {
+            (None, true) => {
+                let prompts = session_prompts(&self.state.read(cx).transcript);
+                if prompts.is_empty() {
+                    return;
+                }
                 self.prompt_history = Some(PromptHistoryNav {
                     back: 0,
-                    draft: self.input.read(cx).text().to_string(),
+                    draft: input.text().to_string(),
+                    prompts,
                 });
                 Some(0)
             }
-            (Some(nav), true) if nav.back + 1 < prompts.len() => Some(nav.back + 1),
+            (Some(nav), true) if nav.back + 1 < nav.prompts.len() => Some(nav.back + 1),
             (Some(nav), false) if nav.back > 0 => Some(nav.back - 1),
             (Some(_), false) => None,
             _ => return,
         };
         let (text, recalled) = match next {
             Some(back) => {
-                if let Some(nav) = self.prompt_history.as_mut() {
-                    nav.back = back;
-                }
-                (prompts[prompts.len() - 1 - back].clone(), true)
+                let nav = self.prompt_history.as_mut().unwrap();
+                nav.back = back;
+                (nav.prompts[nav.prompts.len() - 1 - back].clone(), true)
             }
             None => (
                 self.prompt_history
@@ -11242,6 +11256,10 @@ fn dictation_unavailable_message(
         E::Protocol => "Codex's voice helper stopped responding.".into(),
     }
 }
+
+#[cfg(test)]
+#[path = "composer/prompt_history_tests.rs"]
+mod prompt_history_tests;
 
 #[cfg(test)]
 #[path = "composer/question_recovery_tests.rs"]

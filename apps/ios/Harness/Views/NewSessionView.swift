@@ -757,6 +757,24 @@ struct ModelPickerSheet: View {
     /// catalog is unmanageable (t3's collapsible provider folds).
     @State private var openSections: Set<String> = []
     @State private var query = ""
+    /// The selection this opening compares against for the top-right control.
+    @State private var baseline: SelectionBaseline<ModelSelection>
+
+    init(harness: Binding<String>, modelId: Binding<String>, reasoning: Binding<String?>,
+         lockedHarness: Bool = false, harnesses: [HarnessInfo] = [],
+         catalogs: [String: [ModelInfo]] = [:], catalogsLoading: Bool = false,
+         onRetry: (() -> Void)? = nil) {
+        self._harness = harness
+        self._modelId = modelId
+        self._reasoning = reasoning
+        self.lockedHarness = lockedHarness
+        self.harnesses = harnesses
+        self.catalogs = catalogs
+        self.catalogsLoading = catalogsLoading
+        self.onRetry = onRetry
+        self._baseline = State(initialValue: SelectionBaseline(
+            ModelSelection(harness: harness.wrappedValue, modelId: modelId.wrappedValue)))
+    }
 
     private var searching: Bool { !query.trimmingCharacters(in: .whitespaces).isEmpty }
 
@@ -847,22 +865,25 @@ struct ModelPickerSheet: View {
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always),
                         prompt: "Search models")
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
-                    }
-                    .accessibilityLabel("Close")
-                    .accessibilityIdentifier("model-picker-confirm")
-                }
+                SheetConfirmItem(changed: selectionChanged,
+                                 identifier: "model-picker-confirm") { dismiss() }
             }
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
         .harnessAppearance()
+        .onChange(of: currentSelection) { _, value in baseline.hydrated(to: value) }
+    }
+
+    private var currentSelection: ModelSelection {
+        ModelSelection(harness: harness, modelId: modelId)
+    }
+
+    private var selectionChanged: Bool {
+        baseline.changed(to: currentSelection) {
+            HarnessCatalog.sameRow($0, $1, catalogs: catalogs)
+        }
     }
 
     private var selectedModel: ModelInfo? {
@@ -905,6 +926,7 @@ struct ModelPickerSheet: View {
 
     private func select(harness harnessId: String, model m: ModelInfo) {
         UISelectionFeedbackGenerator().selectionChanged()
+        baseline.picked()
         if harness != harnessId {
             harness = harnessId
         }
@@ -956,27 +978,8 @@ struct TraitPickerSheet: View {
             .navigationTitle("Reasoning")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        if selectionChanged {
-                            Image(systemName: "checkmark.circle.fill")
-                                .renderingMode(.original)
-                                .resizable()
-                                .symbolRenderingMode(.palette)
-                                .foregroundStyle(Theme.bg, Theme.text)
-                                .frame(width: 44, height: 44)
-                        } else {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 13, weight: .semibold))
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(selectionChanged ? "Done" : "Close")
-                    .accessibilityIdentifier("reasoning-picker-confirm")
-                }
-                .sharedBackgroundVisibility(selectionChanged ? .hidden : .automatic)
+                SheetConfirmItem(changed: selectionChanged,
+                                 identifier: "reasoning-picker-confirm") { dismiss() }
             }
         }
         .presentationDetents([.medium, .large])
@@ -1110,6 +1113,42 @@ struct PickRow: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(SheetRowButtonStyle())
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+// MARK: - Picker sheet confirmation
+
+/// A picker sheet's top-right control: an X (Close) while the selection
+/// matches the one the sheet opened with, and a checkmark (Done) once it
+/// differs. The checkmark uses the selected PickRow's colors — `Theme.text`
+/// circle, `Theme.bg` tick — drawn as an original-color palette symbol so
+/// toolbar tinting can't shift them (#407, #416).
+struct SheetConfirmItem: ToolbarContent {
+    let changed: Bool
+    let identifier: String
+    let action: () -> Void
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .confirmationAction) {
+            Button(action: action) {
+                if changed {
+                    Image(systemName: "checkmark.circle.fill")
+                        .renderingMode(.original)
+                        .resizable()
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(Theme.bg, Theme.text)
+                        .frame(width: 44, height: 44)
+                } else {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(changed ? "Done" : "Close")
+            .accessibilityIdentifier(identifier)
+        }
+        .sharedBackgroundVisibility(changed ? .hidden : .automatic)
     }
 }
 

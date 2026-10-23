@@ -66,6 +66,7 @@ use crate::workspace_links::resolve_workspace_file_link;
 
 mod actions_ui;
 mod appearance_sync;
+mod archive_choice;
 mod chat_split;
 mod chat_tabs;
 mod cloud_sandbox_strip;
@@ -78,7 +79,6 @@ mod project_icon;
 mod reauth;
 mod sidebar_pins;
 mod sidebar_search;
-mod sidebar_sections;
 mod spaces;
 mod stale_input;
 mod tabs;
@@ -97,6 +97,7 @@ actions!(
         AddSpacePalette,
         ToggleCommandPalette,
         OpenModelPicker,
+        OpenProjectPicker,
         OpenSettings,
         /// Quit and reopen (a new Screen Recording grant applies only then).
         RestartHarness,
@@ -556,6 +557,14 @@ pub fn apply_keymap(
         KeyBinding::new(
             &valid_or_default(&keymap.new_project, ShortcutId::NewProject.default_combo()),
             AddSpacePalette,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.open_project_picker,
+                ShortcutId::OpenProjectPicker.default_combo(),
+            ),
+            OpenProjectPicker,
             None,
         ),
         // Fixed: ⌘K summons the command palette.
@@ -1139,7 +1148,6 @@ struct SidebarSessionDrag {
 enum SidebarSessionDrop {
     Pinned(usize),
     Regular,
-    Section(String),
 }
 
 struct SidebarSessionTransfer {
@@ -1220,7 +1228,6 @@ struct PinnedSessionDragState {
 type SidebarKeyedRow = (String, f32, AnyElement);
 
 struct SidebarSessionRows {
-    custom_count: usize,
     regular_count: usize,
     rows: Vec<SidebarKeyedRow>,
     pinned_count: usize,
@@ -1913,6 +1920,8 @@ pub struct Shell {
     chat_split: Option<chat_split::ChatSplit>,
     /// The selection the split last saw, to tell outside picks from its own.
     chat_split_selected: Option<String>,
+    /// Only a gesture begun in a peer pane may activate it on release.
+    chat_pane_press: Option<(usize, gpui::MouseButton)>,
     /// Unfocused panes' chats last seen unarchived. Only archiving one of
     /// those closes its pane; an archived session opened to read keeps its
     /// pane when focus moves away (#489).
@@ -1992,6 +2001,8 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// The first ⌘W close is asking whether to archive (`archive_choice.rs`).
+    archive_choice_prompt: bool,
     /// Global confirmation/error dialog for the Changes-pane trash action. The
     /// RPC task is retained separately so rerenders do not cancel it.
     discard_working_tree: Option<DiscardWorkingTreeFlow>,
@@ -1999,12 +2010,6 @@ pub struct Shell {
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
-    sidebar_section_migration: Option<(String, crate::state::EngineHandle)>,
-    section_dialog: Option<sidebar_sections::SectionDialog>,
-    section_menu: Option<(String, Point<Pixels>)>,
-    section_header_hover: Option<String>,
-    section_menu_focus: FocusHandle,
-    section_menu_active: Option<usize>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
     /// The add-space palette (device tabs + folder search), `Some`
@@ -2474,6 +2479,7 @@ impl Shell {
             subagent_seq: 0,
             chat_split: None,
             chat_split_selected: None,
+            chat_pane_press: None,
             chat_split_live: std::collections::HashSet::new(),
             chat_tabs: Vec::new(),
             chat_tab: 0,
@@ -2523,16 +2529,11 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            archive_choice_prompt: false,
             discard_working_tree: None,
             discard_working_tree_task: None,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
-            sidebar_section_migration: None,
-            section_dialog: None,
-            section_menu: None,
-            section_header_hover: None,
-            section_menu_focus: cx.focus_handle(),
-            section_menu_active: None,
             delete_space_confirm: None,
             add_space: None,
             command_palette: None,
@@ -4863,6 +4864,7 @@ impl Shell {
             }
             target.skills_in_slash_menu = current.skills_in_slash_menu;
             target.archive_sessions_on_close = current.archive_sessions_on_close;
+            target.archive_on_close_chosen = current.archive_on_close_chosen;
             target.reduce_motion = current.reduce_motion;
             target.pause_animations_in_background = current.pause_animations_in_background;
         });
@@ -5467,7 +5469,6 @@ impl Shell {
 
     fn reconcile_sidebar_pins(&mut self, cx: &mut Context<Self>) {
         self.discard_stale_sidebar_pin_writes(cx);
-        self.migrate_sidebar_sections(cx);
         let Some(profile_key) = self.active_sidebar_pin_profile_key(cx) else {
             return;
         };
@@ -5500,14 +5501,7 @@ impl Shell {
     }
 
     fn active_sidebar_pins(&self, cx: &App) -> Vec<String> {
-        let mut pins = self.raw_sidebar_pins(cx);
-        let sections = self.active_sidebar_sections(cx);
-        pins.retain(|id| {
-            !sections
-                .iter()
-                .any(|section| section.session_ids.contains(id))
-        });
-        pins
+        self.raw_sidebar_pins(cx)
     }
 
     fn raw_sidebar_pins(&self, cx: &App) -> Vec<String> {
@@ -5615,11 +5609,6 @@ impl Shell {
         if pins.contains(&chat_id) == pinned {
             return;
         }
-        if pinned && self.raw_sidebar_pins(cx).contains(&chat_id) {
-            self.assign_sidebar_section(&chat_id, None, cx);
-            cx.notify();
-            return;
-        }
         let change = if pinned {
             harness_proto::SidebarPinChange::Pin {
                 session_id: chat_id.clone(),
@@ -5631,12 +5620,7 @@ impl Shell {
                 session_id: chat_id.clone(),
             }
         };
-        if self.apply_sidebar_pin_change(profile_key, change, cx)
-            && pinned
-            && self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local)
-        {
-            self.assign_sidebar_section(&chat_id, None, cx);
-        }
+        self.apply_sidebar_pin_change(profile_key, change, cx);
         cx.notify();
     }
 
@@ -5689,8 +5673,6 @@ impl Shell {
     /// stranding it over a session the user never picked.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
         self.command_palette.is_some()
-            || self.section_dialog.is_some()
-            || self.section_menu.is_some()
             || self.add_space.is_some()
             || self.composer.read(cx).pickers().read(cx).is_open()
     }
@@ -8142,8 +8124,7 @@ impl Shell {
             .moving_row
             .map(|(row, height)| self.render_moving_sidebar_session(row, height, theme));
         let pinned_count = session_rows.pinned_count;
-        let custom_count = session_rows.custom_count;
-        let regular_start = pinned_count + custom_count;
+        let regular_start = pinned_count;
         let keyed = session_rows.rows;
         let regular_count = session_rows.regular_count;
         let ungrouped = self.settings.sidebar_organization == SidebarOrganization::InOneList;
@@ -8196,7 +8177,7 @@ impl Shell {
                 order.push((
                     "sidebar-sessions-header".into(),
                     spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT
-                        + if show_pinned_section || custom_count > 0 {
+                        + if show_pinned_section {
                             12.0
                         } else {
                             0.0
@@ -8357,8 +8338,7 @@ impl Shell {
         let filter_row = self.render_spaces_filter(theme, cx);
         let active_list = if !list_items.is_empty() {
             let mut pinned_items = list_items;
-            let mut custom_items = pinned_items.split_off(pinned_count);
-            let regular_items = custom_items.split_off(custom_count);
+            let regular_items = pinned_items.split_off(pinned_count);
             let regular_empty = regular_items.is_empty();
             let pinned_group = show_pinned_section
                 .then(|| self.render_pinned_section(pinned_items, pinned_body_height, theme, cx));
@@ -8369,7 +8349,6 @@ impl Shell {
                 .gap(px(SIDEBAR_LIST_GAP))
                 .pb(px(Theme::SPACE_SM))
                 .when_some(pinned_group, |el, group| el.child(group))
-                .children(custom_items)
                 .when(
                     !regular_items.is_empty() || self.sidebar_session_transfer.is_some(),
                     |el| {
@@ -8439,7 +8418,7 @@ impl Shell {
                                     .into_any_element(),
                                 regular_body_height,
                                 regular_count,
-                                show_pinned_section || custom_count > 0,
+                                show_pinned_section,
                                 theme,
                                 cx,
                             ),
@@ -9740,6 +9719,9 @@ impl Shell {
         {
             return true;
         }
+        if self.dismiss_archive_choice(cx) {
+            return true;
+        }
         if self.rename_dialog.is_some() {
             self.rename_dialog = None;
             cx.notify();
@@ -10148,7 +10130,6 @@ impl Shell {
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
-        overlays.extend(self.render_section_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_command_palette(viewport, window, cx) {
             overlays.push(overlay);
         }
@@ -10201,6 +10182,10 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+        }
+
+        if let Some(dialog) = self.render_archive_choice_dialog(viewport, &theme, cx) {
+            overlays.push(dialog);
         }
 
         if let Some(flow) = self.discard_working_tree.clone() {
@@ -13108,6 +13093,26 @@ impl Render for Shell {
                     pickers.update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
                 }
             }))
+            // The project switcher: a keyboard path to the popover the
+            // new-session canvas's project chip opens. A press that finds the
+            // menu up dismisses it (⌘K's toggle); any other overlay keeps the
+            // quiet-underneath rule instead of being swapped out from under
+            // the pointer. The popover re-homes the NEW session, so it only
+            // opens where that destination is visible — the canvas.
+            .on_action(cx.listener(|this, _: &OpenProjectPicker, window, cx| {
+                if !matches!(this.route, Route::Chat) {
+                    return;
+                }
+                let pickers = this.composer.read(cx).pickers().clone();
+                let dismiss = pickers.read(cx).project_menu_open();
+                if !dismiss
+                    && (this.overlay_owns_keyboard(cx)
+                        || this.state.read(cx).selected_chat.is_some())
+                {
+                    return;
+                }
+                pickers.update(cx, |pickers, cx| pickers.toggle_project_menu(window, cx));
+            }))
             .on_action(cx.listener(|this, _: &RestartHarness, _, cx| this.relaunch(cx)))
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
                 if this.add_space.is_some() {
@@ -15525,6 +15530,103 @@ mod exit_regressions {
         }
     }
 
+    /// The project switcher shortcut (⌘⇧P by default) opens the project
+    /// popover on the new-session canvas, a second press dismisses it, and a
+    /// running chat keeps its keyboard — it has no destination to re-home.
+    #[gpui::test]
+    fn project_switcher_shortcut_opens_and_dismisses_the_project_menu(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    codegraff_client_id: None,
+                    default_harness: harness_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                window.activate_window();
+                shell.route = Route::Chat;
+                shell.open_new_session(cx);
+            })
+            .unwrap();
+        press_shortcut(cx, window);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    shell.composer.read(cx).pickers().read(cx).project_menu_open(),
+                    "the switcher shortcut opens the project menu"
+                );
+            })
+            .unwrap();
+        press_shortcut(cx, window);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    !shell.composer.read(cx).pickers().read(cx).project_menu_open(),
+                    "a second press dismisses it"
+                );
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("existing".into()));
+            })
+            .unwrap();
+        press_shortcut(cx, window);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    !shell.composer.read(cx).pickers().read(cx).project_menu_open(),
+                    "a running chat keeps its keyboard"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Press the project switcher's stored combo the way the platform spells
+    /// it (`mod` is ⌘ on macOS, ⌃ elsewhere), through real key events so the
+    /// registered binding and its action dispatch are covered too.
+    fn press_shortcut(cx: &mut TestAppContext, window: gpui::WindowHandle<Shell>) {
+        let combo = platform_combo(ShortcutId::OpenProjectPicker.default_combo());
+        let keystroke = gpui::Keystroke::parse(&combo).unwrap();
+        cx.update_window(window.into(), |_, w, cx| {
+            w.draw(cx).clear();
+            w.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            w.dispatch_event(gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }), cx);
+        })
+        .unwrap();
+    }
+
     #[gpui::test]
     fn projectless_new_session_restores_opt_out_and_clears_sidebar_filter(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -15718,6 +15820,8 @@ mod exit_regressions {
             )
         });
         let windows = |cx: &mut TestAppContext| cx.update(|cx| cx.windows().len());
+        // Already chosen, so ⌘W closes instead of asking first.
+        cx.update(|cx| settings::set_archive_sessions_on_close(false, cx));
         // A fresh, unprompted chat (the new-session canvas): nothing closes.
         cx.update(|cx| crate::app_menus::close_tab_in(window, cx));
         assert_eq!(windows(cx), 1, "⌘W on a new chat closed the app (#55)");
@@ -17918,6 +18022,15 @@ mod shortcut_focus_regressions {
 impl Shell {
     pub fn fixture_readme_agents_settings(&mut self, cx: &mut Context<Self>) {
         self.open_settings(SettingsSection::Harnesses, cx);
+    }
+
+    /// Close-and-archive QA (`examples/archive-choice-fixture.rs`).
+    pub fn fixture_archived_settings(&mut self, open: bool, cx: &mut Context<Self>) {
+        if open {
+            self.open_settings(SettingsSection::Archived, cx);
+        } else {
+            self.close_settings(cx);
+        }
     }
 
     pub fn fixture_appshots_settings(&mut self, open: bool, cx: &mut Context<Self>) {
