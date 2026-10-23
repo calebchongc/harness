@@ -505,23 +505,18 @@ impl Shell {
     fn drop_paths_on_pane(
         &mut self,
         ix: usize,
-        paths: Vec<std::path::PathBuf>,
+        mut paths: Vec<std::path::PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.select_chat_pane(ix, cx) {
+        paths.retain(|path| !path.as_os_str().is_empty());
+        if paths.is_empty() || !self.select_chat_pane(ix, cx) {
             return;
         }
-        // The composer swaps to the pane's draft only once the selection
-        // change reaches it, so name the destination.
-        let key = self
-            .state
-            .read(cx)
-            .selected_chat
-            .clone()
-            .unwrap_or_default();
+        // Synchronize the selected composer, including queued-message editing,
+        // before staging. Selection observers may not have run in this event.
         self.composer
-            .update(cx, |composer, cx| composer.add_paths_for(key, paths, cx));
+            .update(cx, |composer, cx| composer.add_paths(paths, cx));
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
@@ -915,6 +910,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let drop_target = self.attachment_drop_target(Some(ix), cx);
         let title: SharedString = chat_id
             .and_then(|id| {
                 self.state
@@ -1048,7 +1044,9 @@ impl Shell {
             .child(attachment_drop_veil(("chat-peer-pane-drop", ix), theme))
             .on_drop(
                 cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
-                    this.drop_paths_on_pane(ix, paths.paths().to_vec(), window, cx);
+                    if this.attachment_drop_is_current(&drop_target, cx) {
+                        this.drop_paths_on_pane(ix, paths.paths().to_vec(), window, cx);
+                    }
                 }),
             )
             // Finish the original click/selection before moving this entity
@@ -1102,7 +1100,13 @@ pub(super) fn attachment_drop_veil(
         // GPUI matches these styles against the active payload's concrete
         // TypeId. Resize markers therefore cannot reveal this overlay, even
         // after an external drag exits without another move event.
-        .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.opacity(1.0))
+        .drag_over::<gpui::ExternalPaths>(|style, paths, _, _| {
+            if paths.paths().iter().any(|path| !path.as_os_str().is_empty()) {
+                style.opacity(1.0)
+            } else {
+                style
+            }
+        })
         .child("Drop to attach")
 }
 

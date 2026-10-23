@@ -6208,6 +6208,15 @@ impl Composer {
     /// PDF did nothing at all (user report). Read failures, folders and
     /// oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if !paths.iter().any(|path| !path.as_os_str().is_empty()) {
+            return;
+        }
+        // A pane drop can change selection before our observer runs. Swap
+        // attachment keys, drafts and queued-message editing only on navigation;
+        // staging in the same session must not reprocess its queue/wizard state.
+        if self.state.read(cx).selected_chat.as_deref().unwrap_or_default() != self.current_key {
+            self.on_state_changed(cx);
+        }
         self.add_paths_for(self.current_key.clone(), paths, cx);
     }
 
@@ -6217,9 +6226,13 @@ impl Composer {
     pub(crate) fn add_paths_for(
         &mut self,
         key: String,
-        paths: Vec<PathBuf>,
+        mut paths: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        paths.retain(|path| !path.as_os_str().is_empty());
+        if paths.is_empty() {
+            return;
+        }
         let mut staged = Vec::new();
         for path in &paths {
             match attachments::stage_any_file(path) {
