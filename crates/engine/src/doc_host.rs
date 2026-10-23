@@ -17,6 +17,8 @@
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
 
 mod prompt_restore;
+#[cfg(test)]
+mod peer_dispatch_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -5858,7 +5860,8 @@ impl DocHost {
     ///
     /// If that checkout drifted since the chat's last turn (another branch,
     /// or another checkout in the same folder), the dispatch is held behind a
-    /// question instead and this returns `None` (#354).
+    /// question instead and this returns `None` (#354). Peer delivery also
+    /// returns `None` when held for an already active turn.
     ///
     /// The context is recorded only once dispatch accepts the request: one
     /// rejected before it ran leaves the previous context in place. A run
@@ -5872,6 +5875,11 @@ impl DocHost {
         request: harness_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<Option<String>, EngineError> {
+        if self.refuses_peer_mail(chat_id, &request.prompt) {
+            return Err(EngineError::Other(
+                harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
+            ));
+        }
         let context = self.capture_source_context(&request.cwd).await;
         if let Some(context) = &context
             && let Some(drift) = self.drift_since_last_turn(sessions, chat_id, context).await
@@ -5881,6 +5889,30 @@ impl DocHost {
             return Ok(None);
         }
         let (request, message_id) = self.release_branch_drift(chat_id, request, message_id)?;
+        // Source capture and checkout questions can await. Recheck at the
+        // actual handoff, including cold fallbacks and orphan redelivery.
+        if self.refuses_peer_mail(chat_id, &request.prompt) {
+            return Err(EngineError::Other(
+                harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
+            ));
+        }
+        if harness_proto::peer_mail::is_peer_mail(&request.prompt)
+            && sessions.turn_in_flight(chat_id)
+        {
+            let handle = self.open(chat_id)?;
+            handle.doc.push_queued(&QueuedMessage {
+                id: message_id.unwrap_or_else(new_id),
+                text: request.prompt,
+                attachments: request.attachments,
+                hold_for_turn_end: false,
+                issued_by: self.inner.config.device_id.clone(),
+                issued_at: now_ms(),
+                edited_at: None,
+                delivery_gate: None,
+            })?;
+            handle.publish_queue();
+            return Ok(None);
+        }
         let run_id = sessions
             .dispatch(chat_id, harness, request, message_id)
             .await?;
