@@ -55,6 +55,9 @@ use crate::theme::Theme;
 use harness_syntax::LanguageId as Lang;
 
 #[cfg(test)]
+#[path = "transcript/bottom_flicker_tests.rs"]
+mod bottom_flicker_tests;
+#[cfg(test)]
 #[path = "transcript/selection_tests.rs"]
 mod selection_tests;
 #[cfg(test)]
@@ -3868,6 +3871,11 @@ enum BlobFetch {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    /// An error card's "Log in": the run was refused because this chat's
+    /// agent is signed out or out of usage ([`harness_proto::run_errors`]).
+    /// The shell routes it by the chat's own agent and host, never by the
+    /// error text.
+    SignIn { chat_id: String },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -3917,6 +3925,26 @@ impl Transcript {
             }
             link
         })
+    }
+
+    /// The chat's workspace directory: relative file links resolve under it.
+    fn workspace_root(&self, cx: &gpui::App) -> Option<SharedString> {
+        let state = self.state.read(cx);
+        self.chat_id
+            .as_deref()
+            .and_then(|chat_id| state.chats.iter().find(|chat| chat.id == chat_id))
+            .or_else(|| state.selected_chat_row())
+            .and_then(|chat| chat.cwd.as_deref())
+            .map(SharedString::from)
+    }
+
+    /// File badges on tool chips open through the same workspace-link route
+    /// as Markdown file links, so only chats with a link handler and a
+    /// workspace get clickable badges.
+    fn tool_file_opener(&self, cx: &gpui::App) -> Option<ToolFileOpener> {
+        let link = self.link_ui()?;
+        let root = self.workspace_root(cx)?;
+        Some(ToolFileOpener { link, root })
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -7681,15 +7709,7 @@ impl Transcript {
         };
         self.rendered_rows.insert(row.id.clone());
         let theme = Theme::of(cx).clone();
-        let workspace_root = {
-            let state = self.state.read(cx);
-            self.chat_id
-                .as_deref()
-                .and_then(|chat_id| state.chats.iter().find(|chat| chat.id == chat_id))
-                .or_else(|| state.selected_chat_row())
-                .and_then(|chat| chat.cwd.as_deref())
-                .map(SharedString::from)
-        };
+        let workspace_root = self.workspace_root(cx);
         // The viewport spans the full window (under the titlebar): the first
         // row's gap adds the titlebar's height so a top-scrolled transcript
         // rests below the chrome it fades under. The right pane already pads
@@ -7979,7 +7999,22 @@ impl Transcript {
                 mime_type,
                 viewed,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, *viewed, cx),
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip { message } => {
+                let problem = harness_proto::run_errors::provider_problem(message);
+                let sign_in = self
+                    .chat_id
+                    .clone()
+                    .filter(|_| problem.is_some())
+                    .map(|chat_id| {
+                        cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(TranscriptEvent::SignIn {
+                                chat_id: chat_id.clone(),
+                            });
+                        })
+                    });
+                error_chip(&row.id, message.clone(), problem, sign_in, &theme)
+            }
             RowKind::ReauthRequired { message, provider } => {
                 self.render_reauth(ix, &row.id, message, *provider, &theme, cx)
             }
@@ -8352,6 +8387,7 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut fold = self.folds.get(row_id).copied().unwrap_or_default();
+        let file_opener = self.tool_file_opener(cx);
         // Agent/spawn chips never fold: they are their own row, always open,
         // no "Called N tools" header — a running subagent stays visible.
         // Compact mode is the exception: EVERYTHING sits under the one work
@@ -8841,6 +8877,7 @@ impl Transcript {
                             content_reveal,
                             connector_reveal,
                             continuation_reveal,
+                            file_opener.as_ref(),
                             theme,
                             cx.entity_id(),
                             cx,
@@ -8897,7 +8934,14 @@ impl Transcript {
                                 entry.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
-                            .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
+                            .child(chip_header(
+                                tool,
+                                open,
+                                file_opener.as_ref(),
+                                theme,
+                                cx.entity_id(),
+                                cx,
+                            )),
                     );
                 // The body stays mounted while the close tween shrinks over it.
                 // Invocation first (what was asked), then output/diff (what
@@ -9168,13 +9212,6 @@ fn user_bubble_text(
         .into_any_element()
 }
 
-/// The transcript ErrorChip — the shared [`notice_chip`] in its tile
-/// treatment (a port of harness chat-view.tsx `ErrorChip`, restacked for long
-/// payloads: header row with the red-washed tile and the medium "Error"
-/// label, then the human message below). Unlike the web port, the message
-/// WRAPS instead of truncating: startup-crash errors carry the agent's exit
-/// status and stderr, and a one-line ellipsis was exactly what made
-/// the upstream adapter failure undiagnosable from the screenshot.
 /// Latest step lines per subagent still running, oldest first. graff's log
 /// is its step lines, a blank line, then the tail of the text the child is
 /// writing mid-stream — that tail is left out (mid-stream fragments read as
@@ -9250,12 +9287,40 @@ fn plan_usage_limit_card(
         .into_any_element()
 }
 
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+/// The transcript ErrorChip — the shared [`notice_chip`] in its tile
+/// treatment (a port of harness chat-view.tsx `ErrorChip`, restacked for long
+/// payloads: header row with the red-washed tile and the medium label, then
+/// the human message below). Unlike the web port, the message WRAPS instead
+/// of truncating: startup-crash errors carry the agent's exit status and
+/// stderr, and a one-line ellipsis was exactly what made the upstream adapter
+/// failure undiagnosable from the screenshot. A refusal that signing in fixes (signed out, a usage limit)
+/// says so in the label, and with a chat to route it carries a "Log in"
+/// button under the message that starts that agent's sign-in.
+fn error_chip(
+    row_id: &SharedString,
+    message: SharedString,
+    problem: Option<harness_proto::run_errors::ProviderProblem>,
+    sign_in: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
+    theme: &Theme,
+) -> AnyElement {
+    let label = problem.map_or("Error", |problem| problem.label());
+    let button = problem.zip(sign_in).map(|(problem, on_click)| {
+        crate::popover::btn_primary(theme, problem.action_label())
+            .id(SharedString::from(format!("{row_id}-sign-in")))
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .text_size(crate::typography::ui_rems(12.0))
+            .on_click(on_click)
+    });
     div()
         .py(px(4.0))
         .w_full()
         .child(
-            notice_chip(theme, false, "Error", message, Tile)
+            notice_chip(theme, false, label, message, Tile)
+                .when_some(button, |chip, button| {
+                    chip.child(div().pt(px(2.0)).flex().flex_row().child(button))
+                })
                 .overflow_hidden()
                 .w_full(),
         )
@@ -9374,6 +9439,35 @@ fn detail_body(
     theme: &Theme,
 ) -> AnyElement {
     let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
+    // Every line joins the transcript's selection, so paths, output and
+    // thoughts can be drag-selected (across lines too) and copied. Lines clip
+    // rather than ellipsize: selection maps the pointer onto the full text.
+    let line_key = |line_ix: usize| -> std::sync::Arc<str> { format!("{key}:{line_ix}").into() };
+    let clip = |text: AnyElement| {
+        div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(text)
+    };
+    let mono = || gpui::font(theme.font_mono.clone());
+    let plain_line = |line_ix: usize, text: SharedString| {
+        let runs = vec![TextRun {
+            len: text.len(),
+            font: mono(),
+            color: theme.text_faint,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        clip(render::selectable_text_element(
+            line_key(line_ix),
+            text,
+            runs,
+            theme.selection,
+        ))
+    };
     match detail {
         // No comment layer: an inline tool diff is a record of what the
         // agent already did, not a review surface.
@@ -9388,7 +9482,8 @@ fn detail_body(
             .py(px(6.0))
             .font_family(theme.font_mono.clone())
             .text_size(px(TOOL_TEXT_SIZE))
-            .children(stats.iter().map(|stat| {
+            .children(stats.iter().enumerate().map(|(stat_ix, stat)| {
+                let path = plain_line(stat_ix, SharedString::from(stat.path.clone()));
                 div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
@@ -9404,14 +9499,7 @@ fn detail_body(
                         .size(px(14.0))
                         .flex_none(),
                     )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(stat.path.clone())),
-                    )
+                    .child(div().min_w_0().flex_1().child(path))
                     .child(
                         div()
                             .flex_none()
@@ -9434,21 +9522,24 @@ fn detail_body(
             .font_family(theme.font_mono.clone())
             .text_size(px(TOOL_TEXT_SIZE))
             .children(lines.iter().enumerate().map(|(ix, line)| {
-                let text = render::autolinked_text(
-                    format!("{key}:{ix}").into(),
-                    line.clone(),
-                    link.cloned(),
-                    theme,
-                )
-                .unwrap_or_else(|| line.clone().into_any_element());
-                div()
+                let row = div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .text_color(theme.text_faint)
-                    .child(div().w_full().min_w_0().truncate().child(text))
+                    .text_color(theme.text_faint);
+                if line.is_empty() {
+                    return row;
+                }
+                row.child(clip(render::selectable_autolinked_text(
+                    line_key(ix),
+                    line.clone(),
+                    mono(),
+                    theme.text_faint,
+                    link.cloned(),
+                    theme,
+                )))
             }))
             .when(*truncated_by > 0, |block| {
                 block.child(more_lines_row(*truncated_by, theme))
@@ -9460,7 +9551,7 @@ fn detail_body(
         } => body
             .py(px(6.0))
             .text_size(px(TOOL_TEXT_SIZE))
-            .children(lines.iter().map(|line| {
+            .children(lines.iter().enumerate().map(|(line_ix, line)| {
                 let row = div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
@@ -9470,13 +9561,12 @@ fn detail_body(
                 let Some((text, runs)) = thought_line_text(line, theme) else {
                     return row; // blank separator row
                 };
-                row.child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .truncate()
-                        .child(StyledText::new(text).with_runs(runs)),
-                )
+                row.child(clip(render::selectable_text_element(
+                    line_key(line_ix),
+                    text,
+                    runs,
+                    theme.selection,
+                )))
             }))
             .when(*truncated_by > 0, |block| {
                 block.child(more_lines_row(*truncated_by, theme))
@@ -9578,6 +9668,7 @@ enum ChipTrail {
 fn chip_header_row(
     tool: &ToolItem,
     trail: Option<ChipTrail>,
+    file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -9607,6 +9698,10 @@ fn chip_header_row(
         | ToolCall::ApplyPatch { path: Some(path) } => Some(path.as_str()),
         _ => None,
     };
+    let open_file = file_path
+        .zip(file_opener)
+        .filter(|(path, opener)| opener.opens(path))
+        .map(|(path, opener)| (path.to_owned(), opener.clone()));
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
@@ -9742,16 +9837,32 @@ fn chip_header_row(
                                 .child(SharedString::from(file_badge_name(path).to_owned())),
                         )
                         .map(|badge| {
-                            if hover_text {
-                                badge
-                                    .id("tool-file-badge")
-                                    .group_hover("tool-header", |style| {
+                            if !hover_text && open_file.is_none() {
+                                return badge.into_any_element();
+                            }
+                            badge
+                                .id("tool-file-badge")
+                                .when(hover_text, |badge| {
+                                    badge.group_hover("tool-header", |style| {
                                         style.text_color(theme.text)
                                     })
-                                    .into_any_element()
-                            } else {
-                                badge.into_any_element()
-                            }
+                                })
+                                // The badge is its own target: opening the
+                                // file must not also toggle the chip's
+                                // accordion underneath it.
+                                .when_some(open_file, |badge, (path, opener)| {
+                                    badge
+                                        .debug_selector(|| "tool-file-badge".into())
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style.bg(theme.ink(0.1)).text_color(theme.text)
+                                        })
+                                        .on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            opener.open(&path, window, cx);
+                                        })
+                                })
+                                .into_any_element()
                         });
                     // No backdrop blur: behind an inline badge there is only
                     // the flat transcript, so blurring it changes no pixels,
@@ -9874,15 +9985,52 @@ fn chip_header_row(
         })
 }
 
+/// Opens a tool chip's file in the files panel through the transcript's
+/// workspace-link handler.
+#[derive(Clone)]
+struct ToolFileOpener {
+    link: render::LinkUi,
+    /// The chat's workspace, the root the shell's file-link route resolves
+    /// against (`Shell::open_workspace_file_link`).
+    root: SharedString,
+}
+
+impl ToolFileOpener {
+    /// Only paths the file-link route resolves inside the workspace get a
+    /// clickable badge; the rest stay inert instead of looking clickable and
+    /// doing nothing.
+    fn opens(&self, path: &str) -> bool {
+        crate::workspace_links::resolve_workspace_file_link(path, &self.root).is_some()
+    }
+
+    fn open(&self, path: &str, window: &mut Window, cx: &mut gpui::App) {
+        render::activate_link(
+            render::LinkTarget::new(file_badge_name(path), path),
+            render::LinkAction::Primary,
+            Some(&self.link),
+            window,
+            cx,
+        );
+    }
+}
+
 /// The header row of an expandable chip card.
 fn chip_header(
     tool: &ToolItem,
     open: bool,
+    file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
-    chip_header_row(tool, Some(ChipTrail::Chevron { open }), theme, view, cx)
+    chip_header_row(
+        tool,
+        Some(ChipTrail::Chevron { open }),
+        file_opener,
+        theme,
+        view,
+        cx,
+    )
 }
 
 /// Max chars a subagent tab title keeps. The strip chip is fixed-width and
@@ -10095,6 +10243,7 @@ fn tool_chip(
     content_reveal: f32,
     connector_reveal: f32,
     continuation_reveal: f32,
+    file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -10142,7 +10291,7 @@ fn tool_chip(
                         .top(px(4.0 * (1.0 - content_reveal)))
                         .opacity(content_reveal)
                 })
-                .child(chip_header_row(tool, None, theme, view, cx)),
+                .child(chip_header_row(tool, None, file_opener, theme, view, cx)),
         )
         .into_any_element()
 }
@@ -10198,6 +10347,7 @@ fn link_chip(
                 .child(chip_header_row(
                     tool,
                     Some(ChipTrail::OpenArrow),
+                    None,
                     theme,
                     view,
                     cx,
@@ -10646,6 +10796,68 @@ mod tests {
         assert_eq!(seen[0].target.original, "https://example.com/review/123");
         assert_eq!(seen[0].action, render::LinkAction::Primary);
         assert_eq!(seen[0].source_session.as_deref(), Some("chat"));
+    }
+
+    #[gpui::test]
+    fn expanded_tool_output_text_drag_selects_across_lines(cx: &mut gpui::TestAppContext) {
+        let _selection = crate::markdown::selection::test_state_lock();
+        struct Detail;
+        impl Render for Detail {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                div()
+                    .w(px(600.0))
+                    .child(render::selection_frame_reset())
+                    .child(detail_body(
+                        &ToolDetail::Output {
+                            lines: vec![
+                                "cat /workspace/src/main.rs".into(),
+                                "see https://example.com/docs".into(),
+                            ],
+                            truncated_by: 0,
+                        },
+                        None,
+                        "probe#out",
+                        None,
+                        &theme,
+                    ))
+            }
+        }
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Detail);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let first = render::selection_test_bounds("probe#out:0");
+        // The line with a URL joins the selection too.
+        let second = render::selection_test_bounds("probe#out:1");
+        let start = first.origin + gpui::point(px(1.0), first.size.height / 2.0);
+        let end = gpui::point(second.right() + px(40.0), second.center().y);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Left,
+            position: start,
+            click_count: 1,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: end,
+            pressed_button: Some(MouseButton::Left),
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: MouseButton::Left,
+            position: end,
+            ..Default::default()
+        });
+        assert_eq!(
+            crate::markdown::selection::selected_text().as_deref(),
+            Some("cat /workspace/src/main.rs\nsee https://example.com/docs")
+        );
+        crate::markdown::selection::clear_if_owner("probe#out:0");
     }
 
     #[test]
@@ -17510,6 +17722,125 @@ mod tests {
         assert_eq!(file_badge_name("src/components/"), "components");
         assert_eq!(file_badge_name("main.rs"), "main.rs");
         assert_eq!(file_badge_name(""), "");
+    }
+
+    #[gpui::test]
+    fn tool_file_badge_opens_workspace_files_without_toggling_the_chip(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Modifiers;
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let opened: Rc<RefCell<Vec<render::LinkActivation>>> = Rc::default();
+        let recorded = opened.clone();
+        let opener = ToolFileOpener {
+            link: render::LinkUi {
+                source_session: Some("chat".into()),
+                handler: Rc::new(move |activation, _, _| {
+                    recorded.borrow_mut().push(activation.clone());
+                    render::LinkOutcome::Internal
+                }),
+            },
+            root: "/work/app".into(),
+        };
+        assert!(opener.opens("/work/app/src/guard.rs"));
+        assert!(opener.opens("src/guard.rs"));
+        // Outside the workspace: the file-link route would refuse it.
+        assert!(!opener.opens("/tmp/report.md"));
+        assert!(!opener.opens("/work/app/../secret.rs"));
+        assert!(!opener.opens("../secret.rs"));
+
+        let read = |path: &str| ToolItem {
+            part_id: "fixture".into(),
+            call: ToolCall::ReadFile { path: path.into() },
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            view: None,
+            kind: ToolItemKind::Call,
+        };
+        // The chip header inside a clickable parent, standing in for the
+        // accordion toggle that wraps it in `render_tool_group`.
+        struct ChipFixture {
+            tool: ToolItem,
+            opener: ToolFileOpener,
+            toggles: Rc<Cell<usize>>,
+        }
+        impl Render for ChipFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let toggles = self.toggles.clone();
+                div().w(px(600.0)).child(
+                    div()
+                        .id("chip-toggle")
+                        .debug_selector(|| "chip-toggle".into())
+                        .on_click(move |_, _, _| toggles.set(toggles.get() + 1))
+                        .child(chip_header(
+                            &self.tool,
+                            false,
+                            Some(&self.opener),
+                            &theme,
+                            cx.entity_id(),
+                            cx,
+                        )),
+                )
+            }
+        }
+
+        let toggles = Rc::new(Cell::new(0));
+        let (_inside, window) = cx.add_window_view(|_, _| ChipFixture {
+            tool: read("/work/app/src/guard.rs"),
+            opener: opener.clone(),
+            toggles: toggles.clone(),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        let badge = window
+            .debug_bounds("tool-file-badge")
+            .expect("a workspace file badge is clickable");
+        window.simulate_click(badge.center(), Modifiers::default());
+        {
+            let opened = opened.borrow();
+            assert_eq!(opened.len(), 1);
+            assert_eq!(opened[0].target.original, "/work/app/src/guard.rs");
+            assert_eq!(opened[0].action, render::LinkAction::Primary);
+            assert_eq!(opened[0].source_session.as_deref(), Some("chat"));
+        }
+        assert_eq!(
+            toggles.get(),
+            0,
+            "opening the file must not toggle the chip"
+        );
+        // The rest of the header still toggles the accordion.
+        let row = window.debug_bounds("chip-toggle").unwrap();
+        window.simulate_click(
+            gpui::point(row.left() + px(2.0), row.center().y),
+            Modifiers::default(),
+        );
+        assert_eq!(toggles.get(), 1);
+        assert_eq!(opened.borrow().len(), 1);
+
+        let (_outside, window) = cx.add_window_view(|_, _| ChipFixture {
+            tool: read("/tmp/report.md"),
+            opener: opener.clone(),
+            toggles: Rc::new(Cell::new(0)),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            window.debug_bounds("tool-file-badge").is_none(),
+            "paths the file-link route cannot open keep an inert badge"
+        );
     }
 
     #[test]

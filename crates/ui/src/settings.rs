@@ -736,6 +736,8 @@ pub struct UiSettings {
     pub sidebar_show_project_icon: bool,
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
+    /// The Archived accordion below the active session list.
+    pub sidebar_show_archived: bool,
     /// The last selected space — restored on boot when the row still exists;
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -916,6 +918,7 @@ impl Default for UiSettings {
             sidebar_show_project_icon: true,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
+            sidebar_show_archived: true,
             last_space_id: None,
             project_folders_by_device: HashMap::new(),
             last_project_action_by_space_id: std::collections::HashMap::new(),
@@ -1025,6 +1028,7 @@ pub enum ShortcutId {
     SplitTerminalDown,
     NewSession,
     NewProject,
+    OpenProjectPicker,
     OpenModelPicker,
     NextSession,
     PrevSession,
@@ -1035,7 +1039,7 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 17 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 18 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -1047,6 +1051,7 @@ impl ShortcutId {
         ShortcutId::SplitTerminalDown,
         ShortcutId::NewSession,
         ShortcutId::NewProject,
+        ShortcutId::OpenProjectPicker,
         ShortcutId::OpenModelPicker,
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
@@ -1082,6 +1087,7 @@ impl ShortcutId {
             ShortcutId::SplitTerminalDown => "Split terminal down",
             ShortcutId::NewSession => "New chat",
             ShortcutId::NewProject => "New project",
+            ShortcutId::OpenProjectPicker => "Open project picker",
             ShortcutId::OpenModelPicker => "Open model picker",
             ShortcutId::NextSession => "Next tab or session",
             ShortcutId::PrevSession => "Previous tab or session",
@@ -1118,6 +1124,9 @@ impl ShortcutId {
             ShortcutId::NewSession if mac => "mod-t",
             ShortcutId::NewSession => "mod-shift-t",
             ShortcutId::NewProject => "mod-shift-n",
+            // Mnemonic sibling of ⌘⇧N, on the same row as the model picker's
+            // ⌘/ — free of every default, browser and terminal combo.
+            ShortcutId::OpenProjectPicker => "mod-shift-p",
             ShortcutId::OpenModelPicker => "mod-/",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
             // recorder spells ctrl (see `combo_from_keystroke`). Off macOS
@@ -1171,6 +1180,7 @@ pub struct KeymapConfig {
     pub split_terminal_down: String,
     pub new_session: String,
     pub new_project: String,
+    pub open_project_picker: String,
     pub open_model_picker: String,
     pub next_session: String,
     pub prev_session: String,
@@ -1239,6 +1249,7 @@ impl Default for KeymapConfig {
             split_terminal_down: ShortcutId::SplitTerminalDown.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
             new_project: ShortcutId::NewProject.default_combo().into(),
+            open_project_picker: ShortcutId::OpenProjectPicker.default_combo().into(),
             open_model_picker: ShortcutId::OpenModelPicker.default_combo().into(),
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
@@ -1264,6 +1275,7 @@ impl KeymapConfig {
             ShortcutId::SplitTerminalDown => &self.split_terminal_down,
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::NewProject => &self.new_project,
+            ShortcutId::OpenProjectPicker => &self.open_project_picker,
             ShortcutId::OpenModelPicker => &self.open_model_picker,
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
@@ -1291,6 +1303,7 @@ impl KeymapConfig {
             ShortcutId::SplitTerminalDown => self.split_terminal_down = combo,
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::NewProject => self.new_project = combo,
+            ShortcutId::OpenProjectPicker => self.open_project_picker = combo,
             ShortcutId::OpenModelPicker => self.open_model_picker = combo,
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
@@ -2383,6 +2396,7 @@ mod tests {
             sidebar_show_project_label: false,
             sidebar_show_harness: false,
             sidebar_show_branch: false,
+            sidebar_show_archived: false,
             last_space_id: Some("space-1".into()),
             project_folders_by_device: HashMap::from([(
                 "local".into(),
@@ -2614,10 +2628,12 @@ mod tests {
         assert!(settings.sidebar_compact);
         assert!(settings.sidebar_show_project_icon);
         assert!(settings.sidebar_show_project_label);
+        assert!(settings.sidebar_show_archived);
         let customized = UiSettings {
             sidebar_compact: false,
             sidebar_show_project_icon: false,
             sidebar_show_project_label: false,
+            sidebar_show_archived: false,
             sidebar_organization: SidebarOrganization::ByProject,
             ..settings
         };

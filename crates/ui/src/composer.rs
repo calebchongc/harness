@@ -5510,10 +5510,13 @@ fn slash_error_message(err: &RpcError, skill: bool) -> SharedString {
 struct PromptHistoryNav {
     back: usize,
     draft: String,
+    /// Stable while browsing: live transcript appends/replays must not move
+    /// the cursor or invalidate an index. A new browse sees the latest rows.
+    prompts: Vec<String>,
 }
 
-/// The session's sent prompts, oldest first: user rows' text without
-/// attachment references, skipping attachment-only sends and repeats.
+/// The session's human prompts, oldest first: user rows' text without
+/// attachment references, skipping agent deliveries, attachment-only sends and repeats.
 fn session_prompts(transcript: &[SessionMessageEntry]) -> Vec<String> {
     let mut prompts: Vec<String> = Vec::new();
     for entry in transcript
@@ -6208,6 +6211,15 @@ impl Composer {
     /// PDF did nothing at all (user report). Read failures, folders and
     /// oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if !paths.iter().any(|path| !path.as_os_str().is_empty()) {
+            return;
+        }
+        // A pane drop can change selection before our observer runs. Swap
+        // attachment keys, drafts and queued-message editing only on navigation;
+        // staging in the same session must not reprocess its queue/wizard state.
+        if self.state.read(cx).selected_chat.as_deref().unwrap_or_default() != self.current_key {
+            self.on_state_changed(cx);
+        }
         self.add_paths_for(self.current_key.clone(), paths, cx);
     }
 
@@ -6217,9 +6229,13 @@ impl Composer {
     pub(crate) fn add_paths_for(
         &mut self,
         key: String,
-        paths: Vec<PathBuf>,
+        mut paths: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        paths.retain(|path| !path.as_os_str().is_empty());
+        if paths.is_empty() {
+            return;
+        }
         let mut staged = Vec::new();
         for path in &paths {
             match attachments::stage_any_file(path) {
@@ -6977,7 +6993,11 @@ impl Composer {
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
-        if self.wizard_active() {
+        let input = self.input.read(cx);
+        let recalling = input.history_entry.as_deref() == Some(input.text());
+        // Recalling a command or mention is navigation, not fresh typing.
+        // Popups would take the next Up/Down away from prompt history.
+        if self.wizard_active() || recalling {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
@@ -7430,7 +7450,7 @@ impl Composer {
     /// The new-session canvas heading. The destination chips alone read as
     /// settings, so a fresh canvas (first launch, ⌘D) never said where the
     /// session would run; this names the project up front. Clicking it opens
-    /// the project picker, which also offers "New project…".
+    /// the project picker, which also offers "New project".
     fn render_new_thread_heading(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let project = self
             .state
@@ -7987,13 +8007,7 @@ impl Composer {
                     wizard,
                 );
             } else {
-                let mut old_text = self.input.read(cx).text().to_string();
-                // Leaving mid-recall keeps the real draft, not the recalled prompt.
-                if let Some(nav) = self.prompt_history.take()
-                    && self.input.read(cx).history_entry.as_deref() == Some(old_text.as_str())
-                {
-                    old_text = nav.draft;
-                }
+                let old_text = self.take_prompt_draft(cx);
                 if old_text.is_empty() {
                     self.drafts.remove(&self.current_key);
                 } else {
@@ -8058,10 +8072,8 @@ impl Composer {
                     .is_some_and(|w| w.request_id == request_id);
                 if !same {
                     if self.wizard.is_none() {
-                        self.drafts.insert(
-                            self.current_key.clone(),
-                            self.input.read(cx).text().to_string(),
-                        );
+                        let draft = self.take_prompt_draft(cx);
+                        self.drafts.insert(self.current_key.clone(), draft);
                     }
                     self.reset_mention(None, cx);
                     self.wizard_drafts.retain(|(chat, request), _| {
@@ -8246,6 +8258,17 @@ impl Composer {
         cx.notify();
     }
 
+    /// End recall when another editor borrows the composer, preserving the
+    /// displaced draft unless the user actually edited the recalled prompt.
+    pub(crate) fn take_prompt_draft(&mut self, cx: &App) -> String {
+        let input = self.input.read(cx);
+        let text = input.text().to_string();
+        match self.prompt_history.take() {
+            Some(nav) if input.history_entry.as_deref() == Some(text.as_str()) => nav.draft,
+            _ => text,
+        }
+    }
+
     /// Up (`-1`) / Down (`1`) through this session's earlier prompts. The
     /// transcript is the history, so it survives reopening the session and
     /// never mixes sessions. Past the newest prompt the unsent draft returns.
@@ -8254,29 +8277,33 @@ impl Composer {
             return;
         }
         // `set_text` (a send, a draft swap) ends recall inside the input.
-        if self.input.read(cx).history_entry.is_none() {
+        let input = self.input.read(cx);
+        if input.history_entry.as_deref() != Some(input.text()) {
             self.prompt_history = None;
         }
-        let prompts = session_prompts(&self.state.read(cx).transcript);
         let next = match (&self.prompt_history, delta < 0) {
-            (None, true) if !prompts.is_empty() => {
+            (None, true) => {
+                let prompts = session_prompts(&self.state.read(cx).transcript);
+                if prompts.is_empty() {
+                    return;
+                }
                 self.prompt_history = Some(PromptHistoryNav {
                     back: 0,
-                    draft: self.input.read(cx).text().to_string(),
+                    draft: input.text().to_string(),
+                    prompts,
                 });
                 Some(0)
             }
-            (Some(nav), true) if nav.back + 1 < prompts.len() => Some(nav.back + 1),
+            (Some(nav), true) if nav.back + 1 < nav.prompts.len() => Some(nav.back + 1),
             (Some(nav), false) if nav.back > 0 => Some(nav.back - 1),
             (Some(_), false) => None,
             _ => return,
         };
         let (text, recalled) = match next {
             Some(back) => {
-                if let Some(nav) = self.prompt_history.as_mut() {
-                    nav.back = back;
-                }
-                (prompts[prompts.len() - 1 - back].clone(), true)
+                let nav = self.prompt_history.as_mut().unwrap();
+                nav.back = back;
+                (nav.prompts[nav.prompts.len() - 1 - back].clone(), true)
             }
             None => (
                 self.prompt_history
@@ -8619,6 +8646,9 @@ impl Composer {
         };
         self.launching_new_chat = is_new;
         if is_new {
+            self.pickers.update(cx, |pickers, _| {
+                pickers.begin_chat_creation(chat_id.clone(), resolved.clone());
+            });
             cx.emit(ComposerEvent::NewThreadTransitionStarted);
         }
         // A queued message is not in the transcript yet — the queue panel is
@@ -11228,6 +11258,10 @@ fn dictation_unavailable_message(
 }
 
 #[cfg(test)]
+#[path = "composer/prompt_history_tests.rs"]
+mod prompt_history_tests;
+
+#[cfg(test)]
 #[path = "composer/question_recovery_tests.rs"]
 mod question_recovery_tests;
 
@@ -12996,6 +13030,102 @@ mod tests {
                 composer.send_blocked(cx),
                 "Pending edits must still block submission"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn first_send_keeps_canvas_config_while_chat_row_is_missing(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut defaults = crate::settings::composer::ComposerDefaults::default();
+        defaults.remember_model(
+            HarnessId::ClaudeCode,
+            "other-model".into(),
+            "Other model".into(),
+        );
+        defaults
+            .model_options_mut(HarnessId::Codex, "canvas-model")
+            .insert("serviceTier".into(), "fast".into());
+        defaults.save(directory.path()).unwrap();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.data_dir = Some(directory.path().to_path_buf());
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                harness_rpc::RpcClient::new(out, inbound),
+            ));
+            state
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let captured = composer.update(cx, |composer, cx| {
+            composer.pickers.update(cx, |pickers, cx| {
+                pickers.adopt_canvas_draft(
+                    Some(crate::pickers::CanvasDraft {
+                        harness: Some(HarnessId::Codex),
+                        model: Some("canvas-model".into()),
+                        reasoning: Some(harness_proto::ReasoningLevel::High),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+            let captured = composer.pickers.read(cx).resolved(cx);
+            composer.send("First prompt".into(), false, cx);
+            captured
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(state.selected_chat.is_some());
+            assert!(state.selected_chat_row().is_none());
+        });
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.pickers.read(cx).resolved(cx), captured)
+        });
+        let mut create = None;
+        while let Ok(frame) = requests.try_recv() {
+            let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            if frame.method.as_deref() == Some(methods::MUTATE)
+                && frame.params["op"] == "createChat"
+            {
+                create = Some(frame);
+            }
+        }
+        let create = create.expect("first send creates the chat with captured picks");
+        assert_eq!(
+            create.params["config"],
+            serde_json::to_value(captured.chat_config().unwrap()).unwrap()
+        );
+        replies
+            .try_send(
+                serde_json::to_string(&harness_rpc::ServerFrame {
+                    id: create.id,
+                    ok: Some(serde_json::json!({})),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        let mut run = None;
+        while let Ok(frame) = requests.try_recv() {
+            let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            if frame.method.as_deref() == Some(methods::QUEUE_COMMAND) {
+                run = Some(frame.params["command"]["request"].clone());
+            }
+        }
+        let run = run.expect("first send queues the captured run independently of row sync");
+        assert_eq!(run["harness"], "codex");
+        assert_eq!(run["model"], "canvas-model");
+        assert_eq!(run["reasoning"], "high");
+        assert_eq!(run["modelOptions"]["serviceTier"], "fast");
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.pickers.read(cx).resolved(cx), captured)
         });
     }
 

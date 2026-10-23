@@ -378,6 +378,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17dd265a7d0f31ef544e1b20e03add05d3b45b491b633b10d67145d2acc1a38"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1243,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "harness-adapters"
-version = "0.2.121"
+version = "0.2.133"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1269,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "harness-doc"
-version = "0.2.121"
+version = "0.2.133"
 dependencies = [
  "chrono",
  "harness-proto",
@@ -1283,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "harness-engine"
-version = "0.2.121"
+version = "0.2.133"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1298,6 +1300,7 @@ dependencies = [
  "harness-rpc",
  "harness-sync",
  "harness-update",
+ "harness-visual",
  "ignore",
  "libc",
  "loro",
@@ -1319,8 +1322,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-mcp"
+version = "0.2.133"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "harness-doc",
+ "harness-proto",
+ "harness-rpc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "harness-preview"
-version = "0.2.121"
+version = "0.2.133"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1346,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "harness-proto"
-version = "0.2.121"
+version = "0.2.133"
 dependencies = [
  "chrono",
  "pulldown-cmark",
@@ -1357,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "harness-rpc"
-version = "0.2.121"
+version = "0.2.133"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1375,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "harness-sync"
-version = "0.2.121"
+version = "0.2.133"
 dependencies = [
  "block2",
  "futures",
@@ -1398,11 +1419,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "diffy",
  "futures",
  "harness-adapters",
+ "harness-doc",
  "harness-engine",
+ "harness-mcp",
  "harness-proto",
+ "harness-rpc",
  "libc",
  "serde",
  "serde_json",
@@ -1418,10 +1443,11 @@ dependencies = [
 
 [[package]]
 name = "harness-update"
-version = "0.2.121"
+version = "0.2.133"
 dependencies = [
  "anyhow",
  "futures",
+ "plist",
  "reqwest",
  "serde",
  "serde_json",
@@ -1430,6 +1456,16 @@ dependencies = [
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "harness-visual"
+version = "0.2.133"
+dependencies = [
+ "mlua",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1911,6 +1947,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2163,6 +2209,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "luau0-src"
+version = "0.22.0+luau740"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ea012e8a8aaff2f7b6c788fad41a60630003b6a0932bcf045f7d14952c9bd31"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2246,6 +2301,34 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mlua"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a7ae6b65bf54b7fdd4cf5b6f44f60862350ebf3fe3779b3a9cc005e7fa14f81"
+dependencies = [
+ "bstr",
+ "either",
+ "libc",
+ "mlua-sys",
+ "num-traits",
+ "parking_lot",
+ "rustc-hash",
+]
+
+[[package]]
+name = "mlua-sys"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1631cda17bd6486410ab751d91f5fd4484f441589278cdad879eb3afc721a285"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "luau0-src",
+ "pkg-config",
 ]
 
 [[package]]
@@ -2630,6 +2713,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "plist"
+version = "1.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "327a4cb2ad49dc48adfdc9da89e22c64d488b508c67a044d71ba729e4521a285"
+dependencies = [
+ "base64 0.23.1",
+ "indexmap",
+ "quick-xml",
+ "serde",
+ "time",
+]
+
+[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2776,6 +2872,15 @@ name = "pulldown-cmark-escape"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "quick_cache"

@@ -1746,7 +1746,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         .map(|a| a.as_slice())
         .unwrap_or_default();
 
-    let ladder: Vec<ReasoningLevel> = config_options
+    let mut ladder: Vec<ReasoningLevel> = config_options
         .iter()
         .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
         .and_then(|o| o.get("options").and_then(Value::as_array))
@@ -1757,6 +1757,10 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 .collect()
         })
         .unwrap_or_default();
+    // Agents advertise in either direction (Grok Build: highest first); the
+    // effort slider reads lowest to highest.
+    ladder.sort_unstable();
+    ladder.dedup();
     let wire_options: Vec<ModelOption> = config_options
         .iter()
         .filter_map(trait_from_config_option)
@@ -2850,6 +2854,20 @@ impl EffortTracker {
 
 /// Per-turn token usage from a settled `session/prompt` response, when the
 /// adapter attaches it (tolerant of both field spellings; absent → nothing).
+/// The save a turn's session now lives in, when graff reports one that is not
+/// the connection's session id: `/resume` moves the live session onto another
+/// save while the connection keeps routing by its original id. The engine
+/// resumes from `Done.session_id`, so a restart loads the save the
+/// conversation continued in rather than the one handed out at session/new.
+fn durable_session_id(res: &Result<Value, HarnessError>, session_id: &str) -> String {
+    res.as_ref()
+        .ok()
+        .and_then(|resp| resp.get("_meta")?.get("graff/durableSessionId")?.as_str())
+        .filter(|id| !id.is_empty())
+        .unwrap_or(session_id)
+        .to_owned()
+}
+
 fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> {
     let resp = res.as_ref().ok()?;
     // Grok settles usage on the response `_meta` (inputTokens/outputTokens —
@@ -4159,7 +4177,7 @@ async fn run_session(session: Session) {
                         status,
                         result: None,
                         error,
-                        session_id: Some(session_id.clone()),
+                        session_id: Some(durable_session_id(&res, &session_id)),
                     },
                 )
                 .await
@@ -4402,7 +4420,7 @@ async fn run_session(session: Session) {
                                 status,
                                 result: None,
                                 error,
-                                session_id: Some(session_id.clone()),
+                                session_id: Some(durable_session_id(&res, &session_id)),
                             },
                         )
                         .await;
@@ -4917,6 +4935,22 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resumed_graff_session_resumes_from_the_save_it_reported() {
+        let moved: Result<Value, HarnessError> = Ok(json!({
+            "stopReason": "end_turn",
+            "_meta": {"graff/durableSessionId": "baseline"}
+        }));
+        assert_eq!(durable_session_id(&moved, "acp-1-1"), "baseline");
+        let plain: Result<Value, HarnessError> = Ok(json!({"stopReason": "end_turn"}));
+        assert_eq!(durable_session_id(&plain, "acp-1-1"), "acp-1-1");
+        let empty: Result<Value, HarnessError> =
+            Ok(json!({"_meta": {"graff/durableSessionId": ""}}));
+        assert_eq!(durable_session_id(&empty, "acp-1-1"), "acp-1-1");
+        let failed: Result<Value, HarnessError> = Err(HarnessError::Protocol("x".into()));
+        assert_eq!(durable_session_id(&failed, "acp-1-1"), "acp-1-1");
+    }
 
     #[test]
     fn a_cancel_says_whether_the_user_asked() {
@@ -5708,6 +5742,57 @@ mod tests {
             vec!["fast-mode"]
         );
         assert_eq!(models[0].options[0].default_choice, "off");
+    }
+
+    #[test]
+    fn advertised_thought_levels_order_from_lowest_to_highest() {
+        // Grok Build advertises `thought_level` highest first. A model without
+        // a catalog row (`grok-4.8` here) takes the advertised ladder, which
+        // must still read lowest to highest in the effort slider.
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "grok-4.8",
+                    "options": [
+                        { "value": "grok-4.8", "name": "Grok 4.8" },
+                        { "value": "grok-4.7", "name": "Grok 4.7" },
+                    ],
+                },
+                {
+                    "id": "reasoning_effort",
+                    "name": "Reasoning Effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "xhigh",
+                    "options": [
+                        { "value": "xhigh", "name": "Extra High" },
+                        { "value": "high", "name": "High" },
+                        { "value": "medium", "name": "Medium" },
+                        { "value": "low", "name": "Low" },
+                    ],
+                },
+            ],
+        });
+        let models = models_from_session(&response, &(grok_spec().models)());
+        let ladders = models
+            .iter()
+            .map(|m| (m.id.as_str(), m.reasoning_levels.clone()))
+            .collect::<Vec<_>>();
+        let ascending = vec![
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+        ];
+        assert_eq!(
+            ladders,
+            vec![("grok-4.8", ascending.clone()), ("grok-4.7", ascending)]
+        );
     }
 
     #[test]
