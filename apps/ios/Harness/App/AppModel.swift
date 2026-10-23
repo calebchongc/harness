@@ -896,6 +896,52 @@ final class AppModel {
         return try await workspace.agentAccounts(deviceId: deviceId, forceUsage: forceUsage)
     }
 
+    /// The cloud sandboxes of the Codegraff account one computer's engine is
+    /// signed in with (Settings → Cloud sandboxes); nil while it is signed out.
+    /// Demo mode serves a made-up account.
+    func cloudSandboxes(deviceId: String) async throws -> CodegraffSandboxes? {
+        if let demo { return demo.cloud.sandboxes }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.codegraffSandboxes(deviceId: deviceId)
+    }
+
+    func createCloudSandbox(deviceId: String, size: String?) async throws {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)  // a create takes a while
+            demo.cloud.create(size: size)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.createCodegraffSandbox(deviceId: deviceId, size: size)
+    }
+
+    func cloudSandboxAction(deviceId: String, id: String, action: CloudSandboxAction) async throws {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            demo.cloud.act(id: id, action: action)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.codegraffSandboxAction(deviceId: deviceId, id: id, action: action)
+    }
+
+    /// GitHub CI runners for that account (Settings → GitHub CI); nil while signed out.
+    func githubRunners(deviceId: String) async throws -> GithubRunners? {
+        if let demo { return demo.cloud.runners }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.codegraffGithubRunners(deviceId: deviceId)
+    }
+
+    func githubRunnerAction(deviceId: String, action: GithubRunnerAction) async throws {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            demo.cloud.act(action)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.codegraffGithubRunnerAction(deviceId: deviceId, action: action)
+    }
+
     /// Where graff compacts on one computer (Settings → Graff compaction);
     /// nil is graff's default. Demo mode keeps the default.
     func graffCompactAt(deviceId: String) async throws -> Int? {
