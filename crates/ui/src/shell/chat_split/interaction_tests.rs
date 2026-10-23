@@ -4,6 +4,8 @@ use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, Point, ScrollDelta, Scroll
 use harness_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use harness_proto::ToolCall;
 
+mod gesture_edges;
+
 /// Keep the real Shell and peer-pane capture handlers, transcript, markdown and
 /// tool controls, without booting an engine or rendering unrelated chrome.
 struct InteractionPanes(Entity<Shell>);
@@ -12,43 +14,45 @@ impl Render for InteractionPanes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.0.update(cx, |shell, cx| {
             let theme = Theme::of(cx).clone();
-            let focus = shell.chat_split.as_ref().unwrap().focus;
-            div().size_full().flex().children((0..2).map(|ix| {
-                let pane = if ix == focus {
-                    // Match the peer's geometry when its entity is promoted.
+            let split = shell.chat_split.as_ref().unwrap();
+            let (focus, len, axis) = (split.focus, split.panes.len(), split.axis);
+            div()
+                .size_full()
+                .flex()
+                .when(axis == SplitAxis::Vertical, |el| el.flex_col())
+                .children((0..len).map(|ix| {
+                    let pane = if ix == focus {
+                        // Match the peer's geometry when its entity is promoted.
+                        div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .pt(px(Theme::TITLEBAR_HEIGHT))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(14.0))
+                                    .pb(px(6.0))
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .child(SharedString::from("Session")),
+                            )
+                            .child(div().flex_1().min_h_0().child(shell.transcript.clone()))
+                            .into_any_element()
+                    } else {
+                        let id = shell.chat_split.as_ref().unwrap().panes[ix].clone();
+                        shell.render_peer_chat_pane(ix, id.as_deref(), &theme, cx)
+                    };
                     div()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .pt(px(Theme::TITLEBAR_HEIGHT))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(14.0))
-                                .pb(px(6.0))
-                                .text_size(crate::typography::ui_rems(12.0))
-                                .child(SharedString::from("Session")),
-                        )
-                        .child(div().flex_1().min_h_0().child(shell.transcript.clone()))
-                        .into_any_element()
-                } else {
-                    let id = shell.chat_split.as_ref().unwrap().panes[ix].clone();
-                    shell.render_peer_chat_pane(ix, id.as_deref(), &theme, cx)
-                };
-                div()
-                    .w(px(480.0))
-                    .h_full()
-                    .flex_none()
-                    .debug_selector(move || {
-                        if ix == 0 {
-                            "peer-column"
-                        } else {
-                            "current-column"
-                        }
-                        .into()
-                    })
-                    .child(pane)
-            }))
+                        .when(axis == SplitAxis::Horizontal, |el| el.w(px(480.0)).h_full())
+                        .when(axis == SplitAxis::Vertical, |el| el.w_full().h(px(320.0)))
+                        .flex_none()
+                        .debug_selector(move || match ix {
+                            0 => "peer-column".into(),
+                            1 => "current-column".into(),
+                            _ => format!("extra-column-{ix}"),
+                        })
+                        .child(pane)
+                }))
         })
     }
 }
@@ -292,6 +296,45 @@ fn selecting_in_an_inactive_pane_activates_and_preserves_selection(cx: &mut gpui
             selection::clear_if_owner(&key(&peer, first));
         });
     }
+}
+
+#[gpui::test]
+fn releasing_a_selection_over_an_inactive_pane_does_not_activate_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    with_panes(
+        cx,
+        vec![reply("Selectable response text.")],
+        |shell, peer, current, cx| {
+            let start = text_point(&current, "current-reply#text.0:0")
+                + gpui::point(px(60.0), px(0.0));
+            let end = text_point(&peer, "reply#text.0:0");
+            cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+            cx.simulate_mouse_move(
+                start + gpui::point(px(100.0), px(0.0)),
+                Some(MouseButton::Left),
+                Default::default(),
+            );
+            assert!(selection::selected_text().is_some());
+            // Include a frame during the drag: activation tracking must survive
+            // the re-render caused by updating the selection.
+            draw(cx);
+            cx.simulate_mouse_move(end, Some(MouseButton::Left), Default::default());
+            let selected = selection::selected_text().expect("B's selection must survive crossing into A");
+            cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+            draw(cx);
+            shell.read_with(cx, |shell, cx| {
+                assert_eq!(shell.chat_split.as_ref().unwrap().focus, 1);
+                assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("current"));
+                assert_eq!(shell.transcript.entity_id(), current.entity_id());
+                assert_eq!(shell.peer_chat_views["peer"].transcript.entity_id(), peer.entity_id());
+            });
+            assert_eq!(selection::selected_text(), Some(selected));
+            selection::end_active_drag();
+            selection::clear_if_owner(&key(&current, "current-reply#text.0:0"));
+        },
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
