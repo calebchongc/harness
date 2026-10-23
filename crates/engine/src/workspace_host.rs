@@ -1148,8 +1148,13 @@ impl WorkspaceHost {
     }
 
     /// Persist before the caller retires its durable restoration receipt.
-    pub(crate) fn restore_chat_on_send(&self, chat_id: &str, clock: &str) -> Result<bool, EngineError> {
-        let restored = self.mutate(|doc| doc.restore_chat_on_send(chat_id, clock))?;
+    pub(crate) fn restore_chat_on_send(
+        &self,
+        chat_id: &str,
+        clock: &str,
+        archive_basis: Option<&str>,
+    ) -> Result<bool, EngineError> {
+        let restored = self.mutate(|doc| doc.restore_chat_on_send_from(chat_id, clock, archive_basis))?;
         if restored {
             self.inner.persist_snapshot()?;
         }

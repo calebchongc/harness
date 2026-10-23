@@ -2488,6 +2488,8 @@ async fn drive_run(
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
+    let workspace = inner.doc_host().and_then(|host| host.workspace().cloned());
+    let mut chat_changes = workspace.as_ref().map(|workspace| workspace.watch_chats());
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
@@ -2775,13 +2777,44 @@ async fn drive_run(
     // long stretch of work is expected and the chain's streaming cap is off.
     let mut task_woken_turn = false;
 
+    let chat_archived = || {
+        workspace.as_ref().is_some_and(|workspace| {
+            workspace.chat(&chat_id).ok().flatten().is_some_and(|chat| chat.archived)
+        })
+    };
     let mut final_completed_turn = None;
     let final_status = loop {
+        // Archive is a runtime boundary, not just a sidebar filter. Retire a
+        // parked child so native peer discovery and idle wakes disappear too.
+        // Finish an active human turn first. Unconfirmed human prompts are
+        // recovered below; peer prompts must not cross this boundary. Read
+        // the registry directly so late output cannot beat watch publication.
+        if idle_since.is_some() && chat_archived() {
+            if let Some(token) = lock(&inner.runs)
+                .get(&chat_id)
+                .filter(|handle| handle.run_id == run_id)
+                .map(|handle| handle.interrupt_token.clone())
+            {
+                token.cancel();
+            }
+            break SessionStatus::Idle;
+        }
         let mut event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
         } else {
             let raw_event = tokio::select! {
                 biased;
+                changed = async {
+                    match chat_changes.as_mut() {
+                        Some(chats) => chats.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        chat_changes = None;
+                    }
+                    continue;
+                }
                 changed = cancel_rx.changed(), if !interrupted => {
                     let _ = changed;
                     interrupted = true;
@@ -3095,6 +3128,13 @@ async fn drive_run(
             };
             event
         };
+
+        // Polling the stream (or preparing image output) can yield while an
+        // archive arrives. Do not let that frame unpark the runtime before the
+        // next loop's retirement check, even if its watch update is delayed.
+        if idle_since.is_some() && chat_archived() {
+            continue;
+        }
 
         // A queued explicit image never publishes once the run was cancelled
         // between its import and this fold turn: drop the event, reject the
@@ -4058,6 +4098,10 @@ async fn drive_run(
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
                     break;
                 };
+                if host.refuses_peer_mail(&chat, &steer.prompt) {
+                    tracing::info!(chat = %chat, "discarding archived peer steer before redelivery");
+                    continue;
+                }
                 if let Err(err) = host
                     .dispatch_with_source_context(
                         &engine,
