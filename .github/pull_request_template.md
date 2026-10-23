@@ -9,9 +9,9 @@ what changes. Upload with: scripts/issue-screenshot.sh <PR number> <images> -->
 
 ## After
 
-<!-- The same view with this change. The PR screenshots check fails until both
-images are here. A change with nothing to see needs a maintainer to add the
-`no-screenshots` label. -->
+<!-- The same view with this change. A pull request without both images is
+closed automatically and reopens when you edit them in. A change with nothing
+to see needs a maintainer to add the `no-screenshots` label. -->
 
 ## Tests
 

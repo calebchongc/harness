@@ -61,18 +61,26 @@ class Screenshots(unittest.TestCase):
 
 
 class Main(unittest.TestCase):
-    def run_event(self, pr):
+    def run_event(self, pr, *flags, action="opened", sender="author"):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump({"pull_request": pr}, f)
+            json.dump({"action": action, "sender": {"login": sender}, "pull_request": pr}, f)
         return subprocess.run(
-            [sys.executable, "-I", str(SCRIPT), "--event", f.name],
+            [sys.executable, "-I", str(SCRIPT), "--event", f.name, *flags],
             capture_output=True,
             text=True,
             env={},
         )
 
     def base(self, **extra):
-        pr = {"body": "", "labels": [], "head": {"ref": "fix/x"}, "user": {"type": "User"}}
+        pr = {
+            "number": 7,
+            "body": "",
+            "labels": [],
+            "state": "open",
+            "head": {"ref": "fix/x"},
+            "user": {"type": "User", "login": "author"},
+            "created_at": "2026-10-24T00:00:00Z",
+        }
         pr.update(extra)
         return pr
 
@@ -90,8 +98,50 @@ class Main(unittest.TestCase):
             self.base(labels=[{"name": "no-screenshots"}]),
             self.base(head={"ref": "release/v0.2.134"}),
             self.base(user={"type": "Bot"}),
+            self.base(created_at="2026-10-20T00:00:00Z"),
         ):
             self.assertEqual(self.run_event(pr).returncode, 0)
+
+
+class Enforce(Main):
+    def enforce(self, pr, **kw):
+        result = self.run_event(pr, "--enforce", "--dry-run", **kw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_a_new_pull_request_without_screenshots_is_closed(self):
+        out = self.enforce(self.base(body="Fixes a thing."))
+        self.assertIn('POST /issues/7/labels {"labels": ["needs-screenshots"]}', out)
+        self.assertIn("POST /issues/7/comments", out)
+        self.assertIn('PATCH /pulls/7 {"state": "closed"}', out)
+
+    def test_adding_screenshots_reopens_it(self):
+        pr = self.base(
+            body=f"## Before\n{A}\n## After\n{B}",
+            state="closed",
+            labels=[{"name": "needs-screenshots"}],
+        )
+        out = self.enforce(pr, action="edited")
+        self.assertIn("DELETE /issues/7/labels/needs-screenshots", out)
+        self.assertIn('PATCH /pulls/7 {"state": "open"}', out)
+
+    def test_old_and_exempt_pull_requests_are_left_alone(self):
+        for pr in (
+            self.base(created_at="2026-10-20T00:00:00Z"),
+            self.base(labels=[{"name": "no-screenshots"}]),
+            self.base(head={"ref": "release/v0.2.134"}),
+        ):
+            self.assertNotIn("[dry-run]", self.enforce(pr))
+
+    def test_a_pull_request_closed_by_hand_is_not_reopened(self):
+        pr = self.base(body=f"## Before\n{A}\n## After\n{B}", state="closed")
+        self.assertNotIn("[dry-run]", self.enforce(pr, action="edited"))
+
+    def test_a_maintainer_reopen_overrides(self):
+        pr = self.base(labels=[{"name": "needs-screenshots"}])
+        out = self.enforce(pr, action="reopened", sender="maintainer")
+        self.assertNotIn("closed", out.split("[dry-run]")[-1] if "[dry-run]" in out else "")
+        self.assertNotIn('"state": "closed"', out)
 
 
 if __name__ == "__main__":

@@ -98,10 +98,15 @@ description, not in a comment.
 - For behaviour you can't see in one frame, show the before and after state
   (a dialog that now appears, a row that now opens), or a test's output
   rendered as an image when nothing is on screen at all.
-- The `PR screenshots` check (`scripts/check-pr-screenshots.py`) fails until
-  both are there. A change with genuinely nothing to see, such as CI or a pure
-  refactor, needs a maintainer to add the `no-screenshots` label. Release
-  pull requests (`release/...`) are exempt; their parts carry the screenshots.
+- A pull request opened without both is **closed straight away** with the
+  `needs-screenshots` label and a comment; editing the description to add
+  them reopens it. The `PR screenshots` status check (required on `main` and
+  `release/v*`) also fails until both are there. Both run
+  `scripts/check-pr-screenshots.py`.
+- A change with genuinely nothing to see, such as CI or a pure refactor, needs
+  a maintainer to add the `no-screenshots` label (which also reopens it).
+  Release pull requests (`release/...`) are exempt; their parts carry the
+  screenshots. Pull requests opened before 2026-10-23 06:30 UTC aren't checked.
 
 ## Issue format: every report states its versions
 
