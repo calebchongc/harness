@@ -46,6 +46,10 @@ name = "error-cards-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "tool-preview-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "question-wrap-fixture"
 required-features = ["appshots-fixture"]
 
