@@ -14,6 +14,17 @@ use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
 
+/// The archive-on-close row's description, given the close shortcut and the
+/// close-without-archiving one as displayed ("⌘W", "⌥⌘W").
+pub(crate) fn archive_on_close_copy(close: &str, close_only: &str) -> String {
+    format!(
+        "Closing a session tab or pane with {close} or its \u{2715} button archives it if idle, \
+         unless it is still open in another tab or pane in this app. {close_only} always closes \
+         without archiving. Running sessions and sessions waiting for input remain in the \
+         sidebar. Closing the app or a window does not archive sessions."
+    )
+}
+
 /// Archived rows in sidebar (recency) order. Pure.
 pub fn archived_chats(chats: &[Chat]) -> Vec<&Chat> {
     chats.iter().filter(|c| c.archived).collect()
@@ -224,6 +235,7 @@ impl Render for ArchivedPage {
         let theme = Theme::of(cx).clone();
         let accent = theme.accent;
         let archive_sessions_on_close = crate::settings::archive_sessions_on_close(cx);
+        let (close, close_only) = crate::settings::close_shortcut_badges(cx);
         let now = chrono::Utc::now();
         let (rows, device_names): (Vec<Chat>, std::collections::HashMap<String, String>) = {
             let state = self.state.read(cx);
@@ -524,7 +536,7 @@ impl Render for ArchivedPage {
                                                         .mt(px(4.0))
                                                         .text_size(crate::typography::ui_rems(12.0))
                                                         .text_color(theme.text_muted)
-                                                        .child("Explicitly closing a session tab or pane archives it if idle, unless it is still open in another tab or pane in this app. Running sessions and sessions waiting for input remain in the sidebar. Closing the app or a window does not archive sessions."),
+                                                        .child(archive_on_close_copy(&close, &close_only)),
                                                 ),
                                         )
                                         .child(
@@ -632,6 +644,17 @@ mod tests {
         let rows = archived_chats(&chats);
         let ids: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["b", "c"]);
+    }
+
+    #[test]
+    fn archive_on_close_copy_names_what_the_toggle_covers() {
+        let copy = archive_on_close_copy("⌘W", "⌥⌘W");
+        assert!(copy.starts_with("Closing a session tab or pane with ⌘W or its \u{2715} button"));
+        assert!(
+            copy.contains("⌥⌘W always closes without archiving."),
+            "{copy}"
+        );
+        assert!(!copy.contains("Explicitly"), "{copy}");
     }
 
     #[gpui::test]

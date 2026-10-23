@@ -42,6 +42,10 @@ name = "reauth-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "archive-choice-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "error-cards-fixture"
 required-features = ["appshots-fixture"]
 
