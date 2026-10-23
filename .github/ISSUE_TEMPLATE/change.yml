@@ -1,0 +1,35 @@
+name: Change or feature
+description: Something you'd like Harness to do differently. Include a picture of the change.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository is public. Use made-up data in any screenshot, and no account names, emails, local paths or private conversation text.
+  - type: input
+    id: harness
+    attributes:
+      label: Harness version
+      placeholder: "0.2.133 (latest: 0.2.133)"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: App and platform
+      placeholder: "desktop, macOS arm64 | iOS 0.2.133, iOS 27 | Android 0.2.133, Android 16"
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: The change
+      description: What should be different, and why.
+    validations:
+      required: true
+  - type: textarea
+    id: image
+    attributes:
+      label: Image
+      description: A picture of the change you'd like, such as a mockup, a sketch, or an annotated screenshot of where it goes. Issues without an image are closed automatically and reopen when one is added.
+    validations:
+      required: true
