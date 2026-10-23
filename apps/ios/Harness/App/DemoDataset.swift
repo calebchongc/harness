@@ -17,6 +17,9 @@ final class DemoDataset {
     var changeRequests: [String: ChangeRequestSummary]
     /// What each computer reports in `ListHarnesses`, by device id (onboarding).
     var agents: [String: [AgentDescriptor]]
+    /// The Codegraff account behind Settings → Cloud sandboxes and GitHub CI.
+    @ObservationIgnored lazy var cloud = DemoCloud.standard(
+        connected: !ProcessInfo.processInfo.arguments.contains("-github-ci-new"))
     private var stores: [String: SessionStore] = [:]
     private var streamTask: Task<Void, Never>?
 

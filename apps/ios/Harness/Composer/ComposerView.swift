@@ -278,6 +278,9 @@ struct ComposerView: View {
     @State private var showOptionPicker: ModelOptionInfo?
     /// Live catalog for the chat's harness from its space's device.
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var catalogsLoading = true
+    @State private var catalogRetry = 0
+    @State private var catalogSource: String?
     @State private var queueEdit: QueueComposerEdit?
     private var editingQueuedId: String? { queueEdit?.lease.rowId }
     private var queueEditLease: QueueEditLease? { queueEdit?.lease }
@@ -302,15 +305,27 @@ struct ComposerView: View {
 
     private var harness: String { chat.config?.harness ?? "claude-code" }
 
-    private var models: [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+    private var catalogKey: String { "\(chat.id)/\(chat.deviceId)/\(harness)" }
+
+    private var scopedCatalogs: [String: [ModelInfo]] {
+        catalogSource == catalogKey ? catalogs : [:]
     }
 
+    private var models: [ModelInfo] { scopedCatalogs[harness] ?? [] }
+
     private var currentModel: ModelInfo {
-        HarnessCatalog.resolve(modelId: chat.config?.model, in: models, harness: harness)
+        if (chat.config?.model ?? "").isEmpty, models.isEmpty {
+            return ModelInfo(id: "", label: catalogsLoading ? "Loading models…" : "Select model",
+                             description: nil, reasoningLevels: [])
+        }
+        return HarnessCatalog.resolve(modelId: chat.config?.model, in: models, harness: harness)
     }
 
     private var currentReasoning: String? {
+        guard !currentModel.id.isEmpty else { return nil }
+        if HarnessCatalog.resolveExisting(modelId: currentModel.id, in: models) == nil {
+            return chat.config?.reasoning
+        }
         guard !currentModel.reasoningLevels.isEmpty else { return nil }
         if let r = chat.config?.reasoning, currentModel.reasoningLevels.contains(r) { return r }
         return HarnessCatalog.defaultReasoning(for: currentModel)
@@ -462,7 +477,9 @@ struct ComposerView: View {
                     set: { writeConfig(model: chat.config?.model, reasoning: $0) }
                 ),
                 lockedHarness: true,
-                catalogs: catalogs
+                catalogs: scopedCatalogs,
+                catalogsLoading: catalogsLoading || catalogSource != catalogKey,
+                onRetry: { catalogRetry += 1 }
             )
         }
         .sheet(isPresented: $showTraitPicker) {
@@ -480,10 +497,25 @@ struct ComposerView: View {
                 set: { writeOption(option: option, choiceId: $0) }
             ))
         }
-        .task(id: "\(chat.id)/\(chat.deviceId)/\(harness)") {
-            let catalog = await model.listModels(deviceId: chat.deviceId, harness: harness)
-            guard !Task.isCancelled else { return }
-            catalogs[harness] = catalog
+        .task(id: "\(catalogKey)|\(model.deviceOnline(chat.deviceId))|\(catalogRetry)") {
+            let source = catalogKey
+            let ownerHarness = harness
+            if catalogSource != source {
+                catalogs = [:]
+                catalogSource = source
+                if let cached = DocDisk.loadModels(deviceId: chat.deviceId, harness: ownerHarness), !cached.isEmpty {
+                    catalogs[ownerHarness] = cached
+                }
+            }
+            // Same-host refresh/reconnect keeps real rows visible. Failure
+            // must not blank good in-memory metadata if the disk cache failed.
+            catalogsLoading = true
+            let catalog = await model.listModels(deviceId: chat.deviceId, harness: ownerHarness)
+            guard !Task.isCancelled, catalogSource == source, catalogKey == source else { return }
+            if catalog.isLive || catalogs[ownerHarness]?.isEmpty != false {
+                catalogs[ownerHarness] = catalog.items
+            }
+            catalogsLoading = false
         }
         .task(id: queueEdit?.terminal == true ? nil : queueEditLease?.leaseId) {
             guard let lease = queueEditLease, queueEdit?.terminal != true else { return }
