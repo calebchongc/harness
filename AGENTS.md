@@ -84,6 +84,25 @@ git log origin/main..HEAD --format=%B | grep -iE "co-authored-by|generated with"
 If a pushed commit already has a trailer, reword it and force-push the branch
 before it is merged. Once it's on `main`, removing it means rewriting `main`.
 
+### Every pull request shows before and after
+
+A pull request's description has a **Before** screenshot and an **After**
+screenshot of what it changes: an image under a `## Before` heading and one
+under `## After`, or a two-column `| Before | After |` table. The template in
+`.github/pull_request_template.md` has the sections. Screenshots go in the
+description, not in a comment.
+
+- Capture from made-up data, crop to what changed, and post with
+  `scripts/issue-screenshot.sh <PR number> <images>` (see "Every issue carries
+  an image" below for what must not be in them).
+- For behaviour you can't see in one frame, show the before and after state
+  (a dialog that now appears, a row that now opens), or a test's output
+  rendered as an image when nothing is on screen at all.
+- The `PR screenshots` check (`scripts/check-pr-screenshots.py`) fails until
+  both are there. A change with genuinely nothing to see, such as CI or a pure
+  refactor, needs a maintainer to add the `no-screenshots` label. Release
+  pull requests (`release/...`) are exempt; their parts carry the screenshots.
+
 ## Issue format: every report states its versions
 
 This repository is public. Every issue, whether a person or an agent files
