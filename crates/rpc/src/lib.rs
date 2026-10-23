@@ -167,6 +167,9 @@ pub mod methods {
     /// `{size?}` → create the account's Harness cloud sandbox (fleet, persistent, kept running),
     /// `size` a personal size id from the list's `sizes` (default size when absent).
     pub const CODEGRAFF_CREATE_SANDBOX: &str = "CodegraffCreateSandbox";
+    /// `{}` → a temporary API/tool sandbox (`auto`, ephemeral, 30 minutes). Fleet first with
+    /// Daytona fallback, no Harness device setup, personal size or keep-running renewal.
+    pub const CODEGRAFF_CREATE_TEMPORARY_SANDBOX: &str = "CodegraffCreateTemporarySandbox";
     /// `{id, action}` on one sandbox: `start` (wake, kept running), `stop` (pause), `delete`,
     /// or `keep-running-on` / `keep-running-off` (whether the gateway renews its window).
     pub const CODEGRAFF_SANDBOX_ACTION: &str = "CodegraffSandboxAction";

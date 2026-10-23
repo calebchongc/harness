@@ -80,6 +80,19 @@
     ]
   },
   "plans": {
+    "createTemporary": [
+      {
+        "method": "POST",
+        "path": "/v1/sandboxes",
+        "body": {
+          "provider": "auto",
+          "ephemeral": true,
+          "name": "Temporary sandbox",
+          "autoStopMinutes": 30,
+          "labels": { "harness-purpose": "temporary" }
+        }
+      }
+    ],
     "create": [
       {
         "method": "GET",
