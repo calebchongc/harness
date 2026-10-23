@@ -4,7 +4,9 @@
 Run by .github/workflows/issue-image.yml on `issues` events. Every issue opens
 with an image of what's wrong or what should change (AGENTS.md, "Issue format").
 
-- No image: label the issue `needs-image` and leave one comment saying so.
+- No image: label the issue `needs-image`, leave one comment saying so, and
+  close it. Editing it to add an image reopens it. GitHub has no hook that
+  runs before an issue is created, so this runs right after.
 - An image, and TYPESAFE_API_KEY set: ask TypeSafe's System One model two yes/no
   questions about the first image: does it show what the issue describes, and
   does it show private details. Either outcome updates the same comment.
@@ -50,6 +52,9 @@ MIN_SIDE, MAX_SIDE = 280, 1568
 SHOWS_ISSUE_AT = 0.3
 PRIVATE_AT = 0.7
 BODY_CHARS = 4000
+# Issues opened before the check existed are left alone, so editing an old
+# issue never closes it.
+ENFORCE_SINCE = "2026-10-23T00:00:00Z"
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 HTML_IMAGE = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
@@ -174,11 +179,12 @@ def verdict(urls: list[str], answers: dict[str, float] | None) -> tuple[set[str]
     """Labels the issue should carry and the comment to show (None: no comment)."""
     if not urls:
         return {NEEDS_IMAGE}, (
-            "This issue has no image. Every issue here includes one: a screenshot "
-            "of what's wrong, or a picture of the change you'd like (a mockup or "
-            "an annotated screenshot is fine). Edit the issue to add it, and this "
-            "check runs again.\n\nCapture from made-up data, not your real chats, "
-            "and crop to the part that matters. See AGENTS.md, \"Issue format\"."
+            "Closed because this issue has no image. Every issue here includes "
+            "one: a screenshot of what's wrong, or a picture of the change you'd "
+            "like (a mockup or an annotated screenshot is fine). Edit the issue "
+            "to add it and it reopens on its own.\n\nCapture from made-up data, "
+            "not your real chats, and crop to the part that matters. See "
+            "AGENTS.md, \"Issue format\"."
         )
     if answers is None:
         return set(), None
@@ -229,6 +235,12 @@ class GitHub:
             if method == "DELETE" and error.code == 404:
                 return None
             raise
+
+    def set_state(self, number: int, state: str):
+        payload = {"state": state}
+        if state == "closed":
+            payload["state_reason"] = "not_planned"
+        self.call("PATCH", f"/issues/{number}", payload)
 
     def ensure_label(self, name: str, color: str, description: str):
         try:
@@ -287,9 +299,36 @@ def main() -> int:
     current = {label["name"] for label in issue.get("labels") or []}
     token = os.environ.get("GITHUB_TOKEN", "")
     api_key = os.environ.get("TYPESAFE_API_KEY", "")
+    if (issue.get("created_at") or "") < ENFORCE_SINCE:
+        print(f"Issue #{number} predates the image check; skipping.")
+        return 0
+    closed = issue.get("state") == "closed"
+    if closed and NEEDS_IMAGE not in current:
+        print(f"Issue #{number} was closed for another reason; skipping.")
+        return 0
 
     urls = image_urls(body)
     print(f"Issue #{number}: {len(urls)} image(s).")
+    github = GitHub(os.environ.get("GITHUB_REPOSITORY", ""), token, args.dry_run)
+    reopener = (event.get("sender") or {}).get("login")
+    if (
+        not urls
+        and event.get("action") == "reopened"
+        and reopener != (issue.get("user") or {}).get("login")
+    ):
+        # Someone other than the author reopened it: a maintainer override.
+        print(f"Issue #{number} reopened by {reopener}; leaving it open.")
+        github.sync(number, current, set(), None)
+        return 0
+    if not urls:
+        labels, comment = verdict(urls, None)
+        github.sync(number, current, labels, comment)
+        if not closed:
+            github.set_state(number, "closed")
+        return 0
+    if closed:
+        # Closed by this check for having no image; it has one now.
+        github.set_state(number, "open")
     answers = None
     if urls and api_key:
         url = urls[0]
@@ -311,9 +350,7 @@ def main() -> int:
         labels = current & {IMAGE_UNCLEAR}
         if NEEDS_IMAGE not in current:
             comment = KEEP
-    GitHub(os.environ.get("GITHUB_REPOSITORY", ""), token, args.dry_run).sync(
-        number, current, labels, comment
-    )
+    github.sync(number, current, labels, comment)
     return 0
 
 

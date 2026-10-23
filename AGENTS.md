@@ -142,11 +142,19 @@ changes how something looks shows it before and after, at the sizes it was
 checked at. A description of a picture can't be checked against the fix; a
 screenshot can.
 
-The `Issue image` workflow (`scripts/check-issue-image.py`) checks each new or
-edited issue. With no image it adds `needs-image` and one comment. Otherwise it
-asks TypeSafe whether the first image shows what the issue describes (adding
-`image-unclear` if not) and whether it shows private details. Editing the
-issue re-runs it.
+GitHub has no hook that runs before an issue is created, so this is enforced
+right after:
+- **Issue forms** (`.github/ISSUE_TEMPLATE`) require an Image field, and blank
+  issues are off. `gh issue create --body` skips the forms; the workflow below
+  still applies.
+- **The `Issue image` workflow** (`scripts/check-issue-image.py`) runs on each
+  new, edited or reopened issue. With no image, it labels the issue
+  `needs-image`, comments, and closes it. Editing the issue to add one reopens
+  it. With an image, it asks TypeSafe whether the first image shows what the
+  issue describes (labelling `image-unclear` if not) and whether it shows
+  private details; those two only warn.
+- A maintainer who reopens an issue the check closed overrides it. Issues
+  opened before 2026-10-23 aren't checked.
 
 - **Capture from synthetic data, never the user's real app.** Run an isolated
   build (`scripts/run-macos-dev.sh`, or any build with its own
