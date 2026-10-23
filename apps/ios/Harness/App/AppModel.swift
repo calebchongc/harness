@@ -167,6 +167,9 @@ final class AppModel {
             // Simulator fixtures for both empty-workspace and viewer-only
             // accounts. Apply before Home resolves its initial destination.
             override("-sethomefilter") { UserDefaults.standard.set($0, forKey: "homeSpaceFilter") }
+            override("-setnewsessionharness") { UserDefaults.standard.set($0, forKey: "newSessionHarness") }
+            override("-setnewsessionmodel") { UserDefaults.standard.set($0, forKey: "newSessionModel") }
+            override("-setnewsessionreasoning") { UserDefaults.standard.set($0, forKey: "newSessionReasoning") }
             if args.contains("-no-projects") {
                 demo?.spaces = []
                 demo?.chats = []
@@ -717,21 +720,17 @@ final class AppModel {
 
     /// Live harness catalog from the selected execution device (Settings → Agents
     /// gates which agents a device offers); the last-seen list when
-    /// unreachable, the static pair only if the device was never reached.
-    func listHarnesses(deviceId: String) async -> [HarnessInfo] {
+    /// unreachable, never a fabricated pair for an unknown device.
+    func listHarnesses(deviceId: String) async -> DeviceCatalog<HarnessInfo> {
         if demo != nil {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            return HarnessCatalog.harnesses
+            try? await Task.sleep(for: .seconds(ProcessInfo.processInfo.arguments.contains("-slow-catalog") ? 15 : 0.1))
+            return DeviceCatalog(items: ProcessInfo.processInfo.arguments.contains("-no-agents") ? [] : HarnessCatalog.harnesses, isLive: true)
         }
-        if let live = await workspace?.listHarnesses(deviceId: deviceId),
-           !live.isEmpty {
+        if let live = await workspace?.listHarnesses(deviceId: deviceId) {
             _ = DocDisk.saveHarnesses(live, deviceId: deviceId)
-            return live
+            return DeviceCatalog(items: live, isLive: true)
         }
-        if let cached = DocDisk.loadHarnesses(deviceId: deviceId), !cached.isEmpty {
-            return cached
-        }
-        return HarnessCatalog.harnesses
+        return DeviceCatalog(items: DocDisk.loadHarnesses(deviceId: deviceId) ?? [], isLive: false)
     }
 
     /// Whether an agent has been brought in: every computer's `ListHarnesses`, judged by [AgentReadiness]. A computer
@@ -754,32 +753,40 @@ final class AppModel {
     }
 
     /// Live model catalog from the selected execution device (the desktop's
-    /// "catalog source = the device that runs the session" rule); static
-    /// fallback when the device is unreachable.
-    func listModels(deviceId: String, harness: String) async -> [ModelInfo] {
+    /// "catalog source = the device that runs the session" rule). A failed
+    /// request can use cached metadata, but must never invent runnable models.
+    @ObservationIgnored private var demoModelFailuresRemaining = 1
+
+    func listModels(deviceId: String, harness: String) async -> DeviceCatalog<ModelInfo> {
         if demo != nil {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            return HarnessCatalog.models(for: harness)
-        }
-        if let live = await workspace?.listModels(deviceId: deviceId, harness: harness),
-           !live.isEmpty {
-            let normalized = HarnessCatalog.normalize(harness: harness, models: live)
-            if !normalized.isEmpty {
-                _ = DocDisk.saveModels(normalized, deviceId: deviceId, harness: harness)
-                return normalized
+            let args = ProcessInfo.processInfo.arguments
+            try? await Task.sleep(for: .seconds(args.contains("-slow-catalog") ? 15 : 0.1))
+            if args.contains("-models-fail-once"), harness == "codex", demoModelFailuresRemaining > 0 {
+                demoModelFailuresRemaining -= 1
+                return DeviceCatalog(items: [], isLive: false)
             }
+            return DeviceCatalog(items: HarnessCatalog.models(for: harness), isLive: true)
         }
-        if let cached = DocDisk.loadModels(deviceId: deviceId, harness: harness),
-           !cached.isEmpty {
-            return cached
+        if let live = await workspace?.listModels(deviceId: deviceId, harness: harness) {
+            let normalized = HarnessCatalog.normalize(harness: harness, models: live)
+            _ = DocDisk.saveModels(normalized, deviceId: deviceId, harness: harness)
+            return DeviceCatalog(items: normalized, isLive: true)
         }
-        return HarnessCatalog.models(for: harness)
+        return DeviceCatalog(items: DocDisk.loadModels(deviceId: deviceId, harness: harness) ?? [], isLive: false)
     }
+
+    @ObservationIgnored private var demoRefFailuresRemaining = 1
 
     /// Refs of the space's repo (git spaces only).
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            let args = ProcessInfo.processInfo.arguments
+            try? await Task.sleep(for: .seconds(args.contains("-slow-refs") ? 2 : 0.12))
+            if args.contains("-refs-empty") { return [] }
+            if args.contains("-refs-fail-once"), demoRefFailuresRemaining > 0 {
+                demoRefFailuresRemaining -= 1
+                return nil
+            }
             return demo.listRefs(spacePath: space.path)
         }
         return await workspace?.listRefs(deviceId: space.deviceId, repoPath: space.path)
