@@ -120,8 +120,9 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   codesign --verify --strict "$APP/Contents/Resources/bin/codedb" 2>/dev/null &&
     codesign -dv "$APP/Contents/Resources/bin/codedb" 2>&1 | grep -q "Authority=Developer ID Application" ||
     codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP/Contents/Resources/bin/codedb"
-  # The entitlements let dictation reach the microphone under the hardened
-  # runtime (dist/macos/Harness.entitlements).
+  # The entitlements let dictation reach the microphone, and dropped or
+  # picked files from any folder stay readable, under the hardened runtime
+  # (dist/macos/Harness.entitlements).
   codesign --force --options runtime --timestamp \
     --entitlements "$ROOT/dist/macos/Harness.entitlements" --sign "$CODESIGN_IDENTITY" "$APP"
 else

@@ -4,6 +4,8 @@ use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, Point, ScrollDelta, Scroll
 use harness_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use harness_proto::ToolCall;
 
+mod archive_edges;
+
 /// Keep the real Shell and peer-pane capture handlers, transcript, markdown and
 /// tool controls, without booting an engine or rendering unrelated chrome.
 struct InteractionPanes(Entity<Shell>);

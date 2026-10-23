@@ -6208,6 +6208,15 @@ impl Composer {
     /// PDF did nothing at all (user report). Read failures, folders and
     /// oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if !paths.iter().any(|path| !path.as_os_str().is_empty()) {
+            return;
+        }
+        // A pane drop can change selection before our observer runs. Swap
+        // attachment keys, drafts and queued-message editing only on navigation;
+        // staging in the same session must not reprocess its queue/wizard state.
+        if self.state.read(cx).selected_chat.as_deref().unwrap_or_default() != self.current_key {
+            self.on_state_changed(cx);
+        }
         self.add_paths_for(self.current_key.clone(), paths, cx);
     }
 
@@ -6217,9 +6226,13 @@ impl Composer {
     pub(crate) fn add_paths_for(
         &mut self,
         key: String,
-        paths: Vec<PathBuf>,
+        mut paths: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        paths.retain(|path| !path.as_os_str().is_empty());
+        if paths.is_empty() {
+            return;
+        }
         let mut staged = Vec::new();
         for path in &paths {
             match attachments::stage_any_file(path) {
@@ -7430,7 +7443,7 @@ impl Composer {
     /// The new-session canvas heading. The destination chips alone read as
     /// settings, so a fresh canvas (first launch, ⌘D) never said where the
     /// session would run; this names the project up front. Clicking it opens
-    /// the project picker, which also offers "New project…".
+    /// the project picker, which also offers "New project".
     fn render_new_thread_heading(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let project = self
             .state
@@ -8619,6 +8632,9 @@ impl Composer {
         };
         self.launching_new_chat = is_new;
         if is_new {
+            self.pickers.update(cx, |pickers, _| {
+                pickers.begin_chat_creation(chat_id.clone(), resolved.clone());
+            });
             cx.emit(ComposerEvent::NewThreadTransitionStarted);
         }
         // A queued message is not in the transcript yet — the queue panel is
@@ -12996,6 +13012,102 @@ mod tests {
                 composer.send_blocked(cx),
                 "Pending edits must still block submission"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn first_send_keeps_canvas_config_while_chat_row_is_missing(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut defaults = crate::settings::composer::ComposerDefaults::default();
+        defaults.remember_model(
+            HarnessId::ClaudeCode,
+            "other-model".into(),
+            "Other model".into(),
+        );
+        defaults
+            .model_options_mut(HarnessId::Codex, "canvas-model")
+            .insert("serviceTier".into(), "fast".into());
+        defaults.save(directory.path()).unwrap();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.data_dir = Some(directory.path().to_path_buf());
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                harness_rpc::RpcClient::new(out, inbound),
+            ));
+            state
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let captured = composer.update(cx, |composer, cx| {
+            composer.pickers.update(cx, |pickers, cx| {
+                pickers.adopt_canvas_draft(
+                    Some(crate::pickers::CanvasDraft {
+                        harness: Some(HarnessId::Codex),
+                        model: Some("canvas-model".into()),
+                        reasoning: Some(harness_proto::ReasoningLevel::High),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+            let captured = composer.pickers.read(cx).resolved(cx);
+            composer.send("First prompt".into(), false, cx);
+            captured
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(state.selected_chat.is_some());
+            assert!(state.selected_chat_row().is_none());
+        });
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.pickers.read(cx).resolved(cx), captured)
+        });
+        let mut create = None;
+        while let Ok(frame) = requests.try_recv() {
+            let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            if frame.method.as_deref() == Some(methods::MUTATE)
+                && frame.params["op"] == "createChat"
+            {
+                create = Some(frame);
+            }
+        }
+        let create = create.expect("first send creates the chat with captured picks");
+        assert_eq!(
+            create.params["config"],
+            serde_json::to_value(captured.chat_config().unwrap()).unwrap()
+        );
+        replies
+            .try_send(
+                serde_json::to_string(&harness_rpc::ServerFrame {
+                    id: create.id,
+                    ok: Some(serde_json::json!({})),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        let mut run = None;
+        while let Ok(frame) = requests.try_recv() {
+            let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            if frame.method.as_deref() == Some(methods::QUEUE_COMMAND) {
+                run = Some(frame.params["command"]["request"].clone());
+            }
+        }
+        let run = run.expect("first send queues the captured run independently of row sync");
+        assert_eq!(run["harness"], "codex");
+        assert_eq!(run["model"], "canvas-model");
+        assert_eq!(run["reasoning"], "high");
+        assert_eq!(run["modelOptions"]["serviceTier"], "fast");
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.pickers.read(cx).resolved(cx), captured)
         });
     }
 
