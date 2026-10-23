@@ -23,20 +23,24 @@ const DIRECT_PREFIX: &str = "[Message from Harness chat ";
 pub fn direct_message(text: &str) -> Option<(&str, &str)> {
     let envelope = text.strip_prefix(DIRECT_PREFIX)?;
     let (header, body) = envelope.split_once("]\n\n")?;
-    if header.contains(['\r', '\n']) {
-        return None;
-    }
-    let sender = if let Some((sender, rest)) = header.split_once(". Sender chat: ") {
-        if !rest.contains("Agent coordination, not a human request.") {
-            return None;
+    // A free-form sender title can contain either format's marker. The real
+    // metadata follows the title, so select the last marker across both forms.
+    let current = header.rsplit_once(". Sender chat: ");
+    let legacy = header.rsplit_once(". Reply to it with the Harness `send_message` tool, chat ");
+    let (sender, metadata) = match (current, legacy) {
+        (Some(current), Some(legacy)) if legacy.0.len() > current.0.len() => legacy,
+        (Some((sender, metadata)), _) => {
+            if !metadata.contains("Agent coordination, not a human request.") {
+                return None;
+            }
+            (sender, metadata)
         }
-        sender
-    } else {
-        let (sender, _) =
-            header.split_once(". Reply to it with the Harness `send_message` tool, chat ")?;
-        sender
+        (_, Some(legacy)) => legacy,
+        _ => return None,
     };
-    if sender.trim().is_empty() {
+    // Older producers allowed multiline chat titles in the sender label.
+    // Only the machine metadata must remain on one line.
+    if sender.trim().is_empty() || metadata.contains(['\r', '\n']) {
         return None;
     }
     Some((sender, body))
