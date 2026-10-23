@@ -14,7 +14,7 @@ use harness_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
-use crate::settings::widgets;
+use crate::settings::{self, widgets};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -231,6 +231,81 @@ impl DevicesPage {
             )
             .children(button)
             .into_any_element()
+    }
+
+    /// "Restart automatically to install updates", under the version card on
+    /// installs that update themselves.
+    fn render_auto_restart_row(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.desktop_update {
+            return None;
+        }
+        let env_on = harness_update::desktop_auto_update_enabled();
+        let on = env_on && settings::with_current(cx, |s| s.restart_to_install_updates);
+        let accent = theme.accent;
+        let description = if env_on {
+            "Once an update has downloaded, Harness restarts into it when no agent is running, \
+             nothing is unsaved and you've stepped away. Your windows, tabs and chats come back. \
+             Off, it installs when you quit."
+        } else {
+            "Automatic updates are off (HARNESS_AUTO_UPDATE=0)."
+        };
+        let toggle = widgets::toggle_switch(theme, on)
+            .id("restart-to-install-updates")
+            .debug_selector(|| "restart-to-install-updates".into())
+            .role(gpui::Role::Switch)
+            .aria_label("Restart automatically to install updates")
+            .aria_toggled(if on {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .tab_index(0)
+            .focus_visible(move |style| style.border_2().border_color(accent))
+            .when(!env_on, |el| el.opacity(0.45))
+            .when(env_on, |el| {
+                el.cursor_pointer().on_click(cx.listener(|_, _, _, cx| {
+                    settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                        s.restart_to_install_updates = !s.restart_to_install_updates;
+                    });
+                    cx.notify();
+                }))
+            });
+        Some(
+            widgets::card_row(theme, false)
+                .child(widgets::row_tile(theme, crate::icons::RESTART))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(widgets::row_title(
+                            theme,
+                            "Restart automatically to install updates",
+                        ))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .line_height(px(18.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(description)),
+                        ),
+                )
+                .child(toggle)
+                .into_any_element(),
+        )
+    }
+
+    /// App update QA: show the toggle as a desktop install would.
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_desktop_update(&mut self, cx: &mut Context<Self>) {
+        self.desktop_update = true;
+        cx.notify();
     }
 
     fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
@@ -633,6 +708,7 @@ impl Render for DevicesPage {
                                 devices_subtitle(workspace_scope),
                             ))
                             .child(self.render_version_card(&theme, cx))
+                            .children(self.render_auto_restart_row(&theme, cx))
                             .when_some(self.error.clone(), |el, message| {
                                 el.child(
                                     widgets::error_strip(&theme, message)
