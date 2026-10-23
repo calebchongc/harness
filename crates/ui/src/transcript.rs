@@ -55,6 +55,9 @@ use crate::theme::Theme;
 use harness_syntax::LanguageId as Lang;
 
 #[cfg(test)]
+#[path = "transcript/bottom_flicker_tests.rs"]
+mod bottom_flicker_tests;
+#[cfg(test)]
 #[path = "transcript/selection_tests.rs"]
 mod selection_tests;
 #[cfg(test)]
