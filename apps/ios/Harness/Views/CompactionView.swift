@@ -61,10 +61,12 @@ struct CompactionView: View {
                         }
                         .accessibilityIdentifier("compaction-device")
                     }
+                    .harnessListRow()
                 }
                 content
             }
         }
+        .harnessGroupedList()
         .refreshable { await reload() }
         .task(id: deviceId) { await reload() }
         .navigationTitle("Graff compaction")
@@ -82,11 +84,13 @@ struct CompactionView: View {
                     Spacer()
                 }
             }
+            .harnessListRow()
         case .failed(let message):
             Section {
                 Text(message)
                     .foregroundStyle(.secondary)
             }
+            .harnessListRow()
         case .loaded(let pct):
             Section {
                 Picker("Compact context at", selection: Binding(
@@ -107,6 +111,7 @@ struct CompactionView: View {
             } footer: {
                 Text("Graff compacts a conversation once it fills this much of the model's context window. Lower keeps each request smaller and cheaper; higher keeps more of the conversation word for word. Applies to Graff chats started after the change. To change one chat, type /compact-at 70 in it.")
             }
+            .harnessListRow()
         }
     }
 
@@ -141,7 +146,7 @@ struct CompactionView: View {
             if case RelayError.rpc(let message) = error, message.contains("unknown method") {
                 return .failed("Update Harness on \(name) to change this from your phone.")
             }
-            let reason = (error as? RelayError)?.errorDescription ?? describeTransportError(error)
+            let reason = describeUserFacingError(error)
             return .failed("Couldn't reach \(name): \(reason)")
         }
     }

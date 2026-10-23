@@ -67,10 +67,13 @@ fn offers_install(harness: HarnessId, installed: bool, can_install: bool) -> boo
 
 fn install_hint(harness: HarnessId, enabled: bool, can_install: bool) -> String {
     if harness == HarnessId::Antigravity {
+        // Harness talks to Google's ACP server, which the Antigravity app and
+        // the `agy` CLI don't include: say so, or "install Antigravity" reads
+        // as wrong to someone who already has it.
         return if can_install {
-            "Install Antigravity to enable"
+            "Needs Antigravity's ACP server (separate from the agy CLI) — click Install"
         } else {
-            "Set ANTIGRAVITY_ACP_EXECUTABLE to enable Antigravity"
+            "Needs Antigravity's ACP server (separate from the agy CLI) — set ANTIGRAVITY_ACP_EXECUTABLE to it"
         }
         .into();
     }
@@ -120,7 +123,7 @@ pub fn executable_override(harness: HarnessId) -> Option<&'static str> {
         HarnessId::Grok => Some("GROK_EXECUTABLE"),
         HarnessId::Hermes => Some("HERMES_EXECUTABLE"),
         HarnessId::Graff => Some("GRAFF_EXECUTABLE"),
-        HarnessId::Pi => Some("PI_ACP_EXECUTABLE"),
+        HarnessId::Pi => Some("PI_EXECUTABLE"),
         HarnessId::Opencode => Some("OPENCODE_EXECUTABLE"),
         HarnessId::Antigravity => Some("ANTIGRAVITY_ACP_EXECUTABLE"),
         HarnessId::Exo => Some("EXO_ACP_EXECUTABLE"),
@@ -1696,7 +1699,7 @@ fn install_visibility_and_hint_follow_target_capabilities() {
     assert_eq!(cli_name(HarnessId::Antigravity), "Antigravity");
     assert_eq!(
         install_hint(HarnessId::Antigravity, false, true),
-        "Install Antigravity to enable"
+        "Needs Antigravity's ACP server (separate from the agy CLI) — click Install"
     );
     assert!(
         install_hint(HarnessId::Antigravity, false, false).contains("ANTIGRAVITY_ACP_EXECUTABLE")

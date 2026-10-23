@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Dictation: Codex's voice helper runs as a child of Harness, so macOS
+         checks the microphone against Harness. Under the hardened runtime
+         that needs this entitlement as well as NSMicrophoneUsageDescription;
+         without either, capture silently yields silence. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <!-- Files the user drops, pastes or picks (and the Downloads folder) stay
+         readable under the hardened runtime, so a file dropped into a chat
+         from a folder that isn't a project still attaches. macOS treats the
+         drop as the user picking that file: no prompt, no folder-wide grant. -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+</dict>
+</plist>

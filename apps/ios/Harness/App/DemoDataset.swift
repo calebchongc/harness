@@ -160,7 +160,7 @@ final class DemoDataset {
 
     func listRefs(spacePath: String) -> [RepoRef] {
         if let cached = refsByPath[spacePath] { return cached }
-        let seeded: [RepoRef]
+        var seeded: [RepoRef]
         if spacePath.contains("harness") {
             seeded = [
                 RepoRef(name: "main", current: true, worktreePath: nil),
@@ -169,6 +169,12 @@ final class DemoDataset {
                 RepoRef(name: "feature/diff-pane", current: false, worktreePath: nil),
                 RepoRef(name: "fix/tool-colors", current: false, worktreePath: nil),
             ]
+            // UI-test fixture: more refs than the medium detent shows.
+            if ProcessInfo.processInfo.arguments.contains("-many-refs") {
+                seeded += (1...30).map {
+                    RepoRef(name: "chore/batch-\($0)", current: false, worktreePath: nil)
+                }
+            }
         } else {
             seeded = [
                 RepoRef(name: "main", current: true, worktreePath: nil),
@@ -216,6 +222,25 @@ final class DemoDataset {
                 MessageEntry(id: "links-reply", role: .assistant,
                     parts: [.text(id: "t0", text: "Bare: http://127.0.0.1:3777/bare and markdown: [the preview](http://127.0.0.1:3777/md).")],
                     createdAt: nowMs(), deviceId: "demo", status: .complete, continuationOf: nil)
+            ])
+        } else if ProcessInfo.processInfo.arguments.contains("-errors") {
+            // Error-card checks: signed out and a usage limit read as such;
+            // a plain failure stays an Error.
+            let error = { (id: String, message: String) in
+                MessageEntry(id: id, role: .assistant, parts: [.error(id: "e0", message: message)],
+                    createdAt: nowMs(), deviceId: "demo", status: .aborted, continuationOf: nil)
+            }
+            let ask = { (id: String, text: String) in
+                MessageEntry(id: id, role: .user, parts: [.text(id: "t0", text: text)],
+                    createdAt: nowMs(), deviceId: "demo", status: .complete, continuationOf: nil)
+            }
+            store.setEntries([
+                ask("errors-ask-1", "Add a retry to the upload step."),
+                error("errors-signed-out", "Not logged in · Please run /login"),
+                ask("errors-ask-2", "Signed in, try again."),
+                error("errors-limit", "Claude usage limit reached — try again after the limit resets."),
+                ask("errors-ask-3", "And once more."),
+                error("errors-plain", "Claude Code exited with status 1: the upload test crashed"),
             ])
         } else if ProcessInfo.processInfo.arguments.contains("-longprompt") {
             store.setEntries([

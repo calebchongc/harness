@@ -136,6 +136,10 @@ impl WorkspaceFilesClient {
         Self { transport, context }
     }
 
+    pub fn target(&self) -> &WorkspaceTarget {
+        &self.context.target
+    }
+
     pub async fn list_directory(
         &self,
         request: ListWorkspaceDirectoryRequest,

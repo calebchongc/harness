@@ -66,11 +66,33 @@ else
   rm -rf "$GRAFF_TMP"
 fi
 echo "bundled $("$APP/Contents/Resources/bin/graff" --version | head -1)"
+# codedb ships beside it (Contents/Resources/bin/codedb): the app seeds
+# ~/.harness/tools/bin/codedb from it for the agents, then keeps that copy
+# current from codedb's releases. CODEDB_BINARY overrides; otherwise the
+# latest codedb release, checked against its checksums.sha256.
+if [[ -n "${CODEDB_BINARY:-}" ]]; then
+  install -m 755 "$CODEDB_BINARY" "$APP/Contents/Resources/bin/codedb"
+else
+  CODEDB_ASSET="codedb-darwin-$ARCH"
+  CODEDB_URL="${CODEDB_RELEASES_URL:-https://github.com/justrach/codedb/releases/latest/download}"
+  CODEDB_TMP="$(mktemp -d)"
+  curl -fsSL "$CODEDB_URL/$CODEDB_ASSET" -o "$CODEDB_TMP/$CODEDB_ASSET"
+  curl -fsSL "$CODEDB_URL/checksums.sha256" -o "$CODEDB_TMP/checksums.sha256"
+  (cd "$CODEDB_TMP" && grep " $CODEDB_ASSET\$" checksums.sha256 | shasum -a 256 -c -)
+  install -m 755 "$CODEDB_TMP/$CODEDB_ASSET" "$APP/Contents/Resources/bin/codedb"
+  rm -rf "$CODEDB_TMP"
+fi
+echo "bundled $("$APP/Contents/Resources/bin/codedb" --version | head -1)"
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
 cp "$ROOT/third_party/licenses/Zeron-MIT.txt" "$APP/Contents/Resources/licenses/"
 cp "$ROOT/third_party/licenses/CodeGraff-LICENSE.txt" "$APP/Contents/Resources/licenses/"
+# Session chimes, by name, for the notification center to play: background
+# chimes ride on their banner so Focus applies (crates/ui/src/sound.rs).
+for chime in done request attention; do
+  cp "$ROOT/crates/ui/assets/sounds/$chime.wav" "$APP/Contents/Resources/harness-$chime.wav"
+done
 
 # Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow
 # baked into dist/macos/icon-1024.png — sips can't alpha-mask, so the mask is
@@ -93,11 +115,20 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   codesign --verify --strict "$APP/Contents/Resources/bin/graff" 2>/dev/null &&
     codesign -dv "$APP/Contents/Resources/bin/graff" 2>&1 | grep -q "Authority=Developer ID Application" ||
     codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP/Contents/Resources/bin/graff"
-  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP"
+  # codedb likewise: keep a Developer ID signature, else sign it ourselves so
+  # the bundle notarizes.
+  codesign --verify --strict "$APP/Contents/Resources/bin/codedb" 2>/dev/null &&
+    codesign -dv "$APP/Contents/Resources/bin/codedb" 2>&1 | grep -q "Authority=Developer ID Application" ||
+    codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP/Contents/Resources/bin/codedb"
+  # The entitlements let dictation reach the microphone, and dropped or
+  # picked files from any folder stay readable, under the hardened runtime
+  # (dist/macos/Harness.entitlements).
+  codesign --force --options runtime --timestamp \
+    --entitlements "$ROOT/dist/macos/Harness.entitlements" --sign "$CODESIGN_IDENTITY" "$APP"
 else
   # Ad-hoc signature so the app launches on Apple silicon (Gatekeeper still
   # requires right-click → Open on first launch without notarization).
-  codesign --deep --force --sign - "$APP"
+  codesign --deep --force --entitlements "$ROOT/dist/macos/Harness.entitlements" --sign - "$APP"
 fi
 
 # notarize <path>: submit to Apple and wait for the verdict. A rejection may

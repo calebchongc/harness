@@ -21,12 +21,15 @@ export type SessionMessageRole = "user" | "assistant" | "system";
  */
 export interface DocMessagePart {
   readonly id: string;
-  readonly kind: "text" | "reasoning" | "tool" | "input" | "error" | "image";
+  readonly kind: "text" | "reasoning" | "tool" | "input" | "error" | "image" | "visual";
   /** kind === "text" — LoroText in the doc, string in mirror state. */
   readonly text?: string;
   readonly path?: string;
   readonly name?: string;
   readonly mimeType?: string;
+  /** kind === "visual" — bounded atomic source, never prose or LoroText. */
+  readonly title?: string;
+  readonly script?: string;
   /** kind === "reasoning" — LoroText in the doc. Deliberately NOT `text`:
    * old readers' unknown-kind fallback renders `text` as prose, so reasoning
    * on this field degrades to an invisible empty part instead of leaking
@@ -42,12 +45,25 @@ export interface DocMessagePart {
   readonly message?: string;
 }
 
+const encoder = new TextEncoder();
+
+/** Match the native visual ingress bounds; malformed source never becomes prose. */
+const visualPart = (
+  id: string, title: unknown, script: unknown
+): Extract<SessionMessagePart, { kind: "visual" | "text" }> =>
+  typeof title === "string" && title.trim().length > 0 && Array.from(title).length <= 200 &&
+  typeof script === "string" && script.trim().length > 0 && encoder.encode(script).length <= 64 * 1024
+    ? { kind: "visual", id, title, script }
+    : { kind: "text", id, text: "" };
+
 /** App-layer parts → doc parts. Input parts key on their requestId. */
 export const toDocParts = (
   parts: ReadonlyArray<SessionMessagePart>
 ): ReadonlyArray<DocMessagePart> =>
   parts.map((p): DocMessagePart => {
     switch (p.kind) {
+      case "visual":
+        return visualPart(p.id, p.title, p.script);
       case "image":
         return { id: p.id, kind: "image", path: p.path, name: p.name, mimeType: p.mimeType };
       case "text":
@@ -80,6 +96,8 @@ export const fromDocParts = (
 ): ReadonlyArray<SessionMessagePart> =>
   parts.map((p): SessionMessagePart => {
     switch (p.kind) {
+      case "visual":
+        return visualPart(p.id, p.title, p.script);
       case "image":
         return typeof p.path === "string" && p.path.length > 0 && typeof p.name === "string" && p.name.length > 0 && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(p.mimeType ?? "")
           ? { kind: "image", id: p.id, path: p.path, name: p.name, mimeType: p.mimeType! }
@@ -140,7 +158,6 @@ export interface SessionMessageEntry {
   readonly continuationOf?: string;
 }
 
-const encoder = new TextEncoder();
 const partBytes = (part: DocMessagePart): number =>
   encoder.encode(JSON.stringify(part)).length;
 

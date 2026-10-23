@@ -441,6 +441,24 @@ final class ParityTests: XCTestCase {
         }
     }
 
+    // MARK: Run errors (the desktop runs the same cases in harness-proto `run_errors`)
+
+    func testRunErrorsReadTheSameAsTheDesktop() throws {
+        let v = try load("vectors/run-errors.json")
+        let labels = try XCTUnwrap(v["labels"] as? [String: String])
+        let cases = try rows(v, "cases")
+        XCTAssertFalse(cases.isEmpty)
+        for c in cases {
+            let message = try XCTUnwrap(c["message"] as? String)
+            let problem = RunErrors.providerProblem(message)
+            XCTAssertEqual(problem?.rawValue, c["expect"] as? String, message)
+            if let problem {
+                XCTAssertEqual(problem.label, labels[problem.rawValue], message)
+                XCTAssertEqual(problem.actionLabel, v["actionLabel"] as? String)
+            }
+        }
+    }
+
     // MARK: Live sync: registry projection and transcript decoding (Android runs these in crates/mobile)
 
     func testRegistryRowsProjectTheSameWay() throws {

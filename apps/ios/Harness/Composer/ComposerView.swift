@@ -42,6 +42,7 @@ struct ComposerShell<Chips: View>: View {
     /// Images pasted into the box; nil pastes text only.
     var onPasteImages: (([Data]) -> Void)? = nil
     var onRemoveAttachment: (String) -> Void = { _ in }
+    var attachmentDraft: AttachmentDraft? = nil
     /// Screenshot rig (-focuscomposer): take keyboard focus shortly after
     /// appearing, so the keyboard-up transcript states can be driven headless.
     var autoFocus = false
@@ -158,6 +159,7 @@ struct ComposerShell<Chips: View>: View {
     private var input: some View {
         ComposerEditor(text: $draft, focused: $focused, placeholder: placeholder,
                        maxLines: compact ? 2 : 7, controller: editor,
+                       attachmentDraft: attachmentDraft,
                        onModifiedSubmit: {
                            guard !busy else { return }
                            editor.commit()
@@ -261,7 +263,11 @@ struct ComposerView: View {
 
     // What was typed and not sent comes back with the chat (DraftStore).
     @State private var text: String
-    @State private var attachments: [StagedAttachment] = []
+    @Bindable var attachmentDraft: AttachmentDraft
+    private var attachments: [StagedAttachment] {
+        get { attachmentDraft.items }
+        nonmutating set { attachmentDraft.items = newValue }
+    }
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPicker = false
     @State private var uploading = false
@@ -280,11 +286,17 @@ struct ComposerView: View {
     /// Distinguishes a live composer from an async acquire that completed
     /// after navigation removed this view.
     @State private var queueEditorVisible = false
+    /// The queued row whose images are open in the Attachments editor.
+    @State private var attachmentEdit: QueuedAttachmentEdit?
+    /// The lease that editor holds until it saves; released if it closes
+    /// any other way.
+    @State private var attachmentLease: QueueEditLease?
 
-    init(store: SessionStore, chat: Chat, runLive: Bool) {
+    init(store: SessionStore, chat: Chat, runLive: Bool, attachmentDraft: AttachmentDraft) {
         self.store = store
         self.chat = chat
         self.runLive = runLive
+        self.attachmentDraft = attachmentDraft
         _text = State(initialValue: DraftStore.load(DraftStore.chatKey(chat.id)))
     }
 
@@ -316,11 +328,18 @@ struct ComposerView: View {
         // the graced stream (1Hz only while something is degraded/pending).
         let _ = model.connectivity.pulse
         return VStack(spacing: 6) {
-            if let error = uploadError ?? store.queueActionError {
+            if let error = attachmentDraft.error ?? uploadError ?? store.queueActionError {
                 Text(error)
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.danger)
                     .lineLimit(2)
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if attachmentDraft.loading {
+                Text("Importing images…")
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textMuted)
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -353,7 +372,8 @@ struct ComposerView: View {
                            onEdit: { item in Task { await beginQueueEdit(item) } },
                            onCancelEdit: { Task { await cancelQueueEdit() } },
                            supportsActions: supportsQueueActions,
-                           onAction: performQueueAction)
+                           onAction: performQueueAction,
+                           onAttachments: { item in Task { await beginAttachmentEdit(item) } })
             }
             if editingQueuedId != nil {
                 Button(queueEdit?.terminal == true ? "Copy edit and stop editing" : "Stop editing") {
@@ -378,7 +398,7 @@ struct ComposerView: View {
                     : (runLive ? "Queue message" : "Send message"),
                 allowEmptySend: editingQueuedId != nil,
                 showStop: runLive,
-                busy: uploading || queueEditBusy,
+                busy: uploading || queueEditBusy || attachmentDraft.loading,
                 keepExpanded: showModelPicker || showTraitPicker || showOptionPicker != nil,
                 onSend: send,
                 onStop: { store.sendInterrupt() },
@@ -387,6 +407,7 @@ struct ComposerView: View {
                 onAttach: editingQueuedId == nil ? { showPicker = true } : nil,
                 onPasteImages: editingQueuedId == nil ? { stagePasted($0) } : nil,
                 onRemoveAttachment: { id in attachments.removeAll { $0.id == id } },
+                attachmentDraft: attachmentDraft,
                 autoFocus: model.launchFocusComposer
             ) {
                 if let pullRequest = model.changeRequest(for: chat) {
@@ -411,11 +432,23 @@ struct ComposerView: View {
                 }
             }
         }
-        .photosPicker(isPresented: $showPicker, selection: $pickerItems,
-                      maxSelectionCount: 8, matching: .images)
+        .themedPhotosPicker(isPresented: $showPicker, selection: $pickerItems)
         .onChange(of: pickerItems) { _, items in
             guard !items.isEmpty else { return }
             stage(items)
+        }
+        .sheet(item: $attachmentEdit, onDismiss: releaseAttachmentLease) { edit in
+            QueuedImageEditor(draft: edit.draft, deviceId: queueImageDeviceId) { draft in
+                await commitAttachments(draft, lease: edit.lease)
+            }
+        }
+        .task(id: attachmentLease?.leaseId) {
+            guard let lease = attachmentLease else { return }
+            while !Task.isCancelled, attachmentLease?.leaseId == lease.leaseId {
+                try? await Task.sleep(for: .seconds(20))
+                guard !Task.isCancelled, attachmentLease?.leaseId == lease.leaseId else { return }
+                _ = await store.renewQueuedEdit(lease)
+            }
         }
         .sheet(isPresented: $showModelPicker) {
             ModelPickerSheet(
@@ -467,7 +500,14 @@ struct ComposerView: View {
         .onChange(of: text) { _, new in
             if editingQueuedId == nil { DraftStore.save(new, for: DraftStore.chatKey(chat.id)) }
         }
+        .onChange(of: uploading || queueEditBusy || editingQueuedId != nil, initial: true) { _, blocked in
+            attachmentDraft.enabled = !blocked
+        }
+        .onChange(of: ObjectIdentifier(attachmentDraft)) { _, _ in
+            attachmentDraft.enabled = !uploading && !queueEditBusy && editingQueuedId == nil
+        }
         .onAppear {
+            attachmentDraft.enabled = !uploading && !queueEditBusy && editingQueuedId == nil
             queueEditorVisible = true
             if model.launchSheet == "config" {
                 model.launchSheet = nil
@@ -475,7 +515,10 @@ struct ComposerView: View {
             }
         }
         .onDisappear {
+            attachmentDraft.enabled = false
+            attachmentDraft.targeted = false
             queueEditorVisible = false
+            releaseAttachmentLease()
             guard let lease = queueEditLease else { return }
             text = queueEdit?.originalDraft ?? ""
             queueEdit = nil
@@ -523,27 +566,15 @@ struct ComposerView: View {
     /// unsupported/oversized picks surface as an error line).
     private func stage(_ items: [PhotosPickerItem]) {
         Task { @MainActor in
-            var failed = 0
-            for item in items {
-                guard let data = try? await item.loadTransferable(type: Data.self),
-                      let staged = StagedAttachment.stage(data: data) else {
-                    failed += 1
-                    continue
-                }
-                attachments.append(staged)
-            }
+            uploadError = nil
+            await attachmentDraft.stagePhotos(items)
             pickerItems = []
-            if failed > 0 {
-                uploadError = failed == 1
-                    ? "One image couldn't be attached (unsupported or over 24 MB)."
-                    : "\(failed) images couldn't be attached (unsupported or over 24 MB)."
-            } else {
-                uploadError = nil
-            }
         }
     }
 
     private func stagePasted(_ images: [Data]) {
+        guard attachmentDraft.canImport else { return }
+        attachmentDraft.error = nil
         let (staged, failed) = StagedAttachment.stage(images: images)
         attachments.append(contentsOf: staged)
         uploadError = StagedAttachment.failureMessage(failed)
@@ -553,7 +584,7 @@ struct ComposerView: View {
     /// steps aside rather than being lost.
     @MainActor
     private func beginQueueEdit(_ item: QueuedMessage) async {
-        guard editingQueuedId == nil, !queueEditBusy else { return }
+        guard editingQueuedId == nil, !queueEditBusy, !attachmentDraft.loading else { return }
         guard model.hostSupportsQueueEditLease(chat) else {
             uploadError = "Update the chat host to edit queued messages safely."
             return
@@ -580,6 +611,110 @@ struct ComposerView: View {
         case .unavailable:
             uploadError = "Connect to the chat host to edit this message."
         }
+    }
+
+    /// Where the queue's committed images live: the chat's host.
+    private var queueImageDeviceId: String { store.hostDeviceId ?? store.deviceId }
+
+    /// Open the Attachments editor on a queued row. The host holds the row
+    /// back from delivery under the same protected-edit lease a text edit
+    /// takes, so adding an image never sends it early.
+    @MainActor
+    private func beginAttachmentEdit(_ item: QueuedMessage) async {
+        guard editingQueuedId == nil, attachmentEdit == nil, !queueEditBusy else { return }
+        if model.demo != nil {
+            // No host in demo mode; the editor writes the local row.
+            attachmentEdit = QueuedAttachmentEdit(lease: nil, draft: QueuedAttachmentDraft(row: item))
+            return
+        }
+        guard model.hostSupportsQueueEditLease(chat) else {
+            uploadError = "Update the chat host to edit queued messages safely."
+            return
+        }
+        queueEditBusy = true
+        let result = await store.beginQueuedEdit(id: item.id, instanceId: queueEditInstanceId)
+        queueEditBusy = false
+        switch result {
+        case .acquired(let lease):
+            guard queueEditorVisible else {
+                _ = await store.finishQueuedEdit(lease, action: "cancel")
+                return
+            }
+            var row = item
+            row.attachments = lease.attachments ?? item.attachments
+            attachmentLease = lease
+            attachmentEdit = QueuedAttachmentEdit(
+                lease: lease, draft: QueuedAttachmentDraft(row: row, leasedText: lease.text))
+            uploadError = nil
+        case .locked:
+            uploadError = "That queued message is being edited on another device."
+        case .missing:
+            uploadError = "That queued message is no longer available."
+        case .unavailable:
+            uploadError = "Connect to the chat host to edit this message."
+        }
+    }
+
+    /// Upload the new images to the host, then commit the row's attachment
+    /// list through `FinishQueuedMessageEdit`, as the desktop does. Returns
+    /// the error to show in the editor, or nil once saved.
+    @MainActor
+    private func commitAttachments(_ draft: QueuedAttachmentDraft,
+                                   lease: QueueEditLease?) async -> String? {
+        guard let text = draft.commitText else { return "A queued message needs text or an image." }
+        let deviceId = queueImageDeviceId
+        var uploaded: [String: String] = [:]
+        guard let lease else {
+            // Demo: stand-in paths, seeded so the row previews them.
+            for staged in draft.pendingUploads {
+                let path = "/demo/queued/\(staged.name)"
+                AttachmentImageCache.shared.seed(deviceId: deviceId, path: path,
+                                                 name: staged.name, data: staged.data)
+                uploaded[staged.id] = path
+            }
+            guard let paths = draft.committedPaths(uploaded: uploaded),
+                  store.applyQueuedAttachmentsLocally(id: draft.rowId, text: text, attachments: paths)
+            else { return "That queued message is no longer available." }
+            attachmentEdit = nil
+            return nil
+        }
+        do {
+            for staged in draft.pendingUploads {
+                let path = try await store.uploadAttachment(name: staged.name, data: staged.data)
+                AttachmentImageCache.shared.seed(deviceId: deviceId, path: path,
+                                                 name: staged.name, data: staged.data)
+                uploaded[staged.id] = path
+            }
+        } catch {
+            return "Attachment upload failed — \(error.localizedDescription)"
+        }
+        guard let params = draft.finishParams(chatId: store.chatId, lease: lease, uploaded: uploaded) else {
+            return "Couldn't save the attachments."
+        }
+        switch await store.finishQueuedEdit(lease, params: params) {
+        case .finished:
+            attachmentLease = nil
+            attachmentEdit = nil
+            return nil
+        case .conflict:
+            return "This message changed on another device. Close and try again."
+        case .missing:
+            attachmentLease = nil
+            return "That queued message is no longer available."
+        case .lost:
+            attachmentLease = nil
+            return "Edit protection changed. Close and try again."
+        case .unavailable:
+            return "Couldn't save the attachments. Check the connection to the chat host."
+        }
+    }
+
+    /// The editor closed without saving: let the row go as it was.
+    private func releaseAttachmentLease() {
+        attachmentEdit = nil
+        guard let lease = attachmentLease else { return }
+        attachmentLease = nil
+        Task { _ = await store.finishQueuedEdit(lease, action: "cancel") }
     }
 
     @MainActor
@@ -626,6 +761,7 @@ struct ComposerView: View {
     }
 
     private func send() {
+        guard !attachmentDraft.loading else { return }
         // Editing a queued row: the button saves that row rather than sending
         // anything new.
         if editingQueuedId != nil {
@@ -766,6 +902,17 @@ struct QuestionPanel: View {
     @State private var picked: [String: Set<String>] = [:]  // questionId → labels
     @State private var typed: [String: String] = [:]
     @State private var autoAdvanceTask: Task<Void, Never>?
+    @State private var promptHeight: CGFloat = 0
+    @FocusState private var typing: Bool
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    /// Inside a stacked phone split: typing an answer gives the session the screen, as the composer does.
+    /// Without it the list kept the top half and the answer field sat behind the keyboard.
+    @Environment(\.stackedComposerFocus) private var stackedComposerFocus
+
+    /// The question and its options scroll inside this height, so a long
+    /// question leaves the transcript above it readable and keeps the answer
+    /// field and Submit on screen.
+    private var promptCap: CGFloat { verticalSizeClass == .compact ? 120 : 300 }
 
     var body: some View {
         // `questions[min(page, count - 1)]` traps on an empty list (count - 1
@@ -775,10 +922,65 @@ struct QuestionPanel: View {
             EmptyView()
         } else {
             panel(for: questions[min(max(page, 0), questions.count - 1)])
+                .onChange(of: typing) { _, typing in stackedComposerFocus?(typing) }
+                // Answered or dismissed while typing: the split gets its rest back.
+                .onDisappear { if typing { stackedComposerFocus?(false) } }
         }
     }
 
     private func panel(for question: UserInputQuestion) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ScrollView {
+                prompt(for: question)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { promptHeight = $0 }
+            }
+            .id(page)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: min(max(promptHeight, 1), promptCap))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Rectangle().fill(hairline(0.06)).frame(height: 1)
+                TextField("Or type your own answer", text: Binding(
+                    get: { typed[question.id] ?? "" },
+                    set: { typed[question.id] = $0 }
+                ))
+                .focused($typing)
+                .onSubmit { advance() }
+                .font(Theme.sans(13))
+                .foregroundStyle(Theme.text)
+                .padding(.top, 6)
+            }
+
+            HStack {
+                if page > 0 {
+                    Button("Back") {
+                        page -= 1
+                    }
+                    .font(Theme.sans(13, weight: .medium))
+                    .foregroundStyle(Theme.textMuted)
+                }
+                Spacer()
+                Button(page < questions.count - 1 ? "Next" : "Submit") {
+                    advance()
+                }
+                .font(Theme.sans(13, weight: .medium))
+                .foregroundStyle(Theme.bg)
+                .padding(.horizontal, 16)
+                .frame(height: 34)
+                .background(Theme.text, in: Capsule())
+                .opacity(canAdvance(question) ? 1 : 0.4)
+                .disabled(!canAdvance(question))
+            }
+        }
+        .padding(16)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26))
+        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(hairline(0.05), lineWidth: 1))
+        .padding(.horizontal, 12)
+        .transition(.opacity)
+    }
+
+    /// Header, question and options: the part that scrolls.
+    private func prompt(for question: UserInputQuestion) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text(question.header.uppercased())
@@ -812,44 +1014,8 @@ struct QuestionPanel: View {
                     optionRow(question: question, ix: ix, option: option)
                 }
             }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Rectangle().fill(hairline(0.06)).frame(height: 1)
-                TextField("Or type your own answer", text: Binding(
-                    get: { typed[question.id] ?? "" },
-                    set: { typed[question.id] = $0 }
-                ))
-                .font(Theme.sans(13))
-                .foregroundStyle(Theme.text)
-                .padding(.top, 6)
-            }
-
-            HStack {
-                if page > 0 {
-                    Button("Back") {
-                        page -= 1
-                    }
-                    .font(Theme.sans(13, weight: .medium))
-                    .foregroundStyle(Theme.textMuted)
-                }
-                Spacer()
-                Button(page < questions.count - 1 ? "Next" : "Submit") {
-                    advance()
-                }
-                .font(Theme.sans(13, weight: .medium))
-                .foregroundStyle(Theme.bg)
-                .padding(.horizontal, 16)
-                .frame(height: 34)
-                .background(Theme.text, in: Capsule())
-                .opacity(canAdvance(question) ? 1 : 0.4)
-                .disabled(!canAdvance(question))
-            }
         }
-        .padding(16)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26))
-        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(hairline(0.05), lineWidth: 1))
-        .padding(.horizontal, 12)
-        .transition(.opacity)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func optionRow(question: UserInputQuestion, ix: Int, option: String) -> some View {
@@ -920,6 +1086,15 @@ struct QuestionPanel: View {
             }
             return UserInputAnswer(questionId: q.id, labels: Array(picked[q.id, default: []]))
         }
+        typing = false
         respond(requestId, answers)
     }
+}
+
+/// One open Attachments editor: the row's draft and, outside demo mode, the
+/// lease that holds the row back from delivery while it is open.
+struct QueuedAttachmentEdit: Identifiable {
+    var id: String { draft.rowId }
+    let lease: QueueEditLease?
+    let draft: QueuedAttachmentDraft
 }

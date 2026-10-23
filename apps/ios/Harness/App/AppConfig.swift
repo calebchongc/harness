@@ -51,6 +51,8 @@ final class AppConfig: @unchecked Sendable {
     /// A refresh token the edge turned down. Spending it again can only fail (and CodeGraff treats a
     /// replayed token as theft), so it is left alone until a sign-in replaces it.
     private var rejectedRefreshToken: String?
+    /// Unanswered refresh attempts across rounds, so a rejection right after one gets its second try.
+    private let refreshMemory = TokenRefresh.Memory()
     /// Called once when the edge rejects the stored sign-in: the person must sign in again. Set by AppModel.
     var onSessionExpired: (@Sendable () -> Void)? {
         get { lock.withLock { sessionExpiredHandler } }
@@ -150,7 +152,7 @@ final class AppConfig: @unchecked Sendable {
                 let grace = await MainActor.run { BackgroundGrace.begin("harness.refreshToken") }
                 defer { grace.end() }
                 let client = AuthClient(baseURL: edgeURL)
-                let outcome = await TokenRefresh.run {
+                let outcome = await TokenRefresh.run(memory: self.refreshMemory) {
                     try await client.refresh(refreshToken: current.refreshToken, organizationId: orgId)
                 }
                 var token: String?
@@ -276,6 +278,25 @@ final class AppConfig: @unchecked Sendable {
         request.httpMethod = "POST"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
+    }
+
+    /// POST /registry/{orgId}/push-target — this phone's APNs token and
+    /// notification choices; nil registration is the DELETE (sign-out, or
+    /// notifications turned off here).
+    func pushTargetRequest(register registration: PushRegistration?) async -> URLRequest? {
+        guard let token = await currentToken() else { return nil }
+        var url = edgeURL.appending(path: "registry/\(orgId)/push-target")
+        url.append(queryItems: [URLQueryItem(name: "device", value: deviceId)])
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let registration {
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try? JSONEncoder().encode(registration)
+        } else {
+            request.httpMethod = "DELETE"
+        }
         return request
     }
 

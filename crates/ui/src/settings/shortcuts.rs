@@ -652,7 +652,9 @@ fn group(id: ShortcutId) -> &'static str {
         | ShortcutId::NewSession
         | ShortcutId::NextSession
         | ShortcutId::PrevSession
-        | ShortcutId::ArchiveSession => "Sessions",
+        | ShortcutId::ArchiveSession
+        | ShortcutId::CloseTabWithoutArchiving
+        | ShortcutId::ReopenClosedTab => "Sessions",
         ShortcutId::JumpSession(_) => "Jump to session",
     }
 }
@@ -674,7 +676,7 @@ fn description(id: ShortcutId) -> &'static str {
             "Split the focused terminal to the right, like Ghostty ⌘D."
         }
         ShortcutId::SplitTerminalDown => "Split the focused terminal downward.",
-        ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
+        ShortcutId::NewSession => "Open a new chat tab, preserving the current chat and split layout.",
         ShortcutId::NewProject => "Open the new project dialog.",
         ShortcutId::OpenModelPicker => "Open the model picker for the current session.",
         ShortcutId::NextSession => {
@@ -684,6 +686,12 @@ fn description(id: ShortcutId) -> &'static str {
             "Switch to the previous tab when two or more are open; otherwise select the previous session in the sidebar."
         }
         ShortcutId::ArchiveSession => "Move the current session to the archived shelf.",
+        ShortcutId::CloseTabWithoutArchiving => {
+            "Close the focused pane or tab without archiving, regardless of the archive-on-close setting."
+        }
+        ShortcutId::ReopenClosedTab => {
+            "Reopen the most recently closed chat tab where it was; press again for earlier ones."
+        }
         // One line per slot would repeat itself nine times; the ordinal is
         // already in the row's label.
         ShortcutId::JumpSession(_) => "Open the session at this place in the sidebar list.",
@@ -1142,11 +1150,11 @@ mod tests {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
             cx.bind_keys([gpui::KeyBinding::new(
-                &crate::settings::platform_combo("mod-n"),
-                crate::shell::NewSession,
+                &crate::settings::platform_combo(ShortcutId::NewSession.default_combo()),
+                crate::shell::NewChatTab,
                 None,
             )]);
-            cx.on_action(move |_: &crate::shell::NewSession, _| observed.set(true));
+            cx.on_action(move |_: &crate::shell::NewChatTab, _| observed.set(true));
         });
         let window = cx.add_window(|_, cx| {
             let state = cx.new(|_| AppState::new());
@@ -1166,7 +1174,7 @@ mod tests {
                 page.start_recording(ShortcutId::CaptureAppshot, window, cx)
             })
             .unwrap();
-        cx.simulate_keystrokes(window.into(), &crate::settings::platform_combo("mod-n"));
+        cx.simulate_keystrokes(window.into(), &crate::settings::platform_combo(ShortcutId::NewSession.default_combo()));
         window
             .update(cx, |page, _, _| {
                 assert!(!fired.get(), "the existing action ran while recording");
@@ -1174,7 +1182,7 @@ mod tests {
                     page.conflict_notice
                         .as_deref()
                         .unwrap()
-                        .contains("New session")
+                        .contains("New chat")
                 );
                 assert_eq!(
                     page.keymap.capture_appshot,
@@ -1184,7 +1192,7 @@ mod tests {
                 assert!(page.recording_interceptor.is_none());
             })
             .unwrap();
-        cx.simulate_keystrokes(window.into(), &crate::settings::platform_combo("mod-n"));
+        cx.simulate_keystrokes(window.into(), &crate::settings::platform_combo(ShortcutId::NewSession.default_combo()));
         assert!(
             fired.get(),
             "finishing recording must restore normal actions"
@@ -1278,7 +1286,7 @@ mod tests {
     fn appshot_binding_participates_in_existing_conflict_checks() {
         let mut keymap = KeymapConfig::default();
         assert_eq!(
-            conflict_owner(&keymap, ShortcutId::CaptureAppshot, "mod-n"),
+            conflict_owner(&keymap, ShortcutId::CaptureAppshot, ShortcutId::NewSession.default_combo()),
             Some(ShortcutId::NewSession)
         );
         keymap.set(ShortcutId::CaptureAppshot, "mod-alt-k".into());

@@ -459,12 +459,38 @@ struct StartAgentLoginParams {
     /// Which sign-in, for harnesses that have several (graff: `xai`, `kimi`, `zai`).
     #[serde(default)]
     provider: Option<String>,
+    /// Finish graff's ChatGPT recovery on the calling device (a phone) instead
+    /// of the host's browser: the reply carries the authorize page, and the
+    /// caller returns the redirect via `CompleteAgentLogin`.
+    #[serde(default)]
+    relay_browser: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SignOutGraffLoginParams {
     provider: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListMcpServersParams {
+    /// The project folder whose `.mcp.json` counts (the space's folder).
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerActionParams {
+    #[serde(default)]
+    cwd: Option<String>,
+    action: harness_proto::McpServerVerb,
+    /// None: a reconnect of every switched-on server.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -591,7 +617,13 @@ enum MutateParams {
     #[serde(rename_all = "camelCase")]
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
-    SetChatArchived { chat_id: String, archived: bool },
+    SetChatArchived {
+        chat_id: String,
+        archived: bool,
+        /// Automatic close requests retain their intent time across RPC delay.
+        #[serde(default)]
+        archive_requested_at: Option<i64>,
+    },
     /// Change one pin without replacing another device's edits.
     #[serde(rename_all = "camelCase")]
     ChangeSidebarPin {
@@ -1040,7 +1072,7 @@ impl EngineRpc {
                 let chat_ids = deleted.chat_ids;
                 tokio::spawn(async move {
                     for chat_id in chat_ids {
-                        if let Err(err) = sessions.interrupt(&chat_id).await {
+                        if let Err(err) = sessions.interrupt_for(&chat_id, "space deleted").await {
                             tracing::debug!(chat = %chat_id, error = %err, "deleteSpace interrupt skipped");
                         }
                         doc_host.purge_chat(&chat_id);
@@ -1077,11 +1109,18 @@ impl EngineRpc {
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatArchived { chat_id, archived } => self
-                .workspace
-                .set_chat_archived(&chat_id, archived)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatArchived { chat_id, archived, archive_requested_at } => {
+                match archive_requested_at.filter(|_| archived) {
+                    Some(at) => self.workspace.archive_chat_at(&chat_id, at),
+                    None => self.workspace.set_chat_archived(&chat_id, archived),
+                }
+                .map_err(failed)?;
+                // A person's restore lets peer mail held while archived out (#498).
+                if !archived {
+                    self.doc_host.kick_queue(&chat_id);
+                }
+                Ok(())
+            }
             MutateParams::ChangeSidebarPin { change } => {
                 self.workspace.change_sidebar_pin(&change).map_err(failed)
             }
@@ -1231,6 +1270,11 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
+        // A reconnect handshakes every server; a login waits on a browser page.
+        methods::LIST_MCP_SERVERS => Duration::from_secs(70),
+        methods::MCP_SERVER_ACTION => Duration::from_secs(6 * 60),
+        // A relayed sign-in finishes on the host after graff exchanges the code.
+        methods::COMPLETE_AGENT_LOGIN => Duration::from_secs(120),
         _ => Duration::from_secs(30),
     }
 }
@@ -1327,6 +1371,9 @@ fn forwardable(method: &str) -> bool {
             | methods::CANCEL_AGENT_LOGIN
             | methods::LIST_GRAFF_LOGINS
             | methods::SIGN_OUT_GRAFF_LOGIN
+            // graff's MCP config, caches and sign-ins are per device.
+            | methods::LIST_MCP_SERVERS
+            | methods::MCP_SERVER_ACTION
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -1660,8 +1707,20 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&sandboxes)
             }
             methods::CODEGRAFF_CREATE_SANDBOX => {
+                let size = params
+                    .get("size")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|size| !size.is_empty());
                 let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
-                    .create_sandbox()
+                    .create_sandbox(size)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&sandbox)
+            }
+            methods::CODEGRAFF_CREATE_TEMPORARY_SANDBOX => {
+                let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .create_temporary_sandbox()
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&sandbox)
@@ -1676,9 +1735,32 @@ impl RpcService for EngineRpc {
                     Some("start") => auth.start_sandbox(id).await,
                     Some("stop") => auth.stop_sandbox(id).await,
                     Some("delete") => auth.delete_sandbox(id).await,
+                    Some("keep-running-on") => {
+                        auth.set_sandbox_keep_running(id, true).await.map(drop)
+                    }
+                    Some("keep-running-off") => {
+                        auth.set_sandbox_keep_running(id, false).await.map(drop)
+                    }
                     _ => Err("unknown sandbox action".into()),
                 }
                 .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CODEGRAFF_GITHUB_RUNNERS => {
+                let runners = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runners()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&runners)
+            }
+            methods::CODEGRAFF_GITHUB_RUNNER_ACTION => {
+                let action: crate::codegraff_auth::RunnerAction =
+                    serde_json::from_value(params.clone())
+                        .map_err(|e| RpcError::Failed(format!("bad GitHub CI action: {e}")))?;
+                crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runner_action(action)
+                    .await
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::ROOM_REQUEST => {
@@ -1865,6 +1947,34 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({}))
             }
+            methods::SHOW_VISUAL => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct P {
+                    chat_id: String,
+                    id: String,
+                    title: String,
+                    script: String,
+                }
+                let p: P = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::BadParams("chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::BadParams("chat belongs to another device".into()));
+                }
+                self.sessions
+                    .show_visual(&p.chat_id, &p.id, &p.title, &p.script)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "attached": true,
+                    "id": format!("show-visual:{}", p.id),
+                    "title": p.title,
+                }))
+            }
             methods::SHOW_IMAGE => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1929,16 +2039,28 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Prompts first: watch_queue's publish then fills both.
+                let prompts = handle.watch_pending_prompts();
                 let rx = handle.watch_queue();
                 Ok(RpcReply::Stream(
-                    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
-                        if !first {
-                            rx.changed().await.ok()?;
-                        }
-                        let items = rx.borrow_and_update().clone();
-                        let value = serde_json::json!({ "items": items });
-                        Some((value, (rx, false)))
-                    })
+                    futures::stream::unfold(
+                        (rx, prompts, true),
+                        |(mut rx, mut prompts, first)| async move {
+                            if !first {
+                                tokio::select! {
+                                    changed = rx.changed() => changed.ok()?,
+                                    changed = prompts.changed() => changed.ok()?,
+                                }
+                            }
+                            let items = rx.borrow_and_update().clone();
+                            let pending = prompts.borrow_and_update().clone();
+                            let value = serde_json::json!({
+                                "items": items,
+                                "pendingPrompts": pending,
+                            });
+                            Some((value, (rx, prompts, false)))
+                        },
+                    )
                     .boxed(),
                 ))
             }
@@ -3259,10 +3381,26 @@ impl RpcService for EngineRpc {
                             .into(),
                     ));
                 }
+                if p.relay_browser
+                    && (p.harness != HarnessId::Graff
+                        || p.provider.as_deref() != Some("chatgpt-new"))
+                {
+                    return Err(RpcError::Failed(
+                        "Finishing sign-in on another device is supported only for graff's ChatGPT sign-in."
+                            .into(),
+                    ));
+                }
                 let start = match (p.harness, p.provider.as_deref()) {
                     // Recovery attaches to a sign-in already waiting on this host.
                     (HarnessId::Graff, Some(provider)) if p.reauthenticate => {
-                        self.agent_accounts.start_graff_reauth(provider).await
+                        self.agent_accounts
+                            .start_graff_reauth(provider, p.relay_browser)
+                            .await
+                    }
+                    (HarnessId::Graff, Some(provider)) if p.relay_browser => {
+                        self.agent_accounts
+                            .start_graff_login_relayed(provider)
+                            .await
                     }
                     (HarnessId::Graff, Some(provider)) => {
                         self.agent_accounts.start_graff_login(provider).await
@@ -3282,16 +3420,51 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&start)
             }
             methods::LIST_GRAFF_LOGINS => RpcReply::value(&self.agent_accounts.list_graff_logins()),
+            methods::LIST_MCP_SERVERS => {
+                let p: ListMcpServersParams = parse_params(params)?;
+                let home = self.agent_accounts.graff_home();
+                let rows = crate::mcp_servers::list(
+                    &home,
+                    p.cwd.as_deref().map(std::path::Path::new),
+                    &p.names,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&rows)
+            }
+            methods::MCP_SERVER_ACTION => {
+                let p: McpServerActionParams = parse_params(params)?;
+                let home = self.agent_accounts.graff_home();
+                let rows = crate::mcp_servers::act(
+                    &home,
+                    p.cwd.as_deref().map(std::path::Path::new),
+                    p.action,
+                    p.name,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&rows)
+            }
             methods::SIGN_OUT_GRAFF_LOGIN => {
                 let p: SignOutGraffLoginParams = parse_params(params)?;
                 let rows = self
                     .agent_accounts
                     .sign_out_graff_login(&p.provider)
+                    .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&rows)
             }
             methods::COMPLETE_AGENT_LOGIN => {
                 let p: CompleteAgentLoginParams = parse_params(params)?;
+                // A relayed ChatGPT sign-in: `code` is the redirect it landed on.
+                if let Some(done) = self
+                    .agent_accounts
+                    .complete_relayed_login(&p.login_id, &p.code)
+                    .await
+                {
+                    done.map_err(|e| RpcError::Failed(e.to_string()))?;
+                    return RpcReply::value(&serde_json::json!({ "ok": true }));
+                }
                 let snapshot = self
                     .agent_accounts
                     .complete_login(&p.login_id, &p.code)
@@ -3791,6 +3964,7 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::SHOW_VISUAL));
         assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));

@@ -7,6 +7,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'protocol/**'
       - 'scripts/test-linux-browser.sh'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'dist/macos/Info.plist'
@@ -20,6 +21,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'protocol/**'
       - 'scripts/test-linux-browser.sh'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'dist/macos/Info.plist'
@@ -44,6 +46,14 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/kache
+        with:
+          access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: OpenCode protocol and permission regressions
         run: |
           cargo test --locked -p harness-adapters --lib opencode::
@@ -51,8 +61,9 @@ jobs:
       - name: Durable session publication and recovery
         run: |
           cargo test --locked -p harness-sync --lib
+          cargo test --locked -p harness-sync --test chat2_vectors
           cargo test --locked -p harness-update --lib
-          cargo test --locked -p harness-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles --test diff_sync_idle
+          cargo test --locked -p harness-engine --lib --test e2e --test session_publication --test restart_resume --test orphaned_steers --test acp_orphaned_steers --test codex_subagents --test local_profiles --test diff_sync_idle --test show_visual --test branch_drift --test graff_worktree_run --test m5c_accounts_uploads_titles --test worktree_on_run --test graff_login
       - name: graff trace observer
         run: cargo test --locked -p harness-observe
 
@@ -77,13 +88,30 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/kache
+        with:
+          access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - wait: system-deps
+      - name: Preview-local design runtime regressions
+        run: node --test crates/ui/tests/visualize-runtime.test.mjs
       - name: UI and headless layout regressions
         run: cargo test --release --locked -p harness-ui --lib -- --test-threads=1
 
   macos-frame-recovery:
+    # Three release builds that share little, so they run side by side
+    # instead of one after another on a single runner.
+    name: macos-frame-recovery (${{ matrix.suite }})
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [app, native-ui, browser]
     steps:
       - uses: actions/checkout@v4
       - name: Rust toolchain
@@ -108,39 +136,69 @@ jobs:
           PY
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ${{ matrix.suite }}
           cache-on-failure: true
           workspaces: |
             .
             ${{ steps.gpui-source.outputs.workspace }}
+      - uses: ./.github/actions/kache
+        with:
+          access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check macOS application
+        if: matrix.suite == 'app'
         run: cargo check --release --locked -p harness
+      - name: Native frame-source recovery regression
+        if: matrix.suite == 'app'
+        working-directory: ${{ steps.gpui-source.outputs.workspace }}
+        # The vendored GPUI workspace has no independent lockfile. Its source
+        # is pinned by this checkout and selected from Cargo.toml above.
+        run: cargo test --release -p gpui_macos --test frame_source_recovery
       - name: Native diff font geometry regression
+        if: matrix.suite == 'native-ui'
         run: cargo test --release --locked -p harness-ui --lib native_diff_font_geometry -- --test-threads=1
       - name: Native notification click regressions
+        if: matrix.suite == 'native-ui'
         run: |
           cargo test --release --locked -p harness-ui --lib notify::tests:: -- --test-threads=1
       - name: Build native browser fixture
+        if: matrix.suite == 'browser'
         run: cargo build --release --locked -p harness-ui --example browser-fixture --example preview-fixture --features browser-fixture
       - name: Native browser regression and screenshots
+        if: matrix.suite == 'browser'
         timeout-minutes: 3
         env:
           RUST_BACKTRACE: 1
         run: |
           bash scripts/run-macos-browser-fixture.sh target/release/examples/browser-fixture "$RUNNER_TEMP/browser-captures"
           test -f "$RUNNER_TEMP/browser-captures/result.txt"
+      - name: Native isolated HTML design preview
+        if: matrix.suite == 'browser'
+        timeout-minutes: 2
+        env:
+          HARNESS_HTML_PREVIEW_FIXTURE_ONLY: 1
+        run: |
+          bash scripts/run-macos-browser-fixture.sh target/release/examples/browser-fixture "$RUNNER_TEMP/html-preview"
+          test -f "$RUNNER_TEMP/html-preview/result.txt"
       - name: Upload browser screenshots
-        if: always()
+        if: always() && matrix.suite == 'browser'
         uses: actions/upload-artifact@v4
         with:
           name: browser-macos-captures
           path: ${{ runner.temp }}/browser-captures
           if-no-files-found: ignore
       - uses: actions/setup-node@v4
+        if: matrix.suite == 'browser'
         with:
           node-version: 24
       - name: Install preview fixture server
+        if: matrix.suite == 'browser'
         run: npm ci --prefix edge
       - name: Project discovery, stable URLs and HMR in native WebKit
+        if: matrix.suite == 'browser'
         timeout-minutes: 3
         env:
           HARNESS_PREVIEW_AUTO_OPEN: 1
@@ -148,17 +206,12 @@ jobs:
           VITE_BINARY="$GITHUB_WORKSPACE/edge/node_modules/vite/bin/vite.js" bash scripts/run-macos-browser-fixture.sh target/release/examples/preview-fixture "$RUNNER_TEMP/preview-captures"
           test -f "$RUNNER_TEMP/preview-captures/result.txt"
       - name: Upload preview screenshots
-        if: always()
+        if: always() && matrix.suite == 'browser'
         uses: actions/upload-artifact@v4
         with:
           name: preview-macos-captures
           path: ${{ runner.temp }}/preview-captures
           if-no-files-found: ignore
-      - name: Native frame-source recovery regression
-        working-directory: ${{ steps.gpui-source.outputs.workspace }}
-        # The vendored GPUI workspace has no independent lockfile. Its source
-        # is pinned by this checkout and selected from Cargo.toml above.
-        run: cargo test --release -p gpui_macos --test frame_source_recovery
 
   ios-tests:
     # Skipped for now: the iOS app isn't shipping yet and this job fails.
@@ -217,6 +270,14 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/kache
+        with:
+          access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - wait: system-deps
       - name: Build browser fixture
         run: cargo build --release --locked -p harness-ui --example browser-fixture --features browser-fixture
@@ -227,6 +288,13 @@ jobs:
         run: |
           scripts/test-linux-browser.sh "$RUNNER_TEMP/linux-browser/default"
           VK_DRIVER_FILES=/dev/null scripts/test-linux-browser.sh "$RUNNER_TEMP/linux-browser/opengl"
+      - name: Native isolated HTML design preview
+        timeout-minutes: 2
+        env:
+          HARNESS_HTML_PREVIEW_FIXTURE_ONLY: 1
+        run: |
+          xvfb-run -a -s '-screen 0 1280x800x24' target/release/examples/browser-fixture "$RUNNER_TEMP/linux-html-preview"
+          test -f "$RUNNER_TEMP/linux-html-preview/result.txt"
       - name: Upload native browser evidence
         if: always()
         uses: actions/upload-artifact@v4

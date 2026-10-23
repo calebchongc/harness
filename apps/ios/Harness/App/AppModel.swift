@@ -122,6 +122,13 @@ final class AppModel {
 
     func restore() {
         if demo != nil { return }
+        // After a restart iOS can launch the app in the background before the first unlock, when the
+        // Keychain, the saved account and the cached docs can't be read yet. Read then, a sign-in that is
+        // there looks absent and the phone opens signed out. Wait for the unlock instead.
+        guard UIApplication.shared.isProtectedDataAvailable else {
+            restoreAfterUnlock()
+            return
+        }
         DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
         // Debug-rig config overrides (cfprefsd caching defeats external
@@ -248,11 +255,38 @@ final class AppModel {
             connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,
                     tokens: nil, devBearer: devBearer(userId: storedUserId, orgId: storedOrgId))
         case .codegraff:
-            guard let access = Keychain.load(key: "codegraffAccessToken"),
-                  let refresh = Keychain.load(key: "codegraffRefreshToken") else { return }
+            let refresh = Keychain.read(key: "codegraffRefreshToken")
+            let access = Keychain.read(key: "codegraffAccessToken")
+            if refresh == .unavailable || access == .unavailable {
+                restoreAfterUnlock()
+                return
+            }
+            guard case .found(let access) = access, case .found(let refresh) = refresh else { return }
             connect(url: url, mode: .codegraff, userId: storedUserId, orgId: storedOrgId,
                     tokens: AuthTokens(accessToken: access, refreshToken: refresh), devBearer: nil)
         }
+    }
+
+    /// The restore waiting for the Keychain: on the unlock, or the next time the app comes to the front.
+    @ObservationIgnored private var restoreWaitsForUnlock = false
+    @ObservationIgnored private var unlockObserver: NSObjectProtocol?
+
+    private func restoreAfterUnlock() {
+        restoreWaitsForUnlock = true
+        guard unlockObserver == nil else { return }
+        unlockObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.retryRestoreIfWaiting() }
+        }
+    }
+
+    private func retryRestoreIfWaiting() {
+        guard restoreWaitsForUnlock, UIApplication.shared.isProtectedDataAvailable else { return }
+        restoreWaitsForUnlock = false
+        if let unlockObserver { NotificationCenter.default.removeObserver(unlockObserver) }
+        unlockObserver = nil
+        restore()
     }
 
     // MARK: Sign-in flows
@@ -399,6 +433,7 @@ final class AppModel {
     }
 
     func signOut() {
+        PushNotifications.shared.signingOut(config: demo == nil ? config : nil)
         workspace?.stop()
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
@@ -474,7 +509,11 @@ final class AppModel {
         store.start()
         startConnectivity()
         phase = .ready
+        PushNotifications.shared.signedIn(model: self)
     }
+
+    /// The live sign-in, for the edge calls notifications make (none in demo mode).
+    var pushConfig: AppConfig? { demo == nil ? config : nil }
 
     /// Wire the graced-connectivity recompute over the live stores (the
     /// engine's 1s compute_connectivity, phone edition).
@@ -751,6 +790,10 @@ final class AppModel {
     func switchSpaceRef(space: Space, refName: String) async -> String? {
         if let demo {
             try? await Task.sleep(nanoseconds: 200_000_000)
+            // UI-test fixture: a host that refuses every checkout (#424).
+            if ProcessInfo.processInfo.arguments.contains("-checkout-refused") {
+                return describeUserFacingError(RelayError.rpc("git: synthetic checkout refused"))
+            }
             demo.switchRef(path: space.path, refName: refName)
             return nil
         }
@@ -831,6 +874,9 @@ final class AppModel {
                                    roomGen: 2))
             return id
         }
+        // The first session started from the phone is when "tell me when it's
+        // done" makes sense: ask for notification permission then.
+        PushNotifications.shared.askAfterFirstSession()
         if let space {
             return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
         }
@@ -906,8 +952,7 @@ final class AppModel {
     func archivedMatches(in spaceId: String?, query: String) -> [Chat] {
         let archived = archivedChats(in: spaceId)
         guard !query.isEmpty else { return archived }
-        return HomeFilter.apply(archived, query: query, status: .all,
-                                indicator: { _ in .idle }, names: homeFilterNames)
+        return HomeFilter.apply(archived, query: query, names: homeFilterNames)
     }
 
     func homeFilterNames(_ chat: Chat) -> HomeFilter.Names {
@@ -916,6 +961,15 @@ final class AppModel {
 
     func archive(chatId: String) { setArchived(chatId: chatId, archived: true) }
     func unarchive(chatId: String) { setArchived(chatId: chatId, archived: false) }
+
+    /// Delete a session for good, everywhere (the desktop's Delete session).
+    func delete(chatId: String) {
+        if let demo {
+            demo.chats.removeAll { $0.id == chatId }
+            return
+        }
+        workspace?.deleteChat(chatId: chatId)
+    }
 
     func rename(chatId: String, title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1020,6 +1074,8 @@ final class AppModel {
     /// online event on success, so every PARKED backoff (not just the rooms
     /// the kick reaches) lands a redial in ~1 RTT.
     func foregrounded() {
+        Keychain.flushPending()
+        retryRestoreIfWaiting()
         workspace?.setActive(true)
         refreshSignInIfDue()
         kickAllRooms()
@@ -1232,16 +1288,16 @@ final class AppModel {
         return false
     }
 
-    /// The user-visible truth of a chat's oldest unadopted send. `failed`
-    /// (unadopted past the 2-minute grace, with a retry affordance) wins over
-    /// `queued` (pending on a degraded path); a healthy in-flight send reads
-    /// `sending`. nil = nothing pending.
+    /// The user-visible truth of a chat's unadopted sends (`SendState.of`).
+    /// `failed` only when the doc says a send can no longer run; past the
+    /// grace a still-pending command reads `waiting` (#413). nil = nothing
+    /// pending.
     func sendState(for chat: Chat, now: Int64 = nowMs()) -> SendState? {
         guard demo == nil, let store = sessionStores[chat.id],
               let oldest = store.pendingSends.map(\.started).min() else { return nil }
-        if now - oldest > undeliveredGraceMs { return .failed }
-        if chatDeliveryDegraded(chat) { return .queued }
-        return .sending
+        return SendState.of(oldestStarted: oldest,
+                            undeliverable: !store.undeliverableSends(now: now).isEmpty,
+                            degraded: chatDeliveryDegraded(chat), now: now)
     }
 
     func releaseSessionStore(chatId: String) {

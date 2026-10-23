@@ -194,6 +194,13 @@ pub struct Chat {
     /// chat sharing the same checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_context: Option<ConversationSourceContext>,
+    /// Set when the chat's latest accepted run could not observe its checkout
+    /// (not a repository, or inspection failed): `source_context` is then only
+    /// the last known one, not where the chat runs now, and nothing may treat
+    /// it as current (branch PRs, branch labels). Cleared by the next
+    /// successful capture. Written only by the host, never by row upserts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context_unavailable_at: Option<DateTime<Utc>>,
     pub config: Option<ChatConfig>,
     pub last_message_preview: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
@@ -300,6 +307,12 @@ pub struct Session {
     /// Interrupts, failures and liveness expiry never advance this marker.
     #[serde(default)]
     pub last_completed_turn: Option<String>,
+    /// `last_completed_turn` answered peer mail only (another chat's message
+    /// or a room delivery, no person's prompt): clients consume the marker
+    /// without a completion alert. Published with the marker; older hosts
+    /// omit it, which reads as an ordinary completion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_completed_peer_only: bool,
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
@@ -961,6 +974,11 @@ pub enum AgentLoginMode {
     HostBrowser,
     /// Approve a one-time code on any device; tokens are stored on the host.
     DeviceCode,
+    /// The CLI's loopback sign-in, finished on the device that asked for it:
+    /// `url` is the provider's authorize page, and that device sends the
+    /// redirect it lands on back with `CompleteAgentLogin`. The host delivers
+    /// it to the CLI's callback, so tokens stay on the host (PKCE).
+    RelayBrowser,
 }
 
 impl AgentLoginStart {
@@ -1003,7 +1021,22 @@ pub const GRAFF_LOGIN_PROVIDERS: &[(&str, &str)] = &[
     ("kimi", "Kimi"),
     ("zai", "Z.AI"),
     ("chatgpt-new", "ChatGPT"),
+    // An Anthropic Console account, through Anthropic's own `ant` CLI; graff
+    // spends that workspace's API credits (graff ADR 0281).
+    ("anthropic", "Anthropic Console"),
 ];
+
+/// Where a person manages their ChatGPT plan's usage (OpenAI's UI guidelines
+/// for Sign in with ChatGPT link here from every plan-usage surface).
+pub const CHATGPT_MANAGE_USAGE_URL: &str = "https://chatgpt.com/settings/usage";
+
+/// The one-time confirmation after graff's first ChatGPT sign-in on a device,
+/// carried as the `Done` poll's message.
+pub const CHATGPT_PLAN_CONFIRMATION: &str = "You're using your ChatGPT plan";
+
+/// A ChatGPT sign-in that succeeded without plan usage (the `Error` poll's
+/// message): it can't run requests on the plan.
+pub const CHATGPT_PLAN_OFF: &str = "Signed in to ChatGPT, but plan usage is off. Continue with ChatGPT again and allow plan usage, or use an API key.";
 
 /// One graff sign-in provider on a device (`ListGraffLogins` row).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1011,7 +1044,16 @@ pub const GRAFF_LOGIN_PROVIDERS: &[(&str, &str)] = &[
 pub struct GraffLoginProvider {
     pub id: String,
     pub name: String,
+    /// Ready to use. For ChatGPT that means signed in with plan usage granted.
     pub signed_in: bool,
+    /// ChatGPT: the signed-in account, when graff's record names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// ChatGPT: whether the stored sign-in was granted plan usage. `None` when
+    /// signed out (and for other providers); `Some(false)` is signed in with
+    /// plan usage off, which can't run requests on the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_usage: Option<bool>,
 }
 
 /// CLI plan rate-limit window (accounts settings meters) — NOT app token accounting.

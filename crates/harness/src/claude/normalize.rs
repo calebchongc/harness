@@ -67,6 +67,152 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// Spawn tools: their tool_use id keys the subagent's chip and doc.
+fn is_spawn_tool(name: &str) -> bool {
+    matches!(name, "Agent" | "Task" | "Workflow")
+}
+
+/// A Workflow call's chip name: the inline script's `meta.description`
+/// (the input carries only the script), else a saved workflow's `name`.
+fn workflow_title(input: &Value) -> String {
+    let script = input.get("script").and_then(Value::as_str).unwrap_or("");
+    let description = script.find("meta").and_then(|meta| {
+        let rest = &script[meta..];
+        let rest = &rest[rest.find("description")? + "description".len()..];
+        let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+        let quote = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '\'' | '"' | '`'))?;
+        let body = &rest[1..];
+        Some(body[..body.find(quote)?].trim().to_owned())
+    });
+    description
+        .filter(|d| !d.is_empty())
+        .or_else(|| opt_str_field(input, "name").filter(|n| !n.is_empty()))
+        .unwrap_or_else(|| "Workflow".into())
+}
+
+/// One workflow agent's live line: "label — Bash: sleep 8 · 2 tools ·
+/// 13.3k tokens · 14s" while running; "done"/"failed" replaces the step once
+/// it settles. `terminal` is `Some(is_error)` for a settled agent.
+fn workflow_agent_line(agent: &Value, index: u64, terminal: Option<bool>) -> String {
+    let num = |key: &str| agent.get(key).and_then(Value::as_u64);
+    let label = opt_str_field(agent, "label")
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| format!("agent {index}"));
+    let step = match terminal {
+        Some(false) => Some("done".to_owned()),
+        Some(true) => Some("failed".to_owned()),
+        None => opt_str_field(agent, "lastToolName").map(|tool| {
+            match opt_str_field(agent, "lastToolSummary").filter(|s| !s.is_empty()) {
+                Some(summary) => format!("{tool}: {summary}"),
+                None => tool,
+            }
+        }),
+    };
+    let mut stats = Vec::new();
+    match num("toolCalls") {
+        Some(1) => stats.push("1 tool".to_owned()),
+        Some(n) if n > 1 => stats.push(format!("{n} tools")),
+        _ => {}
+    }
+    stats.extend(num("tokens").and_then(tokens_label));
+    // Settled agents carry `durationMs`; running ones only timestamps.
+    let elapsed = num("durationMs").or_else(|| {
+        terminal
+            .is_none()
+            .then(|| num("lastProgressAt")?.checked_sub(num("startedAt")?))
+            .flatten()
+    });
+    stats.extend(elapsed.and_then(duration_label));
+    // A settled agent's answer, first line only: the chip header truncates.
+    let outcome = terminal
+        .and_then(|_| opt_str_field(agent, "resultPreview"))
+        .and_then(|r| {
+            r.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_owned)
+        })
+        .map(|line| format!("→ {line}"));
+    let detail = step
+        .into_iter()
+        .chain(stats)
+        .chain(outcome)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if detail.is_empty() {
+        label
+    } else {
+        format!("{label} — {detail}")
+    }
+}
+
+/// The `Transcript dir: <path>` line of a Workflow launch result's text.
+fn transcript_dir_line(content: &Value) -> Option<String> {
+    let text = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("Transcript dir:"))
+        .map(|d| d.trim().to_owned())
+}
+
+/// A workflow agent's settled state: `Some(is_error)`, `None` while live.
+fn workflow_terminal(state: &str) -> Option<bool> {
+    match state {
+        "done" | "completed" | "success" => Some(false),
+        "failed" | "error" | "errored" | "killed" | "cancelled" | "canceled" => Some(true),
+        _ => None,
+    }
+}
+
+/// "26.6k tokens" / "812 tokens"; nothing for zero.
+fn tokens_label(n: u64) -> Option<String> {
+    match n {
+        0 => None,
+        n if n >= 1000 => Some(format!("{:.1}k tokens", n as f64 / 1000.0)),
+        n => Some(format!("{n} tokens")),
+    }
+}
+
+/// "13s" / "1m10s"; nothing under a second.
+fn duration_label(ms: u64) -> Option<String> {
+    let secs = ms / 1000;
+    match secs {
+        0 => None,
+        s if s < 60 => Some(format!("{s}s")),
+        s => Some(format!("{}m{}s", s / 60, s % 60)),
+    }
+}
+
+/// A workflow chip's summary: "1/3 agents · 26.6k tokens" while running,
+/// "3 agents · 40.1k tokens · 13s" once settled (Claude Code's own wording).
+fn workflow_summary(done: usize, total: usize, usage: Option<&Value>, settled: bool) -> String {
+    let num = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
+    let agents = if settled {
+        format!("{total} agent{}", if total == 1 { "" } else { "s" })
+    } else {
+        format!("{done}/{total} agents")
+    };
+    std::iter::once(agents)
+        .chain(num("total_tokens").and_then(tokens_label))
+        .chain(
+            settled
+                .then(|| num("duration_ms").and_then(duration_label))
+                .flatten(),
+        )
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
@@ -126,6 +272,16 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
                 input: (!input.is_null()).then(|| input.clone()),
             }
         }
+        // A Workflow run is a spawn too: its agents run in the background
+        // and report through `task_progress`, never as tagged frames.
+        "Workflow" => {
+            let mut input = input.as_object().cloned().unwrap_or_default();
+            input.insert("subagent_type".into(), "workflow".into());
+            ToolCall::Unknown {
+                name: format!("Agent: {}", workflow_title(&Value::Object(input.clone()))),
+                input: Some(Value::Object(input)),
+            }
+        }
         // MCP tools arrive as `mcp__<server>__<tool>`.
         _ => match name.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
             Some((server, tool)) => ToolCall::Mcp {
@@ -173,6 +329,39 @@ fn is_synthetic_user_text(text: &str) -> bool {
     text.starts_with("<system-reminder>") || text.starts_with("[Request interrupted")
 }
 
+/// Work the CLI runs past the turn: every `task_started` (a background shell
+/// command, monitor, agent or workflow) and every terminal
+/// `task_notification`. The engine keeps a parked session alive while any is
+/// open, since stopping the CLI kills it (#517).
+fn background_task(f: &super::wire::SystemFrame) -> Option<AgentEvent> {
+    let id = f
+        .task_id
+        .as_deref()
+        .or(f.tool_use_id.as_deref())
+        .filter(|id| !id.is_empty())?;
+    let running = match f.subtype.as_str() {
+        "task_started" => true,
+        "task_notification" if task_settled(f.status.as_deref().unwrap_or("")).is_some() => false,
+        _ => return None,
+    };
+    Some(AgentEvent::BackgroundTask {
+        id: id.to_owned(),
+        running,
+    })
+}
+
+/// A `task_notification` status that ends the task, as the run's Done status.
+fn task_settled(status: &str) -> Option<DoneStatus> {
+    match status {
+        "completed" | "complete" | "succeeded" | "success" => Some(DoneStatus::Completed),
+        "failed" | "errored" | "error" => Some(DoneStatus::Errored),
+        "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
+            Some(DoneStatus::Interrupted)
+        }
+        _ => None,
+    }
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -199,6 +388,22 @@ pub(crate) struct Normalizer {
     /// which then opened as an empty, never-created subagent doc (user
     /// report 2026-08-20).
     agent_spawn_tools: std::collections::HashSet<String>,
+    /// Workflow agents already surfaced (`<spawn>:wf<index>`) → last state
+    /// and chip name; `task_progress` re-sends every agent each frame, so
+    /// only changes emit.
+    workflow_agents: std::collections::HashMap<String, (String, String)>,
+    /// Workflow phases already headed (`<spawn>:<title>`).
+    workflow_phases: std::collections::HashSet<String>,
+    /// Workflow spawns → last (settled, total) agent counts summarized onto
+    /// the chip; a new summary goes out only when the counts move.
+    workflow_counts: std::collections::HashMap<String, (usize, usize)>,
+    /// Workflow spawns → the run's transcript dir (from the launch result).
+    workflow_dirs: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Agent transcripts to follow, as they become known: (file, agent chip
+    /// id). Drained by the run loop into the [`super::workflow_tail`] reader.
+    workflow_transcripts: Vec<(std::path::PathBuf, String)>,
+    /// Agent chip ids whose transcript is already followed.
+    workflow_followed: std::collections::HashSet<String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -213,6 +418,12 @@ impl Normalizer {
             last_model: None,
             agent_tasks: std::collections::HashMap::new(),
             agent_spawn_tools: std::collections::HashSet::new(),
+            workflow_agents: std::collections::HashMap::new(),
+            workflow_phases: std::collections::HashSet::new(),
+            workflow_counts: std::collections::HashMap::new(),
+            workflow_dirs: std::collections::HashMap::new(),
+            workflow_transcripts: Vec::new(),
+            workflow_followed: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
         }
@@ -225,79 +436,232 @@ impl Normalizer {
         (prev, self.assistant_message_id.clone())
     }
 
+    /// Agent transcripts newly known since the last call: (file, chip id).
+    pub fn take_workflow_transcripts(&mut self) -> Vec<(std::path::PathBuf, String)> {
+        std::mem::take(&mut self.workflow_transcripts)
+    }
+
+    /// Whether tagged traffic for `parent` belongs to a workflow — the spawn
+    /// itself or one of its agent chips (`<spawn>:wf<index>`). Their settles
+    /// must queue behind the transcript reader so no line lands after them.
+    pub fn is_workflow_parent(&self, parent: &str) -> bool {
+        let spawn = parent.split_once(":wf").map_or(parent, |(spawn, _)| spawn);
+        self.workflow_counts.contains_key(spawn)
+    }
+
+    /// A workflow's `task_progress` → its doc: a heading per phase and one
+    /// agent chip per agent, re-emitted (same id, replaced in place) whenever
+    /// its live line changes, and resolved when it reaches a terminal state.
+    /// The wire streams no agent transcripts; this summary is all there is.
+    fn workflow_progress(&mut self, f: &super::wire::SystemFrame) -> Vec<AgentEvent> {
+        let spawn = f
+            .task_id
+            .as_deref()
+            .and_then(|task| self.agent_tasks.get(task).cloned())
+            .or_else(|| f.tool_use_id.clone().filter(|t| !t.is_empty()));
+        let Some(spawn) = spawn.filter(|s| self.agent_spawn_tools.contains(s)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for agent in &f.workflow_progress {
+            let Some(index) = agent.get("index").and_then(Value::as_u64) else {
+                continue;
+            };
+            let id = format!("{spawn}:wf{index}");
+            let state = str_field(agent, "state");
+            let terminal = workflow_terminal(&state);
+            // A queued agent reports its requested model alias ("haiku");
+            // wait for `startedAt`, when the resolved id is filled in.
+            if agent.get("startedAt").is_none() && terminal.is_none() {
+                continue;
+            }
+            if let Some(phase) = opt_str_field(agent, "phaseTitle").filter(|p| !p.is_empty())
+                && self.workflow_phases.insert(format!("{spawn}:{phase}"))
+            {
+                out.push(tag(
+                    &spawn,
+                    AgentEvent::TextDelta {
+                        text: format!("### {phase}\n"),
+                    },
+                ));
+            }
+            let name = format!("Agent: {}", workflow_agent_line(agent, index, terminal));
+            let previous = self
+                .workflow_agents
+                .insert(id.clone(), (state.clone(), name.clone()));
+            if previous.as_ref().map(|(_, n)| n) != Some(&name) {
+                let mut input = serde_json::Map::new();
+                for (from, to) in [("model", "model"), ("promptPreview", "prompt")] {
+                    if let Some(v) = agent.get(from).filter(|v| v.is_string()) {
+                        input.insert(to.into(), v.clone());
+                    }
+                }
+                out.push(tag(
+                    &spawn,
+                    AgentEvent::ToolCall {
+                        id: id.clone(),
+                        call: ToolCall::Unknown {
+                            name,
+                            input: Some(Value::Object(input)),
+                        },
+                    },
+                ));
+            }
+            // The agent's own transcript, once both its id and the run's dir
+            // are known: the chip then links to it like any subagent.
+            if let (Some(agent_id), Some(dir)) = (
+                opt_str_field(agent, "agentId")
+                    .filter(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric())),
+                self.workflow_dirs.get(&spawn),
+            ) && self.workflow_followed.insert(id.clone())
+            {
+                self.workflow_transcripts
+                    .push((dir.join(format!("agent-{agent_id}.jsonl")), id.clone()));
+            }
+            if previous.as_ref().map(|(s, _)| s) == Some(&state) {
+                continue;
+            }
+            let Some(is_error) = terminal else {
+                continue;
+            };
+            out.push(tag(
+                &spawn,
+                AgentEvent::ToolResult {
+                    id: id.clone(),
+                    is_error,
+                    output: opt_str_field(agent, "resultPreview")
+                        .or_else(|| opt_str_field(agent, "error")),
+                    diff: None,
+                },
+            ));
+            // The agent's own transcript settles with it.
+            out.push(tag(
+                &id,
+                AgentEvent::Done {
+                    status: if is_error {
+                        DoneStatus::Errored
+                    } else {
+                        DoneStatus::Completed
+                    },
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            ));
+        }
+        // Every frame re-sends every known agent (queued ones included), so
+        // the counts come straight from it; the chip hears only movements.
+        let agents = f
+            .workflow_progress
+            .iter()
+            .filter(|a| a.get("type").and_then(Value::as_str) == Some("workflow_agent"));
+        let total = agents.clone().count();
+        let settled = agents
+            .filter(|a| workflow_terminal(&str_field(a, "state")).is_some())
+            .count();
+        if let Some(counts) = self.workflow_counts.get_mut(&spawn)
+            && *counts != (settled, total)
+        {
+            *counts = (settled, total);
+            out.push(tag(
+                &spawn,
+                AgentEvent::SubagentProgress {
+                    summary: workflow_summary(settled, total, f.usage.as_ref(), false),
+                },
+            ));
+        }
+        out
+    }
+
+    /// One `system` frame: init, workflow progress, and agent tasks settling.
+    fn normalize_system(&mut self, f: super::wire::SystemFrame) -> Vec<AgentEvent> {
+        // A background subagent's completion arrives as an UNTAGGED
+        // `task_notification` carrying the spawning tool's id — the
+        // wire's only terminal signal for it (live-verified 2.1.228:
+        // no tagged frame follows; the subagent's stream just stops).
+        // Surface it as the subagent's tagged Done so the chip flips
+        // done/failed and the transcript freezes.
+        if f.subtype == "task_notification" {
+            let Some(parent) = f.tool_use_id.as_deref().filter(|t| !t.is_empty()) else {
+                return Vec::new();
+            };
+            // Only a KNOWN spawn settles as a subagent. Background
+            // SHELL tasks (`Bash` with `run_in_background`) settle
+            // through this same subtype carrying the Bash call's id —
+            // tagging that Done would bind a subagent ref onto an
+            // ordinary Run chip. A real spawn's tool_use frame always
+            // precedes its notification on the wire, so the set is
+            // populated by the time a genuine one arrives.
+            if !self.agent_spawn_tools.contains(parent) {
+                return Vec::new();
+            }
+            // Non-terminal notification shapes: nothing to close.
+            let Some(status) = task_settled(f.status.as_deref().unwrap_or("")) else {
+                return Vec::new();
+            };
+            // A workflow's notification carries its final totals:
+            // summarize them onto the chip before it settles.
+            let summary = self.workflow_counts.get(parent).map(|&(_, total)| {
+                tag(
+                    parent,
+                    AgentEvent::SubagentProgress {
+                        summary: workflow_summary(total, total, f.usage.as_ref(), true),
+                    },
+                )
+            });
+            return summary
+                .into_iter()
+                .chain(std::iter::once(tag(
+                    parent,
+                    AgentEvent::Done {
+                        status,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                )))
+                .collect();
+        }
+        // An AGENT task starting (subagent_type present — subagent-
+        // owned shell tasks carry the same subtype without it):
+        // record agentId → spawn id for SendMessage steer re-keying.
+        if f.subtype == "task_progress" && !f.workflow_progress.is_empty() {
+            return self.workflow_progress(&f);
+        }
+        if f.subtype == "task_started"
+            && (f.subagent_type.is_some() || f.task_type.as_deref() == Some("local_workflow"))
+            && let (Some(task), Some(tool)) = (
+                f.task_id.as_deref().filter(|t| !t.is_empty()),
+                f.tool_use_id.as_deref().filter(|t| !t.is_empty()),
+            )
+        {
+            self.agent_tasks.insert(task.to_owned(), tool.to_owned());
+            self.agent_spawn_tools.insert(tool.to_owned());
+            return Vec::new();
+        }
+        if f.subtype != "init" || self.saw_init {
+            return Vec::new();
+        }
+        self.saw_init = true;
+        self.session_id = Some(f.session_id.clone());
+        vec![AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: f.model,
+            tools: f.tools,
+            cwd: f.cwd,
+            session_id: f.session_id,
+            assistant_message_id: self.assistant_message_id.clone(),
+        }]
+    }
+
     /// Normalize one stdout frame into 0+ unified events. `interrupted` folds
     /// a post-interrupt `result` into `Done { status: Interrupted }`.
     pub fn normalize(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
         match frame {
             Frame::System(f) => {
-                // A background subagent's completion arrives as an UNTAGGED
-                // `task_notification` carrying the spawning tool's id — the
-                // wire's only terminal signal for it (live-verified 2.1.228:
-                // no tagged frame follows; the subagent's stream just stops).
-                // Surface it as the subagent's tagged Done so the chip flips
-                // done/failed and the transcript freezes.
-                if f.subtype == "task_notification" {
-                    let Some(parent) = f.tool_use_id.as_deref().filter(|t| !t.is_empty()) else {
-                        return Vec::new();
-                    };
-                    // Only a KNOWN spawn settles as a subagent. Background
-                    // SHELL tasks (`Bash` with `run_in_background`) settle
-                    // through this same subtype carrying the Bash call's id —
-                    // tagging that Done would bind a subagent ref onto an
-                    // ordinary Run chip. A real spawn's tool_use frame always
-                    // precedes its notification on the wire, so the set is
-                    // populated by the time a genuine one arrives.
-                    if !self.agent_spawn_tools.contains(parent) {
-                        return Vec::new();
-                    }
-                    let status = match f.status.as_deref().unwrap_or("") {
-                        "completed" | "complete" | "succeeded" | "success" => {
-                            DoneStatus::Completed
-                        }
-                        "failed" | "errored" | "error" => DoneStatus::Errored,
-                        "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
-                            DoneStatus::Interrupted
-                        }
-                        // Non-terminal notification shapes: nothing to close.
-                        _ => return Vec::new(),
-                    };
-                    return vec![tag(
-                        parent,
-                        AgentEvent::Done {
-                            status,
-                            result: None,
-                            error: None,
-                            session_id: None,
-                        },
-                    )];
-                }
-                // An AGENT task starting (subagent_type present — subagent-
-                // owned shell tasks carry the same subtype without it):
-                // record agentId → spawn id for SendMessage steer re-keying.
-                if f.subtype == "task_started"
-                    && f.subagent_type.is_some()
-                    && let (Some(task), Some(tool)) = (
-                        f.task_id.as_deref().filter(|t| !t.is_empty()),
-                        f.tool_use_id.as_deref().filter(|t| !t.is_empty()),
-                    )
-                {
-                    self.agent_tasks.insert(task.to_owned(), tool.to_owned());
-                    self.agent_spawn_tools.insert(tool.to_owned());
-                    return Vec::new();
-                }
-                if f.subtype != "init" || self.saw_init {
-                    return Vec::new();
-                }
-                self.saw_init = true;
-                self.session_id = Some(f.session_id.clone());
-                vec![AgentEvent::SessionStarted {
-                    harness: HarnessId::ClaudeCode,
-                    model: f.model,
-                    tools: f.tools,
-                    cwd: f.cwd,
-                    session_id: f.session_id,
-                    assistant_message_id: self.assistant_message_id.clone(),
-                }]
+                let mut out: Vec<AgentEvent> = background_task(&f).into_iter().collect();
+                out.extend(self.normalize_system(f));
+                out
             }
 
             // Frames with `parent_tool_use_id` set belong to a SUBAGENT's
@@ -390,8 +754,11 @@ impl Normalizer {
                 // Record spawn tool ids up front: `task_notification` keys on
                 // them, and only foreground spawns ever get a `task_started`.
                 for b in f.message.blocks() {
-                    if b.kind == "tool_use" && matches!(b.name.as_str(), "Agent" | "Task") {
+                    if b.kind == "tool_use" && is_spawn_tool(&b.name) {
                         self.agent_spawn_tools.insert(b.id.clone());
+                        if b.name == "Workflow" {
+                            self.workflow_counts.insert(b.id.clone(), (0, 0));
+                        }
                     }
                 }
                 let mut out: Vec<AgentEvent> = f
@@ -407,18 +774,20 @@ impl Normalizer {
                         // message — the wire never echoes it on the child
                         // feed (child user frames carry tool results and
                         // steers only), so seed it here and the subagent
-                        // transcript starts the way every chat does.
-                        let opening = matches!(b.name.as_str(), "Agent" | "Task")
-                            .then(|| b.input.get("prompt"))
-                            .flatten()
-                            .and_then(Value::as_str)
-                            .filter(|p| !p.trim().is_empty())
-                            .map(|prompt| tag(
-                                &b.id,
-                                AgentEvent::UserMessage {
-                                    text: prompt.to_owned(),
-                                },
-                            ));
+                        // transcript starts the way every chat does. A
+                        // workflow has no prompt; its title opens the doc so
+                        // the chip goes live before the first progress frame.
+                        let opening = match b.name.as_str() {
+                            "Agent" | "Task" => b
+                                .input
+                                .get("prompt")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            "Workflow" => Some(workflow_title(&b.input)),
+                            _ => None,
+                        }
+                        .filter(|p| !p.trim().is_empty())
+                        .map(|text| tag(&b.id, AgentEvent::UserMessage { text }));
                         // A SendMessage steer never echoes on the child feed
                         // (live-verified) — surface it from the parent's own
                         // call, re-keyed onto the spawn it addresses.
@@ -519,6 +888,23 @@ impl Normalizer {
                             .map(|b| tag(parent, AgentEvent::UserMessage { text: b.text })),
                     );
                     return out;
+                }
+                // A Workflow launch result names where its agents write their
+                // transcripts: the structured echo first, its text as backup.
+                for b in f.message.blocks().filter(|b| b.kind == "tool_result") {
+                    if !self.workflow_counts.contains_key(&b.tool_use_id) {
+                        continue;
+                    }
+                    let dir = f
+                        .tool_use_result
+                        .as_ref()
+                        .and_then(|r| r.get("transcriptDir"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| transcript_dir_line(&b.content));
+                    if let Some(dir) = dir.filter(|d| !d.is_empty()) {
+                        self.workflow_dirs.insert(b.tool_use_id.clone(), dir.into());
+                    }
                 }
                 f.message
                     .blocks()
@@ -701,6 +1087,15 @@ mod tests {
             decode_tool_use("Mystery", &json!({})),
             ToolCall::Unknown { .. }
         ));
+    }
+
+    /// Events other than the engine's background-task bookkeeping (#517),
+    /// for tests about what a frame means to the transcript.
+    fn without_background(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        events
+            .into_iter()
+            .filter(|e| !matches!(e, AgentEvent::BackgroundTask { .. }))
+            .collect()
     }
 
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {
@@ -893,7 +1288,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_started","task_id":"a20b2336","tool_use_id":"toolu_spawn","subagent_type":"general-purpose","prompt":"p","description":"d"}"#,
         )
         .expect("parses");
-        assert!(norm.normalize(started, false).is_empty());
+        assert!(without_background(norm.normalize(started, false)).is_empty());
         let send = crate::claude::wire::parse_frame(
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_send","name":"SendMessage","input":{"to":"a20b2336","message":"Also read the rebuild.","summary":"s"}}]}}"#,
         )
@@ -915,7 +1310,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
         )
         .expect("parses");
-        assert!(norm.normalize(shell_task, false).is_empty());
+        assert!(without_background(norm.normalize(shell_task, false)).is_empty());
         let send = crate::claude::wire::parse_frame(
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"SendMessage","input":{"to":"bg1","message":"x"}}]}}"#,
         )
@@ -985,7 +1380,7 @@ mod tests {
         };
         let notify = |norm: &mut Normalizer, raw: &str| {
             let frame = crate::claude::wire::parse_frame(raw).expect("parses");
-            norm.normalize(frame, false)
+            without_background(norm.normalize(frame, false))
         };
         let mut norm = Normalizer::new();
         spawn(&mut norm);
@@ -1025,6 +1420,54 @@ mod tests {
     }
 
     #[test]
+    fn background_tasks_start_and_settle_for_the_reaper() {
+        // #517: every task the CLI runs past the turn is reported, shell
+        // commands included, so the engine can keep the session alive.
+        let mut norm = Normalizer::new();
+        let mut frame = |line: &str| {
+            norm.normalize(
+                crate::claude::wire::parse_frame(line).expect("parses"),
+                false,
+            )
+        };
+        let task = |events: &[AgentEvent]| {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::BackgroundTask { id, running } => Some((id.clone(), *running)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let started = frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
+        );
+        assert_eq!(task(&started), [("bg1".to_owned(), true)]);
+        let progress = frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"running"}"#,
+        );
+        assert!(
+            task(&progress).is_empty(),
+            "a non-terminal status settles nothing"
+        );
+        for status in ["completed", "failed", "killed", "stopped"] {
+            let settled = frame(&format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"{status}"}}"#
+            ));
+            assert_eq!(task(&settled), [("bg1".to_owned(), false)], "{status}");
+            assert!(
+                !settled.iter().any(|e| matches!(e, AgentEvent::Subagent { .. })),
+                "a shell task never settles as a subagent"
+            );
+        }
+        // An agent task is reported too, keyed by its task id.
+        let agent = frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_agent","subagent_type":"general-purpose","task_type":"local_agent"}"#,
+        );
+        assert_eq!(task(&agent), [("a1".to_owned(), true)]);
+    }
+
+    #[test]
     fn shell_task_notification_never_settles_a_subagent() {
         // `Bash` with `run_in_background` settles through the SAME
         // `task_notification` subtype, carrying the Bash call's own id.
@@ -1045,7 +1488,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"completed"}"#,
         )
         .expect("parses");
-        assert!(norm.normalize(done, false).is_empty());
+        assert!(without_background(norm.normalize(done, false)).is_empty());
     }
 
     #[test]
@@ -1152,6 +1595,237 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn workflow_runs_surface_as_a_spawn_with_one_chip_per_agent() {
+        // Shapes trimmed from a live 2.1.285 capture: the agents report only
+        // through untagged task_progress, then one task_notification.
+        let mut norm = Normalizer::new();
+        let mut feed = |raw: &str| {
+            without_background(norm.normalize(
+                crate::claude::wire::parse_frame(raw).expect("parses"),
+                false,
+            ))
+        };
+        let ev = feed(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_wf","name":"Workflow","input":{"script":"export const meta = {\n  name: 'apple-banana',\n  description: 'Two agents in parallel',\n}\nawait parallel([])"}}]}}"#,
+        );
+        assert!(ev.iter().any(|e| matches!(e,
+            AgentEvent::ToolCall { id, call } if id == "toolu_wf" && call.is_subagent_spawn()
+                && matches!(call, ToolCall::Unknown { name, .. } if name == "Agent: Two agents in parallel"))));
+        assert!(ev.contains(&tag(
+            "toolu_wf",
+            AgentEvent::UserMessage {
+                text: "Two agents in parallel".into()
+            }
+        )));
+        assert!(feed(
+            r#"{"type":"system","subtype":"task_started","task_id":"wd1","tool_use_id":"toolu_wf","description":"Two agents in parallel","task_type":"local_workflow"}"#,
+        )
+        .is_empty());
+        // Agent 2 starts out queued: no `startedAt`, model still the alias.
+        let progress = |a: &str, b: &str, second: &str| {
+            format!(
+                r#"{{"type":"system","subtype":"task_progress","task_id":"wd1","tool_use_id":"toolu_wf","workflow_progress":[{{"type":"workflow_agent","index":1,"label":"Reply APPLE","model":"claude-haiku-4-5","startedAt":1,"state":"{a}","resultPreview":"APPLE"}},{{"type":"workflow_agent","index":2,"label":"Reply BANANA",{second}"state":"{b}","resultPreview":"BANANA"}}]}}"#
+            )
+        };
+        let summary = |text: &str| {
+            tag(
+                "toolu_wf",
+                AgentEvent::SubagentProgress {
+                    summary: text.into(),
+                },
+            )
+        };
+        let ev = feed(&progress("start", "start", r#""model":"haiku","#));
+        assert_eq!(ev.len(), 2);
+        assert!(
+            matches!(&ev[0], AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == "toolu_wf"
+                && matches!(event.as_ref(), AgentEvent::ToolCall { id, call }
+                    if id == "toolu_wf:wf1" && call.subagent_model() == Some("claude-haiku-4-5")))
+        );
+        // The queued agent already counts toward the chip's total.
+        assert_eq!(ev[1], summary("0/2 agents"));
+        let started = r#""model":"claude-haiku-4-5","startedAt":2,"#;
+        let ev = feed(&progress("start", "start", started));
+        assert!(matches!(&ev[..], [AgentEvent::Subagent { event, .. }]
+            if matches!(event.as_ref(), AgentEvent::ToolCall { id, call }
+                if id == "toolu_wf:wf2" && call.subagent_model() == Some("claude-haiku-4-5"))));
+        // Unchanged states re-sent each frame emit nothing.
+        assert!(feed(&progress("start", "start", started)).is_empty());
+        // Settling rewrites the chip's line in place, resolves it, and moves
+        // the parent chip's count.
+        let ev = feed(&progress("start", "done", started));
+        assert!(matches!(&ev[0], AgentEvent::Subagent { event, .. }
+            if matches!(event.as_ref(), AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+                if id == "toolu_wf:wf2" && name == "Agent: Reply BANANA — done · → BANANA")));
+        assert_eq!(
+            ev[1..],
+            [
+                tag(
+                    "toolu_wf",
+                    AgentEvent::ToolResult {
+                        id: "toolu_wf:wf2".into(),
+                        is_error: false,
+                        output: Some("BANANA".into()),
+                        diff: None,
+                    }
+                ),
+                // The agent's own transcript settles with it.
+                tag(
+                    "toolu_wf:wf2",
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    }
+                ),
+                summary("1/2 agents"),
+            ]
+        );
+        // The notification's totals land on the chip just before it settles.
+        let ev = feed(
+            r#"{"type":"system","subtype":"task_notification","task_id":"wd1","tool_use_id":"toolu_wf","status":"completed","usage":{"total_tokens":40100,"tool_uses":4,"duration_ms":70500}}"#,
+        );
+        assert_eq!(ev[0], summary("2 agents · 40.1k tokens · 1m10s"));
+        assert!(
+            matches!(&ev[1..], [AgentEvent::Subagent { parent_tool_use_id, event }]
+            if parent_tool_use_id == "toolu_wf"
+                && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. }))
+        );
+        // Progress for a task never seen as a spawn is ignored.
+        assert!(normalize_one(&progress("start", "start", started)).is_empty());
+    }
+
+    #[test]
+    fn workflow_launch_result_names_each_agents_transcript() {
+        for (echo, content) in [
+            // The structured echo (2.1.285 stream-json)…
+            (
+                r#","tool_use_result":{"status":"async_launched","transcriptDir":"/cfg/s1/subagents/workflows/wf_1"}"#,
+                "Workflow launched in background.",
+            ),
+            // …or, without it, the result text's own line.
+            (
+                "",
+                "Workflow launched in background.\\nTranscript dir: /cfg/s1/subagents/workflows/wf_1\\nRun ID: wf_1",
+            ),
+        ] {
+            let mut norm = Normalizer::new();
+            let mut feed = |raw: &str| {
+                norm.normalize(
+                    crate::claude::wire::parse_frame(raw).expect("parses"),
+                    false,
+                );
+            };
+            feed(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_wf","name":"Workflow","input":{"script":"x"}}]}}"#,
+            );
+            feed(&format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_wf","content":"{content}"}}]}}{echo}}}"#
+            ));
+            feed(
+                r#"{"type":"system","subtype":"task_progress","tool_use_id":"toolu_wf","workflow_progress":[{"type":"workflow_agent","index":1,"label":"a","agentId":"a64c421077cdd17f0","startedAt":1,"state":"start"},{"type":"workflow_agent","index":2,"label":"b","state":"start"}]}"#,
+            );
+            // Only the started agent (it has an id) is followed, once.
+            assert_eq!(
+                norm.take_workflow_transcripts(),
+                [(
+                    std::path::PathBuf::from(
+                        "/cfg/s1/subagents/workflows/wf_1/agent-a64c421077cdd17f0.jsonl"
+                    ),
+                    "toolu_wf:wf1".to_owned()
+                )]
+            );
+            assert!(norm.take_workflow_transcripts().is_empty());
+            assert!(norm.is_workflow_parent("toolu_wf") && norm.is_workflow_parent("toolu_wf:wf1"));
+            assert!(!norm.is_workflow_parent("toolu_agent"));
+        }
+    }
+
+    #[test]
+    fn live_workflow_capture_heads_phases_and_tracks_agent_progress() {
+        // Live 2.1.285 capture (trimmed to the Workflow call and task frames):
+        // phases Scan (2 agents running Bash/Read) then Report (1 agent).
+        let raw = include_str!("../../tests/fixtures/claude/live-2.1.285-workflow.jsonl");
+        let mut norm = Normalizer::new();
+        let events: Vec<AgentEvent> = raw
+            .lines()
+            .map(|line| crate::claude::wire::parse_frame(line).expect("parses"))
+            .flat_map(|frame| norm.normalize(frame, false))
+            .collect();
+        let tagged: Vec<&AgentEvent> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Subagent { event, .. } => Some(event.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let headings: Vec<&str> = tagged
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headings, ["### Scan\n", "### Report\n"]);
+        let names: Vec<&str> = tagged
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCall {
+                    call: ToolCall::Unknown { name, .. },
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // A running line names the agent's current step; the settled line
+        // carries its totals.
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("Agent: agent-a — Bash: "))
+        );
+        assert!(names.contains(
+            &"Agent: agent-a — done · 2 tools · 13.3k tokens · 13s · → AssetCacheLocatorUtil"
+        ));
+        let results = tagged
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::ToolResult {
+                        is_error: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(results, 3);
+        // The parent chip hears only count movements, then the final totals.
+        let summaries: Vec<&str> = tagged
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::SubagentProgress { summary } => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(summaries.first(), Some(&"0/2 agents"));
+        assert_eq!(summaries.last(), Some(&"3 agents · 38.5k tokens · 19s"));
+        assert!(
+            summaries.len() <= 6,
+            "low-frequency by contract: {summaries:?}"
+        );
+        assert!(matches!(
+            tagged.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ));
     }
 }
 

@@ -14,10 +14,12 @@
 //!   reflow already-painted text; the canonical parse settles honestly on
 //!   completion.
 
+pub mod content_reference;
 mod link_destination;
 mod link_interaction;
 mod link_presentation;
 pub mod links;
+mod math;
 pub mod mend;
 pub mod parser;
 pub mod render;
