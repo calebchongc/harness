@@ -108,6 +108,7 @@ fn nested_children_preserve_registered_parent_lineage_and_harness(cx: &mut gpui:
                         reasoning: None,
                         model_options: Default::default(),
                         sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                        chat_mode: false,
                     });
                     cx.notify();
                 })
