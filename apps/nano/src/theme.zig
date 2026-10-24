@@ -117,7 +117,7 @@ pub fn colors(dark: bool) Colors {
         .subline = .hex(0xada89d),
         .accent = accent,
         .accent_wash = accent.alpha(0.12),
-        .glyph = .{ .hex(0xd09346), accent, .hex(0x935c18) },
+        .glyph = .{ .hex(0xd09346), accent, .hex(0x935d18) },
         .danger = .hex(0xb14228),
         .danger_muted = .hex(0x873622),
         .warning = .hex(0x9a6e1b),

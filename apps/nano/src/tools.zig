@@ -99,23 +99,86 @@ pub fn label(buf: []u8, parts: []const tr.Part) []const u8 {
     return out;
 }
 
-/// A tool's chip in an open group.
-pub fn chip(kind: tr.ToolKind) []const u8 {
-    return switch (kind) {
-        .exec => "Run",
-        .readFile => "Read",
-        .editFile => "Edit",
-        .writeFile => "Write",
-        .applyPatch => "Patch",
-        .search => "Search",
-        .glob => "Glob",
-        .webFetch => "Fetch",
-        .webSearch => "Web",
-        .todo => "Todo",
-        .mcp => "MCP",
-        .unknown => "Tool",
+pub const Chip = struct { label: []const u8, detail: []const u8 };
+
+/// A tool call's chip, its label and what it ran on one line
+/// (`tool_chip_content`, crates/proto/src/view.rs). `call` is the
+/// `ToolCall` object, tagged by `kind`; strings go in `arena`.
+pub fn chipContent(arena: std.mem.Allocator, call: std.json.ObjectMap) Chip {
+    const S = struct {
+        fn str(o: std.json.ObjectMap, k: []const u8) ?[]const u8 {
+            const v = o.get(k) orelse return null;
+            return if (v == .string) v.string else null;
+        }
     };
+    const kind = S.str(call, "kind") orelse "";
+    const eq = std.mem.eql;
+    const raw: struct { []const u8, []const u8 } = if (eq(u8, kind, "exec"))
+        .{ "Run", S.str(call, "command") orelse "" }
+    else if (eq(u8, kind, "readFile"))
+        .{ "Read", S.str(call, "path") orelse "" }
+    else if (eq(u8, kind, "writeFile"))
+        .{ "Write", S.str(call, "path") orelse "" }
+    else if (eq(u8, kind, "editFile"))
+        .{ "Edit", S.str(call, "path") orelse "" }
+    else if (eq(u8, kind, "applyPatch"))
+        .{ "Patch", S.str(call, "path") orelse "workspace" }
+    else if (eq(u8, kind, "search"))
+        .{ "Search", if (S.str(call, "path")) |path| std.fmt.allocPrint(arena, "{s} in {s}", .{ S.str(call, "pattern") orelse "", path }) catch "" else S.str(call, "pattern") orelse "" }
+    else if (eq(u8, kind, "glob"))
+        .{ "Glob", S.str(call, "pattern") orelse "" }
+    else if (eq(u8, kind, "webFetch"))
+        .{ "Fetch", S.str(call, "url") orelse "" }
+    else if (eq(u8, kind, "webSearch"))
+        .{ "Web", S.str(call, "query") orelse "" }
+    else if (eq(u8, kind, "todo")) blk: {
+        var done: usize = 0;
+        var all: usize = 0;
+        if (call.get("items")) |items| if (items == .array) for (items.array.items) |it| {
+            all += 1;
+            if (it == .object) if (it.object.get("done")) |d| {
+                if (d == .bool and d.bool) done += 1;
+            };
+        };
+        break :blk .{ "Todo", std.fmt.allocPrint(arena, "{d}/{d} done", .{ done, all }) catch "" };
+    } else if (eq(u8, kind, "mcp"))
+        .{ "MCP", std.fmt.allocPrint(arena, "{s} · {s}", .{ S.str(call, "server") orelse "", S.str(call, "tool") orelse "" }) catch "" }
+    else
+        unknownChip(S.str(call, "name") orelse "");
+    return .{ .label = raw[0], .detail = singleLine(arena, raw[1]) };
 }
+
+/// An `unknown` call: subagents and the agent's own controls read as what
+/// they are; anything else is a tool by its name.
+fn unknownChip(name: []const u8) struct { []const u8, []const u8 } {
+    const starts = std.mem.startsWith;
+    const eq = std.mem.eql;
+    if (starts(u8, name, "Agent: ")) return .{ "Agent", name["Agent: ".len..] };
+    if (starts(u8, name, "Jev: ")) return .{ "Jev", name["Jev: ".len..] };
+    if (eq(u8, name, "Agent")) return .{ "Agent", "" };
+    if (eq(u8, name, "Compact context")) return .{ "Compact", "context" };
+    if (starts(u8, name, "Wait for ")) return .{ "Waiting on", "subagent" };
+    for ([_][2][]const u8{ .{ "Message agent", "Message" }, .{ "Resume agent", "Resume" }, .{ "Close agent", "Close" } }) |p| {
+        if (eq(u8, name, p[0]) or (starts(u8, name, p[0]) and name.len > p[0].len and name[p[0].len] == ' ')) return .{ p[1], "subagent" };
+    }
+    if (eq(u8, name, "agent_output")) return .{ "Waiting on", "subagent" };
+    if (eq(u8, name, "Send agent message") or eq(u8, name, "agent_message")) return .{ "Message", "subagent" };
+    if (eq(u8, name, "subagent_resume")) return .{ "Resume", "subagent" };
+    if (eq(u8, name, "Load tools")) return .{ "Load", "tools" };
+    return .{ "Tool", name };
+}
+
+/// Runs of whitespace become one space, none at the ends (`single_line`).
+pub fn singleLine(arena: std.mem.Allocator, text: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, text, " \t\n\r\x0b\x0c");
+    while (it.next()) |word| {
+        if (out.items.len > 0) out.append(arena, ' ') catch break;
+        out.appendSlice(arena, word) catch break;
+    }
+    return out.items;
+}
+
 
 const testing = std.testing;
 

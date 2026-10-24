@@ -21,10 +21,12 @@ client codegraff uses. For now it fetches the newest release's manifest.
 - Composer: Return sends, Shift-Return starts a new line, **Stop** interrupts a
   running turn. A new chat picks its agent and model.
 
-Not there yet: the header's project actions and the files and changes
-panels, attachments and dictation, answering an agent's questions, diffs, the
-message queue, pins, settings, starting an engine when none is running, Linux
-and Windows.
+Also: answering the agent's questions, the message queue, the changes pane
+and file explorer, and project actions with their terminal dock.
+
+Not there yet: typing into the dock, split diffs, editing files, per-type file
+icons, dragging queued messages, attachments and dictation, pins, settings,
+starting an engine when none is running, Linux and Windows.
 
 ## Build and run
 
@@ -69,6 +71,15 @@ HARNESS_IPC_PORT=27990 zig-out/bin/harness-nano --nanoui-snapshot=/tmp/nano.png 
 
 To open a chat at launch (for those checks), set `HARNESS_NANO_OPEN_CHAT` to
 its id.
+
+## Tests that it matches the Rust desktop
+
+`protocol/desktop/` holds what the Rust desktop and this app must agree on, as data: the sidebar's rules (times,
+status marks, order), tool chips and group summaries, how transcript frames apply, the theme's roles, and every
+request this app sends the engine. Both sides run the same files (`src/parity.zig` here; `crates/*/tests/desktop_*`
+in Rust), and the Rust runner sends each request to a real engine. See `protocol/desktop/README.md`.
+
+After changing a request on purpose: `zig build vectors`, then `cargo test -p harness-engine --test desktop_requests`.
 
 ## Matching the desktop app
 

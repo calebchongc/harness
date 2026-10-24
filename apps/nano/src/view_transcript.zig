@@ -171,7 +171,7 @@ fn treeRow(c: *ui.Context, k: theme.Colors, p: *const tr.Part, last: bool) void 
     const head = ui.div(c).row().gap(8).itemsCenter();
     {
         defer head.end();
-        const chip = if (p.kind == .reasoning) "Thought process" else tools.chip(p.tool);
+        const chip = if (p.kind == .reasoning) "Thought process" else p.chip;
         ui.text(c, chip, .{ .size = 12, .weight = .medium, .color = k.text.alpha(0.8) });
         if (p.kind == .tool) {
             const d = firstLine(p.text.items);

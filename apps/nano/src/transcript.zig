@@ -35,6 +35,8 @@ pub const Part = struct {
     /// path, pattern, URL or tool name). An error: its message.
     text: std.ArrayList(u8) = .empty,
     tool: ToolKind = .unknown,
+    /// A tool's chip, as the desktop labels it ("Run", "Agent", "Waiting on").
+    chip: []const u8 = "Tool",
     /// The file a tool read or changed, for counting distinct files.
     path: []u8 = &.{},
     /// A tool has finished, or an input request was answered.
@@ -235,12 +237,15 @@ fn toolCall(gpa: Allocator, p: *Part, call: ?json.Value) !void {
     if (c != .object) return;
     const o = c.object;
     p.tool = std.meta.stringToEnum(ToolKind, string(o.get("kind")) orelse "") orelse .unknown;
-    const path = string(o.get("path")) orelse string(o.get("file_path"));
-    if (path) |f| p.path = try gpa.dupe(u8, f);
-    const detail = string(o.get("command")) orelse path orelse
-        string(o.get("pattern")) orelse string(o.get("query")) orelse
-        string(o.get("url")) orelse string(o.get("tool")) orelse string(o.get("name"));
-    if (detail) |d| try p.text.appendSlice(gpa, d);
+    // The file a write, edit or patch touched, for counting distinct files.
+    if (p.tool == .writeFile or p.tool == .editFile or p.tool == .applyPatch) {
+        if (string(o.get("path"))) |f| p.path = try gpa.dupe(u8, f);
+    }
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const c_ = @import("tools.zig").chipContent(arena.allocator(), o);
+    p.chip = c_.label;
+    try p.text.appendSlice(gpa, c_.detail);
 }
 
 const testing = std.testing;
@@ -319,6 +324,7 @@ test "remove, a tool's summary, and replacing an entry by id" {
         \\  "call":{"kind":"exec","command":"zig build test"}}]},{"id":"b","role":"user","parts":[]}]}
     );
     try testing.expectEqualStrings("zig build test", t.entries.items[0].parts.items[0].text.items);
+    try testing.expectEqualStrings("Run", t.entries.items[0].parts.items[0].chip);
     try testing.expectEqual(ToolKind.exec, t.entries.items[0].parts.items[0].tool);
     try applyText(&t,
         \\{"remove":["b"],"upsert":[{"after":null,"entry":{"id":"a","role":"assistant","status":"complete","parts":[]}}],"count":1}

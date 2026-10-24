@@ -7,6 +7,7 @@
 const std = @import("std");
 const nanoui = @import("nanoui");
 const rpc = @import("rpc.zig");
+const requests = @import("requests.zig");
 const termlog = @import("termlog.zig");
 const App = @import("app.zig").App;
 const Allocator = std.mem.Allocator;
@@ -107,7 +108,7 @@ pub fn refresh(a: *App) void {
     if (x.space) |s| x.gpa.free(s);
     x.space = x.gpa.dupe(u8, sid) catch null;
     x.status = .loading;
-    a.call("ListProjectActions", .{ .spaceId = sid, .targetDeviceId = host(a) }, .of(App, a, onSnapshot));
+    a.request(requests.listActions(sid, host(a)), .of(App, a, onSnapshot));
 }
 
 fn onSnapshot(a: *App, _: u64, r: rpc.Reply) void {
@@ -202,12 +203,7 @@ pub fn save(a: *App) void {
         null;
     if (e.err != null) return a.redraw();
     e.saving = true;
-    a.call("UpsertProjectAction", .{
-        .spaceId = sid,
-        .actionId = e.id,
-        .action = .{ .name = name, .command = command, .icon = icons[e.icon], .runOnWorktreeCreate = e.setup },
-        .targetDeviceId = host(a),
-    }, .of(App, a, onSnapshot));
+    a.request(requests.upsertAction(sid, e.id, .{ .name = name, .command = command, .icon = icons[e.icon], .runOnWorktreeCreate = e.setup }, host(a)), .of(App, a, onSnapshot));
 }
 
 pub fn delete(a: *App) void {
@@ -217,7 +213,7 @@ pub fn delete(a: *App) void {
     const sid = x.space orelse return;
     e.saving = true;
     e.confirm_delete = false;
-    a.call("DeleteProjectAction", .{ .spaceId = sid, .actionId = id, .targetDeviceId = host(a) }, .of(App, a, onSnapshot));
+    a.request(requests.deleteAction(sid, id, host(a)), .of(App, a, onSnapshot));
 }
 
 /// Runs `act` in the chat's checkout; its output opens in the dock.
@@ -231,7 +227,7 @@ pub fn run(a: *App, act: Action) void {
     x.dock_active = x.runs.items.len - 1;
     x.dock_open = true;
     remember(a, sid, act.id);
-    a.call("RunProjectAction", .{ .spaceId = sid, .chatId = chat, .actionId = act.id, .cols = 80, .rows = 24, .targetDeviceId = host(a) }, .of(App, a, onRun));
+    a.request(requests.runAction(sid, chat, act.id, host(a)), .of(App, a, onRun));
     a.redraw();
 }
 
@@ -263,7 +259,7 @@ fn onRun(a: *App, _: u64, r: rpc.Reply) void {
             const term = if (v == .object) v.object.get("terminal") else null;
             const tid = if (term) |t| (if (t == .object) str(t.object, "id") else null) else null;
             run_.terminal = x.gpa.dupe(u8, tid orelse "") catch return;
-            run_.watch = a.engine.call("SubscribeTerminal", .{ .terminalId = run_.terminal, .targetDeviceId = host(a) }, .of(App, a, onOutput));
+            run_.watch = a.send_(requests.subscribeTerminal(run_.terminal, host(a)), .of(App, a, onOutput));
         },
         .err => |e| {
             run_.log.feed("\x1b[31mfailed to run action: ");
@@ -312,7 +308,7 @@ pub fn closeRun(a: *App, i: usize) void {
     if (i >= x.runs.items.len) return;
     var r = x.runs.orderedRemove(i);
     if (r.watch) |w| a.engine.cancel(w);
-    if (r.exited == null and r.terminal.len > 0) a.call("CloseTerminal", .{ .terminalId = r.terminal, .targetDeviceId = host(a) }, .of(App, a, App.onNotice));
+    if (r.exited == null and r.terminal.len > 0) a.request(requests.closeTerminal(r.terminal, host(a)), .of(App, a, App.onNotice));
     freeRun(x.gpa, &r);
     if (x.dock_active >= x.runs.items.len) x.dock_active = x.runs.items.len -| 1;
     if (x.runs.items.len == 0) x.dock_open = false;

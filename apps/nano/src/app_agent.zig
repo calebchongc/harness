@@ -4,6 +4,7 @@
 //! models the engine lists for that agent.
 const std = @import("std");
 const rpc = @import("rpc.zig");
+const requests = @import("requests.zig");
 const workspace = @import("workspace.zig");
 const App = @import("app.zig").App;
 
@@ -57,7 +58,7 @@ pub fn ensureModels(a: *App, harness: []const u8) void {
     a.gpa.free(a.models_for);
     a.models_for = copy;
     a.models.replace(.{ .array = .init(a.gpa) }) catch {};
-    a.call("ListModels", .{ .harness = harness }, .of(App, a, App.onModels));
+    a.request(requests.listModels(harness), .of(App, a, App.onModels));
 }
 
 pub fn togglePicker(a: *App) void {
@@ -112,17 +113,11 @@ fn setChatConfig(a: *App, model: ?[]const u8, reasoning: ?[]const u8, new_model:
     a.picker = .none;
     const id = a.selected orelse return;
     const ch = a.findChat(id) orelse return;
-    a.call("Mutate", .{
-        .op = "setChatConfig",
-        .chatId = id,
-        .config = .{
-            .harness = ch.harness orelse "graff",
-            .model = if (new_model) model else ch.model,
-            .reasoning = if (new_model) null else reasoning orelse ch.reasoning,
-            .modelOptions = rpc.empty,
-            .sandbox = "workspace-write",
-        },
-    }, .of(App, a, App.onNotice));
+    a.request(requests.setChatConfig(id, .{
+        .harness = ch.harness orelse "graff",
+        .model = if (new_model) model else ch.model,
+        .reasoning = if (new_model) null else reasoning orelse ch.reasoning,
+    }), .of(App, a, App.onNotice));
     a.redraw();
 }
 
@@ -133,7 +128,7 @@ pub fn newChatSpace(a: *const App) ?workspace.Space {
 
 /// Archives a chat from its row, or brings it back.
 pub fn setArchived(a: *App, chat_id: []const u8, archived: bool) void {
-    a.call("Mutate", .{ .op = "setChatArchived", .chatId = chat_id, .archived = archived }, .of(App, a, App.onNotice));
+    a.request(requests.setChatArchived(chat_id, archived), .of(App, a, App.onNotice));
 }
 
 /// The wall clock, in milliseconds since the epoch.

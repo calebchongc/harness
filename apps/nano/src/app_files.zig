@@ -5,6 +5,7 @@
 //! into a tab (`ReadWorkspaceFile`).
 const std = @import("std");
 const rpc = @import("rpc.zig");
+const requests = @import("requests.zig");
 const panels = @import("app_panels.zig");
 const App = @import("app.zig").App;
 
@@ -28,7 +29,7 @@ pub fn open(a: *App) void {
     if (p.w_git == null) {
         const chat = a.findChat(a.selected orelse return) orelse return;
         if (chat.space_id) |sid| if (chat.cwd) |dir| {
-            p.w_git = a.engine.call("WatchWorkspaceGitStatus", .{ .spaceId = sid, .checkoutPath = dir, .targetDeviceId = host(a) }, .of(App, a, onGit));
+            p.w_git = a.send_(requests.watchGit(sid, dir, host(a)), .of(App, a, onGit));
         };
     }
 }
@@ -62,12 +63,7 @@ fn list(a: *App, dir: []const u8) void {
     const chat = a.selected orelse return;
     const key = p.arena.allocator().dupe(u8, dir) catch return;
     p.listings.put(p.gpa, key, .{}) catch return;
-    const id = a.engine.call("ListWorkspaceDirectory", .{
-        .chatId = chat,
-        .directory = dir,
-        .includeIgnored = p.show_all,
-        .targetDeviceId = host(a),
-    }, .of(App, a, onListed)) orelse return;
+    const id = a.send_(requests.listDirectory(chat, dir, p.show_all, host(a)), .of(App, a, onListed)) orelse return;
     p.pending_lists.put(p.gpa, id, key) catch {};
 }
 
@@ -159,13 +155,7 @@ pub fn search(a: *App) void {
         return a.redraw();
     }
     p.searching = true;
-    p.search_id = a.engine.call("SearchWorkspaceFiles", .{
-        .chatId = chat,
-        .query = q[0..@min(q.len, 256)],
-        .includeIgnored = p.show_all,
-        .limit = 200,
-        .targetDeviceId = host(a),
-    }, .of(App, a, onSearched));
+    p.search_id = a.send_(requests.searchFiles(chat, q, p.show_all, host(a)), .of(App, a, onSearched));
 }
 
 fn onSearched(a: *App, id: u64, r: rpc.Reply) void {
@@ -208,7 +198,7 @@ pub fn openFile(a: *App, path: []const u8) void {
 pub fn read(a: *App, path: []const u8) void {
     const chat = a.selected orelse return;
     a.panels.file = .{};
-    _ = a.engine.call("ReadWorkspaceFile", .{ .chatId = chat, .path = path, .targetDeviceId = host(a) }, .of(App, a, onRead));
+    a.request(requests.readFile(chat, path, host(a)), .of(App, a, onRead));
 }
 
 fn onRead(a: *App, _: u64, r: rpc.Reply) void {

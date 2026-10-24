@@ -6,6 +6,7 @@
 //! host-only calls name the chat's device when it isn't this one.
 const std = @import("std");
 const rpc = @import("rpc.zig");
+const requests = @import("requests.zig");
 const App = @import("app.zig").App;
 
 /// What the engine says it can do (`EngineInfo.capabilities`).
@@ -58,7 +59,7 @@ pub fn watch(a: *App) void {
     const chat = a.selected orelse return;
     if (a.w_queue.id) |id| a.engine.cancel(id);
     a.queue.replace(.{ .array = .init(a.gpa) }) catch {};
-    a.w_queue = .{ .id = a.engine.call("WatchQueue", .{ .chatId = chat }, .of(App, a, onQueue)) };
+    a.w_queue = .{ .id = a.send_(requests.watchQueue(chat), .of(App, a, onQueue)) };
 }
 
 pub fn stop(a: *App) void {
@@ -99,12 +100,12 @@ pub fn queues(a: *const App) bool {
 
 pub fn queueMessage(a: *App, text: []const u8) void {
     const chat = a.selected orelse return;
-    a.call("QueueMessage", .{ .chatId = chat, .text = text, .holdForTurnEnd = true }, .of(App, a, App.onNotice));
+    a.request(requests.queueMessage(chat, text), .of(App, a, App.onNotice));
 }
 
 pub fn remove(a: *App, row: []const u8) void {
     const chat = a.selected orelse return;
-    a.call("RemoveQueuedMessage", .{ .chatId = chat, .id = row, .targetDeviceId = host(a) }, .of(App, a, onRemoved));
+    a.request(requests.removeQueued(chat, row, host(a)), .of(App, a, onRemoved));
 }
 
 fn onRemoved(a: *App, _: u64, r: rpc.Reply) void {
@@ -119,7 +120,7 @@ fn onRemoved(a: *App, _: u64, r: rpc.Reply) void {
 /// "Send now": interrupts the turn and sends the row.
 pub fn sendNow(a: *App, row: []const u8) void {
     const chat = a.selected orelse return;
-    a.call("SendQueuedMessageNow", .{ .chatId = chat, .id = row, .targetDeviceId = host(a) }, .of(App, a, onSent));
+    a.request(requests.sendQueuedNow(chat, row, host(a)), .of(App, a, onSent));
 }
 
 fn onSent(a: *App, _: u64, r: rpc.Reply) void {
@@ -144,13 +145,7 @@ pub fn beginEdit(a: *App, row: []const u8) void {
     a.queue_begin = a.gpa.dupe(u8, row) catch return;
     var buf: [36]u8 = undefined;
     const instance = a.instanceId(&buf);
-    a.call("BeginQueuedMessageEdit", .{
-        .chatId = chat,
-        .id = row,
-        .editorDeviceId = a.device_id orelse "",
-        .editorInstanceId = instance,
-        .targetDeviceId = host(a),
-    }, .of(App, a, onBegun));
+    a.request(requests.beginEdit(chat, row, a.device_id orelse "", instance, host(a)), .of(App, a, onBegun));
     a.redraw();
 }
 
@@ -200,15 +195,7 @@ pub fn finishEdit(a: *App, action: Finish) void {
     const text = std.mem.trim(u8, a.composer.text(), " \n\t");
     const act: Finish = if (action == .commit and text.len == 0) .discard else action;
     e.saving = true;
-    a.call("FinishQueuedMessageEdit", .{
-        .chatId = chat,
-        .id = e.row,
-        .leaseId = e.lease,
-        .action = @tagName(act),
-        .text = if (act == .commit) text else null,
-        .expectedTextHash = if (act == .commit) e.base_hash else null,
-        .targetDeviceId = host(a),
-    }, .of(App, a, onFinished));
+    a.request(requests.finishEdit(chat, e.row, e.lease, @tagName(act), if (act == .commit) text else null, if (act == .commit) e.base_hash else null, host(a)), .of(App, a, onFinished));
 }
 
 fn onFinished(a: *App, _: u64, r: rpc.Reply) void {
@@ -244,7 +231,7 @@ pub fn tick(a: *App, now: f64) ?f64 {
     if (now < e.renew_at) return e.renew_at;
     e.renew_at = now + renew_s;
     const chat = a.selected orelse return null;
-    a.call("RenewQueuedMessageEdit", .{ .chatId = chat, .id = e.row, .leaseId = e.lease, .targetDeviceId = host(a) }, .of(App, a, onRenewed));
+    a.request(requests.renewEdit(chat, e.row, e.lease, host(a)), .of(App, a, onRenewed));
     return e.renew_at;
 }
 

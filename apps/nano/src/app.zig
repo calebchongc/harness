@@ -14,6 +14,7 @@ const workspace = @import("workspace.zig");
 const Transcript = @import("transcript.zig").Transcript;
 const Tabs = @import("tabs.zig").Tabs;
 const agent = @import("app_agent.zig");
+const requests = @import("requests.zig");
 const question = @import("app_question.zig");
 const queue_mod = @import("app_queue.zig");
 pub const uuid = @import("ids.zig").uuid;
@@ -247,7 +248,7 @@ pub const App = struct {
         var git_buf: [4096]u8 = undefined;
         const git_path = std.fmt.bufPrint(&git_buf, "{s}/.git", .{paths[0]}) catch "";
         const git = std.Io.Dir.cwd().access(a.io, git_path, .{}) != error.FileNotFound;
-        a.call("Mutate", .{ .op = "createSpace", .spaceId = id, .deviceId = device, .path = paths[0], .gitDetected = git }, .of(App, a, onNotice));
+        a.request(requests.createSpace(id, device, paths[0], git), .of(App, a, onNotice));
         a.tabs.newTab();
         a.select(null, id);
     }
@@ -265,10 +266,10 @@ pub const App = struct {
         const a: *App = @ptrCast(@alignCast(ctx.?));
         switch (s) {
             .connected => {
-                a.call("EngineInfo", rpc.empty, .of(App, a, onEngineInfo));
-                a.call("ListHarnesses", rpc.empty, .of(App, a, onHarnesses));
+                a.request(requests.none("EngineInfo"), .of(App, a, onEngineInfo));
+                a.request(requests.none("ListHarnesses"), .of(App, a, onHarnesses));
                 a.ensureModels(a.target().harness);
-                a.call("EngineReady", rpc.empty, .of(App, a, onNotice));
+                a.request(requests.none("EngineReady"), .of(App, a, onNotice));
                 a.watchSidebar();
                 if (a.selected != null) {
                     a.watchDoc(true);
@@ -289,15 +290,24 @@ pub const App = struct {
         a.redraw();
     }
 
+    /// Sends a request built in requests.zig; the call's id, for a stream.
+    pub fn send_(a: *App, r: anytype, h: rpc.Handler) ?u64 {
+        return a.engine.call(r.method, r.params, h);
+    }
+
+    pub fn request(a: *App, r: anytype, h: rpc.Handler) void {
+        _ = a.engine.call(r.method, r.params, h);
+    }
+
     pub fn call(a: *App, method: []const u8, params: anytype, h: rpc.Handler) void {
         _ = a.engine.call(method, params, h);
     }
 
     fn watchSidebar(a: *App) void {
-        if (a.w_devices.id == null) a.w_devices = .{ .id = a.engine.call("WatchDevices", rpc.empty, .of(App, a, onDevices)) };
-        if (a.w_spaces.id == null) a.w_spaces = .{ .id = a.engine.call("WatchSpaces", rpc.empty, .of(App, a, onSpaces)) };
-        if (a.w_chats.id == null) a.w_chats = .{ .id = a.engine.call("WatchChats", rpc.empty, .of(App, a, onChats)) };
-        if (a.w_sessions.id == null) a.w_sessions = .{ .id = a.engine.call("WatchSessions", rpc.empty, .of(App, a, onSessions)) };
+        if (a.w_devices.id == null) a.w_devices = .{ .id = a.send_(requests.none("WatchDevices"), .of(App, a, onDevices)) };
+        if (a.w_spaces.id == null) a.w_spaces = .{ .id = a.send_(requests.none("WatchSpaces"), .of(App, a, onSpaces)) };
+        if (a.w_chats.id == null) a.w_chats = .{ .id = a.send_(requests.none("WatchChats"), .of(App, a, onChats)) };
+        if (a.w_sessions.id == null) a.w_sessions = .{ .id = a.send_(requests.none("WatchSessions"), .of(App, a, onSessions)) };
     }
 
     /// Streams to open again, now that it's time; the seconds until the next.
@@ -471,7 +481,7 @@ pub const App = struct {
 
     fn watchDoc(a: *App, opening: bool) void {
         const chat = a.selected orelse return;
-        a.w_doc = .{ .id = a.engine.call("WatchDocMessages", .{ .chatId = chat, .openingTail = opening }, .of(App, a, onDoc)) };
+        a.w_doc = .{ .id = a.send_(requests.watchDoc(chat, opening), .of(App, a, onDoc)) };
     }
 
     /// Opens `chat_id`, or (null) a new chat in `space_id`.
@@ -488,8 +498,8 @@ pub const App = struct {
             a.space = a.gpa.dupe(u8, s) catch null;
         }
         const chat = a.selected orelse return a.redraw();
-        a.call("FocusChat", .{ .chatId = chat }, .of(App, a, onNotice));
-        a.call("Mutate", .{ .op = "markChatSeen", .chatId = chat }, .of(App, a, onNotice));
+        a.request(requests.focusChat(chat), .of(App, a, onNotice));
+        a.request(requests.markChatSeen(chat), .of(App, a, onNotice));
         a.watchDoc(true);
         queue_mod.watch(a);
         @import("app_panels.zig").chatChanged(a);
@@ -545,32 +555,20 @@ pub const App = struct {
             harness = a.new_harness;
             model = a.new_model;
             reasoning = a.new_reasoning;
-            a.call("Mutate", .{
-                .op = "createChat",
-                .chatId = id,
-                .spaceId = if (space) |s| s.id else null,
-                .config = .{ .harness = a.new_harness, .model = a.new_model, .reasoning = a.new_reasoning, .modelOptions = rpc.empty, .sandbox = "workspace-write" },
-            }, .of(App, a, onNotice));
+            a.request(requests.createChat(id, if (space) |s| s.id else null, .{
+                .harness = a.new_harness,
+                .model = a.new_model,
+                .reasoning = a.new_reasoning,
+            }), .of(App, a, onNotice));
             break :blk id;
         };
-        a.call("QueueCommand", .{
-            .chatId = chat_id,
-            .command = .{
-                .kind = "run",
-                .messageId = message_id,
-                .request = .{
-                    .prompt = prompt,
-                    .turnOrigin = "human",
-                    .harness = harness,
-                    .model = model,
-                    .reasoning = reasoning,
-                    .modelOptions = rpc.empty,
-                    .cwd = cwd,
-                    .sandbox = "workspace-write",
-                    .autoApprove = false,
-                },
-            },
-        }, .of(App, a, onNotice));
+        a.request(requests.run(chat_id, message_id, .{
+            .prompt = prompt,
+            .harness = harness,
+            .model = model,
+            .reasoning = reasoning,
+            .cwd = cwd,
+        }), .of(App, a, onNotice));
         if (a.selected == null) {
             a.tabs.setCurrent(chat_id);
             a.select(chat_id, null);
@@ -582,6 +580,6 @@ pub const App = struct {
     /// Stops the open chat's turn.
     pub fn interrupt(a: *App) void {
         const chat = a.selected orelse return;
-        a.call("QueueCommand", .{ .chatId = chat, .command = .{ .kind = "interrupt" } }, .of(App, a, onNotice));
+        a.request(requests.interrupt(chat), .of(App, a, onNotice));
     }
 };

@@ -29,5 +29,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = imports,
     }) });
+    // The vectors the Rust side runs too (protocol/desktop, at the repo root).
+    const protocol = b.root.joinString(b.allocator, "../../protocol/desktop") catch @panic("OOM");
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "protocol_dir", protocol);
+    tests.root_module.addOptions("parity_options", opts);
     b.step("test", "Run harness-nano tests").dependOn(&b.addRunArtifact(tests).step);
+
+    // `zig build vectors`: rewrite protocol/desktop/requests.json from the
+    // request builders, after changing one on purpose.
+    const vectors = b.addExecutable(.{ .name = "parity-vectors", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/vectors_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) });
+    const write_vectors = b.addRunArtifact(vectors);
+    write_vectors.addArg(b.pathJoin(&.{ protocol, "requests.json" }));
+    b.step("vectors", "Write protocol/desktop/requests.json").dependOn(&write_vectors.step);
 }

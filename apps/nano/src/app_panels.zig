@@ -6,6 +6,7 @@
 //! are fetched on demand.
 const std = @import("std");
 const rpc = @import("rpc.zig");
+const requests = @import("requests.zig");
 const diff = @import("diff.zig");
 const App = @import("app.zig").App;
 const Allocator = std.mem.Allocator;
@@ -204,7 +205,7 @@ pub fn showTab(a: *App, i: usize) void {
 fn openDiffs(a: *App) void {
     const p = &a.panels;
     if (p.scope == .workingTree and p.w_diffs == null) {
-        p.w_diffs = a.engine.call("WatchCheckoutDiffs", .{ .targetDeviceId = host(a) }, .of(App, a, onDiffs));
+        p.w_diffs = a.send_(requests.watchDiffs(host(a)), .of(App, a, onDiffs));
     }
     fetchDiff(a);
 }
@@ -247,13 +248,7 @@ pub fn fetchDiff(a: *App) void {
     const p = &a.panels;
     const dir = cwd(a) orelse return;
     p.diff_loading = true;
-    _ = a.engine.call("GetCheckoutDiff", .{
-        .cwd = dir,
-        .mode = @tagName(p.scope),
-        .baseRef = if (p.scope == .branch) p.base_ref else null,
-        .chatId = if (p.scope == .turn) a.selected else null,
-        .targetDeviceId = host(a),
-    }, .of(App, a, onDiff));
+    a.request(requests.getDiff(dir, @tagName(p.scope), if (p.scope == .branch) p.base_ref else null, if (p.scope == .turn) a.selected else null, host(a)), .of(App, a, onDiff));
 }
 
 fn onDiff(a: *App, _: u64, r: rpc.Reply) void {
@@ -289,7 +284,7 @@ pub fn discard(a: *App) void {
     p.discard_confirm = false;
     const d = p.diff orelse return;
     const chat = a.selected orelse return;
-    a.call("DiscardWorkingTree", .{ .chatId = chat, .checkoutId = d.checkout_id, .expectedChecksum = d.checksum, .targetDeviceId = host(a) }, .of(App, a, onDiscarded));
+    a.request(requests.discard(chat, d.checkout_id, d.checksum, host(a)), .of(App, a, onDiscarded));
 }
 
 fn onDiscarded(a: *App, _: u64, r: rpc.Reply) void {

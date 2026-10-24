@@ -213,7 +213,8 @@ pub fn sortChats(chats: []Chat) void {
             const a = x.calledMs();
             const b = y.calledMs();
             if (a != b) return a > b;
-            return std.mem.order(u8, x.id, y.id) == .gt;
+            // Ties by id, ascending, as `sort_active` breaks them.
+            return std.mem.order(u8, x.id, y.id) == .lt;
         }
     }.lt);
 }
@@ -227,19 +228,27 @@ pub fn sessionOf(sessions: []const Session, chat_id: []const u8) ?Session {
     return null;
 }
 
-/// What a session row's status slot shows (`spaces.rs`): a spinner while
-/// working (a live row, fresher than 45 s), a check once it finished and
-/// hasn't been opened since, else a dot coloured by its state.
+/// What a session row's status slot shows (`display_status`,
+/// crates/proto/src/view.rs): a working or waiting session counts while it
+/// is fresh (updated in the last 45 s); an error shows only until it is
+/// seen; otherwise an unseen reply reads as completed.
 pub const Mark = enum { working, completed, awaiting_input, errored, idle };
 
+pub const stale_ms = 45_000;
+
 pub fn markOf(chat: Chat, session: ?Session, now_ms: i64) Mark {
-    const s = session orelse return if (unseen(chat)) .completed else .idle;
-    return switch (s.status) {
-        .working => if (s.updated_ms == 0 or now_ms - s.updated_ms < 45_000) .working else .idle,
-        .awaiting_input => .awaiting_input,
+    const live: ?Status = if (session) |s| switch (s.status) {
+        .idle => null,
         .errored => .errored,
-        .idle => if (unseen(chat)) .completed else .idle,
+        .working, .awaiting_input => if (now_ms - s.updated_ms > stale_ms) null else s.status,
+    } else null;
+    if (live) |st| switch (st) {
+        .working => return .working,
+        .awaiting_input => return .awaiting_input,
+        .errored => if (unseen(chat)) return .errored,
+        .idle => {},
     };
+    return if (unseen(chat)) .completed else .idle;
 }
 
 fn unseen(chat: Chat) bool {

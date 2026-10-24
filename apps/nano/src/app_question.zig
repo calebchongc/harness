@@ -5,6 +5,7 @@
 //! current page's typed answer.
 const std = @import("std");
 const tr = @import("transcript.zig");
+const requests = @import("requests.zig");
 const Wizard = @import("wizard.zig").Wizard;
 const App = @import("app.zig").App;
 
@@ -101,11 +102,7 @@ fn submit(a: *App) void {
     var arena: std.heap.ArenaAllocator = .init(a.gpa);
     defer arena.deinit();
     const answers = w.answers(arena.allocator()) catch return;
-    a.call("QueueCommand", .{ .chatId = chat, .command = .{
-        .kind = "respondInput",
-        .requestId = w.request_id,
-        .answers = answers,
-    } }, .of(App, a, App.onNotice));
+    a.request(requests.respondInput(chat, w.request_id, answers), .of(App, a, App.onNotice));
     markAnswered(a, w.request_id);
     closeWizard(a);
     a.redraw();
@@ -115,7 +112,7 @@ fn submit(a: *App) void {
 pub fn dismiss(a: *App) void {
     const chat = a.selected orelse return;
     const w = a.wizard orelse return;
-    a.call("QueueCommand", .{ .chatId = chat, .command = .{ .kind = "dismissInput", .requestId = w.request_id } }, .of(App, a, App.onNotice));
+    a.request(requests.dismissInput(chat, w.request_id), .of(App, a, App.onNotice));
     markAnswered(a, w.request_id);
     closeWizard(a);
     a.redraw();
