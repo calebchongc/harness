@@ -33,7 +33,7 @@ fn with_layout(
             shell.state.update(cx, |state, cx| {
                 state.transcript = vec![entry_for(&shell.transcript, text)];
                 state.transcript_revision += 1;
-                state.set_subagent_snapshot(
+                state.set_peer_chat_snapshot(
                     "peer".into(),
                     vec![entry_for(&shell.peer_chat_views["peer"].transcript, text)],
                 );
@@ -41,7 +41,7 @@ fn with_layout(
                     let mut third = state.chats[0].clone();
                     third.id = "third".into();
                     state.chats.push(third);
-                    state.set_subagent_snapshot("third".into(), vec![reply(text)]);
+                    state.set_peer_chat_snapshot("third".into(), vec![reply(text)]);
                 }
                 cx.notify();
             });
@@ -63,7 +63,7 @@ fn with_layout(
         shell.update(cx, |shell, cx| {
             if count == 3 {
                 shell.state.update(cx, |state, cx| {
-                    state.set_subagent_snapshot(
+                    state.set_peer_chat_snapshot(
                         "third".into(),
                         vec![entry_for(&shell.peer_chat_views["third"].transcript, text)],
                     );
