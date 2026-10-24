@@ -59,6 +59,10 @@ name = "error-cards-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "transcript-mermaid-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "restart-resume-fixture"
 required-features = ["appshots-fixture"]
 
@@ -80,6 +84,10 @@ required-features = ["appshots-fixture"]
 
 [[example]]
 name = "markdown-math-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "composer-completion-fade-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]

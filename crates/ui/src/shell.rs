@@ -90,6 +90,13 @@ mod titlebar_tests;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
+/// Text highlighting and row presentation are independent: sidebar search
+/// keeps sidebar view preferences, while the command palette uses card rows.
+enum ChatRowSearch<'a> {
+    Palette(&'a str),
+    Sidebar(&'a str),
+}
+
 actions!(
     shell,
     [
@@ -2749,6 +2756,7 @@ impl Shell {
         }
         self.prune_file_explorers(cx);
         self.prune_browser_surfaces(cx);
+        self.prune_subagent_surfaces(cx);
         self.chat_split_on_state_changed(cx);
         self.maybe_auto_download_update(cx);
         if let Some(chat_id) = state.update(cx, |state, _| state.take_linked_chat()) {
@@ -4143,7 +4151,7 @@ impl Shell {
     /// transcripts (nested spawns open their own tabs).
     fn on_transcript_event(
         &mut self,
-        _: Entity<Transcript>,
+        source: Entity<Transcript>,
         event: &TranscriptEvent,
         cx: &mut Context<Self>,
     ) {
@@ -4159,6 +4167,7 @@ impl Shell {
                     doc_id.clone(),
                     title.clone(),
                     *frozen,
+                    source,
                     cx,
                 );
             }
@@ -4231,39 +4240,148 @@ impl Shell {
         doc_id: String,
         title: String,
         frozen: bool,
+        source_view: Entity<Transcript>,
         cx: &mut Context<Self>,
     ) {
+        // Document and chat IDs can collide. The emitting entity determines
+        // whether this is a root transcript or a registered nested source.
+        let source = chat_id;
+        let (chat_id, harness) = if let Some(tab) = self
+            .subagent_tabs
+            .values()
+            .find(|tab| tab.transcript == source_view)
+        {
+            if tab.doc_id != source {
+                return;
+            }
+            let Some(owner) = tab
+                .transcript
+                .read(cx)
+                .link_ui()
+                .and_then(|links| links.source_session)
+            else {
+                return;
+            };
+            (owner, tab.harness)
+        } else {
+            let primary = source == self.active_chat && source_view == self.transcript;
+            let peer = self
+                .peer_chat_views
+                .get(&source)
+                .is_some_and(|view| view.transcript == source_view);
+            if !primary && !peer {
+                return;
+            }
+            let harness =
+                subagent_tab_harness(&self.state.read(cx).chats, std::iter::empty(), &source);
+            (source, harness)
+        };
+        if chat_id.is_empty()
+            || !matches!(self.route, Route::Chat)
+            || self
+                .state
+                .read(cx)
+                .selected_chat
+                .as_deref()
+                .unwrap_or_default()
+                != self.active_chat
+            || !self.chat_navigation_is_live(&chat_id, cx)
+        {
+            return;
+        }
+        let existing = self
+            .subagent_tabs
+            .iter()
+            .find(|(_, tab)| tab.doc_id == doc_id);
+        if let Some((&id, tab)) = existing
+            && (tab
+                .transcript
+                .read(cx)
+                .link_ui()
+                .and_then(|links| links.source_session)
+                .as_deref()
+                != Some(chat_id.as_str())
+                || !self
+                    .right_tabs
+                    .get(&chat_id)
+                    .is_some_and(|tabs| tabs.contains(&RightSurface::Subagent(id))))
+        {
+            // A document is watched globally: never reuse another owner's
+            // surface or silently attach its transcript to this conversation.
+            return;
+        }
+        let existing = existing.map(|(&id, _)| id);
+        if chat_id != self.active_chat {
+            let pane = self.chat_split.as_ref().and_then(|split| {
+                (!split.zoomed)
+                    .then(|| {
+                        split.panes.iter().enumerate().find_map(|(ix, id)| {
+                            (ix != split.focus && id.as_deref() == Some(chat_id.as_str()))
+                                .then_some(ix)
+                        })
+                    })
+                    .flatten()
+            });
+            let Some(pane) = pane.filter(|_| self.peer_chat_views.contains_key(&chat_id)) else {
+                return;
+            };
+            if !self.select_chat_pane(pane, cx) {
+                return;
+            }
+            self.on_state_changed(&self.state.clone(), cx);
+            if self.active_chat != chat_id {
+                return;
+            }
+        }
         // The chip lives in the conversation column — the pane it opens into
         // may still be closed.
         self.set_surfaces_open(true, cx);
-        if let Some((&id, _)) = self
-            .subagent_tabs
-            .iter()
-            .find(|(_, tab)| tab.doc_id == doc_id)
-        {
+        if let Some(id) = existing {
             self.set_right_active(RightSurface::Subagent(id), cx);
             return;
         }
         self.subagent_seq += 1;
         let id = self.subagent_seq;
-        let harness = subagent_tab_harness(
-            &self.state.read(cx).chats,
-            self.subagent_tabs
-                .values()
-                .map(|tab| (tab.doc_id.as_str(), tab.harness)),
-            &chat_id,
-        );
         // A live subagent follows its streaming end (main-transcript feel);
         // a frozen one reads top-down.
         let transcript =
             cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), !frozen, cx));
-        let links = Self::session_links(Some(self.active_chat.clone()), cx);
+        // Menus retain their handler after a tab closes. Bind it to this
+        // registration, not just a root chat that may still be on screen.
+        let shell = cx.weak_entity();
+        let source_id = transcript.entity_id();
+        let owner = chat_id.clone();
+        let links = crate::markdown::render::LinkUi {
+            source_session: Some(chat_id.clone()),
+            handler: std::rc::Rc::new(move |activation, window, cx| {
+                use crate::markdown::render::LinkOutcome;
+                shell
+                    .update(cx, |shell, cx| {
+                        if activation.source_session.as_deref() != Some(owner.as_str())
+                            || !shell
+                                .subagent_tabs
+                                .get(&id)
+                                .is_some_and(|tab| tab.transcript.entity_id() == source_id)
+                            || !shell
+                                .right_tabs
+                                .get(&owner)
+                                .is_some_and(|tabs| tabs.contains(&RightSurface::Subagent(id)))
+                        {
+                            return LinkOutcome::Rejected;
+                        }
+                        shell.activate_session_link(activation, window, cx)
+                    })
+                    .unwrap_or(LinkOutcome::Rejected)
+            }),
+        };
         let views = Self::view_opener(cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links);
             transcript.set_view_opener(views);
         });
         let events = cx.subscribe(&transcript, Self::on_transcript_event);
+        self.state
+            .update(cx, |state, _| state.retain_subagent_doc(&doc_id));
         let fetch = if frozen {
             self.spawn_subagent_snapshot_fetch(&chat_id, &doc_id, cx)
         } else {
@@ -4299,6 +4417,14 @@ impl Shell {
         doc_id: &str,
         cx: &mut Context<Self>,
     ) -> Option<Task<()>> {
+        // A legacy child ID can also identify a real chat. A frozen blob
+        // must not replace that chat's live shared rows or cancel its watch.
+        if self.state.read(cx).doc_has_chat_consumer(doc_id) {
+            self.state.update(cx, |state, cx| {
+                state.watch_subagent_doc(doc_id.to_owned(), cx)
+            });
+            return None;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.state
                 .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
@@ -4402,6 +4528,52 @@ impl Shell {
         }
     }
 
+    fn release_subagent_surface(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.subagent_tabs.remove(&id) else {
+            return;
+        };
+        self.state
+            .update(cx, |state, _| state.unwatch_subagent_doc(&tab.doc_id));
+        let surface = RightSurface::Subagent(id);
+        let owners: Vec<_> = self
+            .right_tabs
+            .iter_mut()
+            .filter_map(|(owner, tabs)| {
+                let present = tabs.contains(&surface);
+                tabs.retain(|tab| *tab != surface);
+                present.then(|| owner.clone())
+            })
+            .collect();
+        for owner in owners {
+            self.panels.update(&owner, |panel| {
+                if panel.right_active == surface {
+                    panel.right_active = RightSurface::Picker;
+                }
+            });
+            self.collapse_surfaces_if_empty(&owner, cx);
+        }
+        // Dropping the registration also cancels any pending snapshot fetch.
+        cx.notify();
+    }
+
+    fn prune_subagent_surfaces(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if !state.chats_synced {
+            return;
+        }
+        let stale: Vec<_> = self
+            .subagent_tabs
+            .iter()
+            .filter_map(|(&id, tab)| {
+                let owner = tab.transcript.read(cx).link_ui()?.source_session?;
+                (!state.chats.iter().any(|chat| chat.id == owner)).then_some(id)
+            })
+            .collect();
+        for id in stale {
+            self.release_subagent_surface(id, cx);
+        }
+    }
+
     /// A surface tab's ✕. The active fallback happens naturally through
     /// [`Self::resolved_right_active`] on the next frame.
     fn close_right_surface(
@@ -4414,6 +4586,10 @@ impl Shell {
             if self.release_browser_surface(id, cx) {
                 window.focus(&self.composer.focus_handle(cx), cx);
             }
+            return;
+        }
+        if let RightSurface::Subagent(id) = surface {
+            self.release_subagent_surface(id, cx);
             return;
         }
         let key = self.panel_key(cx);
@@ -4448,14 +4624,7 @@ impl Shell {
                 let panel = self.right_terminal_panel(cx);
                 panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
             }
-            RightSurface::Subagent(id) => {
-                // Unwatch drops the watch task — that cancels the engine-side
-                // watch and unpins the subagent doc from the engine LRU.
-                if let Some(tab) = self.subagent_tabs.remove(&id) {
-                    self.state
-                        .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
-                }
-            }
+            RightSurface::Subagent(_) => unreachable!("subagent surfaces are released above"),
             RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
@@ -7364,10 +7533,15 @@ impl Shell {
         // nine chips appear together instead of leaving a hole on whichever
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
-        search_query: Option<&str>,
+        search: Option<ChatRowSearch<'_>>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let (search_query, palette) = match search {
+            Some(ChatRowSearch::Palette(query)) => (Some(query), true),
+            Some(ChatRowSearch::Sidebar(query)) => (Some(query), false),
+            None => (None, false),
+        };
         // Activity, not position (t3code Sidebar): status is a small colored
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
@@ -7384,9 +7558,9 @@ impl Shell {
         };
         // This renderer is shared with palette results; PR badges belong there,
         // not in session rows in the sidebar (including drag previews).
-        let change_request = change_request.filter(|_| search_query.is_some());
-        let compact = search_query.is_none() && self.settings.sidebar_compact;
-        let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
+        let change_request = change_request.filter(|_| palette);
+        let compact = !palette && self.settings.sidebar_compact;
+        let show_label = palette || self.settings.sidebar_show_project_label;
         let remote = self
             .state
             .read(cx)
@@ -7396,10 +7570,10 @@ impl Shell {
             .is_some_and(|chat| {
                 self.state.read(cx).local_device_id.as_deref() != Some(chat.device_id.as_str())
             });
-        let project_icon = (search_query.is_none() && self.settings.sidebar_show_project_icon)
+        let project_icon = (!palette && self.settings.sidebar_show_project_icon)
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
-        let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
+        let archived_muted = archived && !palette && !selected && !corner_hovered;
         let project_icon = project_icon.map(|icon| {
             div()
                 .flex_none()
@@ -7660,7 +7834,7 @@ impl Shell {
         let mut corner = Some(corner);
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
-        let subline = if search_query.is_some() {
+        let subline = if palette {
             theme.text_muted
         } else {
             theme.text_muted.opacity(0.5)
@@ -7680,7 +7854,7 @@ impl Shell {
         // below its near-opaque selected fill, and blending toward it visibly
         // dimmed the active row under the pointer (user report).
         let hover_bg = if selected { selected_wash } else { hover };
-        let rest_text = if selected || search_query.is_some() {
+        let rest_text = if selected || palette {
             text
         } else if archived {
             text.opacity(0.55)
@@ -7703,7 +7877,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .rounded(px(if search_query.is_some() {
+            .rounded(px(if palette {
                 popover::PALETTE_ITEM_RADIUS
             } else {
                 8.0
@@ -16836,6 +17010,7 @@ mod exit_regressions {
                     "child-doc".into(),
                     "Child".into(),
                     true,
+                    shell.transcript.clone(),
                     cx,
                 );
                 let child = shell
@@ -17492,8 +17667,16 @@ mod right_tab_mouse_regressions {
                     cx,
                 );
                 shell.active_chat = "parent".into();
+                shell.state.update(cx, |state, _| state.selected_chat = Some("parent".into()));
                 for id in ["first", "second"] {
-                    shell.add_subagent_surface("parent".into(), id.into(), id.into(), false, cx);
+                    shell.add_subagent_surface(
+                        "parent".into(),
+                        id.into(),
+                        id.into(),
+                        false,
+                        shell.transcript.clone(),
+                        cx,
+                    );
                 }
                 shell
             });
@@ -17528,7 +17711,14 @@ mod right_tab_mouse_regressions {
         let (shell, cx) = setup(cx);
         shell.update(cx, |shell, cx| {
             for id in ["third", "fourth", "fifth", "sixth"] {
-                shell.add_subagent_surface("parent".into(), id.into(), id.into(), false, cx);
+                shell.add_subagent_surface(
+                    "parent".into(),
+                    id.into(),
+                    id.into(),
+                    false,
+                    shell.transcript.clone(),
+                    cx,
+                );
             }
         });
         cx.update(|window, cx| window.draw(cx).clear());
@@ -17561,7 +17751,14 @@ mod right_tab_mouse_regressions {
         let (shell, cx) = setup(cx);
         shell.update(cx, |shell, cx| {
             for id in ["third", "fourth", "fifth", "sixth", "seventh", "eighth"] {
-                shell.add_subagent_surface("parent".into(), id.into(), id.into(), false, cx);
+                shell.add_subagent_surface(
+                    "parent".into(),
+                    id.into(),
+                    id.into(),
+                    false,
+                    shell.transcript.clone(),
+                    cx,
+                );
             }
         });
         cx.update(|window, cx| window.draw(cx).clear());
