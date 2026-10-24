@@ -106,7 +106,11 @@ fn assistant(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, last:
             .image => attachment(c, k, .document, p.text.items),
             .visual => attachment(c, k, .widget, p.text.items),
             .delegation => attachment(c, k, .widget, "Delegated to a subagent"),
-            .input => attachment(c, k, .checklist, if (p.resolved) "Question answered" else "The agent is asking a question"),
+            .input => {
+                const q = if (p.questions.len > 0) p.questions[0] else null;
+                const label = if (q) |x| (if (x.question.len > 0) x.question else x.header) else "Question";
+                @import("view_question.zig").chip(c, k, label, p.resolved);
+            },
             else => {},
         }
     }

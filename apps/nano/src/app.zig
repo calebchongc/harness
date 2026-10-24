@@ -14,6 +14,7 @@ const workspace = @import("workspace.zig");
 const Transcript = @import("transcript.zig").Transcript;
 const Tabs = @import("tabs.zig").Tabs;
 const agent = @import("app_agent.zig");
+const question = @import("app_question.zig");
 
 /// The window's own state, apart from the engine's.
 pub const View = struct {
@@ -118,6 +119,11 @@ pub const App = struct {
     models_for: []u8 = &.{},
     /// The model chip's picker is open.
     picker: enum { none, harness, model } = .none,
+    /// The agent's pending question being answered, the draft set aside
+    /// meanwhile, and the request just answered from here.
+    wizard: ?@import("wizard.zig").Wizard = null,
+    draft_stash: std.ArrayList(u8) = .empty,
+    answered: ?[]u8 = null,
     /// The open chats, one per tab.
     tabs: Tabs,
     /// What the window shows that isn't the engine's: the sidebar, its
@@ -157,6 +163,7 @@ pub const App = struct {
         a.devices.deinit();
         a.tabs.deinit();
         a.view.deinit(a.gpa);
+        question.deinit(a);
         a.transcript.deinit();
         if (a.selected) |s| a.gpa.free(s);
         if (a.space) |s| a.gpa.free(s);
@@ -182,6 +189,11 @@ pub const App = struct {
     pub const newChatSpace = agent.newChatSpace;
     pub const setArchived = agent.setArchived;
     pub const nowMs = agent.nowMs;
+    pub const pendingInput = question.pendingInput;
+    pub const wizardPick = question.pick;
+    pub const wizardAdvance = question.advance;
+    pub const wizardBack = question.back;
+    pub const wizardDismiss = question.dismiss;
 
     /// Asks for a folder and adds it as a space on this device, as the
     /// GPUI app's "Add folder" does (`createSpace`).
@@ -247,7 +259,8 @@ pub const App = struct {
     /// Streams to open again, now that it's time; the seconds until the next.
     pub fn tick(a: *App, now: f64) ?f32 {
         a.now = now;
-        var next: ?f64 = null;
+        question.syncWizard(a);
+        var next: ?f64 = question.tick(a, now);
         inline for (.{ "w_devices", "w_spaces", "w_chats", "w_sessions", "w_doc" }) |name| {
             const w = &@field(a, name);
             if (w.retry_at) |t| {

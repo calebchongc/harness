@@ -17,6 +17,17 @@ pub const PartKind = enum { text, reasoning, tool, image, visual, delegation, in
 /// A tool call's kind (`ToolCall`, crates/proto/src/agent.rs).
 pub const ToolKind = enum { exec, readFile, writeFile, editFile, applyPatch, search, glob, webFetch, webSearch, todo, mcp, unknown };
 
+/// A question an agent asks (`UserInputQuestion`, crates/proto/src/agent.rs).
+pub const Question = struct {
+    id: []const u8,
+    header: []const u8,
+    question: []const u8,
+    options: []const []const u8,
+    multi_select: bool = false,
+    multiline: bool = false,
+    prefill: ?[]const u8 = null,
+};
+
 pub const Part = struct {
     id: []u8,
     kind: PartKind,
@@ -29,11 +40,19 @@ pub const Part = struct {
     /// A tool has finished, or an input request was answered.
     resolved: bool = false,
     is_error: bool = false,
+    /// An input part's request and its questions, in `arena`.
+    request_id: []const u8 = "",
+    questions: []const Question = &.{},
+    arena: ?*std.heap.ArenaAllocator = null,
 
     fn deinit(p: *Part, gpa: Allocator) void {
         gpa.free(p.id);
         gpa.free(p.path);
         p.text.deinit(gpa);
+        if (p.arena) |a| {
+            a.deinit();
+            gpa.destroy(a);
+        }
     }
 };
 
@@ -173,12 +192,40 @@ fn parsePart(gpa: Allocator, o: json.ObjectMap) !Part {
             p.is_error = if (o.get("isError")) |r| r == .bool and r.bool else false;
             try toolCall(gpa, &p, o.get("call"));
         },
-        .input => p.resolved = if (o.get("resolved")) |r| r == .bool and r.bool else false,
+        .input => {
+            p.resolved = if (o.get("resolved")) |r| r == .bool and r.bool else false;
+            try parseQuestions(gpa, &p, o);
+        },
         .image => try p.text.appendSlice(gpa, string(o.get("name")) orelse ""),
         .visual => try p.text.appendSlice(gpa, string(o.get("title")) orelse ""),
         .delegation, .other => {},
     }
     return p;
+}
+
+fn parseQuestions(gpa: Allocator, p: *Part, o: json.ObjectMap) !void {
+    const arena = try gpa.create(std.heap.ArenaAllocator);
+    arena.* = .init(gpa);
+    p.arena = arena;
+    const a = arena.allocator();
+    p.request_id = try a.dupe(u8, string(o.get("requestId")) orelse p.id);
+    var qs: std.ArrayList(Question) = .empty;
+    for (array(o.get("questions"))) |q| {
+        if (q != .object) continue;
+        const qo = q.object;
+        var opts: std.ArrayList([]const u8) = .empty;
+        for (array(qo.get("options"))) |opt| if (opt == .string) try opts.append(a, try a.dupe(u8, opt.string));
+        try qs.append(a, .{
+            .id = try a.dupe(u8, string(qo.get("id")) orelse ""),
+            .header = try a.dupe(u8, string(qo.get("header")) orelse ""),
+            .question = try a.dupe(u8, string(qo.get("question")) orelse ""),
+            .options = opts.items,
+            .multi_select = if (qo.get("multiSelect")) |v| v == .bool and v.bool else false,
+            .multiline = if (qo.get("multiline")) |v| v == .bool and v.bool else false,
+            .prefill = if (string(qo.get("prefill"))) |s| try a.dupe(u8, s) else null,
+        });
+    }
+    p.questions = qs.items;
 }
 
 /// A tool call (`ToolCall`, tagged by `kind`; fields keep their Rust
@@ -248,6 +295,20 @@ test "the tail first, the whole history after, and the tail again ignored" {
     try applyText(&t, "{\"reset\":[{\"id\":\"a\",\"role\":\"user\",\"parts\":[]},{\"id\":\"b\",\"role\":\"user\",\"parts\":[]}]}");
     try applyText(&t, "{\"reset\":[{\"id\":\"b\",\"role\":\"user\",\"parts\":[]}],\"historyPending\":true}");
     try testing.expectEqual(@as(usize, 2), t.entries.items.len);
+}
+
+test "an input part keeps its request and questions" {
+    var t: Transcript = .{ .gpa = testing.allocator };
+    defer t.deinit();
+    try applyText(&t,
+        \\{"reset":[{"id":"a","role":"assistant","parts":[{"kind":"input","id":"r1","requestId":"r1","resolved":false,
+        \\  "questions":[{"id":"q1","header":"Approach","question":"Which one?","options":["A","B"],"multiSelect":true}]}]}]}
+    );
+    const p = &t.entries.items[0].parts.items[0];
+    try testing.expectEqualStrings("r1", p.request_id);
+    try testing.expectEqual(@as(usize, 2), p.questions[0].options.len);
+    try testing.expect(p.questions[0].multi_select);
+    try testing.expect(!p.resolved);
 }
 
 test "remove, a tool's summary, and replacing an entry by id" {

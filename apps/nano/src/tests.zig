@@ -8,6 +8,9 @@ test {
     _ = @import("app.zig");
     _ = @import("rules.zig");
     _ = @import("tools.zig");
+    _ = @import("diff.zig");
+    _ = @import("wizard.zig");
+    _ = @import("tabs.zig");
     _ = @import("icons.zig");
     _ = @import("release.zig");
     _ = @import("view.zig");

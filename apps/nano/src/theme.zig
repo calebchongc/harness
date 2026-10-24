@@ -42,6 +42,12 @@ pub const Colors = struct {
     code_header: Color,
     /// white (dark) or black (light): a project badge's tone.
     tone: Color,
+    /// A primary button's fill and text.
+    solid: Color,
+    on_solid: Color,
+    /// Changed lines in a diff.
+    diff_add: Color,
+    diff_del: Color,
     syntax: [6]Color,
 
     /// White at `a` in dark, black at `a` in light.
@@ -88,6 +94,10 @@ pub fn colors(dark: bool) Colors {
             .code_bg = white.alpha(0.035),
             .code_header = white.alpha(0.02),
             .tone = white,
+            .solid = .hex(0xebebef),
+            .on_solid = black,
+            .diff_add = .hex(0x7fa86b),
+            .diff_del = .hex(0xd2674f),
             .syntax = .{ .hex(0x5c564b), .hex(0xe8a33d), .hex(0x7fa86b), .hex(0xd9a441), .hex(0xedeae2), .hex(0xe8a33d) },
         };
     }
@@ -118,6 +128,10 @@ pub fn colors(dark: bool) Colors {
         .code_bg = black.alpha(0.035),
         .code_header = black.alpha(0.02),
         .tone = black,
+        .solid = .hex(0x232328),
+        .on_solid = white,
+        .diff_add = .hex(0x5c7e47),
+        .diff_del = .hex(0xb14228),
         .syntax = .{ .hex(0xa8a090), .hex(0xc77d20), .hex(0x5c7e47), .hex(0x9a6e1b), .hex(0x1a1813), .hex(0xc77d20) },
     };
 }

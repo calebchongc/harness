@@ -21,6 +21,7 @@ pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
     // 16 points of padding, over the window's 24-point status strip.
     const outer = ui.div(c).column().wFull().px(16).pb(40).itemsCenter();
     defer outer.end();
+    if (a.wizard != null) return @import("view_question.zig").panel(c, a, k, w);
     const expanded = std.mem.indexOfScalar(u8, a.composer.text(), '\n') != null;
     pill(c, a, k, w, if (expanded) .expanded else .compact, 22);
 }
