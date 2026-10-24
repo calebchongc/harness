@@ -148,11 +148,11 @@ final class MobilePolishTests: XCTestCase {
         launch()
         let filter = app.buttons["space-filter"]
         XCTAssertTrue(filter.waitForExistence(timeout: 5))
-        for (index, project) in ["harness", "edge", "All", "harness", "All"].enumerated() {
+        for (index, project) in ["harness", "edge", "All projects", "harness", "All projects"].enumerated() {
             filter.tap()
             if index == 0 { capture("project-menu") }
-            // A row's label carries its owning device ("harness, @ MacBook Pro"), and the home list has its own
-            // "All" status chip, so look for the row inside the open menu.
+            // A row's label carries its owning device ("harness, @ MacBook Pro"), so look for the row inside the
+            // open menu.
             let choice = app.collectionViews.buttons.matching(NSPredicate(
                 format: "label == %@ OR label BEGINSWITH %@", project, "\(project), ")).firstMatch
             XCTAssertTrue(choice.waitForExistence(timeout: 3))
