@@ -20,6 +20,7 @@ pub(super) struct SidebarSearch {
     project: Option<String>,
     active: usize,
     active_id: Option<String>,
+    keyboard_selection: bool,
     pressed_keys: std::collections::HashSet<String>,
     focus_pending: bool,
     scroll: gpui::ScrollHandle,
@@ -173,6 +174,7 @@ impl Shell {
                 project: self.settings.space_filter.clone(),
                 active: 0,
                 active_id: None,
+                keyboard_selection: false,
                 pressed_keys: Default::default(),
                 focus_pending: true,
                 scroll: gpui::ScrollHandle::new(),
@@ -207,6 +209,7 @@ impl Shell {
         if let Some(search) = self.sidebar_search.as_mut() {
             search.active = 0;
             search.active_id = None;
+            search.keyboard_selection = false;
             search.scroll.set_offset(gpui::Point::default());
         }
         cx.notify();
@@ -215,10 +218,20 @@ impl Shell {
     /// Keep the cursor on a session, not its old position in a live sort.
     /// A disappearing target is reported so Enter before the next paint cannot
     /// silently open the row that happened to replace it.
-    fn reconcile_sidebar_search(&mut self, ids: &[String]) -> bool {
+    fn reconcile_sidebar_search(&mut self, ids: &[String], cx: &App) -> bool {
         let Some(search) = self.sidebar_search.as_mut() else {
             return false;
         };
+        // Archive-only browsing paints the current session as selected until
+        // the user navigates. Follow that session even when another tab changes
+        // selection, but never override an explicit keyboard choice.
+        if !search.keyboard_selection && search.input.read(cx).text().trim().is_empty() {
+            if let Some(selected) = self.state.read(cx).selected_chat.as_ref() {
+                if ids.contains(selected) {
+                    search.active_id = Some(selected.clone());
+                }
+            }
+        }
         let position = search
             .active_id
             .as_ref()
@@ -257,6 +270,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Only bare keys belong to result navigation. Modified keys remain
+        // available to text editing, platform shortcuts, and parent controls.
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
         self.sync_sidebar_search_scope(cx);
         match event.keystroke.key.as_str() {
             "escape" => {
@@ -274,7 +292,7 @@ impl Shell {
             }
             "up" | "down" if self.sidebar_search_is_filtering(cx) => {
                 let ids = self.sidebar_search_ids(cx);
-                self.reconcile_sidebar_search(&ids);
+                self.reconcile_sidebar_search(&ids, cx);
                 let count = ids.len();
                 if let Some(search) = self.sidebar_search.as_mut() {
                     if count > 0 {
@@ -285,6 +303,7 @@ impl Shell {
                             (current + count - 1) % count
                         };
                         search.active_id = ids.get(search.active).cloned();
+                        search.keyboard_selection = true;
                         search.scroll.scroll_to_item(search.active);
                         cx.notify();
                     }
@@ -292,7 +311,7 @@ impl Shell {
             }
             "enter" if self.sidebar_search_is_filtering(cx) => {
                 let ids = self.sidebar_search_ids(cx);
-                let disappeared = self.reconcile_sidebar_search(&ids);
+                let disappeared = self.reconcile_sidebar_search(&ids, cx);
                 if disappeared {
                     cx.notify();
                 }
@@ -517,9 +536,10 @@ impl Shell {
         };
         let count = data.len();
         let ids: Vec<_> = data.iter().map(|(chat, _, _)| chat.id.clone()).collect();
-        self.reconcile_sidebar_search(&ids);
+        self.reconcile_sidebar_search(&ids, cx);
         let search = self.sidebar_search.as_ref()?;
         let active = search.active;
+        let keyboard_selection = search.keyboard_selection;
         let selected_chat = self.state.read(cx).selected_chat.clone();
         let rows = data
             .into_iter()
@@ -537,7 +557,7 @@ impl Shell {
                         .then(|| chat.config.as_ref().map(|c| c.harness))
                         .flatten(),
                     status,
-                    if query.is_empty() {
+                    if query.is_empty() && !keyboard_selection {
                         selected_chat.as_deref() == Some(chat.id.as_str())
                     } else {
                         index == active
