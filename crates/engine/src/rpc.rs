@@ -1718,6 +1718,21 @@ impl RpcService for EngineRpc {
                     .await;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::BROWSE_LINK_STATUS => {
+                let link = crate::browse_link::BrowseLink::shared(self.repos.data_dir());
+                // Scopes changed in browse, or Harness revoked there, show now.
+                link.refresh().await;
+                RpcReply::value(&link.status())
+            }
+            methods::BROWSE_LINK_PAIR => {
+                let link = crate::browse_link::BrowseLink::shared(self.repos.data_dir());
+                let code = link.start_pair().await.map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "code": code }))
+            }
+            methods::BROWSE_LINK_DISCONNECT => {
+                crate::browse_link::BrowseLink::shared(self.repos.data_dir()).disconnect();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::CODEGRAFF_JOBS => {
                 let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
                 let updated_since = params.get("updatedSince").and_then(|v| v.as_i64());
