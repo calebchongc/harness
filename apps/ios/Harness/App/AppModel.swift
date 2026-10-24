@@ -164,6 +164,10 @@ final class AppModel {
         }
         if args.contains("-demo") {
             enterDemoMode()
+            if let index = args.firstIndex(of: "-header-status-count"), index + 1 < args.count,
+               let count = Int(args[index + 1]) {
+                demo?.configureHeaderStatusFixture(count: count, allIdle: args.contains("-header-status-idle"))
+            }
             // Simulator fixtures for both empty-workspace and viewer-only
             // accounts. Apply before Home resolves its initial destination.
             override("-sethomefilter") { UserDefaults.standard.set($0, forKey: "homeSpaceFilter") }

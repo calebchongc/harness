@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 struct SessionView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.pageSession) private var pageSession
     /// Open another session beside this one, or close this pane: set only on a Max-class iPhone (SplitScreen).
     @Environment(\.splitScreen) private var splitScreen
     /// Open a new session below this one, in the phone's stacked split (⌘D on the desktop).
@@ -16,23 +17,23 @@ struct SessionView: View {
     @Environment(\.stackedClose) private var stackedClose
     let chatId: String
 
-    /// Width the nav bar's own controls need around a LEADING title — the
-    /// back button ahead of it, bar margins, and slack. Generous on purpose:
-    /// a fixed-width item that does NOT fit gets evicted into a trailing "…"
-    /// overflow menu (where a custom text stack renders as nothing) — seen on
-    /// iPhone Air at 110.
-    private static let headerChromeInset: CGFloat = 170
+    /// Reserve the back button and native bar margins. Anchor the rest to the
+    /// trailing edge so the title can use the space before the controls.
+    private static let headerChromeInset: CGFloat = 100
     private static let topFadeHeight: CGFloat = 28
 
-    /// Room the stacked split's trailing buttons take from the title: the titled Split button, or the ×.
+    /// Room the stacked split's trailing buttons take from the title: the titled Split button (about 90pt),
+    /// or the × (36pt), each plus the bar's 16pt gap before it. The header is a trailing item too, so any
+    /// shortfall pushes the button into the bar's "More" menu instead of narrowing the title.
     private var stackedButtonsWidth: CGFloat {
-        if stackedSplit != nil { return 92 }
-        return stackedClose == nil ? 0 : 44
+        if stackedSplit != nil { return 112 }
+        return stackedClose == nil ? 0 : 56
     }
 
     /// The view's own width, the only reliable basis for capping the principal
     /// toolbar item (its container proposes an unbounded width).
     @State private var viewWidth: CGFloat = 0
+    @State private var headerWidth: CGFloat = 0
 
     /// Follow intent belongs to the session, independent of composer focus.
     @State private var scroll = ScrollState()
@@ -49,33 +50,56 @@ struct SessionView: View {
     /// a lot of lost height. Everywhere else the bar and its header are exactly as before.
     private var paneChrome: Bool { splitScreen != nil }
 
-    /// Title, project and the pager hint; one element for accessibility.
+    /// Rename and paging are sibling controls: tapping an arrow must never rename.
     private func headerTitle(_ chat: Chat) -> some View {
-        Button {
-            renameChatId = chat.id
-            renameTitle = chat.displayTitle
-            renamingSession = true
-        } label: {
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 8) {
-                    Text(chat.displayTitle)
-                        .font(Theme.sans(15, weight: .medium))
-                        .foregroundStyle(Theme.text)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    pagerHint(for: chat)
+        let _ = model.connectivity.pulse
+        let entries = SessionPaging.entries(model: model, including: chat.id)
+        let represented = pageSession == nil ? entries : SessionPaging.pageSet(of: chat.id, in: entries)
+        let chats = represented.compactMap { model.chat(id: $0.id) }
+        let available = headerWidth > 0 ? headerWidth : viewWidth - Self.headerChromeInset
+        let limit = SessionStatusWindow.visibleLimit(availableWidth: available, total: chats.count,
+                                                   hasPager: pageSession != nil && chats.count > 1)
+        return headerControls(chat, chats: chats, maxVisible: limit)
+    }
+
+    private func headerControls(_ chat: Chat, chats: [Chat], maxVisible: Int) -> some View {
+        HStack(spacing: 4) {
+            HStack(spacing: 3) {
+                Button {
+                    renameChatId = chat.id
+                    renameTitle = chat.displayTitle
+                    renamingSession = true
+                } label: {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(chat.displayTitle)
+                            .font(Theme.sans(15, weight: .medium))
+                            .foregroundStyle(Theme.text)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        projectLocation(chat: chat, model: model)
+                            .font(Theme.sans(12))
+                            .foregroundStyle(Theme.textMuted.opacity(0.6))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
-                projectLocation(chat: chat, model: model)
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted.opacity(0.6))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .combine)
+                .accessibilityHint("Rename session")
+                .accessibilityIdentifier("session-header")
+
+                pagerControls(for: chat)
             }
+            .pagerSwipe()
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("session-navigation-controls")
+            SessionStatusIndicators(current: chat.id, chats: chats, maxVisible: maxVisible)
         }
-        .buttonStyle(.plain)
-        .accessibilityElement(children: .combine)
-        .accessibilityHint("Rename session")
-        .accessibilityIdentifier("session-header")
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { headerWidth = $0 }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("session-header-controls")
     }
 
     /// A pane's header strip: the list toggle (one pane), title and project, and the split or close button.
@@ -101,7 +125,6 @@ struct SessionView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(Theme.bg)
-        .pagerSwipe()
     }
 
     @ViewBuilder
@@ -179,17 +202,14 @@ struct SessionView: View {
             if let chat {
                 // Tap the session header to rename — model/effort changes
                 // moved into the composer's picker chips.
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .topBarTrailing) {
                     headerTitle(chat)
-                        // A FIXED width, not a max: iOS 26 proposes leading items
-                        // almost nothing next to the back button, so a flexible
-                        // frame collapses to its minimum ("S…"). Claiming the
-                        // remainder of the bar outright lays the texts out with
-                        // real room and truncates them properly.
+                        // Claim the remaining bar width, less the stacked split's
+                        // trailing buttons: the title expands before the
+                        // fixed-size navigation and status marks. The title and
+                        // pager carry their own swipe (headerControls).
                         .frame(width: max(140, viewWidth - Self.headerChromeInset - stackedButtonsWidth),
                                alignment: .leading)
-                        // Swipe the header to page to the neighbouring session.
-                        .pagerSwipe()
                 }
                 // Bare text on the bar, not a glass capsule.
                 .sharedBackgroundVisibility(.hidden)
@@ -244,22 +264,41 @@ struct SessionView: View {
     }
 
 
-    /// "‹ 2/3 ›": where this session sits among the ones the header swipe pages
-    /// through, so the swipe is discoverable. Hidden when there's nowhere to go.
+    /// Use the same page set and action as swiping, with explicit, separate hit targets.
     @ViewBuilder
-    private func pagerHint(for chat: Chat) -> some View {
+    private func pagerControls(for chat: Chat) -> some View {
         let _ = model.connectivity.pulse
-        if let place = SessionPaging.position(of: chat.id, in: SessionPaging.entries(model: model)) {
-            HStack(spacing: 3) {
-                Image(systemName: "chevron.left").opacity(place.index > 1 ? 1 : 0.3)
-                Text("\(place.index)/\(place.count)").monospacedDigit()
-                Image(systemName: "chevron.right").opacity(place.index < place.count ? 1 : 0.3)
+        if let pageSession,
+           let place = SessionPaging.position(of: chat.id, in: SessionPaging.entries(model: model, including: chat.id)) {
+            HStack(spacing: 0) {
+                pageButton(.previous, enabled: place.index > 1, action: pageSession)
+                Text("\(place.index)/\(place.count)")
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.textFaint)
+                    .accessibilityLabel("Session \(place.index) of \(place.count)")
+                    .accessibilityIdentifier("session-page-position")
+                pageButton(.next, enabled: place.index < place.count, action: pageSession)
             }
             .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(Theme.textFaint)
             .fixedSize()
-            .accessibilityHidden(true)
         }
+    }
+
+    private func pageButton(_ direction: PageDirection, enabled: Bool,
+                            action: @escaping (PageDirection) -> Void) -> some View {
+        let previous = direction == .previous
+        return Button { action(direction) } label: {
+            Image(systemName: previous ? "chevron.left" : "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Theme.textMuted)
+                .frame(width: 28, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.3)
+        .accessibilityLabel(previous ? "Previous session" : "Next session")
+        .accessibilityIdentifier(previous ? "session-page-previous" : "session-page-next")
     }
 
     private func content(chat: Chat, store: SessionStore) -> some View {
@@ -281,11 +320,6 @@ struct SessionView: View {
                     }
                 }
                 .motionAnimation(Motion.fadeQuick, value: store.entries.isEmpty)
-                // Bottom-right, clear of the centered jump-to-latest button.
-                .overlay(alignment: .bottomTrailing) {
-                    SessionSwitcherPill(current: chat.id, compact: true)
-                        .padding(12)
-                }
             VStack(spacing: 0) {
                 if verticalSizeClass != .compact || status == .working || status == .errored
                     || model.sendState(for: chat) != nil || model.connectivity.state != .connected {
