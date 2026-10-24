@@ -67,10 +67,11 @@ final class SessionRenameUITests: XCTestCase {
         alert.buttons["Save"].tap()
         expectation(for: NSPredicate(format: "label CONTAINS %@", "Renamed active session"), evaluatedWith: header(app))
         waitForExpectations(timeout: 5)
-        header(app).swipeLeft()
+        let navigation = app.descendants(matching: .any)["session-navigation-controls"].firstMatch
+        navigation.swipeLeft()
         expectation(for: NSPredicate(format: "label CONTAINS %@", "Model picker"), evaluatedWith: header(app))
         waitForExpectations(timeout: 5)
-        header(app).swipeRight()
+        navigation.swipeRight()
         expectation(for: NSPredicate(format: "label CONTAINS %@", "Renamed active session"), evaluatedWith: header(app))
         waitForExpectations(timeout: 5)
     }

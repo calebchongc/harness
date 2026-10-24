@@ -122,6 +122,13 @@ final class AppModel {
 
     func restore() {
         if demo != nil { return }
+        // After a restart iOS can launch the app in the background before the first unlock, when the
+        // Keychain, the saved account and the cached docs can't be read yet. Read then, a sign-in that is
+        // there looks absent and the phone opens signed out. Wait for the unlock instead.
+        guard UIApplication.shared.isProtectedDataAvailable else {
+            restoreAfterUnlock()
+            return
+        }
         DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
         // Debug-rig config overrides (cfprefsd caching defeats external
@@ -157,9 +164,16 @@ final class AppModel {
         }
         if args.contains("-demo") {
             enterDemoMode()
+            if let index = args.firstIndex(of: "-header-status-count"), index + 1 < args.count,
+               let count = Int(args[index + 1]) {
+                demo?.configureHeaderStatusFixture(count: count, allIdle: args.contains("-header-status-idle"))
+            }
             // Simulator fixtures for both empty-workspace and viewer-only
             // accounts. Apply before Home resolves its initial destination.
             override("-sethomefilter") { UserDefaults.standard.set($0, forKey: "homeSpaceFilter") }
+            override("-setnewsessionharness") { UserDefaults.standard.set($0, forKey: "newSessionHarness") }
+            override("-setnewsessionmodel") { UserDefaults.standard.set($0, forKey: "newSessionModel") }
+            override("-setnewsessionreasoning") { UserDefaults.standard.set($0, forKey: "newSessionReasoning") }
             if args.contains("-no-projects") {
                 demo?.spaces = []
                 demo?.chats = []
@@ -248,11 +262,38 @@ final class AppModel {
             connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,
                     tokens: nil, devBearer: devBearer(userId: storedUserId, orgId: storedOrgId))
         case .codegraff:
-            guard let access = Keychain.load(key: "codegraffAccessToken"),
-                  let refresh = Keychain.load(key: "codegraffRefreshToken") else { return }
+            let refresh = Keychain.read(key: "codegraffRefreshToken")
+            let access = Keychain.read(key: "codegraffAccessToken")
+            if refresh == .unavailable || access == .unavailable {
+                restoreAfterUnlock()
+                return
+            }
+            guard case .found(let access) = access, case .found(let refresh) = refresh else { return }
             connect(url: url, mode: .codegraff, userId: storedUserId, orgId: storedOrgId,
                     tokens: AuthTokens(accessToken: access, refreshToken: refresh), devBearer: nil)
         }
+    }
+
+    /// The restore waiting for the Keychain: on the unlock, or the next time the app comes to the front.
+    @ObservationIgnored private var restoreWaitsForUnlock = false
+    @ObservationIgnored private var unlockObserver: NSObjectProtocol?
+
+    private func restoreAfterUnlock() {
+        restoreWaitsForUnlock = true
+        guard unlockObserver == nil else { return }
+        unlockObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.retryRestoreIfWaiting() }
+        }
+    }
+
+    private func retryRestoreIfWaiting() {
+        guard restoreWaitsForUnlock, UIApplication.shared.isProtectedDataAvailable else { return }
+        restoreWaitsForUnlock = false
+        if let unlockObserver { NotificationCenter.default.removeObserver(unlockObserver) }
+        unlockObserver = nil
+        restore()
     }
 
     // MARK: Sign-in flows
@@ -399,11 +440,14 @@ final class AppModel {
     }
 
     func signOut() {
+        PushNotifications.shared.signingOut(config: demo == nil ? config : nil)
         workspace?.stop()
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
         storeLastUsed.removeAll()
+        // A new instance, so a reply still in flight lands in the old one.
+        folderListings = FolderListingCache()
         config = nil
         demo = nil
         demoPinnedSessionIds = []
@@ -474,7 +518,11 @@ final class AppModel {
         store.start()
         startConnectivity()
         phase = .ready
+        PushNotifications.shared.signedIn(model: self)
     }
+
+    /// The live sign-in, for the edge calls notifications make (none in demo mode).
+    var pushConfig: AppConfig? { demo == nil ? config : nil }
 
     /// Wire the graced-connectivity recompute over the live stores (the
     /// engine's 1s compute_connectivity, phone edition).
@@ -678,21 +726,17 @@ final class AppModel {
 
     /// Live harness catalog from the selected execution device (Settings → Agents
     /// gates which agents a device offers); the last-seen list when
-    /// unreachable, the static pair only if the device was never reached.
-    func listHarnesses(deviceId: String) async -> [HarnessInfo] {
+    /// unreachable, never a fabricated pair for an unknown device.
+    func listHarnesses(deviceId: String) async -> DeviceCatalog<HarnessInfo> {
         if demo != nil {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            return HarnessCatalog.harnesses
+            try? await Task.sleep(for: .seconds(ProcessInfo.processInfo.arguments.contains("-slow-catalog") ? 15 : 0.1))
+            return DeviceCatalog(items: ProcessInfo.processInfo.arguments.contains("-no-agents") ? [] : HarnessCatalog.harnesses, isLive: true)
         }
-        if let live = await workspace?.listHarnesses(deviceId: deviceId),
-           !live.isEmpty {
+        if let live = await workspace?.listHarnesses(deviceId: deviceId) {
             _ = DocDisk.saveHarnesses(live, deviceId: deviceId)
-            return live
+            return DeviceCatalog(items: live, isLive: true)
         }
-        if let cached = DocDisk.loadHarnesses(deviceId: deviceId), !cached.isEmpty {
-            return cached
-        }
-        return HarnessCatalog.harnesses
+        return DeviceCatalog(items: DocDisk.loadHarnesses(deviceId: deviceId) ?? [], isLive: false)
     }
 
     /// Whether an agent has been brought in: every computer's `ListHarnesses`, judged by [AgentReadiness]. A computer
@@ -715,32 +759,40 @@ final class AppModel {
     }
 
     /// Live model catalog from the selected execution device (the desktop's
-    /// "catalog source = the device that runs the session" rule); static
-    /// fallback when the device is unreachable.
-    func listModels(deviceId: String, harness: String) async -> [ModelInfo] {
+    /// "catalog source = the device that runs the session" rule). A failed
+    /// request can use cached metadata, but must never invent runnable models.
+    @ObservationIgnored private var demoModelFailuresRemaining = 1
+
+    func listModels(deviceId: String, harness: String) async -> DeviceCatalog<ModelInfo> {
         if demo != nil {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            return HarnessCatalog.models(for: harness)
-        }
-        if let live = await workspace?.listModels(deviceId: deviceId, harness: harness),
-           !live.isEmpty {
-            let normalized = HarnessCatalog.normalize(harness: harness, models: live)
-            if !normalized.isEmpty {
-                _ = DocDisk.saveModels(normalized, deviceId: deviceId, harness: harness)
-                return normalized
+            let args = ProcessInfo.processInfo.arguments
+            try? await Task.sleep(for: .seconds(args.contains("-slow-catalog") ? 15 : 0.1))
+            if args.contains("-models-fail-once"), harness == "codex", demoModelFailuresRemaining > 0 {
+                demoModelFailuresRemaining -= 1
+                return DeviceCatalog(items: [], isLive: false)
             }
+            return DeviceCatalog(items: HarnessCatalog.models(for: harness), isLive: true)
         }
-        if let cached = DocDisk.loadModels(deviceId: deviceId, harness: harness),
-           !cached.isEmpty {
-            return cached
+        if let live = await workspace?.listModels(deviceId: deviceId, harness: harness) {
+            let normalized = HarnessCatalog.normalize(harness: harness, models: live)
+            _ = DocDisk.saveModels(normalized, deviceId: deviceId, harness: harness)
+            return DeviceCatalog(items: normalized, isLive: true)
         }
-        return HarnessCatalog.models(for: harness)
+        return DeviceCatalog(items: DocDisk.loadModels(deviceId: deviceId, harness: harness) ?? [], isLive: false)
     }
+
+    @ObservationIgnored private var demoRefFailuresRemaining = 1
 
     /// Refs of the space's repo (git spaces only).
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            let args = ProcessInfo.processInfo.arguments
+            try? await Task.sleep(for: .seconds(args.contains("-slow-refs") ? 2 : 0.12))
+            if args.contains("-refs-empty") { return [] }
+            if args.contains("-refs-fail-once"), demoRefFailuresRemaining > 0 {
+                demoRefFailuresRemaining -= 1
+                return nil
+            }
             return demo.listRefs(spacePath: space.path)
         }
         return await workspace?.listRefs(deviceId: space.deviceId, repoPath: space.path)
@@ -751,6 +803,10 @@ final class AppModel {
     func switchSpaceRef(space: Space, refName: String) async -> String? {
         if let demo {
             try? await Task.sleep(nanoseconds: 200_000_000)
+            // UI-test fixture: a host that refuses every checkout (#424).
+            if ProcessInfo.processInfo.arguments.contains("-checkout-refused") {
+                return describeUserFacingError(RelayError.rpc("git: synthetic checkout refused"))
+            }
             demo.switchRef(path: space.path, refName: refName)
             return nil
         }
@@ -831,6 +887,9 @@ final class AppModel {
                                    roomGen: 2))
             return id
         }
+        // The first session started from the phone is when "tell me when it's
+        // done" makes sense: ask for notification permission then.
+        PushNotifications.shared.askAfterFirstSession()
         if let space {
             return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
         }
@@ -861,13 +920,82 @@ final class AppModel {
         return workspace
     }
 
-    func listFolders(deviceId: String, path: String?) async -> FolderListing? {
+    /// The cloud sandboxes of the Codegraff account one computer's engine is
+    /// signed in with (Settings → Cloud sandboxes); nil while it is signed out.
+    /// Demo mode serves a made-up account.
+    func cloudSandboxes(deviceId: String) async throws -> CodegraffSandboxes? {
+        if let demo { return demo.cloud.sandboxes }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.codegraffSandboxes(deviceId: deviceId)
+    }
+
+    func createCloudSandbox(deviceId: String, size: String?) async throws {
         if let demo {
-            try? await Task.sleep(nanoseconds: 120_000_000)  // feel like a network hop
+            try? await Task.sleep(nanoseconds: 1_200_000_000)  // a create takes a while
+            demo.cloud.create(size: size)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.createCodegraffSandbox(deviceId: deviceId, size: size)
+    }
+
+    func cloudSandboxAction(deviceId: String, id: String, action: CloudSandboxAction) async throws {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            demo.cloud.act(id: id, action: action)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.codegraffSandboxAction(deviceId: deviceId, id: id, action: action)
+    }
+
+    /// GitHub CI runners for that account (Settings → GitHub CI); nil while signed out.
+    func githubRunners(deviceId: String) async throws -> GithubRunners? {
+        if let demo { return demo.cloud.runners }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.codegraffGithubRunners(deviceId: deviceId)
+    }
+
+    func githubRunnerAction(deviceId: String, action: GithubRunnerAction) async throws {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            demo.cloud.act(action)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.codegraffGithubRunnerAction(deviceId: deviceId, action: action)
+    }
+
+    /// Where graff compacts on one computer (Settings → Graff compaction);
+    /// nil is graff's default. Demo mode keeps the default.
+    func graffCompactAt(deviceId: String) async throws -> Int? {
+        if demo != nil { return nil }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.graffCompactAt(deviceId: deviceId)
+    }
+
+    func setGraffCompactAt(deviceId: String, pct: Int?) async throws -> Int? {
+        if demo != nil { return pct }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.setGraffCompactAt(deviceId: deviceId, pct: pct)
+    }
+
+    /// Folder listings the New space browser has loaded, per computer and
+    /// path, kept across presentations of the sheet (#420).
+    @ObservationIgnored private(set) var folderListings = FolderListingCache()
+
+    /// Folders only: the browser shows nothing else. Throws the host's or the
+    /// relay's own failure so the browser can say why a folder didn't open.
+    func listFolders(deviceId: String, path: String?) async throws -> FolderListing {
+        if let demo {
+            // Feel like a network hop; `-slow-folders` stands in for a slow host.
+            let slow = ProcessInfo.processInfo.arguments.contains("-slow-folders")
+            try? await Task.sleep(nanoseconds: slow ? 1_500_000_000 : 120_000_000)
             let target = path ?? demo.homePath(deviceId: deviceId)
             return demo.listFolders(deviceId: deviceId, path: target)
         }
-        return await workspace?.listFolders(deviceId: deviceId, path: path)
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.listFoldersDetailed(deviceId: deviceId, path: path, dirsOnly: true)
     }
 
     @discardableResult
@@ -899,8 +1027,7 @@ final class AppModel {
     func archivedMatches(in spaceId: String?, query: String) -> [Chat] {
         let archived = archivedChats(in: spaceId)
         guard !query.isEmpty else { return archived }
-        return HomeFilter.apply(archived, query: query, status: .all,
-                                indicator: { _ in .idle }, names: homeFilterNames)
+        return HomeFilter.apply(archived, query: query, names: homeFilterNames)
     }
 
     func homeFilterNames(_ chat: Chat) -> HomeFilter.Names {
@@ -909,6 +1036,15 @@ final class AppModel {
 
     func archive(chatId: String) { setArchived(chatId: chatId, archived: true) }
     func unarchive(chatId: String) { setArchived(chatId: chatId, archived: false) }
+
+    /// Delete a session for good, everywhere (the desktop's Delete session).
+    func delete(chatId: String) {
+        if let demo {
+            demo.chats.removeAll { $0.id == chatId }
+            return
+        }
+        workspace?.deleteChat(chatId: chatId)
+    }
 
     func rename(chatId: String, title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1013,6 +1149,8 @@ final class AppModel {
     /// online event on success, so every PARKED backoff (not just the rooms
     /// the kick reaches) lands a redial in ~1 RTT.
     func foregrounded() {
+        Keychain.flushPending()
+        retryRestoreIfWaiting()
         workspace?.setActive(true)
         refreshSignInIfDue()
         kickAllRooms()
@@ -1225,16 +1363,16 @@ final class AppModel {
         return false
     }
 
-    /// The user-visible truth of a chat's oldest unadopted send. `failed`
-    /// (unadopted past the 2-minute grace, with a retry affordance) wins over
-    /// `queued` (pending on a degraded path); a healthy in-flight send reads
-    /// `sending`. nil = nothing pending.
+    /// The user-visible truth of a chat's unadopted sends (`SendState.of`).
+    /// `failed` only when the doc says a send can no longer run; past the
+    /// grace a still-pending command reads `waiting` (#413). nil = nothing
+    /// pending.
     func sendState(for chat: Chat, now: Int64 = nowMs()) -> SendState? {
         guard demo == nil, let store = sessionStores[chat.id],
               let oldest = store.pendingSends.map(\.started).min() else { return nil }
-        if now - oldest > undeliveredGraceMs { return .failed }
-        if chatDeliveryDegraded(chat) { return .queued }
-        return .sending
+        return SendState.of(oldestStarted: oldest,
+                            undeliverable: !store.undeliverableSends(now: now).isEmpty,
+                            degraded: chatDeliveryDegraded(chat), now: now)
     }
 
     func releaseSessionStore(chatId: String) {

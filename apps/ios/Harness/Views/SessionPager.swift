@@ -25,12 +25,17 @@ enum SessionPaging {
         let active: Bool
     }
 
+    /// The counter, arrows and status marks must describe this same set.
+    static func pageSet(of current: String, in entries: [Entry]) -> [Entry] {
+        guard entries.contains(where: { $0.id == current }) else { return [] }
+        let active = entries.filter { $0.active || $0.id == current }
+        return active.count < 2 ? entries : active
+    }
+
     /// `entries` are in switcher order (when you last called each session).
     /// Next is the older neighbour, previous the newer one.
     static func neighbors(of current: String, in entries: [Entry]) -> (previous: String?, next: String?) {
-        guard entries.contains(where: { $0.id == current }) else { return (nil, nil) }
-        var set = entries.filter { $0.active || $0.id == current }
-        if set.count < 2 { set = entries }
+        let set = pageSet(of: current, in: entries)
         guard let index = set.firstIndex(where: { $0.id == current }) else { return (nil, nil) }
         return (index > 0 ? set[index - 1].id : nil,
                 index + 1 < set.count ? set[index + 1].id : nil)
@@ -41,15 +46,16 @@ enum SessionPaging {
     static func position(of current: String, in entries: [Entry]) -> (index: Int, count: Int)? {
         let n = neighbors(of: current, in: entries)
         guard n.previous != nil || n.next != nil else { return nil }
-        var set = entries.filter { $0.active || $0.id == current }
-        if set.count < 2 { set = entries }
+        let set = pageSet(of: current, in: entries)
         guard let index = set.firstIndex(where: { $0.id == current }) else { return nil }
         return (index + 1, set.count)
     }
 
     @MainActor
-    static func entries(model: AppModel) -> [Entry] {
-        let juggled = JuggledSessions(model: model)
+    static func entries(model: AppModel, including current: String? = nil) -> [Entry] {
+        // Home's switcher stays bounded, but header overflow must count every
+        // eligible session and retain an older idle session while it is open.
+        let juggled = JuggledSessions(model: model, limit: nil, including: current)
         return juggled.chats.map {
             Entry(id: $0.id, active: (juggled.indicators[$0.id] ?? .idle) != .idle)
         }
@@ -87,7 +93,7 @@ struct SessionPagerHost: View {
     }
 
     private func page(_ direction: PageDirection) {
-        let n = SessionPaging.neighbors(of: current, in: SessionPaging.entries(model: model))
+        let n = SessionPaging.neighbors(of: current, in: SessionPaging.entries(model: model, including: current))
         guard let target = direction == .next ? n.next : n.previous else {
             UIImpactFeedbackGenerator(style: .rigid).impactOccurred(intensity: 0.4)
             return
@@ -97,7 +103,7 @@ struct SessionPagerHost: View {
 
     private func go(to chatId: String) {
         guard chatId != current else { return }
-        let order = SessionPaging.entries(model: model).map(\.id)
+        let order = SessionPaging.entries(model: model, including: current).map(\.id)
         let from = order.firstIndex(of: current), to = order.firstIndex(of: chatId)
         forward = (from ?? 0) <= (to ?? 0)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()

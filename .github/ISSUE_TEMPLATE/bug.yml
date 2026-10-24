@@ -1,0 +1,56 @@
+name: Bug report
+description: Something in Harness doesn't work. Include a screenshot that shows it.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository is public. Capture screenshots from made-up data, not your real chats, and crop to the part that's wrong. No account names, emails, local paths or private conversation text.
+  - type: input
+    id: harness
+    attributes:
+      label: Harness version
+      description: About Harness on macOS, or Settings → Devices.
+      placeholder: "0.2.133 (latest: 0.2.133)"
+    validations:
+      required: true
+  - type: input
+    id: graff
+    attributes:
+      label: graff version
+      description: "`~/.harness/bin/graff --version`"
+    validations:
+      required: false
+  - type: input
+    id: platform
+    attributes:
+      label: App and platform
+      placeholder: "desktop, macOS arm64 | iOS 0.2.133, iOS 27 | Android 0.2.133, Android 16"
+    validations:
+      required: true
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Symptom
+      description: What went wrong, with the app's own error text verbatim.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro
+      description: The smallest sequence of steps that shows it.
+    validations:
+      required: true
+  - type: textarea
+    id: image
+    attributes:
+      label: Image
+      description: Drag in a screenshot that shows the problem. Issues without an image are closed automatically and reopen when one is added.
+    validations:
+      required: true
+  - type: textarea
+    id: fix
+    attributes:
+      label: Expected behavior
+    validations:
+      required: false

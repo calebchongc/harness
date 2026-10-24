@@ -15,6 +15,7 @@
 //! Writers: any device (unlike `messages`, which is host-only). The host is
 //! the only one that *takes* from the queue — see `DocHost::drain_queue`.
 
+use harness_proto::TurnOrigin;
 use loro::ToJson;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,9 @@ pub struct QueuedMessage {
     pub id: String,
     /// What the user typed. Never empty — emptying it deletes the row.
     pub text: String,
+    /// Structural prompt origin; independent of text and optional attribution.
+    #[serde(default)]
+    pub turn_origin: TurnOrigin,
     /// Committed upload paths, staged at queue time so the row never points at
     /// files that only exist on the device that typed it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -39,6 +43,9 @@ pub struct QueuedMessage {
     pub hold_for_turn_end: bool,
     /// Device that queued it.
     pub issued_by: String,
+    /// Optional sender attribution, not a prerequisite for peer origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_chat_id: Option<String>,
     /// Epoch millis.
     pub issued_at: i64,
     /// Epoch millis of the last text edit, when there has been one.
@@ -90,6 +97,8 @@ impl QueuedMessage {
         Self {
             id: id.into(),
             text: text.into(),
+            turn_origin: TurnOrigin::Human,
+            peer_chat_id: None,
             attachments: Vec::new(),
             hold_for_turn_end: false,
             issued_by: issued_by.into(),
@@ -123,9 +132,12 @@ impl SessionDoc {
         if item.text.trim().is_empty() {
             return Err(DocError::Schema("queued message text required".into()));
         }
-        let queue = self.doc().get_movable_list("queue");
-        let map = queue.push_container(loro::LoroMap::new())?;
+        // Publish id last: readers cannot observe or drain partial metadata.
+        let map = loro::LoroMap::new();
         write_queued_map(&map, item)?;
+        let queue = self.doc().get_movable_list("queue");
+        let map = queue.push_container(map)?;
+        map.insert("id", item.id.as_str())?;
         self.doc().commit();
         Ok(())
     }
@@ -141,9 +153,11 @@ impl SessionDoc {
         if item.text.trim().is_empty() {
             return Err(DocError::Schema("queued message text required".into()));
         }
-        let queue = self.doc().get_movable_list("queue");
-        let map = queue.insert_container(index.min(queue.len()), loro::LoroMap::new())?;
+        let map = loro::LoroMap::new();
         write_queued_map(&map, item)?;
+        let queue = self.doc().get_movable_list("queue");
+        let map = queue.insert_container(index.min(queue.len()), map)?;
+        map.insert("id", item.id.as_str())?;
         self.doc().commit();
         Ok(())
     }
@@ -337,9 +351,15 @@ fn index_of(queue: &loro::LoroMovableList, id: &str) -> Option<usize> {
 }
 
 fn write_queued_map(map: &loro::LoroMap, item: &QueuedMessage) -> Result<(), DocError> {
-    map.insert("id", item.id.as_str())?;
     map.insert("text", item.text.as_str())?;
+    map.insert(
+        "turnOrigin",
+        crate::schema::loro_value_from_json(&serde_json::to_value(item.turn_origin)?),
+    )?;
     map.insert("issuedBy", item.issued_by.as_str())?;
+    if let Some(peer_chat_id) = &item.peer_chat_id {
+        map.insert("peerChatId", peer_chat_id.as_str())?;
+    }
     map.insert("issuedAt", item.issued_at)?;
     if !item.attachments.is_empty() {
         map.insert(
@@ -374,6 +394,10 @@ fn queued_from_json(v: serde_json::Value) -> Option<QueuedMessage> {
     Some(QueuedMessage {
         id,
         text,
+        turn_origin: v
+            .get("turnOrigin")
+            .and_then(|origin| serde_json::from_value(origin.clone()).ok())
+            .unwrap_or_default(),
         attachments: v
             .get("attachments")
             .and_then(|a| serde_json::from_value(a.clone()).ok())
@@ -387,6 +411,10 @@ fn queued_from_json(v: serde_json::Value) -> Option<QueuedMessage> {
             .and_then(|d| d.as_str())
             .unwrap_or_default()
             .to_string(),
+        peer_chat_id: v
+            .get("peerChatId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         issued_at: v.get("issuedAt").and_then(|t| t.as_i64()).unwrap_or(0),
         edited_at: v.get("editedAt").and_then(|t| t.as_i64()),
         delivery_gate: match v.get("deliveryGate") {
@@ -413,10 +441,40 @@ mod tests {
         SessionDoc::init("chat-1").unwrap()
     }
 
+    #[test]
+    fn peer_identity_survives_sync_take_reinsert_and_snapshot() {
+        let source = doc();
+        let mut peer = QueuedMessage::new("peer-row", "wait for delivery", "device-a");
+        peer.peer_chat_id = Some("sender-chat".into());
+        peer.turn_origin = TurnOrigin::Peer;
+        source.push_queued(&peer).unwrap();
+        let imported = loro::LoroDoc::new();
+        imported.import(&source.export_snapshot().unwrap()).unwrap();
+        let restored = SessionDoc::from_doc(imported);
+        let taken = restored.take_queued("peer-row").unwrap().unwrap();
+        assert_eq!(taken, peer);
+        restored.insert_queued(0, &taken).unwrap();
+        assert_eq!(restored.read_queue().unwrap(), vec![peer]);
+
+        let legacy = serde_json::json!({
+            "id": "human-row", "text": "old client", "issuedBy": "device-a", "issuedAt": 1
+        });
+        let human = queued_from_json(legacy).unwrap();
+        assert!(human.peer_chat_id.is_none());
+        assert!(
+            serde_json::to_value(human)
+                .unwrap()
+                .get("peerChatId")
+                .is_none()
+        );
+    }
+
     fn item(id: &str, text: &str) -> QueuedMessage {
         QueuedMessage {
             id: id.into(),
             text: text.into(),
+            turn_origin: TurnOrigin::Human,
+            peer_chat_id: None,
             attachments: Vec::new(),
             hold_for_turn_end: false,
             issued_by: "device-a".into(),
@@ -424,6 +482,50 @@ mod tests {
             edited_at: None,
             delivery_gate: None,
         }
+    }
+
+    #[test]
+    fn queue_origin_survives_sync_edit_move_take_and_retry() {
+        let source = doc();
+        let mut peer = item("peer", "ordinary text without attribution");
+        peer.turn_origin = TurnOrigin::Peer;
+        source.push_queued(&peer).unwrap();
+        source
+            .push_queued(&item("human", "FYI from a human"))
+            .unwrap();
+        source.set_queued_text("peer", "updated", 2_000).unwrap();
+        source.move_queued("peer", 1).unwrap();
+        let target = doc();
+        target
+            .doc()
+            .import(&source.export_snapshot().unwrap())
+            .unwrap();
+        let taken = target.take_queued("peer").unwrap().unwrap();
+        assert_eq!(taken.turn_origin, TurnOrigin::Peer);
+        target.insert_queued(0, &taken).unwrap();
+        assert_eq!(
+            target.read_queue().unwrap()[0].turn_origin,
+            TurnOrigin::Peer
+        );
+        assert_eq!(
+            target.read_queue().unwrap()[1].turn_origin,
+            TurnOrigin::Human
+        );
+    }
+
+    #[test]
+    fn legacy_queue_origin_defaults_to_human() {
+        let legacy = serde_json::json!({ "id": "legacy", "text": "FYI", "issuedBy": "device", "issuedAt": 0 });
+        let decoded: QueuedMessage = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.turn_origin, TurnOrigin::Human);
+        assert_eq!(
+            queued_from_json(legacy).unwrap().turn_origin,
+            TurnOrigin::Human
+        );
+        assert_eq!(
+            QueuedMessage::new("q", "hello", "device").turn_origin,
+            TurnOrigin::Human
+        );
     }
 
     fn texts(doc: &SessionDoc) -> Vec<String> {

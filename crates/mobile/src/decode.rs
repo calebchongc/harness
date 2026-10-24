@@ -37,6 +37,17 @@ fn part(value: &Value) -> Option<MessagePartRecord> {
             id,
             text: text(m, "text").unwrap_or_default().to_owned(),
         }),
+        "visual" => {
+            // Mobile shows only the bounded title; source is never read or executed.
+            let title = text(m, "title")?;
+            if title.trim().is_empty() || title.chars().count() > 200 {
+                return None;
+            }
+            Some(MessagePartRecord::Text {
+                id,
+                text: format!("Native visual: {title} — open in Harness desktop"),
+            })
+        }
         "image" => {
             let path = text(m, "path").unwrap_or_default().to_owned();
             let name = text(m, "name").unwrap_or_default().to_owned();
@@ -369,6 +380,60 @@ mod tests {
             panic!()
         };
         assert_eq!(*reauth, None);
+    }
+
+    #[test]
+    fn visual_fallback_preserves_mixed_parts_without_exposing_source() {
+        let entries = entries(&json!([{"id": "a", "role": "assistant", "parts": [
+            {"id": "before", "kind": "text", "text": "Before"},
+            {"id": "v", "kind": "visual", "title": "Overview", "script": "error('must not run or display')", "text": "must not display"},
+            {"id": "unknown", "kind": "future", "text": "hidden"},
+            {"id": "bad", "kind": "visual", "title": "  "},
+            {"id": "after", "kind": "text", "text": "After"}
+        ]}]));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].parts,
+            vec![
+                MessagePartRecord::Text {
+                    id: "before".into(),
+                    text: "Before".into()
+                },
+                MessagePartRecord::Text {
+                    id: "v".into(),
+                    text: "Native visual: Overview — open in Harness desktop".into()
+                },
+                MessagePartRecord::Text {
+                    id: "after".into(),
+                    text: "After".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn visual_fallback_requires_a_bounded_nonblank_title_only() {
+        for title in [
+            json!(null),
+            json!(42),
+            json!(""),
+            json!(" \n\t"),
+            json!("界".repeat(201)),
+            json!("e\u{301}".repeat(101)),
+        ] {
+            assert!(part(&json!({"id": "v", "kind": "visual", "title": title})).is_none());
+        }
+        assert!(part(&json!({"id": "v", "kind": "visual"})).is_none());
+        for title in ["界".repeat(200), "😀".repeat(200), "e\u{301}".repeat(100)] {
+            // A fallback requires no script and counts Unicode scalars, not UTF-8 bytes.
+            assert_eq!(
+                part(&json!({"id": "v", "kind": "visual", "title": title})),
+                Some(MessagePartRecord::Text {
+                    id: "v".into(),
+                    text: format!("Native visual: {title} — open in Harness desktop"),
+                })
+            );
+        }
     }
 
     #[test]

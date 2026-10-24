@@ -117,6 +117,7 @@ fn controls() -> RunControls {
 
 fn request(root: &Path, level: ReasoningLevel) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: "hello".into(),
         harness: None,
         model: Some("p1/shared".into()),

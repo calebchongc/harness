@@ -19,7 +19,7 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn turn_json(id: &str, status: &str, error: Option<&str>) -> Value {
+pub(crate) fn turn_json(id: &str, status: &str, error: Option<&str>) -> Value {
     json!({
         "id": id,
         "items": [],
@@ -58,11 +58,12 @@ pub fn start(conn: &Arc<Conn>, params: Value) -> (Result<Value, RpcError>, After
         let Some(thread) = threads.get_mut(&thread_id) else {
             return (Err(RpcError::invalid_params("unknown threadId")), None);
         };
-        thread.interrupt = Some(token.clone());
-        thread.turn_id = Some(turn_id.clone());
-        thread.steer = Some(steer_tx);
-        thread.steers.clear();
-        thread.steerable = false;
+        if thread.turn_id.is_some() {
+            return (
+                Err(RpcError::invalid_params("a turn is already running")),
+                None,
+            );
+        }
         // A per-turn model override picks the agent too (`<harness>/<model>`).
         let (harness, model) = match params
             .get("model")
@@ -72,11 +73,29 @@ pub fn start(conn: &Arc<Conn>, params: Value) -> (Result<Value, RpcError>, After
             Some((harness, model)) => (harness, Some(model)),
             None => (thread.harness, thread.model.clone()),
         };
+        if thread.resume.is_some() && harness != thread.harness {
+            return (
+                Err(RpcError::invalid_params(
+                    "cannot resume a session with a different agent",
+                )),
+                None,
+            );
+        }
+        if let Err(error) = crate::sessions::begin_turn(conn, &thread_id, thread, &turn_id, &prompt)
+        {
+            return (Err(error), None);
+        }
+        thread.interrupt = Some(token.clone());
+        thread.turn_id = Some(turn_id.clone());
+        thread.steer = Some(steer_tx);
+        thread.steers.clear();
+        thread.steerable = false;
         thread.harness = harness;
         thread.model = model.clone();
         (
             harness,
             RunRequest {
+                turn_origin: Default::default(),
                 prompt,
                 harness: Some(harness),
                 model,
@@ -112,7 +131,7 @@ pub fn start(conn: &Arc<Conn>, params: Value) -> (Result<Value, RpcError>, After
 const STEER_MAILBOX: usize = 16;
 
 /// Text items joined into the prompt, and the local image paths.
-fn prompt_and_attachments(input: &Value) -> (String, Vec<String>) {
+pub(crate) fn prompt_and_attachments(input: &Value) -> (String, Vec<String>) {
     let items = input.as_array().cloned().unwrap_or_default();
     let prompt = items
         .iter()
@@ -212,7 +231,7 @@ struct Tool {
     started: std::time::Instant,
 }
 
-struct Turn {
+pub(crate) struct Turn {
     conn: Arc<Conn>,
     thread_id: String,
     turn_id: String,
@@ -224,7 +243,33 @@ struct Turn {
 }
 
 impl Turn {
-    fn item_started(&self, item: Value) {
+    pub(crate) fn new(conn: Arc<Conn>, thread_id: String, turn_id: String, cwd: String) -> Self {
+        Self {
+            conn,
+            thread_id,
+            turn_id,
+            message: None,
+            reasoning: None,
+            tools: HashMap::new(),
+            cwd,
+        }
+    }
+
+    pub(crate) fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// Close what is still open and report the turn's end to the TUI.
+    pub(crate) fn complete(mut self, status: &str, error: Option<&str>) {
+        self.close_reasoning();
+        self.close_message();
+        self.conn.notify(
+            "turn/completed",
+            json!({ "threadId": self.thread_id, "turn": turn_json(&self.turn_id, status, error) }),
+        );
+    }
+
+    pub(crate) fn item_started(&self, item: Value) {
         self.conn.notify(
             "item/started",
             json!({
@@ -234,7 +279,8 @@ impl Turn {
         );
     }
 
-    fn item_completed(&self, item: Value) {
+    pub(crate) fn item_completed(&self, item: Value) {
+        crate::sessions::record_item(&self.conn, &self.thread_id, &self.turn_id, &item);
         self.conn.notify(
             "item/completed",
             json!({
@@ -255,7 +301,7 @@ impl Turn {
         self.conn.notify(method, params);
     }
 
-    fn close_reasoning(&mut self) {
+    pub(crate) fn close_reasoning(&mut self) {
         if let Some(open) = self.reasoning.take() {
             self.item_completed(
                 json!({ "type": "reasoning", "id": open.id, "summary": [], "content": [open.text] }),
@@ -263,7 +309,7 @@ impl Turn {
         }
     }
 
-    fn close_message(&mut self) {
+    pub(crate) fn close_message(&mut self) {
         if let Some(open) = self.message.take() {
             self.item_completed(
                 json!({ "type": "agentMessage", "id": open.id, "text": open.text }),
@@ -303,7 +349,7 @@ impl Turn {
         !thread.steers.is_empty()
     }
 
-    fn on_event(&mut self, event: AgentEvent) {
+    pub(crate) fn on_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta { text } => {
                 self.close_reasoning();
@@ -446,6 +492,7 @@ async fn run(
         tools: HashMap::new(),
         cwd: request.cwd.clone(),
     };
+    crate::sessions::notify_name(&conn, &thread_id);
     conn.notify(
         "turn/started",
         json!({ "threadId": thread_id, "turn": turn_json(&turn_id, "inProgress", None) }),
@@ -458,6 +505,7 @@ async fn run(
     let (status, error) = drive(&mut turn, harness_id, request, token, steering).await;
     turn.close_reasoning();
     turn.close_message();
+    crate::sessions::finish_turn(&conn, &thread_id, &turn_id, status, error.as_deref());
     conn.notify(
         "turn/completed",
         json!({ "threadId": thread_id, "turn": turn_json(&turn_id, status, error.as_deref()) }),
@@ -522,6 +570,7 @@ async fn drive(
                     .get_mut(&turn.thread_id)
                 {
                     thread.resume = Some(session_id);
+                    crate::sessions::save_or_notify(&turn.conn, &turn.thread_id, thread);
                 }
             }
             Ok(AgentEvent::Steered { .. }) => turn.on_steered(),
@@ -551,133 +600,5 @@ async fn drive(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::wire::ThreadState;
-    use harness_proto::HarnessId;
-
-    fn thread() -> ThreadState {
-        ThreadState {
-            cwd: "/tmp".into(),
-            harness: HarnessId::Graff,
-            model: None,
-            resume: None,
-            interrupt: None,
-            turn_id: None,
-            steer: None,
-            steers: Default::default(),
-            steerable: false,
-        }
-    }
-
-    fn conn_with(state: ThreadState) -> Arc<Conn> {
-        let (conn, _rx) = Conn::for_test(Arc::new(harness_engine::HarnessRegistry::new()));
-        conn.threads.lock().unwrap().insert("t1".into(), state);
-        conn
-    }
-
-    fn steer_params(expected: &str) -> Value {
-        json!({
-            "threadId": "t1",
-            "clientUserMessageId": "c1",
-            "expectedTurnId": expected,
-            "input": [{ "type": "text", "text": "also check the tests" }],
-        })
-    }
-
-    #[test]
-    fn no_running_turn_tells_the_tui_to_start_one() {
-        let conn = conn_with(thread());
-        let (reply, _) = steer(&conn, steer_params("turn-1"));
-        assert_eq!(reply.err().unwrap().message, "no active turn to steer");
-    }
-
-    #[test]
-    fn a_stale_turn_id_names_the_running_turn() {
-        let (tx, _rx) = mpsc::channel(STEER_MAILBOX);
-        let conn = conn_with(ThreadState {
-            turn_id: Some("turn-2".into()),
-            steer: Some(tx),
-            steerable: true,
-            ..thread()
-        });
-        let (reply, _) = steer(&conn, steer_params("turn-1"));
-        assert_eq!(
-            reply.err().unwrap().message,
-            "expected active turn id `turn-1` but found `turn-2`"
-        );
-    }
-
-    #[test]
-    fn an_agent_without_steering_gets_a_not_steerable_turn_error() {
-        let (tx, _rx) = mpsc::channel(STEER_MAILBOX);
-        let conn = conn_with(ThreadState {
-            turn_id: Some("turn-1".into()),
-            steer: Some(tx),
-            ..thread()
-        });
-        let (reply, _) = steer(&conn, steer_params("turn-1"));
-        let data = reply.err().unwrap().data.unwrap();
-        assert_eq!(
-            data["codexErrorInfo"]["activeTurnNotSteerable"]["turnKind"],
-            "review"
-        );
-    }
-
-    #[test]
-    fn an_accepted_steer_reaches_the_agent_and_is_echoed_when_taken() {
-        let (tx, mut rx) = mpsc::channel(STEER_MAILBOX);
-        let conn = conn_with(ThreadState {
-            turn_id: Some("turn-1".into()),
-            steer: Some(tx),
-            steerable: true,
-            ..thread()
-        });
-        let (reply, _) = steer(&conn, steer_params("turn-1"));
-        assert_eq!(reply.ok().unwrap(), json!({ "turnId": "turn-1" }));
-        let message = rx.try_recv().unwrap();
-        assert_eq!(message.prompt, "also check the tests");
-        assert_eq!(message.message_id.as_deref(), Some("c1"));
-
-        let turn = Turn {
-            conn: conn.clone(),
-            thread_id: "t1".into(),
-            turn_id: "turn-1".into(),
-            message: None,
-            reasoning: None,
-            tools: HashMap::new(),
-            cwd: "/tmp".into(),
-        };
-        // The agent's turn ends with the steer still queued: keep the Codex
-        // turn open for it, and close the mailbox.
-        assert!(turn.close_steering(true));
-        assert!(conn.threads.lock().unwrap()["t1"].steer.is_none());
-        let mut turn = turn;
-        turn.on_steered();
-        assert!(conn.threads.lock().unwrap()["t1"].steers.is_empty());
-        assert!(!turn.close_steering(true));
-    }
-
-    #[test]
-    fn an_interrupted_turn_drops_its_queued_steers() {
-        let (tx, _rx) = mpsc::channel(STEER_MAILBOX);
-        let conn = conn_with(ThreadState {
-            turn_id: Some("turn-1".into()),
-            steer: Some(tx),
-            steerable: true,
-            ..thread()
-        });
-        let _ = steer(&conn, steer_params("turn-1"));
-        let turn = Turn {
-            conn: conn.clone(),
-            thread_id: "t1".into(),
-            turn_id: "turn-1".into(),
-            message: None,
-            reasoning: None,
-            tools: HashMap::new(),
-            cwd: "/tmp".into(),
-        };
-        assert!(!turn.close_steering(false));
-        assert!(conn.threads.lock().unwrap()["t1"].steers.is_empty());
-    }
-}
+#[path = "turn_tests.rs"]
+mod tests;

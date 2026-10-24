@@ -161,6 +161,13 @@ struct WorkspaceHostInner {
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
     sidebar_preferences_tx: watch::Sender<SidebarPreferencesState>,
+    /// Held by `publish_lists` from reading the registry snapshot until the
+    /// last list is published, so an older snapshot can never land after a
+    /// newer one (#346). Taken before `reg`, never while holding it.
+    publish_gate: Mutex<()>,
+    /// Test hook: runs once, after the next publication sampled the registry.
+    #[cfg(test)]
+    after_sample: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     room: Mutex<Option<Arc<RegistryClient>>>,
     /// Bumped on every registry change (local mutation or applied server
     /// frame) — drives republish + the snapshot debounce in `workspace_task`.
@@ -181,6 +188,8 @@ struct WorkspaceHostInner {
     /// warm-up clock (`peer_liveness`): a just-joined room hasn't heard
     /// anyone's heartbeat yet, and that silence must not read as "offline".
     room_joined_at: std::sync::atomic::AtomicI64,
+    /// Size of the last saved snapshot — spaces out saves (`save_interval`).
+    snapshot_bytes: std::sync::atomic::AtomicUsize,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -257,12 +266,15 @@ impl WorkspaceHost {
             .read_devices()?
             .into_iter()
             .find(|d| d.id == config.device_id);
+        let device_name = device_name_on_boot(
+            existing.as_ref().map(|device| device.name.as_str()),
+            &config.device_name,
+        );
+        // graff tells the gateway which computer it runs on, by this name.
+        harness_adapters::set_graff_device_name(&device_name);
         doc.upsert_device(&Device {
             id: config.device_id.clone(),
-            name: device_name_on_boot(
-                existing.as_ref().map(|device| device.name.as_str()),
-                &config.device_name,
-            ),
+            name: device_name,
             platform: config.platform.clone(),
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
@@ -285,10 +297,6 @@ impl WorkspaceHost {
             revision: 0,
             synced: false,
             initialized: preferences.is_some(),
-            sections: preferences
-                .as_ref()
-                .map(|p| p.sections.clone())
-                .unwrap_or_default(),
             pinned_session_ids: preferences
                 .map(|preferences| preferences.pinned_session_ids)
                 .unwrap_or_default(),
@@ -305,12 +313,16 @@ impl WorkspaceHost {
                 sessions_tx,
                 spaces_tx,
                 sidebar_preferences_tx,
+                publish_gate: Mutex::new(()),
+                #[cfg(test)]
+                after_sample: Mutex::new(None),
                 room: Mutex::new(None),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
+                snapshot_bytes: std::sync::atomic::AtomicUsize::new(0),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -431,7 +443,10 @@ impl WorkspaceHost {
                                         let Some(inner) = weak.upgrade() else { return };
                                         inner.publish();
                                     }
-                                    Ok(harness_sync::RegistryEvent::Disconnected) => {}
+                                    Ok(harness_sync::RegistryEvent::Disconnected) => {
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        inner.bump_changed();
+                                    }
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 },
@@ -664,15 +679,6 @@ impl WorkspaceHost {
             }
             Ok(doc.change_sidebar_pin(change)?)
         })?;
-        if matches!(
-            change,
-            harness_proto::SidebarPinChange::Section {
-                change: harness_proto::SidebarSectionChange::Import { .. }
-            }
-        ) {
-            // The UI removes its legacy copy only after this acknowledgement.
-            self.inner.persist_snapshot()?;
-        }
         Ok(())
     }
 
@@ -951,6 +957,7 @@ impl WorkspaceHost {
                 branch: None,
                 checkout_id: None,
                 source_context: None,
+                source_context_unavailable_at: None,
                 config,
                 last_message_preview: None,
                 last_message_at: None,
@@ -1119,6 +1126,28 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_appearance(appearance))?)
     }
 
+    pub(crate) fn archive_chat_at(&self, chat_id: &str, requested_at_ms: i64) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.archive_chat_at(chat_id, requested_at_ms))?)
+    }
+
+    pub(crate) fn chat_prompt_clock(&self, chat_id: &str) -> String {
+        self.mutate(|doc| doc.chat_prompt_clock(chat_id))
+    }
+
+    /// Persist before the caller retires its durable restoration receipt.
+    pub(crate) fn restore_chat_on_send(
+        &self,
+        chat_id: &str,
+        clock: &str,
+        archive_basis: Option<&str>,
+    ) -> Result<bool, EngineError> {
+        let restored = self.mutate(|doc| doc.restore_chat_on_send_from(chat_id, clock, archive_basis))?;
+        if restored {
+            self.inner.persist_snapshot()?;
+        }
+        Ok(restored)
+    }
+
     /// LWW full-config replace on the chat row (harness `SetChatConfig` — the
     /// composer's mid-session model/reasoning/options changes). Returns false
     /// when the chat doesn't exist.
@@ -1133,7 +1162,11 @@ impl WorkspaceHost {
     }
 
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {
-        Ok(self.mutate(|doc| doc.rename_device(device_id, name))?)
+        let renamed = self.mutate(|doc| doc.rename_device(device_id, name))?;
+        if renamed && device_id == self.inner.config.device_id {
+            harness_adapters::set_graff_device_name(name);
+        }
+        Ok(renamed)
     }
 
     /// Remove an offline device from the list. Never this device, and never one that is beating
@@ -1166,6 +1199,21 @@ impl WorkspaceHost {
         context: &harness_proto::ConversationSourceContext,
     ) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_source_context(chat_id, context))?)
+    }
+
+    /// The chat's latest accepted run could not observe its checkout: keep
+    /// the last known context, qualified as not current (#356). Written once
+    /// until the next successful capture, so a non-repository chat does not
+    /// rewrite its row on every turn.
+    pub fn mark_chat_source_context_unavailable(&self, chat_id: &str) -> Result<bool, EngineError> {
+        if self
+            .chat(chat_id)?
+            .is_none_or(|chat| chat.source_context_unavailable_at.is_some())
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .mutate(|doc| doc.mark_chat_source_context_unavailable(chat_id, chrono::Utc::now()))?)
     }
 
     /// Retarget a chat onto another folder (mid-session switch to an existing
@@ -1208,6 +1256,10 @@ impl WorkspaceHostInner {
     }
 
     fn publish_lists(&self, clock_tick: bool) {
+        // Presence, relay-probe and registry-change tasks all publish. Without
+        // the gate, one that sampled revision N could publish after another
+        // published N+1, re-archiving a restored chat or dropping a project.
+        let _gate = lock(&self.publish_gate);
         let registry_synced = lock(&self.room)
             .as_ref()
             .is_some_and(|room| room.stats().synced);
@@ -1227,6 +1279,10 @@ impl WorkspaceHostInner {
             self.publish_sidebar_preferences(&doc, registry_synced);
             doc.read_all()
         };
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.after_sample).take() {
+            hook();
+        }
         match snapshot {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
@@ -1253,10 +1309,6 @@ impl WorkspaceHostInner {
     fn publish_sidebar_preferences(&self, doc: &RegistryDoc, synced: bool) {
         let preferences = doc.sidebar_preferences();
         let initialized = preferences.is_some();
-        let sections = preferences
-            .as_ref()
-            .map(|p| p.sections.clone())
-            .unwrap_or_default();
         let pins = preferences
             .map(|p| p.pinned_session_ids)
             .unwrap_or_default();
@@ -1267,7 +1319,6 @@ impl WorkspaceHostInner {
             if current.synced == synced
                 && current.initialized == initialized
                 && current.pinned_session_ids == pins
-                && current.sections == sections
             {
                 return false;
             }
@@ -1276,7 +1327,6 @@ impl WorkspaceHostInner {
                 synced,
                 initialized,
                 pinned_session_ids: pins,
-                sections,
             };
             true
         });
@@ -1396,9 +1446,29 @@ impl WorkspaceHostInner {
         // must not overwrite an acknowledged migration's durable snapshot.
         let doc = lock(&self.reg);
         let bytes = doc.to_bytes()?;
+        self.snapshot_bytes
+            .store(bytes.len(), std::sync::atomic::Ordering::Relaxed);
         self.store
             .save_snapshot(REGISTRY_DOC_ID, &bytes)
             .map_err(|error| EngineError::Other(format!("registry snapshot save failed: {error}")))
+    }
+
+    /// Debounce before the next save. Each save rewrites the whole registry
+    /// (about 1 MB on a long-lived account), and session heartbeats and other
+    /// devices' rows change it every few seconds (#343). Only acknowledged
+    /// edits can wait longer: disconnected rooms and unacknowledged local
+    /// edits keep the short window, even with an edge configured.
+    fn save_interval(&self) -> std::time::Duration {
+        let connected = lock(&self.room)
+            .as_ref()
+            .is_some_and(|room| room.stats().connected);
+        let pending = lock(&self.reg).pending_len();
+        registry_save_interval(
+            connected,
+            pending,
+            self.snapshot_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Presence heartbeat — a memory-only frame on the room, never a row write.
@@ -1553,12 +1623,10 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
                 }
                 let Some(inner) = weak.upgrade() else { break };
                 inner.publish();
-                if save_deadline.is_none() {
-                    save_deadline = Some(
-                        tokio::time::Instant::now()
-                            + std::time::Duration::from_millis(SNAPSHOT_DEBOUNCE_MS),
-                    );
-                }
+                let deadline = tokio::time::Instant::now() + inner.save_interval();
+                // An offline/local edit arriving during a longer wait must
+                // bring the save forward, never extend the dirty window.
+                save_deadline = Some(save_deadline.map_or(deadline, |current| current.min(deadline)));
             }
             _ = tokio::time::sleep_until(sleep_until), if save_deadline.is_some() => {
                 save_deadline = None;
@@ -1577,6 +1645,20 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
             }
         }
     }
+}
+
+fn registry_save_interval(
+    connected: bool,
+    pending: usize,
+    snapshot_bytes: usize,
+) -> std::time::Duration {
+    const BYTES_PER_SEC: usize = 64 * 1024;
+    const MAX: std::time::Duration = std::time::Duration::from_secs(10);
+    let min = std::time::Duration::from_millis(SNAPSHOT_DEBOUNCE_MS);
+    if !connected || pending > 0 {
+        return min;
+    }
+    std::time::Duration::from_secs((snapshot_bytes / BYTES_PER_SEC) as u64).clamp(min, MAX)
 }
 
 fn publish_if_changed<T: PartialEq>(sender: &watch::Sender<T>, value: T) {
@@ -1746,6 +1828,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn registry_saves_space_out_only_after_local_edits_are_acknowledged() {
+        use super::*;
+        use std::time::Duration;
+
+        assert_eq!(
+            registry_save_interval(false, 0, 1 << 20),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            registry_save_interval(true, 1, 1 << 20),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            registry_save_interval(true, 0, 16 * 1024),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            registry_save_interval(true, 0, 320 * 1024),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            registry_save_interval(true, 0, 983 * 1024),
+            Duration::from_secs(10)
+        );
+    }
+
     #[tokio::test]
     async fn presence_publish_keeps_unchanged_lists_quiet_and_late_subscribers_current() {
         use super::*;
@@ -1802,6 +1911,67 @@ mod tests {
         );
     }
 
+    // Current-thread runtime: the body never yields, so the host's own
+    // republish task can't run and mask a stale publication.
+    #[tokio::test]
+    async fn an_older_list_publication_cannot_overwrite_a_newer_one() {
+        use super::*;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(),
+                device_name: "Test device".into(),
+                platform: "macos".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.create_space("old", "test-device", "/old", None, false)
+            .unwrap();
+
+        // Publisher A samples the registry, then waits to be released.
+        let (sampled_tx, sampled_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        *lock(&host.inner.after_sample) = Some(Box::new(move || {
+            sampled_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        let older = std::thread::spawn({
+            let host = host.clone();
+            move || host.inner.publish()
+        });
+        sampled_rx.recv().unwrap();
+
+        // The registry moves on and publisher B starts from the newer state.
+        host.create_space("new", "test-device", "/new", None, false)
+            .unwrap();
+        let newer = std::thread::spawn({
+            let host = host.clone();
+            move || host.inner.publish()
+        });
+        // Ungated, B finishes here and A's release below overwrites it.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        older.join().unwrap();
+        newer.join().unwrap();
+
+        let spaces = host.watch_spaces();
+        let ids: Vec<_> = spaces
+            .borrow()
+            .iter()
+            .map(|space| space.id.clone())
+            .collect();
+        assert!(
+            ids.contains(&"new".to_string()),
+            "stale publication won: {ids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sidebar_preferences_watch_preserves_explicit_empty_state() {
         use super::*;
@@ -1851,28 +2021,6 @@ mod tests {
         let acknowledgement = host.sidebar_preferences_snapshot();
         assert!(acknowledgement.revision > first_revision);
         assert_eq!(*preferences.borrow(), acknowledgement);
-        host.change_sidebar_pin(&harness_proto::SidebarPinChange::Section {
-            change: harness_proto::SidebarSectionChange::Create {
-                id: "focus".into(),
-                name: "Focus".into(),
-            },
-        })
-        .unwrap();
-        let sections = host.sidebar_preferences_snapshot();
-        assert!(sections.revision > acknowledgement.revision);
-        assert_eq!(sections.sections[0].name, "Focus");
-        assert_eq!(*preferences.borrow(), sections);
-        host.change_sidebar_pin(&harness_proto::SidebarPinChange::Section {
-            change: harness_proto::SidebarSectionChange::Collapse {
-                id: "focus".into(),
-                collapsed: true,
-            },
-        })
-        .unwrap();
-        let collapsed = host.sidebar_preferences_snapshot();
-        assert!(collapsed.revision > sections.revision);
-        assert!(collapsed.sections[0].collapsed);
-        assert_eq!(*preferences.borrow(), collapsed);
     }
 
     #[test]

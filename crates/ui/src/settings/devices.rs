@@ -14,7 +14,7 @@ use harness_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
-use crate::settings::widgets;
+use crate::settings::{self, widgets};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -61,14 +61,39 @@ pub enum UpdateAction {
     Check,
     /// Download and restart into this version.
     Update(String),
+    /// A download is running: a disabled "Downloading…" button.
+    Downloading,
+    /// Staged: restart into it, as the titlebar update control does.
+    Restart(String),
+    /// The download failed: try it again.
+    Retry(String),
     None,
 }
+
+/// How far this window's desktop update has come — the shell's update flow,
+/// published so the version card offers the same next step as the titlebar
+/// control instead of starting a download that is already running or done.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UpdatePhase {
+    #[default]
+    Idle,
+    Downloading,
+    Ready(String),
+    Failed(String),
+}
+
+/// The shell's [`UpdatePhase`], as a global the Devices page observes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedUpdatePhase(pub UpdatePhase);
+
+impl gpui::Global for SharedUpdatePhase {}
 
 /// The version card's status line and button. `desktop` = this install can
 /// update itself (the macOS app, the portable Windows package). Pure.
 pub fn update_summary(
     status: Option<&harness_update::UpdateStatus>,
     desktop: bool,
+    phase: &UpdatePhase,
     checking: bool,
     now: DateTime<Utc>,
 ) -> (String, UpdateAction) {
@@ -78,6 +103,28 @@ pub fn update_summary(
             UpdateAction::None,
         );
     };
+    let latest = status
+        .latest_version
+        .clone()
+        .filter(|_| status.update_available);
+    match (phase, latest) {
+        (UpdatePhase::Ready(version), _) => {
+            return (
+                format!("Harness v{version} is downloaded and ready to install."),
+                UpdateAction::Restart(version.clone()),
+            );
+        }
+        (UpdatePhase::Downloading, Some(latest)) => {
+            return (format!("Downloading v{latest}…"), UpdateAction::Downloading);
+        }
+        (UpdatePhase::Failed(message), Some(latest)) => {
+            return (
+                format!("Updating to v{latest} failed: {message}"),
+                UpdateAction::Retry(latest),
+            );
+        }
+        _ => {}
+    }
     if checking {
         return ("Checking for updates…".into(), UpdateAction::None);
     }
@@ -129,11 +176,13 @@ pub struct DevicesPage {
     check_task: Option<Task<()>>,
     desktop_update: bool,
     _observe: Subscription,
+    _observe_phase: Subscription,
 }
 
 impl DevicesPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        let observe_phase = cx.observe_global::<SharedUpdatePhase>(|_, cx| cx.notify());
         Self {
             state,
             scroll: widgets::PageScroll::default(),
@@ -147,6 +196,7 @@ impl DevicesPage {
             check_task: None,
             desktop_update: harness_update::detect_install().supports_desktop_update(),
             _observe: observe,
+            _observe_phase: observe_phase,
         }
     }
 
@@ -193,12 +243,29 @@ impl DevicesPage {
             .as_ref()
             .map(|status| status.current_version.clone())
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let phase = cx
+            .try_global::<SharedUpdatePhase>()
+            .map(|shared| shared.0.clone())
+            .unwrap_or_default();
         let (line, action) = update_summary(
             status.as_ref(),
             self.desktop_update,
+            &phase,
             self.checking.is_some(),
             Utc::now(),
         );
+        // The titlebar control's click: download, retry, or restart into the
+        // staged update (unsaved edits are resolved first, as there).
+        let start = |id: &'static str, label: String| {
+            popover::btn_primary(theme, &label)
+                .id(id)
+                .debug_selector(move || id.into())
+                .cursor_pointer()
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(crate::shell::StartAppUpdate), cx)
+                })
+                .into_any_element()
+        };
         let button = match action {
             UpdateAction::Check => Some(
                 popover::btn_ghost(theme, "Check for updates", "check-for-updates-fade")
@@ -206,13 +273,18 @@ impl DevicesPage {
                     .on_click(cx.listener(|page, _, _, cx| page.check_for_updates(cx)))
                     .into_any_element(),
             ),
-            UpdateAction::Update(latest) => Some(
-                popover::btn_primary(theme, &format!("Update to v{latest}"))
-                    .id("start-app-update")
-                    .cursor_pointer()
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::shell::StartAppUpdate), cx)
-                    })
+            UpdateAction::Update(latest) => {
+                Some(start("start-app-update", format!("Update to v{latest}")))
+            }
+            UpdateAction::Restart(_) => {
+                Some(start("restart-app-update", "Restart to update".into()))
+            }
+            UpdateAction::Retry(_) => Some(start("retry-app-update", "Try again".into())),
+            UpdateAction::Downloading => Some(
+                popover::btn_ghost(theme, "Downloading…", "app-update-downloading-fade")
+                    .id("app-update-downloading")
+                    .debug_selector(|| "app-update-downloading".into())
+                    .opacity(0.6)
                     .into_any_element(),
             ),
             UpdateAction::None => None,
@@ -231,6 +303,81 @@ impl DevicesPage {
             )
             .children(button)
             .into_any_element()
+    }
+
+    /// "Restart automatically to install updates", under the version card on
+    /// installs that update themselves.
+    fn render_auto_restart_row(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.desktop_update {
+            return None;
+        }
+        let env_on = harness_update::desktop_auto_update_enabled();
+        let on = env_on && settings::with_current(cx, |s| s.restart_to_install_updates);
+        let accent = theme.accent;
+        let description = if env_on {
+            "Once an update has downloaded, Harness restarts into it when no agent is running, \
+             nothing is unsaved and you've stepped away. Your windows, tabs and chats come back. \
+             Off, it installs when you quit."
+        } else {
+            "Automatic updates are off (HARNESS_AUTO_UPDATE=0)."
+        };
+        let toggle = widgets::toggle_switch(theme, on)
+            .id("restart-to-install-updates")
+            .debug_selector(|| "restart-to-install-updates".into())
+            .role(gpui::Role::Switch)
+            .aria_label("Restart automatically to install updates")
+            .aria_toggled(if on {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .tab_index(0)
+            .focus_visible(move |style| style.border_2().border_color(accent))
+            .when(!env_on, |el| el.opacity(0.45))
+            .when(env_on, |el| {
+                el.cursor_pointer().on_click(cx.listener(|_, _, _, cx| {
+                    settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                        s.restart_to_install_updates = !s.restart_to_install_updates;
+                    });
+                    cx.notify();
+                }))
+            });
+        Some(
+            widgets::card_row(theme, false)
+                .child(widgets::row_tile(theme, crate::icons::RESTART))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(widgets::row_title(
+                            theme,
+                            "Restart automatically to install updates",
+                        ))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .line_height(px(18.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(description)),
+                        ),
+                )
+                .child(toggle)
+                .into_any_element(),
+        )
+    }
+
+    /// App update QA: show the toggle as a desktop install would.
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_desktop_update(&mut self, cx: &mut Context<Self>) {
+        self.desktop_update = true;
+        cx.notify();
     }
 
     fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
@@ -633,6 +780,7 @@ impl Render for DevicesPage {
                                 devices_subtitle(workspace_scope),
                             ))
                             .child(self.render_version_card(&theme, cx))
+                            .children(self.render_auto_restart_row(&theme, cx))
                             .when_some(self.error.clone(), |el, message| {
                                 el.child(
                                     widgets::error_strip(&theme, message)
@@ -660,6 +808,7 @@ mod tests {
     #[test]
     fn version_card_offers_the_right_next_step() {
         let now = Utc::now();
+        let idle = UpdatePhase::Idle;
         let status = |latest: Option<&str>, available: bool, error: Option<&str>| {
             harness_update::UpdateStatus {
                 current_version: "0.2.92".into(),
@@ -671,17 +820,17 @@ mod tests {
         };
         let up_to_date = status(Some("0.2.92"), false, None);
         assert_eq!(
-            update_summary(Some(&up_to_date), true, false, now),
+            update_summary(Some(&up_to_date), true, &idle, false, now),
             ("Up to date · checked 2m ago".into(), UpdateAction::Check)
         );
         assert_eq!(
-            update_summary(Some(&up_to_date), true, true, now).1,
+            update_summary(Some(&up_to_date), true, &idle, true, now).1,
             UpdateAction::None,
             "no second check while one is running"
         );
         let newer = status(Some("0.2.93"), true, None);
         assert_eq!(
-            update_summary(Some(&newer), true, false, now),
+            update_summary(Some(&newer), true, &idle, false, now),
             (
                 "Harness v0.2.93 is available.".into(),
                 UpdateAction::Update("0.2.93".into())
@@ -689,11 +838,67 @@ mod tests {
         );
         let failed = status(None, false, Some("offline"));
         assert_eq!(
-            update_summary(Some(&failed), true, false, now),
+            update_summary(Some(&failed), true, &idle, false, now),
             ("Couldn't check for updates: offline".into(), UpdateAction::Check)
         );
-        assert_eq!(update_summary(Some(&newer), false, false, now).1, UpdateAction::None);
-        assert_eq!(update_summary(None, true, false, now).1, UpdateAction::None);
+        assert_eq!(
+            update_summary(Some(&newer), false, &idle, false, now).1,
+            UpdateAction::None
+        );
+        assert_eq!(
+            update_summary(None, true, &idle, false, now).1,
+            UpdateAction::None
+        );
+    }
+
+    #[test]
+    fn version_card_follows_the_download_the_titlebar_started() {
+        let now = Utc::now();
+        let newer = harness_update::UpdateStatus {
+            current_version: "0.2.134".into(),
+            latest_version: Some("0.2.135".into()),
+            update_available: true,
+            checked_at: Some(now.timestamp_millis()),
+            error: None,
+        };
+        let summary =
+            |phase: UpdatePhase, desktop| update_summary(Some(&newer), desktop, &phase, false, now);
+        assert_eq!(
+            summary(UpdatePhase::Downloading, true),
+            ("Downloading v0.2.135…".into(), UpdateAction::Downloading),
+            "no second download while one runs"
+        );
+        assert_eq!(
+            summary(UpdatePhase::Ready("0.2.135".into()), true),
+            (
+                "Harness v0.2.135 is downloaded and ready to install.".into(),
+                UpdateAction::Restart("0.2.135".into())
+            )
+        );
+        assert_eq!(
+            summary(UpdatePhase::Failed("offline".into()), true),
+            (
+                "Updating to v0.2.135 failed: offline".into(),
+                UpdateAction::Retry("0.2.135".into())
+            )
+        );
+        // A staged update still restarts even while a check is running.
+        assert_eq!(
+            update_summary(
+                Some(&newer),
+                true,
+                &UpdatePhase::Ready("0.2.135".into()),
+                true,
+                now
+            )
+            .1,
+            UpdateAction::Restart("0.2.135".into())
+        );
+        // Report-only installs never get a download button.
+        assert_eq!(
+            summary(UpdatePhase::Ready("0.2.135".into()), false).1,
+            UpdateAction::None
+        );
     }
 
     #[test]

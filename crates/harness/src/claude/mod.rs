@@ -33,8 +33,11 @@
 
 pub mod catalog;
 mod discovery;
+mod live_sessions;
 mod normalize;
+mod turn_interrupts;
 mod wire;
+mod workflow_tail;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -95,6 +98,8 @@ pub struct ClaudeHarness {
     initialize: discovery::InitializeCache,
     models_cache: crate::catalog::Catalog,
     workspace_commands: crate::skills::CommandDiscovery,
+    /// Live runs that can end just their current turn, by chat.
+    turn_interrupts: turn_interrupts::TurnInterrupts,
 }
 
 impl Default for ClaudeHarness {
@@ -106,6 +111,7 @@ impl Default for ClaudeHarness {
             initialize: discovery::InitializeCache::default(),
             models_cache: crate::catalog::Catalog::default(),
             workspace_commands: crate::skills::CommandDiscovery::default(),
+            turn_interrupts: turn_interrupts::TurnInterrupts::default(),
         }
     }
 }
@@ -378,6 +384,11 @@ impl Harness for ClaudeHarness {
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
     }
+    /// Steers inline their images (stream-json user frames take image
+    /// blocks), so an image send reaches the live process (#364).
+    fn steers_attachments(&self) -> bool {
+        true
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[
             ReasoningLevel::Low,
@@ -396,6 +407,11 @@ impl Harness for ClaudeHarness {
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {
         true
+    }
+    /// The CLI's `interrupt` control request ends the turn and leaves the
+    /// process, and its background tasks, running (#364).
+    fn interrupt_turn(&self, chat_id: &str) -> bool {
+        self.turn_interrupts.request(chat_id)
     }
 
     /// Credential and executable identity scopes both initialize and catalog caches.
@@ -510,6 +526,17 @@ impl ClaudeHarness {
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
+        // A replaced run's process may still be exiting: two processes on
+        // one session drop the new prompt (live_sessions.rs).
+        if let Some(resume) = request.resume.as_deref().filter(|_| !title_only)
+            && !live_sessions::wait_until_closed(resume, live_sessions::WAIT).await
+        {
+            tracing::warn!(
+                target: "harness_adapters::claude",
+                session = %resume,
+                "previous claude process still open; resuming anyway"
+            );
+        }
         let mut cmd = self.build_command(&exe, &request);
         if title_only {
             cmd.args([
@@ -569,6 +596,11 @@ impl ClaudeHarness {
         let _ = stdin_tx.send(StdinMsg::Line(first));
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
+        let turn_interrupt = controls
+            .origin
+            .as_ref()
+            .filter(|_| !title_only)
+            .map(|origin| self.turn_interrupts.register(&origin.chat_id));
         tokio::spawn(run_session(Session {
             title_only,
             child,
@@ -580,6 +612,7 @@ impl ClaudeHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
+            turn_interrupt,
         }));
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
@@ -705,6 +738,16 @@ struct Session {
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
+    /// Turn-only interrupts for this chat's run (see `turn_interrupts`).
+    turn_interrupt: Option<(turn_interrupts::Registration, mpsc::UnboundedReceiver<()>)>,
+}
+
+/// The next turn-interrupt request, or never for a run that can't take one.
+async fn next_turn_interrupt(rx: &mut Option<mpsc::UnboundedReceiver<()>>) -> Option<()> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The per-run event loop: one task multiplexing stdout frames, the steering
@@ -721,7 +764,14 @@ async fn run_session(session: Session) {
         interrupt_grace,
         kill_grace,
         stderr_tail,
+        turn_interrupt,
     } = session;
+    // The registration lives as long as this loop: the run takes turn
+    // interrupts until it ends.
+    let (_turn_registration, mut turn_interrupt_rx) = match turn_interrupt {
+        Some((registration, rx)) => (Some(registration), Some(rx)),
+        None => (None, None),
+    };
     let RunControls {
         request_input,
         mut steering,
@@ -731,12 +781,22 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     let mut norm = Normalizer::new();
+    // Held while this child lives, once its session id is known.
+    let mut registration: Option<live_sessions::Registration> = None;
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut any_done = false;
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
+    // A turn is running: the first prompt went in; each Done ends it and
+    // each steer starts the next. Only a running turn can be interrupted.
+    let mut turn_active = true;
+    // A turn-only interrupt was sent and the turn's Done hasn't come back.
+    let mut turn_interrupting = false;
+    let mut turn_interrupts_sent: u64 = 0;
+    // Workflow agents' own transcripts (see `workflow_tail`).
+    let (transcripts, transcript_reader) = workflow_tail::spawn(event_tx.clone());
 
     'main: loop {
         tokio::select! {
@@ -764,18 +824,53 @@ async fn run_session(session: Session) {
                         }
                         continue;
                     }
-                    for ev in norm.normalize(frame, interrupted) {
+                    let events = norm.normalize(frame, interrupted || turn_interrupting);
+                    if registration.is_none()
+                        && !title_only
+                        && let Some(id) = norm.session_id.as_deref()
+                    {
+                        registration = Some(live_sessions::register(id));
+                    }
+                    for ev in events {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
+                        // A turn the agent started itself (a background
+                        // subagent's wake) is a running turn too.
+                        if !is_done && !matches!(ev, AgentEvent::Usage { .. }) {
+                            turn_active = true;
+                        }
+                        // A workflow (or workflow agent) settle queues behind
+                        // its transcripts so no line lands after it.
+                        if let AgentEvent::Subagent { parent_tool_use_id, event } = &ev
+                            && matches!(event.as_ref(), AgentEvent::Done { .. })
+                            && norm.is_workflow_parent(parent_tool_use_id)
+                        {
+                            let _ = transcripts.send(workflow_tail::TailCmd::Settle(ev));
+                            continue;
+                        }
                         if event_tx.send(Ok(ev)).await.is_err() {
                             break 'main; // consumer gone — reap below
                         }
                         if is_done {
                             any_done = true;
+                            turn_active = false;
                             if interrupted {
                                 done_after_interrupt = true;
                                 break 'main;
                             }
+                            if turn_interrupting {
+                                // The CLI ended the turn and kept running:
+                                // its background tasks live on, so no signal.
+                                turn_interrupting = false;
+                                if let Some(handle) = escalation.take() {
+                                    handle.abort();
+                                }
+                            }
                         }
+                    }
+                    // After the frame's events: an agent's chip is out before
+                    // its transcript starts replaying.
+                    for (file, chip) in norm.take_workflow_transcripts() {
+                        let _ = transcripts.send(workflow_tail::TailCmd::Follow(file, chip));
                     }
                 }
                 Ok(None) => break 'main, // stdout EOF: the CLI exited
@@ -787,8 +882,15 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
+                    // Images ride the steer like the first prompt's: the live
+                    // process takes them, so an image send never replaces it.
+                    let images = load_image_blocks(&msg.attachments).await;
+                    let line = wire::user_message_line_with_images(
+                        &apply_ultrathink(reasoning, &msg.prompt),
+                        &images,
+                    );
                     let _ = stdin_tx.send(StdinMsg::Line(line));
+                    turn_active = true;
                     // The CLI consumes the queued line at its own step
                     // boundary; rotate the assistant message id so post-steer
                     // output folds into a fresh message.
@@ -809,9 +911,38 @@ async fn run_session(session: Session) {
                 }
             },
 
+            request = next_turn_interrupt(&mut turn_interrupt_rx), if !interrupted && !turn_interrupting => {
+                let Some(()) = request else {
+                    // The registry let go of this run: no more requests.
+                    turn_interrupt_rx = None;
+                    continue;
+                };
+                if !turn_active {
+                    continue; // between turns there is nothing to stop
+                }
+                turn_interrupting = true;
+                turn_interrupts_sent += 1;
+                let id = format!("int_turn_{turn_interrupts_sent}");
+                let _ = stdin_tx.send(StdinMsg::Line(wire::interrupt_request_line(&id)));
+                // A CLI that doesn't end the turn in time gets the same
+                // SIGTERM/SIGKILL fallback as a whole-run interrupt; the
+                // turn's Done aborts it.
+                if let Some(pid) = crate::process::signal_target(&child) {
+                    escalation = Some(tokio::spawn(async move {
+                        tokio::time::sleep(interrupt_grace).await;
+                        send_signal(&pid, Signal::Term);
+                        tokio::time::sleep(kill_grace).await;
+                        send_signal(&pid, Signal::Kill);
+                    }));
+                }
+            },
+
             _ = interrupt.cancelled(), if !interrupt_sent => {
                 interrupt_sent = true;
                 interrupted = true;
+                if let Some(handle) = escalation.take() {
+                    handle.abort(); // a pending turn interrupt's fallback
+                }
                 let _ = stdin_tx.send(StdinMsg::Line(wire::interrupt_request_line("int_1")));
                 // Escalate if the CLI doesn't wind down within the grace
                 // periods: SIGTERM (kills bash trees, runs SessionEnd hooks),
@@ -830,10 +961,23 @@ async fn run_session(session: Session) {
         }
     }
 
+    // Let the transcript reader finish what the agents already wrote (and
+    // forward its queued settles) before the run's own end.
+    drop(transcripts);
+    let mut transcript_reader = transcript_reader;
+    if tokio::time::timeout(Duration::from_secs(3), &mut transcript_reader)
+        .await
+        .is_err()
+    {
+        transcript_reader.abort();
+    }
+
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
-        if interrupted && !done_after_interrupt {
+        // A turn interrupt the CLI never acknowledged ends here too (its
+        // fallback signals took the process down): still an interrupt.
+        if (interrupted || turn_interrupting) && !done_after_interrupt {
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Interrupted,
@@ -856,6 +1000,8 @@ async fn run_session(session: Session) {
     }
 
     shutdown_child(&mut child, kill_grace).await;
+    // The child is gone: a resume of this session may start now.
+    drop(registration);
     if let Some(handle) = escalation {
         handle.abort();
     }
@@ -928,6 +1074,8 @@ fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
                 id: uuid::Uuid::new_v4().to_string(),
                 header: field(["header", "title"]).unwrap_or("Question").into(),
                 question: field(["question", "prompt"]).unwrap_or("").into(),
+                prefill: None,
+                multiline: false,
                 multi_select: ["multiSelect", "multi_select"]
                     .iter()
                     .find_map(|k| q.get(*k).and_then(Value::as_bool))

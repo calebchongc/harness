@@ -42,6 +42,7 @@ async fn exo_turn_runs_through_the_harness_bridge() {
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "summarize the repo".into(),
         harness: Some(HarnessId::Exo),
         model: Some("default".into()),

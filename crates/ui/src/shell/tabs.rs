@@ -86,7 +86,7 @@ impl Shell {
     /// these are the very keys the shortcuts table invites them to press) or
     /// underneath the add-space palette, stranding the overlay over a session
     /// they never picked.
-    pub(super) fn cycle_session(&mut self, forward: bool, cx: &mut Context<Self>) {
+    pub(super) fn cycle_session(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
             return;
         }
@@ -95,7 +95,7 @@ impl Shell {
         let order = self.sidebar_visible_order(cx);
         let selected = self.state.read(cx).selected_chat.clone();
         if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
-            self.open_chat(target, cx);
+            self.open_chat_in_tab(target, window, cx);
         }
     }
 
@@ -107,16 +107,30 @@ impl Shell {
         // split layout), unless a deep link or manual pick already landed.
         if !self.boot_restored && self.state.read(cx).chats_synced {
             self.boot_restored = true;
+            let has_draft = {
+                let composer = self.composer.read(cx);
+                !composer.input.read(cx).is_empty()
+                    || !composer.staged().is_empty()
+                    || !composer.staged_appshots().is_empty()
+            };
+            if has_draft && self.state.read(cx).selected_chat.is_none() {
+                // Content entered before sync is new-session intent too.
+                self.state.update(cx, |state, _| state.auto_selected = true);
+            }
             let restore = {
                 let state = self.state.read(cx);
-                let live = |id: &str| state.chats.iter().any(|c| c.id == id && !c.archived);
+                // Saved views may reference archived conversations. Only
+                // automatic recency fallback should filter them out.
+                let live = |id: &str| state.chats.iter().any(|c| c.id == id);
                 (state.selected_chat.is_none() && !state.auto_selected).then(|| {
                     (
                         self.settings.last_chat_id.clone().filter(|id| live(id)),
                         self.settings
                             .chat_layout
                             .as_ref()
-                            .and_then(|saved| chat_split::ChatSplit::from_saved(saved, live)),
+                            .and_then(|saved| chat_split::ChatSplit::from_saved(saved, |id| {
+                                live(id) && self.settings.last_chat_id.as_deref() != Some(id)
+                            })),
                         chat_tabs::restore_chat_tabs(
                             &self.settings.chat_tabs,
                             self.settings.chat_tab,
@@ -125,11 +139,21 @@ impl Shell {
                     )
                 })
             };
-            if let Some((last, layout, tabs)) = restore {
+            if let Some((mut last, mut layout, tabs)) = restore {
                 // The active tab's own layout is the one restored below.
-                if let Some((tabs, active)) = tabs {
-                    self.chat_tabs = tabs;
-                    self.chat_tab = active;
+                if let Some(restored) = tabs {
+                    if restored.tabs.len() >= 2 {
+                        self.chat_tabs = restored.tabs;
+                        self.chat_tab = restored.active;
+                    }
+                    // The saved active tab was empty and dropped: its live
+                    // chat and layout go with it, and the tab that took its
+                    // place loads as the live one.
+                    if let Some(tab) = restored.replace_live {
+                        last = tab.selected;
+                        layout = tab.split;
+                        self.set_space_filter(tab.project, cx);
+                    }
                 }
                 let restored_layout = layout.is_some();
                 self.chat_split = layout;
@@ -145,6 +169,10 @@ impl Shell {
                     });
                     return;
                 }
+            } else {
+                // Persist the manual selection/draft's actual layout, not
+                // the rejected saved layout that could return next launch.
+                self.sync_chat_panes(cx);
             }
         }
         let first = {
@@ -164,8 +192,11 @@ impl Shell {
         }
     }
 
-    /// Open a session from the sidebar: select it, the main area follows.
+    /// Replace the current tab/pane's session, as `/resume` requests.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if chat_split::existing_chat_selection(Some(chat_id.clone()), self.state.read(cx)).is_none() {
+            return;
+        }
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
@@ -181,7 +212,19 @@ impl Shell {
         if !matches!(self.route, Route::Chat) || self.state.read(cx).selected_chat.is_none() {
             return false;
         }
+        self.remember_closed_chat_tab(
+            self.chat_tab,
+            chat_tabs::ChatTab {
+                id: self.chat_tab_id,
+                split: self.chat_split.clone(),
+                selected: self.state.read(cx).selected_chat.clone(),
+                project: self.settings.space_filter.clone(),
+                draft: Some(self.current_canvas_draft(cx)),
+            },
+        );
+        self.chat_tab_id = uuid::Uuid::new_v4();
         self.open_new_session(cx);
+        self.remember_last_tab_canvas(cx);
         true
     }
 
@@ -282,9 +325,11 @@ impl Shell {
                         .device_name(&chat.device_id)
                         .unwrap_or("Unknown device");
                     (
-                        SharedString::from(transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )),
+                        SharedString::from(transcript::single_line(&crate::state::chat_label(
+                            chat,
+                            &state.provisional_title(),
+                            "New session",
+                        ))),
                         Some(SharedString::from(format!("{folder} @ {device}"))),
                         chat.config.as_ref().map(|c| c.harness),
                         false,
@@ -298,7 +343,9 @@ impl Shell {
         // session is selected (`render_titlebar_cluster`) — this row budgets
         // one button slot so the title never sits under it.
         let sidebar_now = self.sidebar_now();
-        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+        // The update control, when shown, takes the next slot after it.
+        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx)
+            + self.titlebar_update_slot(cx);
 
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control

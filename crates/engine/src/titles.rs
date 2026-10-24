@@ -128,8 +128,31 @@ impl TitleGenerator {
                 .await
             {
                 Ok(renamed) if &renamed != branch => {
-                    if let Err(err) = self.inner.workspace.set_chat_branch(chat_id, &renamed) {
-                        tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
+                    // Refresh the checkout identity as well as the label:
+                    // PR discovery trusts source_context, not the scalar branch.
+                    match self
+                        .inner
+                        .repos
+                        .capture_source_context(std::path::Path::new(chat_cwd))
+                        .await
+                    {
+                        Ok(context) => {
+                            if let Err(err) = self
+                                .inner
+                                .workspace
+                                .set_chat_source_context(chat_id, &context)
+                            {
+                                tracing::warn!(chat = %chat_id, error = %err, "chat source update failed");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(chat = %chat_id, error = %err, "renamed worktree source capture failed");
+                            if let Err(err) =
+                                self.inner.workspace.set_chat_branch(chat_id, &renamed)
+                            {
+                                tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
+                            }
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -191,6 +214,7 @@ impl TitleGenerator {
         );
         for attempt in 0..=RETRY_DELAYS_MS.len() {
             let request = RunRequest {
+                turn_origin: Default::default(),
                 prompt: title_prompt.clone(),
                 harness: Some(harness_id),
                 model: model.clone(),
@@ -359,6 +383,7 @@ mod tests {
             ],
         };
         let request = RunRequest {
+            turn_origin: Default::default(),
             prompt: "Title only".into(),
             harness: None,
             model: None,

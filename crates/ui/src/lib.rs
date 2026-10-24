@@ -12,6 +12,7 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — harness pulse loader, gradient spinner, boot splash.
 
+mod agent_message;
 pub mod app_menus;
 pub mod appearance;
 pub mod appshots;
@@ -20,7 +21,9 @@ pub mod badges;
 pub mod browser;
 pub mod change_requests;
 pub mod changes;
+pub(crate) mod chatgpt_plan;
 pub mod codegraff_jobs;
+pub mod codegraff_runners;
 pub mod codegraff_sandboxes;
 mod comment_ui;
 pub mod comments;
@@ -63,6 +66,7 @@ pub(crate) mod screen_access;
 pub mod settings;
 pub mod shell;
 pub mod sound;
+pub mod stall_watch;
 pub(crate) mod starters;
 pub mod state;
 pub(crate) mod surface_chrome;
@@ -73,6 +77,7 @@ pub mod theme_library;
 pub mod transcript;
 mod transcript_paint_check;
 pub mod typography;
+pub mod visuals;
 mod workspace_links;
 
 use std::path::PathBuf;
@@ -204,6 +209,11 @@ pub fn run_app(config: UiConfig) {
             ui_settings.git_history_author_display,
             cx,
         );
+        motion::init(
+            ui_settings.reduce_motion,
+            ui_settings.pause_animations_in_background,
+            cx,
+        );
         composer::init(cx, ui_settings.composer_send_behavior);
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);
@@ -212,6 +222,7 @@ pub fn run_app(config: UiConfig) {
 
         let state = cx.new(|_| state::AppState::new());
         perf_stats::start(data_dir.clone(), state.clone(), cx);
+        stall_watch::start(data_dir.join("logs"), cx);
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
@@ -263,6 +274,12 @@ pub fn run_app(config: UiConfig) {
             state: state.clone(),
             boot: config.boot(),
         });
+        // A restart into an update left a note: confirm the version once, and
+        // come back behind the app the person was using if it restarted while
+        // they were away from Harness.
+        let relaunch = shell::take_relaunch_marker(&config.boot().data_dir);
+        let relaunched_in_background = relaunch.as_ref().is_some_and(|marker| marker.background);
+        cx.set_global(shell::UpdateRelaunched(relaunch));
         open_main_window(state, config.boot(), cx);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         start_appshot_service(config.boot().data_dir, cx);
@@ -274,7 +291,9 @@ pub fn run_app(config: UiConfig) {
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
-        cx.activate(true);
+        if !relaunched_in_background {
+            cx.activate(true);
+        }
     });
 }
 
@@ -297,7 +316,7 @@ fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx
         Some(shell) => {
             let _ = shell.update(cx, |shell, window, cx| {
                 window.activate_window();
-                shell.open_chat(chat_id, cx);
+                shell.open_chat_preserving_tabs(chat_id, cx);
             });
         }
         None => state.update(cx, |state, cx| state.select_chat(Some(chat_id), cx)),

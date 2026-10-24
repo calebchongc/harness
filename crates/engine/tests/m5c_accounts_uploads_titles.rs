@@ -722,7 +722,29 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .set_chat_branch(chat_id, &worktree.branch)
         .expect("set branch");
 
+    let identity = core
+        .repos
+        .checkout_identity(Path::new(&worktree.path))
+        .await
+        .unwrap();
+    let original_context = harness_proto::ConversationSourceContext {
+        checkout_id: identity.id.clone(),
+        repo_root: identity.root.to_string_lossy().into_owned(),
+        cwd: worktree.path.clone(),
+        branch: worktree.branch.clone(),
+        head_sha: core
+            .repos
+            .head_sha(Path::new(&worktree.path))
+            .await
+            .unwrap(),
+        observed_at: chrono::Utc::now(),
+    };
+    core.workspace
+        .set_chat_source_context(chat_id, &original_context)
+        .unwrap();
+
     let request = harness_proto::RunRequest {
+        turn_origin: Default::default(),
         prompt: "please fix the login flow".into(),
         harness: None,
         model: None,
@@ -752,6 +774,17 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));
     // Branch renamed from the title, chat row updated to match.
     assert_eq!(chat.branch.as_deref(), Some("harness/fix-login-flow"));
+    let context = chat
+        .source_context
+        .as_ref()
+        .expect("renamed source context");
+    assert_eq!(context.branch, "harness/fix-login-flow");
+    assert_eq!(context.cwd, original_context.cwd);
+    assert_eq!(context.repo_root, original_context.repo_root);
+    assert_eq!(context.checkout_id, original_context.checkout_id);
+    assert_eq!(context.head_sha, original_context.head_sha);
+    assert!(context.observed_at >= original_context.observed_at);
+    assert_eq!(chat.checkout_id.as_deref(), Some(identity.id.as_str()));
     let head = tokio::process::Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(&worktree.path)
@@ -768,6 +801,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .rename_chat(chat_id, "My Custom Name")
         .expect("rename");
     let request = harness_proto::RunRequest {
+        turn_origin: Default::default(),
         prompt: "another request".into(),
         harness: None,
         model: None,

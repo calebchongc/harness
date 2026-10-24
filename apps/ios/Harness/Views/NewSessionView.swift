@@ -25,18 +25,26 @@ struct NewSessionView: View {
     @State private var showTraitPicker = false
     @State private var showOptionPicker: ModelOptionInfo?
     @State private var showRefPicker = false
+    /// The last refused checkout from the ref picker (#424).
+    @State private var refFailure: RefCheckoutFailure?
     @State private var showCheckoutPicker = false
     @State private var attachments: [StagedAttachment] = []
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPhotoPicker = false
     @State private var attachError: String?
-    /// Live harness list from the selected device (Settings → Agents gate);
-    /// static pair until it loads.
+    /// Only agents actually discovered on this device are offered.
     @State private var liveHarnesses: [HarnessInfo]?
-    /// Live per-harness catalogs from the selected device (static fallback).
+    /// Live or cached metadata, scoped to the execution device.
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var catalogsLoading = true
+    @State private var catalogRetry = 0
+    @State private var confirmedHarnesses: [HarnessInfo]?
+    @State private var confirmedCatalogs: [String: [ModelInfo]] = [:]
     @State private var optionSelections: [String: String] = [:]
-    @State private var refs: [RepoRef] = []
+    /// Never expose a previous host's metadata during a destination change.
+    @State private var catalogDevice: String?
+    @State private var refCatalog = RefCatalogState()
+    @State private var refsRetry = 0
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
     @State private var busy = false
@@ -72,20 +80,37 @@ struct NewSessionView: View {
     }
 
     private var harnesses: [HarnessInfo] {
-        liveHarnesses ?? HarnessCatalog.harnesses
+        catalogDevice == deviceId ? (liveHarnesses ?? []) : []
     }
 
-    private var models: [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+    private var scopedCatalogs: [String: [ModelInfo]] {
+        catalogDevice == deviceId ? catalogs : [:]
+    }
+
+    private var models: [ModelInfo] { scopedCatalogs[harness] ?? [] }
+
+    private var selectionUnavailable: Bool {
+        guard catalogDevice == deviceId else { return false }
+        return HarnessCatalog.selectionUnavailable(harness: harness, modelId: selectedModel.id,
+            liveHarnesses: confirmedHarnesses, liveModels: confirmedCatalogs[harness])
     }
 
     private var selectedModel: ModelInfo {
-        HarnessCatalog.resolveExisting(modelId: storedModel, in: models)
-            ?? models.first
-            ?? HarnessCatalog.defaultModel(for: harness)
+        if storedModel.isEmpty, models.isEmpty {
+            return ModelInfo(id: "", label: catalogsLoading ? "Loading models…" : "Select model",
+                             description: nil, reasoningLevels: [])
+        }
+        // Catalog hydration may add metadata, but must never replace a saved
+        // model with a static default (including in the config sent by Send).
+        return HarnessCatalog.resolve(modelId: storedModel.isEmpty ? nil : storedModel,
+                               in: models, harness: harness)
     }
 
     private var reasoning: String? {
+        guard !selectedModel.id.isEmpty else { return nil }
+        if HarnessCatalog.resolveExisting(modelId: selectedModel.id, in: models) == nil {
+            return storedReasoning.isEmpty ? nil : storedReasoning
+        }
         if selectedModel.reasoningLevels.isEmpty { return nil }
         if selectedModel.reasoningLevels.contains(storedReasoning) { return storedReasoning }
         return HarnessCatalog.defaultReasoning(for: selectedModel)
@@ -168,6 +193,7 @@ struct NewSessionView: View {
         }
         .background(Theme.bg.ignoresSafeArea())
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
+        .onChange(of: space?.id) { refFailure = nil }
         .navigationTitle("New session")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(removing: .title)  // the leading header owns the bar
@@ -199,7 +225,9 @@ struct NewSessionView: View {
             SessionHostPickerSheet(selectedDeviceId: deviceId) { selectedHostId = $0 }
         }
         .sheet(isPresented: $showRefPicker) {
-            RefPickerSheet(refs: refs, selected: selectedRef) { ref in
+            RefPickerSheet(refs: refs, selected: selectedRef, loading: refsLoading,
+                           loadError: refCatalog.scope == refsScope ? refCatalog.error : nil,
+                           onRetry: { refsRetry += 1 }) { ref in
                 await pickRef(ref)
             }
         }
@@ -209,41 +237,67 @@ struct NewSessionView: View {
                 pickCheckout(kind)
             }
         }
-        .task(id: space?.id) {
-            // Load refs for the branch chip (git spaces only).
-            guard let space, space.gitDetected else { return }
-            if let loaded = await model.listRefs(space: space) {
-                refs = loaded
-                if selectedRef == nil {
-                    selectedRef = loaded.first(where: \.current)?.name ?? loaded.first?.name
+        .task(id: "\(refsScope ?? "")|\(deviceId.map(model.deviceOnline) ?? false)|\(refsRetry)") {
+            guard let space, space.gitDetected else {
+                refCatalog.clear()
+                selectedRef = nil
+                return
+            }
+            if refCatalog.scope != refsScope {
+                selectedRef = nil
+                checkoutKind = .local
+            }
+            await loadRefs(for: space)
+        }
+        .task(id: "\(deviceId ?? "")|\(deviceId.map(model.deviceOnline) ?? false)|\(catalogRetry)") {
+            guard let deviceId else {
+                liveHarnesses = nil
+                catalogs = [:]
+                confirmedHarnesses = nil
+                confirmedCatalogs = [:]
+                optionSelections = [:]
+                catalogDevice = nil
+                catalogsLoading = false
+                return
+            }
+            if catalogDevice != deviceId {
+                liveHarnesses = DocDisk.loadHarnesses(deviceId: deviceId)
+                catalogs = [:]
+                confirmedHarnesses = nil
+                confirmedCatalogs = [:]
+                optionSelections = [:]
+                catalogDevice = deviceId
+                if let cached = DocDisk.loadModels(deviceId: deviceId, harness: harness), !cached.isEmpty {
+                    catalogs[harness] = cached
                 }
             }
-        }
-        .task(id: "\(deviceId ?? "")|\(deviceId.map(model.deviceOnline) ?? false)") {
-            // Live harness list + a model catalog per harness, all from the
-            // device that will run the session (the picker shows one sectioned
-            // list across harnesses, so it needs every catalog up front).
-            // Keyed on reachability too: opened offline, it reloads once the
-            // device comes back instead of staying on the fallback.
-            liveHarnesses = nil
-            catalogs = [:]
-            optionSelections = [:]
-            guard let deviceId else { return }
-            let list = await model.listHarnesses(deviceId: deviceId)
+            // Reconnect and explicit retry preserve rows/picks. Presence is
+            // advisory: a stale offline beat must not suppress a manual retry.
+            catalogsLoading = true
+            let result = await model.listHarnesses(deviceId: deviceId)
             guard !Task.isCancelled else { return }
+            let list = result.items
             liveHarnesses = list
-            if !list.contains(where: { $0.id == harness }), let first = list.first {
+            confirmedHarnesses = result.isLive ? list : nil
+            if storedModel.isEmpty, !list.contains(where: { $0.id == harness }), let first = list.first {
                 harness = first.id
             }
-            await withTaskGroup(of: (String, [ModelInfo]).self) { group in
+            await withTaskGroup(of: (String, DeviceCatalog<ModelInfo>).self) { group in
                 for h in list {
+                    if catalogs[h.id] == nil, let cached = DocDisk.loadModels(deviceId: deviceId, harness: h.id),
+                       !cached.isEmpty {
+                        catalogs[h.id] = cached
+                    }
                     group.addTask { (h.id, await model.listModels(deviceId: deviceId, harness: h.id)) }
                 }
                 for await (id, catalog) in group {
                     guard !Task.isCancelled else { return }
-                    catalogs[id] = catalog
+                    catalogs[id] = catalog.items
+                    confirmedCatalogs[id] = catalog.isLive ? catalog.items : nil
                 }
             }
+            guard !Task.isCancelled else { return }
+            catalogsLoading = false
         }
         .sheet(isPresented: $showPicker) {
             ModelPickerSheet(harness: $harness, modelId: Binding(
@@ -252,7 +306,9 @@ struct NewSessionView: View {
             ), reasoning: Binding(
                 get: { reasoning },
                 set: { storedReasoning = $0 ?? "" }
-            ), harnesses: harnesses, catalogs: catalogs)
+            ), harnesses: harnesses, catalogs: scopedCatalogs,
+               catalogsLoading: catalogsLoading || catalogDevice != deviceId,
+               onRetry: { catalogRetry += 1 })
         }
         .sheet(isPresented: $showTraitPicker) {
             TraitPickerSheet(reasoning: Binding(
@@ -266,8 +322,7 @@ struct NewSessionView: View {
                 set: { optionSelections[option.id] = $0 }
             ))
         }
-        .photosPicker(isPresented: $showPhotoPicker, selection: $pickerItems,
-                      maxSelectionCount: 8, matching: .images)
+        .themedPhotosPicker(isPresented: $showPhotoPicker, selection: $pickerItems)
         .onChange(of: draft) { _, new in
             DraftStore.save(new, for: DraftStore.newSessionKey(destination))
         }
@@ -292,6 +347,13 @@ struct NewSessionView: View {
 
     private var composer: some View {
         VStack(spacing: 6) {
+            if selectionUnavailable {
+                Text("Selected agent or model is unavailable on this device. Choose another model.")
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.warning)
+                    .padding(.horizontal, 24)
+                    .accessibilityIdentifier("model-selection-unavailable")
+            }
             if let attachError {
                 Text(attachError)
                     .font(Theme.sans(12))
@@ -300,10 +362,20 @@ struct NewSessionView: View {
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            if let refFailure {
+                Text(refFailure.summary)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.danger)
+                    .lineLimit(2)
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("session-ref-error")
+            }
             ComposerShell(
                 draft: $draft,
                 placeholder: "Do anything…",
-                sendEnabled: deviceId != nil,
+                sendEnabled: deviceId != nil && !selectedModel.id.isEmpty && !selectionUnavailable
+                    && (refsScope == nil || refCatalog.scope == refsScope),
                 showStop: false,
                 busy: busy,
                 alwaysExpanded: true,
@@ -379,6 +451,32 @@ struct NewSessionView: View {
 
     // MARK: Checkout model (pickers.rs port)
 
+    private var refsScope: String? {
+        guard let space, space.gitDetected else { return nil }
+        return "\(space.id)/\(space.deviceId)/\(space.path)"
+    }
+
+    private var refs: [RepoRef] {
+        refCatalog.scope == refsScope ? refCatalog.items : []
+    }
+
+    private var refsLoading: Bool {
+        refsScope != nil && (refCatalog.scope != refsScope || refCatalog.loading)
+    }
+
+    private func loadRefs(for space: Space) async {
+        let scope = "\(space.id)/\(space.deviceId)/\(space.path)"
+        let request = refCatalog.begin(scope: scope)
+        let loaded = await model.listRefs(space: space)
+        guard !Task.isCancelled, refsScope == scope else { return }
+        guard refCatalog.finish(request, items: loaded,
+            failure: "Couldn't load refs from the device. Check its connection and try again.") else { return }
+        if selectedRef == nil, let loaded {
+            // Only a reported current ref can name the current checkout.
+            selectedRef = loaded.first(where: \.current)?.name
+        }
+    }
+
     private var selectedRefRow: RepoRef? {
         refs.first { $0.name == selectedRef }
     }
@@ -397,7 +495,7 @@ struct NewSessionView: View {
 
     /// ref_label: "From <ref>" only when a NEW worktree will be created off it.
     private var refLabel: String {
-        guard let name = selectedRef else { return "Select ref" }
+        guard refCatalog.scope == refsScope, let name = selectedRef else { return "Select ref" }
         return checkoutKind == .newWorktree ? "From \(name)" : name
     }
 
@@ -405,6 +503,7 @@ struct NewSessionView: View {
     /// base picks just record; a plain non-current ref in Local mode CHECKS
     /// OUT the space folder (it must never silently flip the mode).
     private func pickRef(_ row: RepoRef) async -> String? {
+        refFailure = nil
         if row.worktreePath != nil {
             selectedRef = row.name
             checkoutKind = .local
@@ -415,12 +514,17 @@ struct NewSessionView: View {
             return nil
         }
         guard let space else { return nil }
+        let scope = refsScope
+        let kept = selectedRef
         let error = await model.switchSpaceRef(space: space, refName: row.name)
+        guard !Task.isCancelled, refsScope == scope else {
+            return "The destination changed. Choose the ref again."
+        }
+        // Outlives the sheet: closing it mid-checkout must not lose the reason.
+        refFailure = error.map { RefCheckoutFailure(ref: row.name, reason: $0, kept: kept) }
         if error == nil {
             selectedRef = row.name
-            if let reloaded = await model.listRefs(space: space) {
-                refs = reloaded
-            }
+            await loadRefs(for: space)
         }
         return error
     }
@@ -436,7 +540,8 @@ struct NewSessionView: View {
     }
 
     private var canSend: Bool {
-        guard !busy, deviceId != nil else { return false }
+        guard !busy, deviceId != nil, !selectedModel.id.isEmpty, !selectionUnavailable,
+              refsScope == nil || refCatalog.scope == refsScope else { return false }
         return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !attachments.isEmpty
     }
@@ -629,26 +734,65 @@ struct ModelPickerSheet: View {
     @Binding var reasoning: String?
     /// True when reconfiguring a live chat: the harness can't change mid-chat.
     var lockedHarness = false
-    /// Harness sections to offer (the device's live list; static fallback).
+    /// Only host-discovered or per-host cached agents are offered.
     var harnesses: [HarnessInfo] = []
-    /// Live per-harness catalogs from the device (static fallback when absent).
+    /// Live or cached metadata; a missing entry is not a static default.
     var catalogs: [String: [ModelInfo]] = [:]
+    var catalogsLoading = false
+    var onRetry: (() -> Void)?
 
     private func models(for harness: String) -> [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+        catalogs[harness] ?? []
     }
 
     private var sections: [HarnessInfo] {
         if lockedHarness {
             return [HarnessInfo(id: harness, label: HarnessCatalog.label(for: harness))]
         }
-        return harnesses.isEmpty ? HarnessCatalog.harnesses : harnesses
+        return harnesses
     }
 
     /// Accordion state: which harness sections show their models. Seeded with
     /// the current harness — with several agents enabled a flat list of every
     /// catalog is unmanageable (t3's collapsible provider folds).
     @State private var openSections: Set<String> = []
+    @State private var query = ""
+    /// The selection this opening compares against for the top-right control.
+    @State private var baseline: SelectionBaseline<ModelSelection>
+
+    init(harness: Binding<String>, modelId: Binding<String>, reasoning: Binding<String?>,
+         lockedHarness: Bool = false, harnesses: [HarnessInfo] = [],
+         catalogs: [String: [ModelInfo]] = [:], catalogsLoading: Bool = false,
+         onRetry: (() -> Void)? = nil) {
+        self._harness = harness
+        self._modelId = modelId
+        self._reasoning = reasoning
+        self.lockedHarness = lockedHarness
+        self.harnesses = harnesses
+        self.catalogs = catalogs
+        self.catalogsLoading = catalogsLoading
+        self.onRetry = onRetry
+        self._baseline = State(initialValue: SelectionBaseline(
+            ModelSelection(harness: harness.wrappedValue, modelId: modelId.wrappedValue)))
+    }
+
+    private var searching: Bool { !query.trimmingCharacters(in: .whitespaces).isEmpty }
+
+    /// Models in `harness` matching the search (all of them when not searching).
+    private func shown(for harness: String) -> [ModelInfo] {
+        let needle = query.trimmingCharacters(in: .whitespaces)
+        guard !needle.isEmpty else { return models(for: harness) }
+        return models(for: harness).filter { m in
+            [m.label, m.id, m.description ?? ""].contains { $0.localizedCaseInsensitiveContains(needle) }
+        }
+    }
+
+    /// While searching, only sections with a match, each open.
+    private var shownSections: [HarnessInfo] {
+        searching ? sections.filter {
+            !shown(for: $0.id).isEmpty || (catalogsLoading && catalogs[$0.id] == nil)
+        } : sections
+    }
 
     var body: some View {
         NavigationStack {
@@ -656,15 +800,53 @@ struct ModelPickerSheet: View {
                 VStack(alignment: .leading, spacing: 22) {
                     VStack(alignment: .leading, spacing: 4) {
                         SheetLabel("Model")
-                        ForEach(sections) { h in
+                        if let onRetry, !catalogsLoading {
+                            Button("Refresh models", action: onRetry)
+                                .font(Theme.sans(13))
+                                .accessibilityIdentifier("model-picker-retry")
+                        }
+                        if !modelId.isEmpty, selectedModel == nil {
+                            Text("Current selection: \(modelId)")
+                                .font(Theme.sans(13))
+                                .foregroundStyle(Theme.textMuted)
+                                .accessibilityIdentifier("model-picker-current")
+                        }
+                        if sections.isEmpty {
+                            if catalogsLoading {
+                                ProgressView("Loading agents…")
+                                    .accessibilityIdentifier("model-picker-loading")
+                            } else {
+                                Text("No agents available from this device. Check its connection and enabled agents.")
+                                    .font(Theme.sans(13))
+                                    .foregroundStyle(Theme.textMuted)
+                                    .accessibilityIdentifier("model-picker-unavailable")
+                            }
+                        }
+                        if searching, shownSections.isEmpty, !catalogsLoading, !sections.isEmpty {
+                            Text("No models match \u{201C}\(query)\u{201D}")
+                                .font(Theme.sans(13))
+                                .foregroundStyle(Theme.textFaint)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 28)
+                        }
+                        ForEach(shownSections) { h in
                             if sections.count > 1 {
                                 sectionHeader(h)
                             }
-                            if sections.count == 1 || openSections.contains(h.id) {
-                                ForEach(models(for: h.id)) { m in
+                            if sections.count == 1 || searching || openSections.contains(h.id) {
+                                if catalogs[h.id] == nil, catalogsLoading {
+                                    ProgressView("Loading models…")
+                                        .accessibilityIdentifier("model-picker-loading")
+                                } else if models(for: h.id).isEmpty {
+                                    Text("No models available from this device. Check its connection and model settings.")
+                                        .font(Theme.sans(13))
+                                        .foregroundStyle(Theme.textMuted)
+                                        .accessibilityIdentifier("model-picker-unavailable")
+                                }
+                                ForEach(shown(for: h.id)) { m in
                                     PickRow(title: m.label,
                                             subtitle: m.description,
-                                            selected: harness == h.id && m.id == modelId) {
+                                            selected: harness == h.id && m.id == selectedModel?.id) {
                                         select(harness: h.id, model: m)
                                     }
                                 }
@@ -672,6 +854,7 @@ struct ModelPickerSheet: View {
                         }
                     }
                     .onAppear { openSections = [harness] }
+                    .onChange(of: harness) { _, value in openSections.insert(value) }
                 }
                 .padding(20)
                 .padding(.bottom, 12)
@@ -679,22 +862,28 @@ struct ModelPickerSheet: View {
             .background(SheetStyle.panel)
             .navigationTitle("Select model")
             .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always),
+                        prompt: "Search models")
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
-                    }
-                    .accessibilityLabel("Close")
-                }
+                SheetConfirmItem(changed: selectionChanged,
+                                 identifier: "model-picker-confirm") { dismiss() }
             }
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
         .harnessAppearance()
+        .onChange(of: currentSelection) { _, value in baseline.hydrated(to: value) }
+    }
+
+    private var currentSelection: ModelSelection {
+        ModelSelection(harness: harness, modelId: modelId)
+    }
+
+    private var selectionChanged: Bool {
+        baseline.changed(to: currentSelection) {
+            HarnessCatalog.sameRow($0, $1, catalogs: catalogs)
+        }
     }
 
     private var selectedModel: ModelInfo? {
@@ -737,6 +926,7 @@ struct ModelPickerSheet: View {
 
     private func select(harness harnessId: String, model m: ModelInfo) {
         UISelectionFeedbackGenerator().selectionChanged()
+        baseline.picked()
         if harness != harnessId {
             harness = harnessId
         }
@@ -757,6 +947,15 @@ struct TraitPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var reasoning: String?
     let levels: [String]
+    @State private var initialReasoning: String?
+
+    init(reasoning: Binding<String?>, levels: [String]) {
+        self._reasoning = reasoning
+        self.levels = levels
+        self._initialReasoning = State(initialValue: reasoning.wrappedValue)
+    }
+
+    private var selectionChanged: Bool { reasoning != initialReasoning }
 
     var body: some View {
         NavigationStack {
@@ -776,18 +975,11 @@ struct TraitPickerSheet: View {
                 .padding(.bottom, 12)
             }
             .background(SheetStyle.panel)
-            .navigationTitle("Traits")
+            .navigationTitle("Reasoning")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .semibold))
-                    }
-                    .accessibilityLabel("Close")
-                }
+                SheetConfirmItem(changed: selectionChanged,
+                                 identifier: "reasoning-picker-confirm") { dismiss() }
             }
         }
         .presentationDetents([.medium, .large])
@@ -921,6 +1113,42 @@ struct PickRow: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(SheetRowButtonStyle())
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+// MARK: - Picker sheet confirmation
+
+/// A picker sheet's top-right control: an X (Close) while the selection
+/// matches the one the sheet opened with, and a checkmark (Done) once it
+/// differs. The checkmark uses the selected PickRow's colors — `Theme.text`
+/// circle, `Theme.bg` tick — drawn as an original-color palette symbol so
+/// toolbar tinting can't shift them (#407, #416).
+struct SheetConfirmItem: ToolbarContent {
+    let changed: Bool
+    let identifier: String
+    let action: () -> Void
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .confirmationAction) {
+            Button(action: action) {
+                if changed {
+                    Image(systemName: "checkmark.circle.fill")
+                        .renderingMode(.original)
+                        .resizable()
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(Theme.bg, Theme.text)
+                        .frame(width: 44, height: 44)
+                } else {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(changed ? "Done" : "Close")
+            .accessibilityIdentifier(identifier)
+        }
+        .sharedBackgroundVisibility(changed ? .hidden : .automatic)
     }
 }
 
@@ -928,47 +1156,82 @@ struct PickRow: View {
 
 /// Base-ref selector (the desktop footer's branch popover): branch rows with
 /// current-checkout / worktree markers. Picks that require a git checkout run
-/// inline — a spinner on the row, git's error surfaced in place on failure
-/// (dirty tree, held ref), success dismisses.
+/// inline — a spinner on the row, git's error pinned above the list on
+/// failure (dirty tree, held ref) with the old selection kept, success
+/// dismisses.
 struct RefPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     let refs: [RepoRef]
     let selected: String?
+    var loading = false
+    var loadError: String?
+    var onRetry: () -> Void = {}
     /// Returns an error message to keep the sheet open, or nil to close.
     let onPick: (RepoRef) async -> String?
 
     @State private var switching: String?
-    @State private var error: String?
+    @State private var failure: RefCheckoutFailure?
+    @State private var query = ""
+
+    private var shownRefs: [RepoRef] {
+        let needle = query.trimmingCharacters(in: .whitespaces)
+        guard !needle.isEmpty else { return refs }
+        return refs.filter { $0.name.localizedCaseInsensitiveContains(needle) }
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     SheetLabel("Ref")
-                    if refs.isEmpty {
-                        Text("Loading refs from the device…")
+                    if loading {
+                        ProgressView(refs.isEmpty ? "Loading refs from the device…" : "Refreshing refs…")
+                            .accessibilityIdentifier("refs-loading")
+                    }
+                    if let loadError {
+                        Text(loadError)
+                            .font(Theme.sans(13))
+                            .foregroundStyle(Theme.danger)
+                            .accessibilityIdentifier("refs-load-error")
+                        Button("Retry", action: onRetry)
+                            .disabled(loading)
+                            .accessibilityIdentifier("refs-retry")
+                    }
+                    if refs.isEmpty, !loading, loadError == nil {
+                        Text("No refs available. This repository may not have a commit yet.")
+                            .font(Theme.sans(13))
+                            .foregroundStyle(Theme.textFaint)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 28)
+                            .accessibilityIdentifier("refs-empty")
+                        Button("Retry", action: onRetry)
+                            .accessibilityIdentifier("refs-retry")
+                    } else if !refs.isEmpty, shownRefs.isEmpty {
+                        Text("No refs match \u{201C}\(query)\u{201D}")
                             .font(Theme.sans(13))
                             .foregroundStyle(Theme.textFaint)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 28)
                     } else {
-                        ForEach(refs, id: \.name) { ref in
+                        ForEach(shownRefs, id: \.name) { ref in
                             row(ref)
                         }
-                    }
-                    if let error {
-                        Text(error)
-                            .font(Theme.sans(12.5))
-                            .foregroundStyle(Theme.danger)
-                            .padding(.horizontal, 4)
-                            .padding(.top, 4)
                     }
                 }
                 .padding(20)
             }
+            // Pinned, not after the rows: a long list scrolled the old inline
+            // error out of the medium detent, so a refusal looked like a stall.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if let failure {
+                    failureBanner(failure)
+                }
+            }
             .background(SheetStyle.panel)
             .navigationTitle("Select ref")
             .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always),
+                        prompt: "Search branches and tags")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
@@ -994,18 +1257,63 @@ struct RefPickerSheet: View {
                 selected: ref.name == selected) {
             guard switching == nil else { return }
             UISelectionFeedbackGenerator().selectionChanged()
-            error = nil
+            failure = nil
             switching = ref.name
+            let kept = selected
             Task { @MainActor in
                 let result = await onPick(ref)
                 switching = nil
                 if let result {
-                    error = result
+                    let refused = RefCheckoutFailure(ref: ref.name, reason: result, kept: kept)
+                    failure = refused
+                    AccessibilityNotification.Announcement(refused.announcement).post()
                 } else {
                     dismiss()
                 }
             }
         }
+    }
+
+    private func failureBanner(_ failure: RefCheckoutFailure) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.danger)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(failure.title)
+                    .font(Theme.sans(13.5, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                Text(failure.reason)
+                    .font(Theme.sans(12.5))
+                    .foregroundStyle(Theme.danger)
+                    .lineLimit(6)
+                    .textSelection(.enabled)
+                Text(failure.keptNote)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("ref-checkout-error")
+            Button {
+                self.failure = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.textMuted)
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss error")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(Theme.danger.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.danger.opacity(0.25), lineWidth: 1))
+        .padding(.horizontal, 20)
+        .padding(.top, 8)
+        .background(SheetStyle.panel)
     }
 
     private func subtitle(for ref: RepoRef) -> String? {

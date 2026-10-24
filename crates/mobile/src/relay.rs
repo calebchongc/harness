@@ -16,7 +16,7 @@ use crate::edge::Edge;
 use crate::presence::PeerLivenessRecord;
 
 /// `DeviceRelayClient.call`'s default deadline.
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What went wrong with a request to a device. The messages are the iOS app's (`RelayError`).
 #[derive(Debug, Clone, PartialEq, thiserror::Error, uniffi::Error)]
@@ -323,6 +323,28 @@ impl Relay {
             device_id,
             "ListModels",
             json!({ "harness": harness }),
+            CALL_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `GetGraffCompactAt`: the percent of the context window where the device's graff chats compact; `None` is
+    /// graff's default.
+    pub async fn graff_compact_at(&self, device_id: &str) -> Result<Option<u8>, RelayError> {
+        self.call_as(device_id, "GetGraffCompactAt", json!({}), CALL_TIMEOUT)
+            .await
+    }
+
+    /// `SetGraffCompactAt`: `None` restores the default. Answers with the value the device kept.
+    pub async fn set_graff_compact_at(
+        &self,
+        device_id: &str,
+        pct: Option<u8>,
+    ) -> Result<Option<u8>, RelayError> {
+        self.call_as(
+            device_id,
+            "SetGraffCompactAt",
+            json!({ "pct": pct }),
             CALL_TIMEOUT,
         )
         .await

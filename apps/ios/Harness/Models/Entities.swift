@@ -301,7 +301,9 @@ enum AgentReauthProvider: String, Hashable, Sendable {
 
     var startParameters: [String: Any] {
         switch self {
-        case .chatGPTNew: return ["harness": "graff", "provider": "chatgpt-new", "reauthenticate": true]
+        // A host that predates `relayBrowser` ignores it and answers host-browser.
+        case .chatGPTNew: return ["harness": "graff", "provider": "chatgpt-new", "reauthenticate": true,
+                                  "relayBrowser": true]
         case .codex: return ["harness": "codex", "reauthenticate": true, "deviceAuth": true]
         }
     }
@@ -385,7 +387,7 @@ struct FolderEntry: Codable, Hashable {
     var isRepo: Bool
 }
 
-struct FolderListing: Codable {
+struct FolderListing: Codable, Equatable {
     var path: String
     var entries: [FolderEntry]
     var truncated: Bool

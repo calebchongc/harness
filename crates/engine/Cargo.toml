@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 harness-preview.workspace = true
+harness-visual.workspace = true
 harness-proto.workspace = true
 harness-doc.workspace = true
 harness-sync.workspace = true

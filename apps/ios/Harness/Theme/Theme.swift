@@ -71,19 +71,21 @@ extension Theme {
     static let fontMonoName = "GeistMono-Regular"
 
     static func sans(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .custom(sansName(weight), size: size)
+    }
+
+    /// `sans` that scales with Dynamic Type like `style`, from `size` at the default setting.
+    static func sans(_ size: CGFloat, weight: Font.Weight = .regular, relativeTo style: Font.TextStyle) -> Font {
+        .custom(sansName(weight), size: size, relativeTo: style)
+    }
+
+    private static func sansName(_ weight: Font.Weight) -> String {
         // Static weight cuts register as separate families — select by
         // PostScript name so weights actually resolve.
-        let name: String
-        if weight == .medium {
-            name = "Geist-Medium"
-        } else if weight == .semibold {
-            name = "Geist-SemiBold"
-        } else if weight == .bold {
-            name = "Geist-Bold"
-        } else {
-            name = "Geist-Regular"
-        }
-        return .custom(name, size: size)
+        if weight == .medium { return "Geist-Medium" }
+        if weight == .semibold { return "Geist-SemiBold" }
+        if weight == .bold { return "Geist-Bold" }
+        return "Geist-Regular"
     }
 
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
@@ -208,5 +210,19 @@ extension View {
     /// disagrees with the screen under it.
     func harnessAppearance() -> some View {
         preferredColorScheme(ThemeStore.shared.preferredScheme)
+    }
+
+    /// Grouped lists (Settings, Profile and their pages) on the theme's own
+    /// panel instead of the system's grouped gray, which read as the app
+    /// changing theme whenever Settings opened. Pair with
+    /// [`harnessListRow`] on each section for the card surface.
+    func harnessGroupedList() -> some View {
+        scrollContentBackground(.hidden)
+            .background(Theme.bg.ignoresSafeArea())
+    }
+
+    /// A grouped list section's rows on the theme's raised card surface.
+    func harnessListRow() -> some View {
+        listRowBackground(Theme.surfaceRaised)
     }
 }

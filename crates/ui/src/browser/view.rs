@@ -371,7 +371,7 @@ impl BrowserSurface {
                             .text_color(theme.text)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if has_error {
-                                    this.reload(cx);
+                                    this.reload(window, cx);
                                 } else {
                                     this.focus_address(window, cx);
                                 }
@@ -436,7 +436,7 @@ impl Render for BrowserSurface {
             cx,
         )
         .when(has_page, |el| {
-            el.on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
+            el.on_click(cx.listener(|this, _, w, cx| this.reload(w, cx)))
         });
         let address = surface_chrome::input()
             .id("browser-address")
@@ -493,7 +493,11 @@ impl Render for BrowserSurface {
             });
         let open = button(
             "browser-external",
-            "Open in default browser",
+            if self.preview_request.is_some() {
+                "Open source file"
+            } else {
+                "Open in default browser"
+            },
             icons::ARROW_UP_RIGHT,
             has_page,
             &theme,
@@ -664,12 +668,16 @@ impl Render for BrowserSurface {
                 #[cfg(not(target_os = "linux"))]
                 let _=(this,event,w,cx);
             }))
-            .on_action(cx.listener(|this, _: &super::Reload, _, cx| this.reload(cx)))
+            .on_action(cx.listener(|this, _: &super::Reload, w, cx| this.reload(w, cx)))
             .on_action(cx.listener(|this, _: &super::FocusAddress, w, cx| this.focus_address(w, cx)))
             .on_action(cx.listener(|_, _: &super::NewTab, _, cx| cx.emit(BrowserEvent::NewTab(None))))
             .on_action(cx.listener(|_, _: &super::CloseTab, _, cx| cx.emit(BrowserEvent::Close)))
             .on_action(cx.listener(|this, _: &super::Back, _, _| this.history(false)))
             .on_action(cx.listener(|this, _: &super::Forward, _, _| this.history(true)))
+            // Mouse side buttons drive the shell's route history everywhere
+            // else; over the browser they are inert.
+            .on_mouse_down(MouseButton::Navigate(gpui::NavigationDirection::Back), |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Navigate(gpui::NavigationDirection::Forward), |_, _, cx| cx.stop_propagation())
             .child(toolbar)
             .when_some(self.validation.clone(), |el, message| el.child(div().px(px(12.0)).py(px(8.0)).text_size(crate::typography::ui_rems(11.0)).text_color(theme.danger).child(message)))
             .when(remote_loopback, |el| el.child(div().px(px(12.0)).py(px(8.0)).border_b_1().border_color(theme.border)

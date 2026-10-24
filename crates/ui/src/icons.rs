@@ -134,11 +134,14 @@ icon_assets![
     (ARCHIVE_UP_MINIMALISTIC, "archive-up-minimalistic"),
     (REFRESH, "refresh"),
     (RESTART, "restart"),
+    (DOWNLOAD_MINIMALISTIC, "download-minimalistic"),
     (ADD_CIRCLE, "add-circle"),
     (TUNING, "tuning"),
     (EYE, "eye"),
     (EYE_CLOSED, "eye-closed"),
     (PAPERCLIP, "paperclip"),
+    // Hand-drawn microphone in the Solar Linear style for composer dictation.
+    (MICROPHONE, "microphone"),
     // Hand-drawn pushpin in the Solar Linear style for local sidebar pins.
     (PIN, "pin"),
     (PEN, "pen"),

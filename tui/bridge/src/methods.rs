@@ -22,7 +22,17 @@ fn err(error: RpcError) -> Reply {
     (Err(error), None)
 }
 
+fn wrap(result: Result<Value, RpcError>) -> Reply {
+    (result, None)
+}
+
 pub async fn handle(conn: &std::sync::Arc<Conn>, method: &str, params: Value) -> Reply {
+    // Engine mode: threads are Harness chats (see engine.rs).
+    if let Some(engine) = conn.engine.clone()
+        && let Some(reply) = crate::engine_threads::handle(conn, &engine, method, &params).await
+    {
+        return reply;
+    }
     match method {
         "initialize" => ok(json!({
             // The TUI warns when the server's version differs from its own, so
@@ -45,18 +55,24 @@ pub async fn handle(conn: &std::sync::Arc<Conn>, method: &str, params: Value) ->
         "thread/settings/update" => thread_settings_update(conn, &params),
         "hooks/list" | "skills/list" => ok(json!({ "data": [] })),
         "plugin/list" => ok(json!({ "marketplaces": [] })),
-        // Session history is not bridged yet; every thread is new.
-        "thread/list" => ok(json!({ "data": [], "nextCursor": null, "backwardsCursor": null })),
+        "thread/list" => wrap(crate::sessions::list(conn, &params)),
+        "thread/resume" => wrap(crate::sessions::resume(conn, &params)),
         "thread/loaded/list" => ok(json!({ "data": loaded_threads(conn), "nextCursor": null })),
-        "model/list" => ok(json!({ "data": crate::models::list(&conn.registry).await, "nextCursor": null })),
-        "thread/start" => thread_start(conn, params).await,
-        "thread/read" => thread_read(conn, params),
-        "thread/turns/list" => {
-            ok(json!({ "data": [], "nextCursor": null, "backwardsCursor": null }))
+        "model/list" => {
+            ok(json!({ "data": crate::models::list(&conn.registry).await, "nextCursor": null }))
         }
+        "thread/start" => thread_start(conn, params).await,
+        "thread/read" => wrap(crate::sessions::read(conn, &params)),
+        "thread/turns/list" => wrap(crate::sessions::turns(conn, &params)),
         "turn/start" => crate::turn::start(conn, params),
         "turn/steer" => crate::turn::steer(conn, params),
         "turn/interrupt" => turn_interrupt(conn, params),
+        // `/mcp`: graff's MCP servers (crate::mcp).
+        "mcpServerStatus/list" => wrap(crate::mcp::status_list(conn, params).await),
+        "config/mcpServer/reload" => wrap(crate::mcp::reload(conn, params).await),
+        "graff/mcp/reconnect" => wrap(crate::mcp::reconnect(conn, params).await),
+        "graff/mcp/setEnabled" => wrap(crate::mcp::set_enabled(conn, params).await),
+        "mcpServer/oauth/login" => wrap(crate::mcp::oauth_login(conn, params).await),
         other => err(RpcError::method_not_found(other)),
     }
 }
@@ -84,11 +100,19 @@ fn thread_settings_update(conn: &std::sync::Arc<Conn>, params: &Value) -> Reply 
         .and_then(Value::as_str)
         .and_then(split_model)
     {
+        if thread.resume.is_some() && harness != thread.harness {
+            return err(RpcError::invalid_params(
+                "cannot resume a session with a different agent",
+            ));
+        }
         thread.harness = harness;
         thread.model = Some(model);
     }
     if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
         thread.cwd = cwd.to_owned();
+    }
+    if let Err(error) = crate::sessions::checkpoint(conn, thread_id, thread) {
+        return err(error);
     }
     ok(json!({}))
 }
@@ -123,30 +147,25 @@ pub async fn harness_ids(registry: &Arc<HarnessRegistry>) -> Vec<HarnessId> {
     ids
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default()
-}
-
-fn thread_json(id: &str, cwd: &str, model: Option<&str>) -> Value {
-    json!({
-        "id": id,
-        "sessionId": id,
-        "cliVersion": env!("CARGO_PKG_VERSION"),
-        "createdAt": now_secs(),
-        "updatedAt": now_secs(),
-        "cwd": cwd,
-        "ephemeral": false,
-        "model": model,
-        "modelProvider": "harness",
-        "preview": "",
-        "projectId": null,
-        "source": "appServer",
-        "status": { "type": "idle" },
-        "turns": [],
-    })
+/// The thread's agent and model: the one asked for, else the first entry of
+/// the list `model/list` serves (the TUI sends none on a fresh thread).
+pub async fn pick_model(
+    conn: &std::sync::Arc<Conn>,
+    requested: Option<&str>,
+) -> (HarnessId, Option<String>) {
+    if let Some((harness, model)) = requested.and_then(split_model) {
+        return (harness, Some(model));
+    }
+    let first = crate::models::list(&conn.registry).await.into_iter().next();
+    match first
+        .as_ref()
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+        .and_then(split_model)
+    {
+        Some((harness, model)) => (harness, Some(model)),
+        None => (HarnessId::Graff, None),
+    }
 }
 
 async fn thread_start(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
@@ -154,44 +173,23 @@ async fn thread_start(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
         .get("cwd")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
         .unwrap_or_else(|| "/".into());
     let requested = params.get("model").and_then(Value::as_str);
     tracing::info!(?requested, "thread/start model");
-    let (harness, model) = match requested.and_then(split_model) {
-        Some((harness, model)) => (harness, Some(model)),
-        // The TUI sends no model on a fresh thread and expects the server to
-        // pick one, so use the first entry of the same list `model/list` serves.
-        None => {
-            let first = crate::models::list(&conn.registry).await.into_iter().next();
-            match first
-                .as_ref()
-                .and_then(|m| m.get("model"))
-                .and_then(Value::as_str)
-                .and_then(split_model)
-            {
-                Some((harness, model)) => (harness, Some(model)),
-                None => (HarnessId::Graff, None),
-            }
-        }
-    };
+    let (harness, model) = pick_model(conn, requested).await;
     let id = Uuid::new_v4().to_string();
     let shown_model = model.as_ref().map(|m| qualified(harness, m));
-    let thread = thread_json(&id, &cwd, shown_model.as_deref());
-    conn.threads.lock().expect("threads lock").insert(
-        id.clone(),
-        ThreadState {
-            cwd: cwd.clone(),
-            harness,
-            model: model.clone(),
-            resume: None,
-            interrupt: None,
-            turn_id: None,
-            steer: None,
-            steers: Default::default(),
-            steerable: false,
-        },
-    );
+    let state = ThreadState::new(cwd.clone(), harness, model.clone());
+    let thread = crate::sessions::thread_json(&id, &state, false);
+    conn.threads
+        .lock()
+        .expect("threads lock")
+        .insert(id.clone(), state);
     let response = json!({
         "thread": thread.clone(),
         "model": shown_model.clone().unwrap_or_default(),
@@ -200,6 +198,8 @@ async fn thread_start(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": { "type": "workspaceWrite" },
+        "disabledPluginIds": [],
+        "instructionSources": [],
     });
     let conn = conn.clone();
     let after: After = Some(Box::pin(async move {
@@ -208,20 +208,13 @@ async fn thread_start(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
     (Ok(response), after)
 }
 
-fn thread_read(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
-    let Some(id) = params.get("threadId").and_then(Value::as_str) else {
-        return err(RpcError::invalid_params("missing threadId"));
-    };
-    let threads = conn.threads.lock().expect("threads lock");
-    let Some(thread) = threads.get(id) else {
-        return err(RpcError::invalid_params("unknown threadId"));
-    };
-    let model = thread.model.as_ref().map(|m| qualified(thread.harness, m));
-    ok(json!({ "thread": thread_json(id, &thread.cwd, model.as_deref()) }))
-}
-
 fn loaded_threads(conn: &std::sync::Arc<Conn>) -> Vec<String> {
-    conn.threads.lock().expect("threads lock").keys().cloned().collect()
+    conn.threads
+        .lock()
+        .expect("threads lock")
+        .keys()
+        .cloned()
+        .collect()
 }
 
 fn turn_interrupt(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {

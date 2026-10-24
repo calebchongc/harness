@@ -1,0 +1,28 @@
+name: PR screenshots
+
+# Every pull request shows a before and an after screenshot in its description
+# (AGENTS.md, "Commits and pull requests"). A maintainer can exempt a change
+# with nothing to see by adding the `no-screenshots` label. See
+# scripts/check-pr-screenshots.py.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-screenshots-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  before-and-after:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/check-pr-screenshots.py
+          sparse-checkout-cone-mode: false
+      - name: Before and after screenshots
+        run: python3 scripts/check-pr-screenshots.py
