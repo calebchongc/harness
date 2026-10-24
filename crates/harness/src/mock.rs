@@ -28,6 +28,8 @@ fn question_script() -> Vec<UserInputQuestion> {
                 "Event-driven fold with coalesced commits".into(),
                 "Hybrid: event-driven with a polling fallback".into(),
             ],
+            prefill: None,
+            multiline: false,
             multi_select: false,
         },
         UserInputQuestion {
@@ -39,6 +41,8 @@ fn question_script() -> Vec<UserInputQuestion> {
                 "End-to-end (two-device)".into(),
                 "Golden screenshots".into(),
             ],
+            prefill: None,
+            multiline: false,
             multi_select: true,
         },
     ]
@@ -69,6 +73,8 @@ impl Harness for MockHarness {
                 description: None,
                 reasoning_levels: vec![ReasoningLevel::Medium],
                 options: vec![],
+                maker: None,
+                billing: None,
             },
             // Claude-mirroring demo model: lets scripted runs carry the same
             // chip labels ("Fable 5 · High") as a real Claude session.
@@ -83,6 +89,8 @@ impl Harness for MockHarness {
                     ReasoningLevel::XHigh,
                 ],
                 options: vec![],
+                maker: None,
+                billing: None,
             },
         ])
     }

@@ -3,9 +3,10 @@
 //! (the sidebar update strip + macOS bundle swap).
 //!
 //! Release layout (see `.github/workflows/release.yml`): the packaged macOS
-//! app reads Harness's latest stable GitHub release. Managed installs still
-//! use `{edge}/releases/*`. `manifest.json` carries the latest version plus a
-//! sha256 per artifact; `latest.txt` remains a fallback for older releases.
+//! app and managed server installs read Harness's latest stable GitHub
+//! release; other installs still check `{edge}/releases/*`. `manifest.json`
+//! carries the latest version plus a sha256 per artifact; `latest.txt`
+//! remains a fallback for older releases.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.harness/app/<ver>` + `current` symlink — the curl|sh
@@ -35,10 +36,21 @@ pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Background check cadence.
-const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-/// Retry sooner after a failed check (offline boot, transient edge error).
-const CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Background check cadence: how long after a successful check the next one is
+/// due.
+const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Retry sooner after failed checks (offline boot, transient edge error):
+/// 1m, 5m, 15m, then 30m for as long as they keep failing.
+const CHECK_BACKOFF: [std::time::Duration; 4] = [
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(5 * 60),
+    std::time::Duration::from_secs(15 * 60),
+    std::time::Duration::from_secs(30 * 60),
+];
+/// How often the wall clock is compared with the next due time. A monotonic
+/// `sleep` stops while the machine sleeps, so a single long sleep pushes the
+/// next check out by the whole night; a short tick notices on wake instead.
+const CHECK_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 /// First check waits out engine boot (room joins, doc re-sync).
 const CHECK_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
 /// While an auto-apply is deferred behind active sessions, re-probe idleness
@@ -234,9 +246,13 @@ fn release_base(edge_url: &str) -> anyhow::Result<String> {
 }
 
 fn default_release_base(edge_url: &str, install: &InstallKind) -> String {
-    // The installed desktop GUI follows Harness's stable GitHub releases.
-    // Its manifest is attached to the same release as the signed app tarball.
-    if matches!(install, InstallKind::MacApp { .. }) {
+    // The desktop app and managed server installs follow Harness's stable
+    // GitHub releases: the release job attaches the manifest there next to
+    // every artifact, while the edge copy only moves when its upload runs.
+    if matches!(
+        install,
+        InstallKind::MacApp { .. } | InstallKind::Managed { .. }
+    ) {
         return "https://github.com/justrach/harness/releases/latest/download".into();
     }
     format!("{}/releases", edge_url.trim_end_matches('/'))
@@ -262,6 +278,19 @@ pub enum InstallKind {
 }
 
 impl InstallKind {
+    /// Whether the engine's background checker runs for this install,
+    /// signed in or not.
+    pub fn checks_releases(&self) -> bool {
+        match self {
+            Self::MacApp { .. } | Self::Managed { .. } => true,
+            // The zip install follows the release feed too; without the
+            // check it never learned of a release and never offered one.
+            #[cfg(windows)]
+            Self::WindowsPortable { .. } => true,
+            _ => false,
+        }
+    }
+
     pub fn supports_desktop_update(&self) -> bool {
         match self {
             Self::MacApp { .. } => true,
@@ -287,12 +316,36 @@ impl InstallKind {
         }
     }
 
+    /// Swap the staged bundle over the installed one without relaunching —
+    /// the process is quitting anyway, so the next launch runs the new
+    /// version. Non-desktop installs are a no-op.
+    pub fn install_on_exit(&self, staged: &Path) -> anyhow::Result<()> {
+        match self {
+            Self::MacApp { bundle } => apply_mac_app(staged, bundle),
+            #[cfg(windows)]
+            Self::WindowsPortable { directory } => windows::apply(staged, directory, false),
+            _ => Ok(()),
+        }
+    }
+
     /// Install and arrange a relaunch. The UI must quit after this succeeds.
     pub fn apply_desktop(&self, staged: &Path) -> anyhow::Result<()> {
+        self.apply_desktop_relaunching(staged, Relaunch::Foreground)
+    }
+
+    /// [`Self::apply_desktop`], choosing how the new version opens: an
+    /// automatic restart while the person works in another app reopens
+    /// Harness behind it instead of taking focus (macOS; elsewhere the
+    /// platform decides).
+    pub fn apply_desktop_relaunching(
+        &self,
+        staged: &Path,
+        relaunch: Relaunch,
+    ) -> anyhow::Result<()> {
         match self {
             Self::MacApp { bundle } => {
                 apply_mac_app(staged, bundle)?;
-                relaunch_app_after_exit(bundle);
+                relaunch_app_after_exit_with(bundle, relaunch);
                 Ok(())
             }
             #[cfg(windows)]
@@ -337,12 +390,32 @@ fn detect_install_from_for_os(exe: &Path, home: Option<&Path>, os: &str) -> Inst
         if ancestor.extension().is_some_and(|ext| ext == "app")
             && exe.starts_with(ancestor.join("Contents").join("MacOS"))
         {
+            // A dev bundle (scripts/run-macos-dev.sh) never takes a release
+            // update: installing one would replace the local build and its
+            // isolated data dir and IPC port (#452).
+            if is_dev_bundle(ancestor) {
+                return InstallKind::Unmanaged;
+            }
             return InstallKind::MacApp {
                 bundle: ancestor.to_path_buf(),
             };
         }
     }
     InstallKind::Unmanaged
+}
+
+/// Whether `bundle`'s `CFBundleIdentifier` is a dev build's
+/// (`harness.codegraff.app.dev`, from `dist/macos/Info-dev.plist`).
+fn is_dev_bundle(bundle: &Path) -> bool {
+    plist::Value::from_file(bundle.join("Contents").join("Info.plist"))
+        .ok()
+        .and_then(|info| {
+            info.as_dictionary()?
+                .get("CFBundleIdentifier")?
+                .as_string()
+                .map(|id| id.ends_with(".dev"))
+        })
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -597,18 +670,41 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How a relaunched app comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relaunch {
+    /// In front, as if the person opened it.
+    Foreground,
+    /// Behind the app the person is using (`open -g`): an automatic restart
+    /// must not take focus from someone working elsewhere.
+    Background,
+}
+
+/// The relauncher's shell script: wait for `pid` to exit, then open `bundle`.
+fn relaunch_script(pid: u32, bundle: &Path, relaunch: Relaunch) -> String {
+    let flags = match relaunch {
+        Relaunch::Foreground => "",
+        Relaunch::Background => "-g ",
+    };
+    format!(
+        "while /bin/kill -0 {pid} 2>/dev/null; do sleep 0.2; done; /usr/bin/open {flags}\"{}\"",
+        bundle.display()
+    )
+}
+
 /// Detached relauncher: waits for THIS process to exit, then `open`s the bundle.
 /// (Opening before exit would race the single-instance engine lock and the IPC
 /// port.) The caller quits the app after this returns.
 pub fn relaunch_app_after_exit(bundle: &Path) {
+    relaunch_app_after_exit_with(bundle, Relaunch::Foreground);
+}
+
+/// [`relaunch_app_after_exit`], choosing whether the app comes back in front.
+pub fn relaunch_app_after_exit_with(bundle: &Path, relaunch: Relaunch) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        let pid = std::process::id();
-        let script = format!(
-            "while /bin/kill -0 {pid} 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"{}\"",
-            bundle.display()
-        );
+        let script = relaunch_script(std::process::id(), bundle, relaunch);
         let mut command = std::process::Command::new("/bin/sh");
         command
             .args(["-c", &script])
@@ -621,7 +717,7 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
         }
     }
     #[cfg(not(unix))]
-    let _ = bundle;
+    let _ = (bundle, relaunch);
 }
 
 // ---------------------------------------------------------------------------
@@ -657,22 +753,115 @@ impl UpdateStatus {
     }
 }
 
-/// `HARNESS_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
+/// Whether a managed headless install applies updates itself. ON by default,
+/// like the desktop app; `HARNESS_AUTO_UPDATE=0|false|no|off` turns it off.
 fn auto_update_enabled() -> bool {
-    std::env::var("HARNESS_AUTO_UPDATE")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    desktop_auto_update_from(std::env::var("HARNESS_AUTO_UPDATE").ok().as_deref())
+}
+
+/// The launchd label `harness daemon install` registers (see [`restart_service`]).
+const LAUNCHD_LABEL: &str = "harness.codegraff.app";
+
+/// Is this process the service [`restart_service`] restarts? systemd sets
+/// `INVOCATION_ID` for every unit it runs and launchd sets
+/// `XPC_SERVICE_NAME` to the job label. An engine started by hand (a shell,
+/// tmux, a container without an init) has neither and restarts itself.
+fn supervised_by_service(invocation_id: Option<&str>, xpc_service: Option<&str>) -> bool {
+    invocation_id.is_some_and(|id| !id.is_empty()) || xpc_service == Some(LAUNCHD_LABEL)
+}
+
+fn supervised() -> bool {
+    supervised_by_service(
+        std::env::var("INVOCATION_ID").ok().as_deref(),
+        std::env::var("XPC_SERVICE_NAME").ok().as_deref(),
+    )
+}
+
+fn reexec_tx() -> &'static watch::Sender<bool> {
+    static TX: std::sync::OnceLock<watch::Sender<bool>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| watch::channel(false).0)
+}
+
+/// Resolves once an applied update asks this process to restart itself: it
+/// is not under a service manager, or the service restart failed. The engine
+/// shuts down gracefully on it, and the binary then calls [`reexec`].
+pub async fn reexec_requested() {
+    let mut rx = reexec_tx().subscribe();
+    let _ = rx.wait_for(|requested| *requested).await;
+}
+
+/// Replace this process with the newly installed release, same arguments and
+/// environment — the restart for an engine nothing else would restart. Only
+/// returns on failure. Call after the runtime has shut down.
+pub fn reexec() -> Option<std::io::Error> {
+    if !*reexec_tx().borrow() {
+        return None;
+    }
+    let InstallKind::Managed { app_root } = detect_install() else {
+        return Some(std::io::Error::other("not a managed install"));
+    };
+    let exe = app_root.join("current").join("harness");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        tracing::info!(exe = %exe.display(), "restarting into the updated release");
+        Some(
+            std::process::Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .exec(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = exe;
+        Some(std::io::Error::other("self-restart is not supported here"))
+    }
+}
+
+/// Whether the desktop app stages and installs updates on its own. ON by
+/// default; `HARNESS_AUTO_UPDATE=0|false|no|off` turns it off and restores
+/// the manual click-through flow.
+pub fn desktop_auto_update_enabled() -> bool {
+    desktop_auto_update_from(std::env::var("HARNESS_AUTO_UPDATE").ok().as_deref())
+}
+
+fn desktop_auto_update_from(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
 }
 
 /// "Nothing would be interrupted by a restart right now" — wired by the engine
 /// to its live-run and open-terminal registries. `None` = no gate.
 pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Background release checker: polls `{edge}/releases` on a 6h cadence and
-/// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
-/// stream). Managed installs with `HARNESS_AUTO_UPDATE` set stage + apply + service
-/// restart on their own — but only in a quiet window: while `quiescent` reports
-/// activity, the apply defers and re-probes every [`IDLE_RECHECK`].
+/// Delay before the next check: the full interval after a success, otherwise
+/// the backoff step for `failures` in a row (1 = first failure).
+fn next_check_delay(ok: bool, failures: u32) -> std::time::Duration {
+    if ok {
+        return CHECK_INTERVAL;
+    }
+    let step = (failures.max(1) as usize - 1).min(CHECK_BACKOFF.len() - 1);
+    CHECK_BACKOFF[step]
+}
+
+/// Is a check due? Judged on the WALL clock, so time spent asleep counts. A due
+/// time further ahead than a full interval can only mean the clock was set
+/// back; that counts as due, or a wrong clock could silence checks for as long
+/// as it was off.
+fn check_due(now_ms: i64, due_ms: i64) -> bool {
+    now_ms >= due_ms || due_ms - now_ms > CHECK_INTERVAL.as_millis() as i64
+}
+
+/// Background release checker: polls `{edge}/releases` hourly, on the wall
+/// clock, and publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
+/// stream). Managed installs stage + apply + restart on their own unless
+/// `HARNESS_AUTO_UPDATE` turns it off — but only in a quiet window: while
+/// `quiescent` reports activity, the apply defers and re-probes every
+/// [`IDLE_RECHECK`].
 #[derive(Clone)]
 pub struct Updater {
     edge_url: String,
@@ -736,9 +925,9 @@ impl Updater {
     }
 
     async fn check_loop(&self) {
-        // The installed app has a dedicated Harness release feed. Managed
-        // legacy installs retain their existing manual update behavior.
-        if !cfg!(test) && !matches!(detect_install(), InstallKind::MacApp { .. }) {
+        // The installed app and managed server installs follow Harness's
+        // release feed; source builds and copied binaries never check.
+        if !cfg!(test) && !detect_install().checks_releases() {
             return;
         }
         let mut shutdown = self.shutdown_tx.subscribe();
@@ -753,8 +942,10 @@ impl Updater {
                     _ = tokio::time::sleep(CHECK_INITIAL_DELAY) => {}
                     _ = checks.changed() => {}
                 }
+                let mut failures = 0u32;
                 loop {
                     let ok = self.check_once().await;
+                    failures = if ok { 0 } else { failures.saturating_add(1) };
                     if ok
                         && self.status_tx.borrow().update_available
                         && auto_update_enabled()
@@ -762,9 +953,19 @@ impl Updater {
                     {
                         self.auto_apply_when_idle().await;
                     }
-                    tokio::select! {
-                        _ = tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }) => {}
-                        _ = checks.changed() => {}
+                    let due = now_ms()
+                        .saturating_add(next_check_delay(ok, failures).as_millis() as i64);
+                    // Short ticks against the wall clock, not one long sleep:
+                    // waking from sleep checks within a tick.
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(CHECK_TICK) => {
+                                if check_due(now_ms(), due) {
+                                    break;
+                                }
+                            }
+                            _ = checks.changed() => break,
+                        }
                     }
                 }
             } => {}
@@ -802,7 +1003,7 @@ impl Updater {
         }
         match self.apply().await {
             Ok(version) => {
-                tracing::info!(%version, "auto-update applied; service restarting")
+                tracing::info!(%version, "auto-update applied; restarting")
             }
             Err(err) => tracing::warn!(error = %err, "auto-update failed"),
         }
@@ -856,9 +1057,15 @@ impl Updater {
         apply_headless(&app_root, &manifest.version)?;
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            if let Err(err) = restart_service() {
-                tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
+            if supervised() {
+                match restart_service() {
+                    Ok(()) => return,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "service restart failed — restarting in place")
+                    }
+                }
             }
+            reexec_tx().send_replace(true);
         });
         Ok(manifest.version)
     }
@@ -874,6 +1081,126 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_background_relaunch_reopens_the_app_without_taking_focus() {
+        let bundle = Path::new("/Applications/Harness.app");
+        let front = relaunch_script(42, bundle, Relaunch::Foreground);
+        let back = relaunch_script(42, bundle, Relaunch::Background);
+        assert!(front.starts_with("while /bin/kill -0 42 2>/dev/null"));
+        assert!(front.ends_with("/usr/bin/open \"/Applications/Harness.app\""));
+        assert!(back.ends_with("/usr/bin/open -g \"/Applications/Harness.app\""));
+    }
+
+    #[test]
+    fn desktop_auto_update_defaults_on_and_honours_off_values() {
+        assert!(desktop_auto_update_from(None));
+        assert!(desktop_auto_update_from(Some("")));
+        assert!(desktop_auto_update_from(Some("1")));
+        assert!(!desktop_auto_update_from(Some("0")));
+        assert!(!desktop_auto_update_from(Some(" OFF ")));
+        assert!(!desktop_auto_update_from(Some("false")));
+        assert!(!desktop_auto_update_from(Some("no")));
+    }
+
+    #[test]
+    fn servers_and_the_app_check_releases_but_source_builds_never_do() {
+        assert!(
+            InstallKind::Managed {
+                app_root: PathBuf::from("/home/u/.harness/app")
+            }
+            .checks_releases()
+        );
+        assert!(
+            InstallKind::MacApp {
+                bundle: PathBuf::from("/Applications/Harness.app")
+            }
+            .checks_releases()
+        );
+        assert!(!InstallKind::Unmanaged.checks_releases());
+        #[cfg(windows)]
+        assert!(
+            InstallKind::WindowsPortable {
+                directory: PathBuf::from(r"C:\Users\u\Harness")
+            }
+            .checks_releases()
+        );
+    }
+
+    #[test]
+    fn only_the_installed_service_counts_as_supervised() {
+        // systemd unit
+        assert!(supervised_by_service(Some("3f2a9c"), None));
+        // `harness daemon install` launchd job
+        assert!(supervised_by_service(None, Some("harness.codegraff.app")));
+        // a shell, tmux or a container without an init
+        assert!(!supervised_by_service(None, None));
+        assert!(!supervised_by_service(Some(""), None));
+        // a terminal app's own launchd job is not the Harness service
+        assert!(!supervised_by_service(
+            None,
+            Some("application.com.apple.Terminal")
+        ));
+    }
+
+    #[test]
+    fn nothing_restarts_in_place_unless_an_update_asked_for_it() {
+        assert!(reexec().is_none());
+    }
+
+    #[test]
+    fn install_on_exit_is_a_no_op_for_non_desktop_installs() {
+        let staged = tempfile::tempdir().unwrap();
+        assert!(
+            InstallKind::Unmanaged
+                .install_on_exit(staged.path())
+                .is_ok()
+        );
+        assert_eq!(
+            std::fs::read_dir(staged.path()).unwrap().count(),
+            0,
+            "a non-desktop install touches nothing"
+        );
+    }
+
+    #[test]
+    fn a_success_waits_the_full_interval() {
+        assert_eq!(next_check_delay(true, 0), CHECK_INTERVAL);
+        assert_eq!(next_check_delay(true, 7), CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn failures_back_off_one_five_fifteen_then_thirty_minutes() {
+        let minutes = |failures| next_check_delay(false, failures).as_secs() / 60;
+        assert_eq!(
+            (1..=6).map(minutes).collect::<Vec<_>>(),
+            [1, 5, 15, 30, 30, 30]
+        );
+        assert_eq!(minutes(0), 1, "never below the first step");
+        assert_eq!(minutes(u32::MAX), 30);
+    }
+
+    #[test]
+    fn due_time_is_judged_on_the_wall_clock() {
+        let hour = CHECK_INTERVAL.as_millis() as i64;
+        let due = 10_000_000 + hour;
+        assert!(!check_due(due - 1, due), "not due while the clock is short");
+        assert!(check_due(due, due));
+        // A night asleep: the clock jumped past the due time. One long
+        // monotonic sleep would not have noticed; a tick against the wall
+        // clock does.
+        assert!(check_due(due + 8 * hour, due));
+    }
+
+    #[test]
+    fn a_clock_set_back_does_not_silence_checks() {
+        let hour = CHECK_INTERVAL.as_millis() as i64;
+        let now = 10_000_000;
+        // Just scheduled, a full interval ahead: not due.
+        assert!(!check_due(now, now + hour));
+        // The clock moved back a day, so the due time looks a day ahead: due.
+        assert!(check_due(now - 24 * hour, now + hour));
+    }
 
     #[tokio::test]
     async fn stalled_update_headers_and_body_time_out_but_progressing_body_survives() {
@@ -1019,6 +1346,33 @@ mod tests {
                 bundle: PathBuf::from("/Applications/Harness.app")
             }
         );
+        // A dev bundle never takes a release update.
+        let dev = tempfile::tempdir().unwrap();
+        let contents = dev.path().join("Harness.app").join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        let info = |id: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                 <key>CFBundleIdentifier</key><string>{id}</string></dict></plist>"
+            )
+        };
+        let dev_exe = contents.join("MacOS").join("harness");
+        std::fs::write(
+            contents.join("Info.plist"),
+            info("harness.codegraff.app.dev"),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_install_from_for_os(&dev_exe, Some(Path::new("/Users/u")), "macos"),
+            InstallKind::Unmanaged
+        );
+        std::fs::write(contents.join("Info.plist"), info("harness.codegraff.app")).unwrap();
+        assert_eq!(
+            detect_install_from_for_os(&dev_exe, Some(Path::new("/Users/u")), "macos"),
+            InstallKind::MacApp {
+                bundle: dev.path().join("Harness.app")
+            }
+        );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
             detect_install_from_for_os(Path::new("/tmp/foo.app/harness"), None, "macos"),
@@ -1027,6 +1381,16 @@ mod tests {
         assert_eq!(
             detect_install_from_for_os(
                 Path::new("/src/target/release/harness"),
+                Some(Path::new("/home/u")),
+                "linux",
+            ),
+            InstallKind::Unmanaged
+        );
+        // A distro-packaged install (pacman -U → /usr/bin) is not
+        // symlink-managed: updates are report-only.
+        assert_eq!(
+            detect_install_from_for_os(
+                Path::new("/usr/bin/harness"),
                 Some(Path::new("/home/u")),
                 "linux",
             ),
@@ -1049,13 +1413,20 @@ mod tests {
     }
 
     #[test]
-    fn installed_mac_app_uses_published_stable_manifest() {
+    fn installed_apps_and_servers_use_published_stable_manifest() {
         let app = InstallKind::MacApp {
             bundle: PathBuf::from("/Applications/Harness.app"),
         };
         assert!(app.supports_desktop_update());
         assert_eq!(
             default_release_base("https://example.test", &app),
+            "https://github.com/justrach/harness/releases/latest/download"
+        );
+        let server = InstallKind::Managed {
+            app_root: PathBuf::from("/home/u/.harness/app"),
+        };
+        assert_eq!(
+            default_release_base("https://example.test", &server),
             "https://github.com/justrach/harness/releases/latest/download"
         );
         assert_eq!(

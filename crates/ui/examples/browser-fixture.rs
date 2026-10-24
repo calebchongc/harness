@@ -1,5 +1,11 @@
 #[path = "browser-fixture/transcript_links.rs"]
 mod transcript_links;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "browser-fixture/html_preview.rs"]
+mod html_preview;
+#[cfg(target_os = "macos")]
+#[path = "browser-fixture/saved_views.rs"]
+mod saved_views;
 #[cfg(target_os = "linux")]
 #[path = "browser-fixture/linux.rs"]
 mod linux;
@@ -198,8 +204,18 @@ fn main() -> anyhow::Result<()> {
         cx.spawn(async move |cx| {
             let run: anyhow::Result<()> = async {
                 pause(cx, 1200).await;
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if std::env::var_os("HARNESS_HTML_PREVIEW_FIXTURE_ONLY").is_some() {
+                    html_preview::exercise(window, cx).await?;
+                    std::fs::write(output.join("result.txt"), "PASS: native isolated HTML preview; controls, state reset, origin/storage/host-API isolation and blocked network/navigation.\n")?;
+                    return Ok(());
+                }
                 if std::env::var_os("HARNESS_TRANSCRIPT_LINK_FIXTURE_ONLY").is_some() {
                     return transcript_links::exercise(window, state.clone(), &_origin, &output, cx).await;
+                }
+                #[cfg(target_os = "macos")]
+                if std::env::var_os("HARNESS_VIEW_FIXTURE_HTML").is_some() {
+                    return saved_views::exercise(window, &output, cx).await;
                 }
                 state.update(cx, |s, cx| {
                     let entries = serde_json::from_value(serde_json::json!([
@@ -210,6 +226,8 @@ fn main() -> anyhow::Result<()> {
                 });
                 let (first_id, first) = window.update(cx, |shell, w, cx| shell.fixture_open_browser(None, w, cx))?;
                 pause(cx, 500).await;
+                #[cfg(target_os = "linux")]
+                linux::wait_for_fixture_window(cx).await?;
                 capture(&output, "browser-empty-dark")?;
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {

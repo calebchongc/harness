@@ -6,23 +6,40 @@ import SwiftUI
 
 @main
 struct HarnessApp: App {
+    /// APNs registration and notification taps (PushNotifications).
+    @UIApplicationDelegateAdaptor(HarnessAppDelegate.self) private var appDelegate
     @State private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
+
+    init() {
+        Perf.shared.startWatching()
+    }
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environment(model)
-                .preferredColorScheme(.dark)
+                .harnessAppearance()
                 // Monochrome controls: glass buttons, toolbar icons, and
-                // toggles render white like the desktop — accent stays paint
-                // for status/markdown, never chrome.
+                // toggles render in text color like the desktop — accent
+                // stays paint for status/markdown, never chrome.
                 .tint(Theme.text)
                 .background(Theme.bg)
+                .hingeRecede()
+                .onAppear {
+                    Perf.shared.markFirstFrame()
+                    if let scene = UIApplication.shared.connectedScenes
+                        .compactMap({ $0 as? UIWindowScene }).first {
+                        ThemeStore.shared.attach(to: scene)
+                    }
+                }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .background {
+                        model.backgrounded()
                         model.flushDocs()
+                        PerfSharing.flush()
                     } else if phase == .active {
+                        ThemeStore.shared.refreshSystemAppearance()
                         // Suspension kills sockets without running any
                         // failure path — without this kick the workspace
                         // room stays dead after foregrounding while chat
@@ -47,8 +64,26 @@ struct RootView: View {
                 OrgPickerView(tokens: tokens, orgs: orgs)
             case .ready:
                 HomeView()
+                    .task {
+                        // Sampled, not observed: the snapshots read live
+                        // transcripts, so observing them re-rendered the root
+                        // on every streamed token. A lock-screen status only
+                        // needs a couple of seconds' resolution — and only
+                        // while something is running or showing. With every
+                        // session quiet there is nothing to sample: wait for
+                        // a session row to change instead of waking every 2s.
+                        while !Task.isCancelled {
+                            model.liveActivities.sync(model.liveActivitySnapshots)
+                            if model.liveActivitiesNeedSampling {
+                                try? await Task.sleep(for: .seconds(2), tolerance: .milliseconds(500))
+                            } else {
+                                await model.untilSessionsChange()
+                            }
+                        }
+                    }
             }
         }
         .task { model.restore() }
+        .onOpenURL { model.openDeepLink($0) }
     }
 }

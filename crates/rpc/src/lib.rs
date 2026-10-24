@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
 mod server;
+mod ws;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
@@ -43,6 +44,10 @@ pub mod methods {
     pub const SET_TITLE_SETTINGS: &str = "SetTitleSettings";
     pub const GET_GRAFF_DRAFT_SUBAGENTS: &str = "GetGraffDraftSubagents";
     pub const SET_GRAFF_DRAFT_SUBAGENTS: &str = "SetGraffDraftSubagents";
+    /// Where graff starts automatic compaction, as a percent of the context
+    /// window; `null` is graff's own default (80%).
+    pub const GET_GRAFF_COMPACT_AT: &str = "GetGraffCompactAt";
+    pub const SET_GRAFF_COMPACT_AT: &str = "SetGraffCompactAt";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";
@@ -86,6 +91,14 @@ pub mod methods {
     pub const REMOVE_QUEUED_MESSAGE: &str = "RemoveQueuedMessage";
     /// Interrupt whatever is running and send this one. `{ chatId, id }` → `{ sent }`.
     pub const SEND_QUEUED_MESSAGE_NOW: &str = "SendQueuedMessageNow";
+    /// Publish a workspace raster image inline in a chat with a live run.
+    /// Local-only: the run and its workspace live on this device, so this
+    /// method is deliberately NOT in the forwarding allowlist. Params
+    /// `{ chatId, id, path, caption? }` → `{ attached, id, name, mimeType }`.
+    pub const SHOW_IMAGE: &str = "ShowImage";
+    /// Publish bounded inline native visual data into a local live run.
+    /// Local-owner only, never forwarded. `{ chatId, id, title, script }`.
+    pub const SHOW_VISUAL: &str = "ShowVisual";
     /// Steer this row into the live turn without interrupting it.
     /// `{ chatId, id }` → `{ sent }`.
     pub const STEER_QUEUED_MESSAGE_NOW: &str = "SteerQueuedMessageNow";
@@ -139,6 +152,37 @@ pub mod methods {
     pub const CODEGRAFF_AUTH_STATUS: &str = "CodegraffAuthStatus";
     pub const CODEGRAFF_USAGE: &str = "CodegraffUsage";
     pub const CODEGRAFF_SIGN_OUT: &str = "CodegraffSignOut";
+    /// `{cwd?, limit?}` → conversations from Claude Code, Codex and graff found on this
+    /// device that Harness doesn't have yet, newest first.
+    pub const EXTERNAL_HISTORY_LIST: &str = "ExternalHistoryList";
+    /// `{sessions?: [{source, id}], cwd?}` → import those (or, without `sessions`, every
+    /// one the list shows for `cwd`) as chats. Returns `{imported, skipped, errors, chatIds}`.
+    pub const EXTERNAL_HISTORY_IMPORT: &str = "ExternalHistoryImport";
+    /// The account's recent CodeGraff PR-agent runs (`GET /v1/jobs`).
+    pub const CODEGRAFF_JOBS: &str = "CodegraffJobs";
+    /// Cancel one PR-agent run (`POST /v1/jobs/:id/cancel`).
+    pub const CODEGRAFF_CANCEL_JOB: &str = "CodegraffCancelJob";
+    /// The account's cloud sandboxes (`GET /v1/sandboxes`); `enabled: false` hides the card.
+    pub const CODEGRAFF_SANDBOXES: &str = "CodegraffSandboxes";
+    /// `{size?}` → create the account's Harness cloud sandbox (fleet, persistent, kept running),
+    /// `size` a personal size id from the list's `sizes` (default size when absent).
+    pub const CODEGRAFF_CREATE_SANDBOX: &str = "CodegraffCreateSandbox";
+    /// `{}` → a temporary API/tool sandbox (`auto`, ephemeral, 30 minutes). Fleet first with
+    /// Daytona fallback, no Harness device setup, personal size or keep-running renewal.
+    pub const CODEGRAFF_CREATE_TEMPORARY_SANDBOX: &str = "CodegraffCreateTemporarySandbox";
+    /// `{id, action}` on one sandbox: `start` (wake, kept running), `stop` (pause), `delete`,
+    /// or `keep-running-on` / `keep-running-off` (whether the gateway renews its window).
+    pub const CODEGRAFF_SANDBOX_ACTION: &str = "CodegraffSandboxAction";
+    /// The account's GitHub CI runners (`GET /v1/github/runners`): `null` while signed out,
+    /// `{available: false}` from a gateway without them.
+    pub const CODEGRAFF_GITHUB_RUNNERS: &str = "CodegraffGithubRunners";
+    /// `{action, installationId, …}` on one GitHub installation: `installation` (budgets, max
+    /// concurrent jobs), `repo` (`fullName`, `enabled?`, `defaultSize?`) or `disconnect`.
+    pub const CODEGRAFF_GITHUB_RUNNER_ACTION: &str = "CodegraffGithubRunnerAction";
+    /// Agent rooms: one call to the edge's `/rooms…` or `/room/{id}/…` routes
+    /// (`{method, path, query?, body?}` → `{status, body}`), made with the
+    /// engine's own sign-in. harness-mcp's room tools compose it.
+    pub const ROOM_REQUEST: &str = "RoomRequest";
     // browse Connected apps (engine browse_link; local only).
     pub const BROWSE_LINK_STATUS: &str = "BrowseLinkStatus";
     pub const BROWSE_LINK_PAIR: &str = "BrowseLinkPair";
@@ -202,7 +246,14 @@ pub mod methods {
     pub const WATCH_WORKSPACE_GIT_STATUS: &str = "WatchWorkspaceGitStatus";
     /// Current pull request for one checkout, resolved on the checkout's host device.
     pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
+    /// Merge the open pull request a chat's checkout branch has, on the
+    /// checkout's host. `{ cwd, branch?, number }` → `ChangeRequestMergeResult`.
+    /// The host re-resolves the branch and merges only that open PR.
+    pub const MERGE_CHANGE_REQUEST: &str = "MergeChangeRequest";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
+    /// Permanently restore one chat-owned checkout to its current HEAD and
+    /// remove only its untracked, non-ignored paths.
+    pub const DISCARD_WORKING_TREE: &str = "DiscardWorkingTree";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
@@ -212,6 +263,14 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    // graff's own provider sign-ins (xAI, Kimi, Z.AI; `StartAgentLogin` takes a
+    // `provider` for the sign-in itself). Same per-device forwarding.
+    pub const LIST_GRAFF_LOGINS: &str = "ListGraffLogins";
+    pub const SIGN_OUT_GRAFF_LOGIN: &str = "SignOutGraffLogin";
+    // graff's MCP servers on a device (`graff mcp status|reconnect|enable|
+    // disable|login`); per-device like the sign-ins above.
+    pub const LIST_MCP_SERVERS: &str = "ListMcpServers";
+    pub const MCP_SERVER_ACTION: &str = "McpServerAction";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
@@ -225,6 +284,9 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    /// Run the release check now instead of waiting for its schedule; the
+    /// result arrives on the `UpdateStatus` stream.
+    pub const CHECK_FOR_UPDATES: &str = "CheckForUpdates";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -557,6 +619,79 @@ mod tests {
         assert_eq!(items.recv().await, Some(serde_json::json!(0)));
         assert_eq!(items.recv().await, Some(serde_json::json!(1)));
         assert_eq!(items.recv().await, None);
+    }
+
+    /// A reply past tungstenite's default 16 MiB frame cap (a long chat's
+    /// transcript watch) must arrive, not drop the connection.
+    #[tokio::test]
+    async fn websocket_carries_messages_past_the_default_frame_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+        // Multi-byte chars so fragment boundaries land mid-codepoint.
+        let big = "é".repeat(9_500_000);
+
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let echoed = client.call("Echo", serde_json::json!(big)).await.unwrap();
+        assert_eq!(echoed.as_str().map(str::len), Some(big.len()));
+        assert_eq!(client.close_reason(), None);
+
+        // A peer still on tungstenite's default limits (an older app build)
+        // reassembles the fragmented reply too.
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (mut legacy, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let request = serde_json::to_string(&ClientFrame {
+            id: 1,
+            method: Some("Echo".into()),
+            params: serde_json::json!(big),
+            cancel: false,
+        })
+        .unwrap();
+        // It sends one unfragmented frame past 16 MiB: the raised cap takes it.
+        assert!(request.len() > 16 << 20);
+        legacy.send(Message::Text(request)).await.unwrap();
+        let reply = loop {
+            match legacy.next().await.unwrap().unwrap() {
+                Message::Text(text) => break text,
+                _ => continue,
+            }
+        };
+        let frame: ServerFrame = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            frame.ok.and_then(|v| v.as_str().map(str::len)),
+            Some(big.len())
+        );
+    }
+
+    /// A transport failure (here, a text frame that isn't UTF-8) fails the
+    /// pending call and leaves the reason behind for the caller to report.
+    #[tokio::test]
+    async fn close_reason_names_a_transport_failure() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Wait for the request, then answer with bytes no text frame may carry.
+            let _ = ws.next().await;
+            let bad = Frame::message(vec![0xff, 0xfe], OpCode::Data(Data::Text), true);
+            let _ = ws.send(Message::Frame(bad)).await;
+            let _ = ws.next().await;
+        });
+
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let err = client.call("Echo", serde_json::json!(1)).await.unwrap_err();
+        assert!(matches!(err, RpcError::Closed), "{err:?}");
+        let reason = client.close_reason().expect("a failed transport says why");
+        assert!(reason.starts_with("reading the socket failed"), "{reason}");
     }
 
     #[tokio::test]

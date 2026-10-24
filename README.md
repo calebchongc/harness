@@ -19,6 +19,7 @@
 <p align="center">
   English · <a href="README.zh-CN.md">简体中文</a> ·
   <a href="README.de.md">Deutsch</a> ·
+  <a href="README.es.md">Español</a> ·
   <a href="README.hindi.md">हिन्दी</a> ·
   <a href="README.thai.md">ไทย</a> ·
   <a href="README.indo.md">Bahasa Indonesia</a> ·
@@ -70,6 +71,14 @@ Windows portable builds use `harness.exe`; keep `harness-update.json` beside
 it for in-app updates. See [Windows development](docs/reference/windows-development.md).
 The Linux sidebar browser needs the
 [browser runtime](docs/reference/linux-browser.md).
+
+### Arch Linux
+
+Download `harness-VERSION-linux-x86_64.pkg.tar.zst` (or `-aarch64`) from
+[Releases](https://github.com/justrach/harness/releases) and install with
+`sudo pacman -U ./harness-VERSION-linux-x86_64.pkg.tar.zst`. A Vulkan driver is
+required for rendering. Pacman installs are never self-updated — reinstall the
+new `.pkg.tar.zst` on each release.
 
 ## CodeGraff
 
@@ -137,9 +146,28 @@ theme import, see [the theme guide](docs/theme-system.md).
 
 ## License
 
-Harness is available under the [GNU Affero General Public License, version 3](LICENSE)
-(`AGPL-3.0-only`), the same AGPL version used as the public license for
-[CodeGraff](https://github.com/justrach/codegraff). Standard Harness Pte. Ltd.
-reserves rights in the original Harness contributions it owns. Earlier and
+**Modified GNU AGPL-3.0** ([`LICENSE`](LICENSE)), built the same way as
+[CodeGraff](https://github.com/justrach/codegraff)'s. Network use triggers
+Section 13. Standard Harness Pte. Ltd., **Rach Pradhan (justrach)** and
+**Yu Xi Lim (yxlyx)** reserve the right to offer proprietary or hosted versions
+of the original Harness contributions they own. A recipient's AGPL license is
+perpetual unless they breach it. Commercial permission without copyleft exists
+only if **all three grant it jointly in writing**, and is revocable. Earlier and
 third-party material keeps its own copyright and license notices; see
 [third-party notices](THIRD_PARTY_NOTICES.md).
+
+**Companies need a commercial license.** Every version after v0.2.108 adds one
+term. Your organization, counted together with its affiliates, needs a
+commercial license for any use of Harness (including on its own machines,
+cloud, CI and network) if it meets **any one** of these:
+
+- it has raised more than **US$500k** in total from investors or lenders;
+- its net worth or latest valuation is more than **US$500k**;
+- its gross revenue was more than **US$100k** in its last fiscal year or any
+  12-month period.
+
+A company that crosses a line must contact us within 5 working days. Individuals always use Harness under the AGPL, whatever they earn,
+and so do organizations that meet none of these tests. Versions up
+to v0.2.108 keep the license they shipped with. Unsure? Treat yourself as
+covered and get in touch.
+Contact [rach@standardharness.com](mailto:rach@standardharness.com).

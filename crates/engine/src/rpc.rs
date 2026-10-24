@@ -24,7 +24,7 @@
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
 //!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
-//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
+//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows, cwd?}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
@@ -116,6 +116,12 @@ struct SetGraffDraftSubagentsParams {
     enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetGraffCompactAtParams {
+    /// Percent of the context window; `null` restores graff's default.
+    pct: Option<u8>,
+}
+
 async fn update_harness_enabled(
     registry: &HarnessRegistry,
     harness: HarnessId,
@@ -165,6 +171,10 @@ struct QueueMessageParams {
     /// supports mid-turn steering.
     #[serde(default)]
     hold_for_turn_end: bool,
+    #[serde(default)]
+    turn_origin: harness_proto::TurnOrigin,
+    #[serde(default)]
+    peer_chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,6 +249,15 @@ struct CheckoutChangeRequestParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MergeChangeRequestParams {
+    cwd: String,
+    #[serde(default)]
+    branch: Option<String>,
+    number: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SwitchRefParams {
     /// The checkout to switch — a session's cwd (main folder or worktree).
     repo_path: String,
@@ -269,6 +288,14 @@ struct DeleteWorktreeParams {
     repo_path: String,
     #[serde(alias = "path")]
     worktree_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscardWorkingTreeParams {
+    chat_id: String,
+    checkout_id: String,
+    expected_checksum: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +335,10 @@ struct RunProjectActionParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+    /// Leave files out of the listing (folder pickers). Older engines ignore
+    /// the field and return files too, which those pickers already filter.
+    #[serde(default)]
+    dirs_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -346,6 +377,46 @@ struct OpenTerminalParams {
     chat_id: String,
     cols: u16,
     rows: u16,
+    /// Explicit working directory (new-chat canvas: the selected project
+    /// folder, or `~`). When omitted, the chat row's cwd is used, then the
+    /// space named by a `space-canvas:{spaceId}` chat id.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Matches the UI canvas panel key (`AppState::panel_session_key`).
+const CANVAS_TERMINAL_PREFIX: &str = "space-canvas:";
+
+/// A cwd the user (or a project-less chat) meant as "host home", not a folder.
+fn meaningful_cwd(cwd: Option<String>) -> Option<String> {
+    cwd.filter(|cwd| {
+        let trimmed = cwd.trim();
+        !trimmed.is_empty() && trimmed != "~"
+    })
+}
+
+/// Space id encoded in a new-chat canvas terminal key, if any.
+fn canvas_space_id(chat_id: &str) -> Option<&str> {
+    chat_id
+        .strip_prefix(CANVAS_TERMINAL_PREFIX)
+        .filter(|id| !id.is_empty())
+}
+
+/// Resolve the PTY cwd: a real explicit path wins, then the chat row, then
+/// the project folder named by `space-canvas:{spaceId}`, then `~`.
+/// The portable `~` marker is a fallback, not an override — otherwise a
+/// canvas OpenTerminal that still says `~` (spaces watch not landed in the
+/// UI) would ignore the selected project encoded in `chatId`.
+fn resolve_open_terminal_cwd(
+    explicit: Option<String>,
+    chat_cwd: Option<String>,
+    space_cwd: Option<String>,
+) -> String {
+    let raw = meaningful_cwd(explicit)
+        .or_else(|| meaningful_cwd(chat_cwd))
+        .or_else(|| meaningful_cwd(space_cwd))
+        .unwrap_or_else(|| "~".to_string());
+    crate::repos::expand_home(&raw)
 }
 
 #[derive(Debug, Deserialize)]
@@ -396,6 +467,47 @@ struct AgentAccountParams {
 #[serde(rename_all = "camelCase")]
 struct StartAgentLoginParams {
     harness: HarnessId,
+    /// Explicit recovery may replace the expired live login after approval.
+    #[serde(default)]
+    reauthenticate: bool,
+    /// Host-owned device authorization can be approved from a phone.
+    #[serde(default)]
+    device_auth: bool,
+    /// Which sign-in, for harnesses that have several (graff: `xai`, `kimi`, `zai`).
+    #[serde(default)]
+    provider: Option<String>,
+    /// Finish graff's ChatGPT recovery on the calling device (a phone) instead
+    /// of the host's browser: the reply carries the authorize page, and the
+    /// caller returns the redirect via `CompleteAgentLogin`.
+    #[serde(default)]
+    relay_browser: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignOutGraffLoginParams {
+    provider: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListMcpServersParams {
+    /// The project folder whose `.mcp.json` counts (the space's folder).
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerActionParams {
+    #[serde(default)]
+    cwd: Option<String>,
+    action: harness_proto::McpServerVerb,
+    /// None: a reconnect of every switched-on server.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,12 +634,22 @@ enum MutateParams {
     #[serde(rename_all = "camelCase")]
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
-    SetChatArchived { chat_id: String, archived: bool },
+    SetChatArchived {
+        chat_id: String,
+        archived: bool,
+        /// Automatic close requests retain their intent time across RPC delay.
+        #[serde(default)]
+        archive_requested_at: Option<i64>,
+    },
     /// Change one pin without replacing another device's edits.
     #[serde(rename_all = "camelCase")]
     ChangeSidebarPin {
         change: harness_proto::SidebarPinChange,
     },
+    /// The desktop's appearance mode and light/dark theme ids, published to
+    /// the registry so phones can match the desktop.
+    #[serde(rename_all = "camelCase")]
+    SetAppearance { mode: String, light: String, dark: String },
     /// Full-config replace on the chat row (harness `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -538,6 +660,9 @@ enum MutateParams {
     DeleteChat { chat_id: String },
     #[serde(rename_all = "camelCase")]
     RenameDevice { device_id: String, name: String },
+    /// Tombstone an offline device's row (Settings → Devices → Remove).
+    #[serde(rename_all = "camelCase")]
+    ForgetDevice { device_id: String },
     /// Synced seen marker (LWW + monotonic guard): clears the "completed"
     /// badge on every device. `at` is epoch ms; default = now.
     #[serde(rename_all = "camelCase")]
@@ -566,6 +691,7 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<harness_update::Updater>,
     local_import: Option<crate::local_import::LocalImporter>,
+    external_history: Option<crate::external_history::ExternalHistory>,
     engine_info: EngineInfo,
 }
 
@@ -610,6 +736,7 @@ impl EngineRpc {
             links: None,
             updater: None,
             local_import: None,
+            external_history: None,
             engine_info,
         }
     }
@@ -641,6 +768,21 @@ impl EngineRpc {
     pub fn with_local_import(mut self, importer: crate::local_import::LocalImporter) -> Self {
         self.local_import = Some(importer);
         self
+    }
+
+    /// Attach the importer for conversations that live in other tools.
+    pub fn with_external_history(
+        mut self,
+        history: crate::external_history::ExternalHistory,
+    ) -> Self {
+        self.external_history = Some(history);
+        self
+    }
+
+    fn external_history(&self) -> Result<crate::external_history::ExternalHistory, RpcError> {
+        self.external_history
+            .clone()
+            .ok_or_else(|| RpcError::Failed("conversation import unavailable".into()))
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -710,11 +852,29 @@ impl EngineRpc {
             if chat.space_id.is_none() {
                 return Ok(chat
                     .cwd
-                    .map(|cwd| std::path::PathBuf::from(crate::sessions::expand_home(&cwd)))
+                    .map(|cwd| std::path::PathBuf::from(crate::repos::expand_home(&cwd)))
                     .unwrap_or_else(home_dir));
             }
         }
         self.file_search_root(p).await
+    }
+
+    /// Kept off the dispatcher's stack: `gh` runs three subprocesses here.
+    #[inline(never)]
+    fn merge_change_request(
+        &self,
+        params: serde_json::Value,
+    ) -> futures::future::BoxFuture<'_, Result<RpcReply, RpcError>> {
+        Box::pin(async move {
+            let p: MergeChangeRequestParams = parse_params(params)?;
+            let cwd = self.change_request_root(&p.cwd).await?;
+            let result = self
+                .change_requests
+                .merge(&cwd, p.branch.as_deref(), p.number)
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            RpcReply::value(&result)
+        })
     }
 
     /// Accept only a checkout already named by a local chat or contained in a
@@ -947,7 +1107,7 @@ impl EngineRpc {
                 let chat_ids = deleted.chat_ids;
                 tokio::spawn(async move {
                     for chat_id in chat_ids {
-                        if let Err(err) = sessions.interrupt(&chat_id).await {
+                        if let Err(err) = sessions.interrupt_for(&chat_id, "space deleted").await {
                             tracing::debug!(chat = %chat_id, error = %err, "deleteSpace interrupt skipped");
                         }
                         doc_host.purge_chat(&chat_id);
@@ -984,14 +1144,25 @@ impl EngineRpc {
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatArchived { chat_id, archived } => self
-                .workspace
-                .set_chat_archived(&chat_id, archived)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatArchived { chat_id, archived, archive_requested_at } => {
+                match archive_requested_at.filter(|_| archived) {
+                    Some(at) => self.workspace.archive_chat_at(&chat_id, at),
+                    None => self.workspace.set_chat_archived(&chat_id, archived),
+                }
+                .map_err(failed)?;
+                // A person's restore lets peer mail held while archived out (#498).
+                if !archived {
+                    self.doc_host.kick_queue(&chat_id);
+                }
+                Ok(())
+            }
             MutateParams::ChangeSidebarPin { change } => {
                 self.workspace.change_sidebar_pin(&change).map_err(failed)
             }
+            MutateParams::SetAppearance { mode, light, dark } => self
+                .workspace
+                .set_appearance(&harness_doc::SyncedAppearance { mode, light, dark })
+                .map_err(failed),
             MutateParams::SetChatConfig { chat_id, config } => self
                 .workspace
                 .set_chat_config(&chat_id, &config)
@@ -1005,6 +1176,11 @@ impl EngineRpc {
             MutateParams::RenameDevice { device_id, name } => self
                 .workspace
                 .rename_device(&device_id, &name)
+                .map_err(failed)
+                .map(drop),
+            MutateParams::ForgetDevice { device_id } => self
+                .workspace
+                .forget_device(&device_id)
                 .map_err(failed)
                 .map(drop),
             MutateParams::MarkChatSeen { chat_id, at } => {
@@ -1129,6 +1305,11 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
+        // A reconnect handshakes every server; a login waits on a browser page.
+        methods::LIST_MCP_SERVERS => Duration::from_secs(70),
+        methods::MCP_SERVER_ACTION => Duration::from_secs(6 * 60),
+        // A relayed sign-in finishes on the host after graff exchanges the code.
+        methods::COMPLETE_AGENT_LOGIN => Duration::from_secs(120),
         _ => Duration::from_secs(30),
     }
 }
@@ -1146,6 +1327,8 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_TITLE_SETTINGS
             | methods::GET_GRAFF_DRAFT_SUBAGENTS
             | methods::SET_GRAFF_DRAFT_SUBAGENTS
+            | methods::GET_GRAFF_COMPACT_AT
+            | methods::SET_GRAFF_COMPACT_AT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
@@ -1200,7 +1383,9 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_GIT_STATUS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
+            | methods::MERGE_CHANGE_REQUEST
             | methods::GET_CHECKOUT_DIFF
+            | methods::DISCARD_WORKING_TREE
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
@@ -1212,12 +1397,19 @@ fn forwardable(method: &str) -> bool {
             // retargets which device's logins are shown).
             | methods::LIST_AGENT_ACCOUNTS
             | methods::CODEGRAFF_USAGE
+            | methods::CODEGRAFF_JOBS
+            | methods::CODEGRAFF_CANCEL_JOB
             | methods::ACTIVATE_AGENT_ACCOUNT
             | methods::FORGET_AGENT_ACCOUNT
             | methods::START_AGENT_LOGIN
             | methods::COMPLETE_AGENT_LOGIN
             | methods::POLL_AGENT_LOGIN
             | methods::CANCEL_AGENT_LOGIN
+            | methods::LIST_GRAFF_LOGINS
+            | methods::SIGN_OUT_GRAFF_LOGIN
+            // graff's MCP config, caches and sign-ins are per device.
+            | methods::LIST_MCP_SERVERS
+            | methods::MCP_SERVER_ACTION
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -1501,6 +1693,9 @@ impl RpcService for EngineRpc {
                 .handle(method, params)
                 .await;
         }
+        if method == methods::MERGE_CHANGE_REQUEST {
+            return self.merge_change_request(params).await;
+        }
         match method {
             methods::CODEGRAFF_SIGN_IN => {
                 let auth = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir());
@@ -1535,6 +1730,108 @@ impl RpcService for EngineRpc {
                 crate::browse_link::BrowseLink::shared(self.repos.data_dir()).disconnect();
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::CODEGRAFF_JOBS => {
+                let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+                let updated_since = params.get("updatedSince").and_then(|v| v.as_i64());
+                let jobs = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .jobs(limit, updated_since)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&jobs)
+            }
+            methods::CODEGRAFF_CANCEL_JOB => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RpcError::Failed("missing job id".into()))?;
+                crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .cancel_job(id)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CODEGRAFF_SANDBOXES => {
+                let sandboxes = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .sandboxes()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&sandboxes)
+            }
+            methods::CODEGRAFF_CREATE_SANDBOX => {
+                let size = params
+                    .get("size")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|size| !size.is_empty());
+                let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .create_sandbox(size)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&sandbox)
+            }
+            methods::CODEGRAFF_CREATE_TEMPORARY_SANDBOX => {
+                let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .create_temporary_sandbox()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&sandbox)
+            }
+            methods::CODEGRAFF_SANDBOX_ACTION => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RpcError::Failed("missing sandbox id".into()))?;
+                let auth = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir());
+                match params.get("action").and_then(|v| v.as_str()) {
+                    Some("start") => auth.start_sandbox(id).await,
+                    Some("stop") => auth.stop_sandbox(id).await,
+                    Some("delete") => auth.delete_sandbox(id).await,
+                    Some("keep-running-on") => {
+                        auth.set_sandbox_keep_running(id, true).await.map(drop)
+                    }
+                    Some("keep-running-off") => {
+                        auth.set_sandbox_keep_running(id, false).await.map(drop)
+                    }
+                    _ => Err("unknown sandbox action".into()),
+                }
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CODEGRAFF_GITHUB_RUNNERS => {
+                let runners = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runners()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&runners)
+            }
+            methods::CODEGRAFF_GITHUB_RUNNER_ACTION => {
+                let action: crate::codegraff_auth::RunnerAction =
+                    serde_json::from_value(params.clone())
+                        .map_err(|e| RpcError::Failed(format!("bad GitHub CI action: {e}")))?;
+                crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .github_runner_action(action)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::ROOM_REQUEST => {
+                #[derive(Deserialize)]
+                struct P {
+                    method: String,
+                    path: String,
+                    #[serde(default)]
+                    query: Vec<(String, String)>,
+                    #[serde(default)]
+                    body: Option<serde_json::Value>,
+                }
+                let p: P = parse_params(params)?;
+                let reply = self
+                    .doc_host
+                    .room_request(&p.method, &p.path, &p.query, p.body)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&reply)
+            }
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
@@ -1560,6 +1857,14 @@ impl RpcService for EngineRpc {
                 let p: SetGraffDraftSubagentsParams = parse_params(params)?;
                 self.registry.set_graff_draft_subagents(p.enabled);
                 RpcReply::value(&self.registry.graff_draft_subagents())
+            }
+            methods::GET_GRAFF_COMPACT_AT => RpcReply::value(&self.registry.graff_compact_at()),
+            methods::SET_GRAFF_COMPACT_AT => {
+                let p: SetGraffCompactAtParams = parse_params(params)?;
+                self.registry
+                    .set_graff_compact_at(p.pct)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&self.registry.graff_compact_at())
             }
             methods::SET_TITLE_SETTINGS => {
                 let p: crate::registry::TitleSettings = parse_params(params)?;
@@ -1693,6 +1998,67 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({}))
             }
+            methods::SHOW_VISUAL => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct P {
+                    chat_id: String,
+                    id: String,
+                    title: String,
+                    script: String,
+                }
+                let p: P = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::BadParams("chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::BadParams("chat belongs to another device".into()));
+                }
+                self.sessions
+                    .show_visual(&p.chat_id, &p.id, &p.title, &p.script)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "attached": true,
+                    "id": format!("show-visual:{}", p.id),
+                    "title": p.title,
+                }))
+            }
+            methods::SHOW_IMAGE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct P {
+                    chat_id: String,
+                    id: String,
+                    path: String,
+                    caption: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                // Local-only (kept out of `forwardable`): only this device's
+                // live run may read its own workspace file. Chat-scoped, never
+                // an arbitrary device selector.
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::BadParams("chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::BadParams("chat belongs to another device".into()));
+                }
+                let image = self
+                    .sessions
+                    .show_image(&p.chat_id, &p.id, &p.path, p.caption)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "attached": true,
+                    "id": format!("show-image:{}", p.id),
+                    "name": image.name,
+                    "mimeType": image.mime_type,
+                }))
+            }
             methods::WATCH_DOC_MESSAGES => {
                 // Opt-in: older viewports retain the full-reset contract.
                 let opening_tail = params
@@ -1724,16 +2090,28 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Prompts first: watch_queue's publish then fills both.
+                let prompts = handle.watch_pending_prompts();
                 let rx = handle.watch_queue();
                 Ok(RpcReply::Stream(
-                    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
-                        if !first {
-                            rx.changed().await.ok()?;
-                        }
-                        let items = rx.borrow_and_update().clone();
-                        let value = serde_json::json!({ "items": items });
-                        Some((value, (rx, false)))
-                    })
+                    futures::stream::unfold(
+                        (rx, prompts, true),
+                        |(mut rx, mut prompts, first)| async move {
+                            if !first {
+                                tokio::select! {
+                                    changed = rx.changed() => changed.ok()?,
+                                    changed = prompts.changed() => changed.ok()?,
+                                }
+                            }
+                            let items = rx.borrow_and_update().clone();
+                            let pending = prompts.borrow_and_update().clone();
+                            let value = serde_json::json!({
+                                "items": items,
+                                "pendingPrompts": pending,
+                            });
+                            Some((value, (rx, prompts, false)))
+                        },
+                    )
                     .boxed(),
                 ))
             }
@@ -1756,11 +2134,13 @@ impl RpcService for EngineRpc {
                 let p: QueueMessageParams = parse_params(params)?;
                 let id = self
                     .doc_host
-                    .queue_message_with_behavior(
+                    .queue_message_with_origin(
                         &p.chat_id,
                         &p.text,
                         p.attachments,
                         p.hold_for_turn_end,
+                        p.turn_origin,
+                        p.peer_chat_id,
                     )
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "id": id }))
@@ -2024,6 +2404,47 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
+            methods::EXTERNAL_HISTORY_LIST => {
+                let history = self.external_history()?;
+                let cwd = params
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                // Walks other tools' session folders: blocking filesystem work.
+                let sessions =
+                    tokio::task::spawn_blocking(move || history.list(cwd.as_deref(), limit))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&sessions)
+            }
+            methods::EXTERNAL_HISTORY_IMPORT => {
+                #[derive(Deserialize)]
+                struct Key {
+                    source: crate::external_history::Source,
+                    id: String,
+                }
+                let history = self.external_history()?;
+                let cwd = params
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let keys: Option<Vec<Key>> = match params.get("sessions") {
+                    Some(v) if !v.is_null() => Some(
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| RpcError::Failed(format!("bad sessions: {e}")))?,
+                    ),
+                    _ => None,
+                };
+                let summary = tokio::task::spawn_blocking(move || {
+                    let keys: Option<Vec<_>> =
+                        keys.map(|k| k.into_iter().map(|k| (k.source, k.id)).collect());
+                    history.import(keys.as_deref(), cwd.as_deref())
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&summary)
+            }
             methods::LOCAL_IMPORT_STATUS => {
                 let importer = self.local_importer()?.clone();
                 let status = tokio::task::spawn_blocking(move || importer.status())
@@ -2061,6 +2482,10 @@ impl RpcService for EngineRpc {
                 ))))
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
+            methods::CHECK_FOR_UPDATES => {
+                self.updater()?.check_now();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::APPLY_UPDATE => {
                 let version = self
                     .updater()?
@@ -2201,6 +2626,86 @@ impl RpcService for EngineRpc {
                         checksum: snapshot.checksum,
                         updated_at: chrono::Utc::now(),
                     })
+                })
+                .await
+            }
+            methods::DISCARD_WORKING_TREE => {
+                // This destructive branch performs several nested filesystem
+                // futures. Box it so unrelated RPC calls do not inherit that
+                // state in the already-large dispatcher stack frame.
+                Box::pin(async move {
+                    let p: DiscardWorkingTreeParams = parse_params(params)?;
+                    let chat = self
+                        .workspace
+                        .chat(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+                    if chat.device_id != self.doc_host.device_id() {
+                        return Err(RpcError::Failed("chat is not hosted by this device".into()));
+                    }
+                    let cwd = chat
+                        .cwd
+                        .as_deref()
+                        .ok_or_else(|| RpcError::Failed("chat has no checkout".into()))?;
+                    let identity = self
+                        .repos
+                        .checkout_identity(std::path::Path::new(cwd))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if identity.id != p.checkout_id {
+                        return Err(RpcError::Failed(
+                            "chat checkout changed since the confirmation was opened".into(),
+                        ));
+                    }
+
+                    // Refuse the mutation when any local chat on this exact
+                    // checkout has a live run. We never interrupt an agent as a
+                    // side effect of discarding files.
+                    let chats = self.workspace.watch_chats().borrow().clone();
+                    for candidate in chats {
+                        if candidate.device_id != self.doc_host.device_id() {
+                            continue;
+                        }
+                        let same_checkout =
+                            if candidate.checkout_id.as_deref() == Some(identity.id.as_str()) {
+                                true
+                            } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
+                                self.repos
+                                    .checkout_identity(std::path::Path::new(candidate_cwd))
+                                    .await
+                                    .is_ok_and(|candidate_identity| {
+                                        candidate_identity.id == identity.id
+                                    })
+                            } else {
+                                false
+                            };
+                        if same_checkout
+                            && self
+                                .sessions
+                                .session_status(&candidate.id)
+                                .is_some_and(|session| {
+                                    matches!(
+                                        session.status,
+                                        harness_proto::SessionStatus::Working
+                                            | harness_proto::SessionStatus::AwaitingInput
+                                    )
+                                })
+                        {
+                            return Err(RpcError::Failed(
+                                "an agent is active in this working tree".into(),
+                            ));
+                        }
+                    }
+
+                    let snapshot = self
+                        .diff_sync
+                        .discard_working_tree(&identity.id, &p.expected_checksum)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    RpcReply::value(&serde_json::json!({
+                        "ok": true,
+                        "checksum": snapshot.checksum,
+                    }))
                 })
                 .await
             }
@@ -2526,7 +3031,7 @@ impl RpcService for EngineRpc {
                 let p: ListFoldersParams = parse_params(params)?;
                 let listing = self
                     .repos
-                    .list_folders(p.path)
+                    .list_folders_opts(p.path, p.dirs_only)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
@@ -2837,15 +3342,23 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                // The terminal runs in the chat's checkout; a chat with no cwd (or
-                // no row yet) gets the home directory.
-                let cwd = self
+                // Prefer an explicit real path (new-chat canvas has no row
+                // yet). `space-canvas:{spaceId}` names the selected project
+                // so a missing/tilde cwd still lands in that folder.
+                let chat_cwd = self
                     .workspace
                     .chat(&p.chat_id)
                     .ok()
                     .flatten()
-                    .and_then(|chat| chat.cwd)
-                    .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+                    .and_then(|chat| chat.cwd);
+                let space_cwd = canvas_space_id(&p.chat_id).and_then(|space_id| {
+                    self.workspace
+                        .space(space_id)
+                        .ok()
+                        .flatten()
+                        .map(|space| space.path)
+                });
+                let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd);
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -2915,15 +3428,96 @@ impl RpcService for EngineRpc {
             }
             methods::START_AGENT_LOGIN => {
                 let p: StartAgentLoginParams = parse_params(params)?;
-                let start = self
+                if p.device_auth && (!p.reauthenticate || p.harness != HarnessId::Codex) {
+                    return Err(RpcError::Failed(
+                        "Device authorization is supported only for explicit Codex recovery."
+                            .into(),
+                    ));
+                }
+                if p.relay_browser
+                    && (p.harness != HarnessId::Graff
+                        || p.provider.as_deref() != Some("chatgpt-new"))
+                {
+                    return Err(RpcError::Failed(
+                        "Finishing sign-in on another device is supported only for graff's ChatGPT sign-in."
+                            .into(),
+                    ));
+                }
+                let start = match (p.harness, p.provider.as_deref()) {
+                    // Recovery attaches to a sign-in already waiting on this host.
+                    (HarnessId::Graff, Some(provider)) if p.reauthenticate => {
+                        self.agent_accounts
+                            .start_graff_reauth(provider, p.relay_browser)
+                            .await
+                    }
+                    (HarnessId::Graff, Some(provider)) if p.relay_browser => {
+                        self.agent_accounts
+                            .start_graff_login_relayed(provider)
+                            .await
+                    }
+                    (HarnessId::Graff, Some(provider)) => {
+                        self.agent_accounts.start_graff_login(provider).await
+                    }
+                    (HarnessId::Graff, None) => Err(crate::EngineError::Other(
+                        "Say which graff provider to sign in to.".into(),
+                    )),
+                    (HarnessId::Codex, _) if p.reauthenticate => {
+                        self.agent_accounts.start_codex_reauth(p.device_auth).await
+                    }
+                    (_, _) if p.device_auth => Err(crate::EngineError::Other(
+                        "Device sign-in is not supported for this provider.".into(),
+                    )),
+                    (harness, _) => self.agent_accounts.start_login(harness).await,
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&start)
+            }
+            methods::LIST_GRAFF_LOGINS => RpcReply::value(&self.agent_accounts.list_graff_logins()),
+            methods::LIST_MCP_SERVERS => {
+                let p: ListMcpServersParams = parse_params(params)?;
+                let home = self.agent_accounts.graff_home();
+                let rows = crate::mcp_servers::list(
+                    &home,
+                    p.cwd.as_deref().map(std::path::Path::new),
+                    &p.names,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&rows)
+            }
+            methods::MCP_SERVER_ACTION => {
+                let p: McpServerActionParams = parse_params(params)?;
+                let home = self.agent_accounts.graff_home();
+                let rows = crate::mcp_servers::act(
+                    &home,
+                    p.cwd.as_deref().map(std::path::Path::new),
+                    p.action,
+                    p.name,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&rows)
+            }
+            methods::SIGN_OUT_GRAFF_LOGIN => {
+                let p: SignOutGraffLoginParams = parse_params(params)?;
+                let rows = self
                     .agent_accounts
-                    .start_login(p.harness)
+                    .sign_out_graff_login(&p.provider)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&start)
+                RpcReply::value(&rows)
             }
             methods::COMPLETE_AGENT_LOGIN => {
                 let p: CompleteAgentLoginParams = parse_params(params)?;
+                // A relayed ChatGPT sign-in: `code` is the redirect it landed on.
+                if let Some(done) = self
+                    .agent_accounts
+                    .complete_relayed_login(&p.login_id, &p.code)
+                    .await
+                {
+                    done.map_err(|e| RpcError::Failed(e.to_string()))?;
+                    return RpcReply::value(&serde_json::json!({ "ok": true }));
+                }
                 let snapshot = self
                     .agent_accounts
                     .complete_login(&p.login_id, &p.code)
@@ -2997,6 +3591,21 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_message_decodes_structural_origin_without_attribution() {
+        let human: QueueMessageParams = serde_json::from_value(serde_json::json!({
+            "chatId": "chat", "text": "legacy"
+        }))
+        .unwrap();
+        assert_eq!(human.turn_origin, harness_proto::TurnOrigin::Human);
+        let peer: QueueMessageParams = serde_json::from_value(serde_json::json!({
+            "chatId": "chat", "text": "ordinary follow-up", "turnOrigin": "peer"
+        }))
+        .unwrap();
+        assert_eq!(peer.turn_origin, harness_proto::TurnOrigin::Peer);
+        assert!(peer.peer_chat_id.is_none());
+    }
 
     // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
     #[cfg(unix)]
@@ -3407,8 +4016,23 @@ mod tests {
     }
 
     #[test]
+    fn appearance_mutation_accepts_desktop_wire_shape() {
+        let p: MutateParams = parse_params(serde_json::json!({
+            "op": "setAppearance", "mode": "system",
+            "light": "codegraff-light", "dark": "codegraff-dark",
+        }))
+        .expect("appearance params");
+        assert!(matches!(
+            p,
+            MutateParams::SetAppearance { mode, light, dark }
+                if mode == "system" && light == "codegraff-light" && dark == "codegraff-dark"
+        ));
+    }
+
+    #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::SHOW_VISUAL));
         assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
@@ -3419,6 +4043,7 @@ mod tests {
         assert!(forwardable(methods::RESOLVE_GIT_AVATARS));
         assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+        assert!(forwardable(methods::DISCARD_WORKING_TREE));
         assert!(forwardable(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
         assert!(forwardable(methods::READ_WORKSPACE_FILE));
@@ -3462,6 +4087,44 @@ mod tests {
             forward_deadline(methods::QUEUE_COMMAND),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn open_terminal_cwd_prefers_explicit_then_chat_then_space_then_home() {
+        let home = crate::repos::home_dir().to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_open_terminal_cwd(
+                Some("/proj".into()),
+                Some("/chat".into()),
+                Some("/space".into())
+            ),
+            "/proj"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(None, Some("/chat".into()), Some("/space".into())),
+            "/chat"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("~".into()), None, Some("/space".into())),
+            "/space",
+            "tilde is a fallback, not an override of the selected project"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(None, None, Some("/space".into())),
+            "/space"
+        );
+        assert_eq!(resolve_open_terminal_cwd(None, None, None), home);
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("~".into()), Some("/chat".into()), None),
+            "/chat"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("  ".into()), Some("/chat".into()), None),
+            "/chat"
+        );
+        assert_eq!(canvas_space_id("space-canvas:s1"), Some("s1"));
+        assert_eq!(canvas_space_id("space-canvas:"), None);
+        assert_eq!(canvas_space_id("chat-1"), None);
     }
 
     #[test]

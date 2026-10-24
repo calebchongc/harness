@@ -11,6 +11,19 @@
 use super::*;
 use crate::pickers::CanvasDraft;
 
+mod opening;
+
+#[cfg(test)]
+mod archived_tests;
+#[cfg(test)]
+mod archived_session_tests;
+#[cfg(test)]
+mod sidebar_tests;
+#[cfg(test)]
+mod interaction_tests;
+#[cfg(test)]
+mod drop_tests;
+
 /// Every pane holds another engine doc watch; Ghostty-scale grids aren't
 /// the point of a chat column.
 pub(super) const MAX_CHAT_PANES: usize = 8;
@@ -53,6 +66,9 @@ pub(super) struct ChatSplit {
     /// Each unfocused pane's parked composer picks (the focused pane's are
     /// live in the pickers); only a new-session canvas pane reads its own.
     pub drafts: Vec<Option<CanvasDraft>>,
+    /// The chat each empty unfocused pane showed before a chats frame arrived
+    /// without it. It goes back in when a later frame lists it again.
+    pub vanished: Vec<Option<String>>,
     pub zoomed: bool,
 }
 
@@ -73,6 +89,7 @@ impl ChatSplit {
             shares: vec![1.0],
             projects: vec![project],
             drafts: vec![None],
+            vanished: vec![None],
             zoomed: false,
         });
         if split.axis != axis || split.panes.len() >= MAX_CHAT_PANES {
@@ -89,6 +106,7 @@ impl ChatSplit {
         let project = split.projects[split.focus].clone();
         split.projects.insert(at, project);
         split.drafts.insert(at, None);
+        split.vanished.insert(at, None);
         split.focus = at;
         split.zoomed = false;
         Some(split)
@@ -102,6 +120,8 @@ impl ChatSplit {
         }
         self.panes[self.focus] = selected;
         let target = self.panes[ix].take();
+        // Focusing an emptied pane makes it a canvas; its lost chat stays lost.
+        self.vanished[ix] = None;
         self.focus = ix;
         self.zoomed = false;
         Some(target)
@@ -207,6 +227,7 @@ impl ChatSplit {
         self.panes.remove(closed);
         self.projects.remove(closed);
         self.drafts.remove(closed);
+        self.vanished.remove(closed);
         let next = closed.saturating_sub(1).min(self.panes.len() - 1);
         self.shares[next] += share;
         if even {
@@ -214,6 +235,7 @@ impl ChatSplit {
         }
         self.focus = next;
         self.zoomed = false;
+        self.vanished[next] = None;
         Some(self.panes[next].take())
     }
 
@@ -242,6 +264,37 @@ impl ChatSplit {
         Some(from)
     }
 
+    /// Empty the panes whose chat is gone from the chats list. `archived(id)`
+    /// is `None` when the list lacks the chat, else whether it was archived
+    /// while shown. That pane simply closes; a missing chat is remembered,
+    /// because a list can lack a chat only briefly and emptying the pane for
+    /// good turned it into a new-session canvas (user report, 2026-09-29).
+    pub fn prune(&mut self, archived: impl Fn(&str) -> Option<bool>) {
+        for (pane, vanished) in self.panes.iter_mut().zip(self.vanished.iter_mut()) {
+            match pane.as_deref().map(&archived) {
+                Some(None) => {
+                    *vanished = pane.take();
+                    tracing::info!(chat = vanished.as_deref(), "split pane's chat left the chats list");
+                }
+                Some(Some(true)) => *pane = None,
+                _ => {}
+            }
+        }
+    }
+
+    /// Put each remembered chat back in its pane once `live` lists it again,
+    /// unless the pane has been focused or filled since.
+    pub fn restore_returned(&mut self, live: impl Fn(&str) -> bool) {
+        for (ix, (pane, vanished)) in self.panes.iter_mut().zip(self.vanished.iter_mut()).enumerate() {
+            if pane.is_some() || ix == self.focus {
+                *vanished = None;
+            } else if let Some(id) = vanished.take_if(|id| live(id)) {
+                tracing::info!(chat = %id, "chat is back in the chats list; restoring its split pane");
+                *pane = Some(id);
+            }
+        }
+    }
+
     pub fn to_saved(&self) -> crate::settings::SavedChatLayout {
         crate::settings::SavedChatLayout {
             vertical: self.axis == SplitAxis::Vertical,
@@ -263,21 +316,35 @@ impl ChatSplit {
         {
             return None;
         }
-        let total: f32 = saved.shares.iter().sum();
+        // Finite f32 weights can still overflow when summed. Normalize in
+        // f64, then reject ratios that cannot represent visible f32 panes.
+        let total: f64 = saved.shares.iter().map(|share| f64::from(*share)).sum();
+        let shares: Vec<f32> = saved
+            .shares
+            .iter()
+            .map(|share| (f64::from(*share) / total) as f32)
+            .collect();
+        if shares.iter().any(|share| *share <= 0.0) {
+            return None;
+        }
         let mut projects = saved.projects.clone();
         projects.resize(len, None);
+        let mut seen = std::collections::HashSet::new();
         Some(Self {
             axis: if saved.vertical { SplitAxis::Vertical } else { SplitAxis::Horizontal },
             panes: saved
                 .panes
                 .iter()
                 .enumerate()
-                .map(|(ix, pane)| pane.clone().filter(|id| ix != saved.focus && live(id)))
+                .map(|(ix, pane)| {
+                    pane.clone().filter(|id| ix != saved.focus && live(id) && seen.insert(id.clone()))
+                })
                 .collect(),
             focus: saved.focus,
-            shares: saved.shares.iter().map(|s| s / total).collect(),
+            shares,
             projects,
             drafts: vec![None; len],
+            vanished: vec![None; len],
             zoomed: false,
         })
     }
@@ -296,7 +363,7 @@ impl ChatSplit {
 /// (Ctrl+Shift/Super combos, so bare Ctrl+letter stays with text inputs).
 pub(super) fn chat_split_bindings(mac: bool) -> Vec<KeyBinding> {
     let b = |mac_combo: &str, other: &str| if mac { mac_combo.to_owned() } else { other.to_owned() };
-    vec![
+    let mut bindings = vec![
         KeyBinding::new(&b("cmd-d", "ctrl-shift-o"), SplitChatRight, None),
         KeyBinding::new(&b("cmd-shift-d", "ctrl-shift-e"), SplitChatDown, None),
         KeyBinding::new(&b("cmd-]", "ctrl-super-]"), FocusNextChatPane, None),
@@ -315,10 +382,20 @@ pub(super) fn chat_split_bindings(mac: bool) -> Vec<KeyBinding> {
         // its address bar: its Browser-scoped binding is bound later).
         KeyBinding::new(&b("cmd-l", "ctrl-shift-l"), FocusComposer, None),
         // Chat tabs (`chat_tabs.rs`): Safari/Terminal's keys on macOS.
-        KeyBinding::new(&b("cmd-t", "ctrl-shift-t"), NewChatTab, None),
         KeyBinding::new(&b("cmd-shift-]", "ctrl-pagedown"), NextChatTab, None),
         KeyBinding::new(&b("cmd-shift-[", "ctrl-pageup"), PrevChatTab, None),
-    ]
+    ];
+    // ⌃1–⌃9 pick a tab on macOS, where ⌘1–⌘9 jump to sidebar sessions;
+    // elsewhere Ctrl+digit is that jump, so tabs take Alt+digit.
+    bindings.extend((0..=chat_tabs::LAST_TAB_SLOT).map(|slot| {
+        let digit = slot + 1;
+        KeyBinding::new(
+            &b(&format!("ctrl-{digit}"), &format!("alt-{digit}")),
+            SelectChatTab(slot),
+            None,
+        )
+    }));
+    bindings
 }
 
 /// An in-progress divider drag: which divider, where the pointer went down
@@ -333,6 +410,12 @@ pub(super) struct DividerDrag {
 pub(super) struct PeerChatView {
     pub transcript: Entity<Transcript>,
     _events: Subscription,
+}
+
+/// Validate a reference from an existing view, not a newly created session.
+/// Archived rows are valid; an incomplete initial list is not deletion proof.
+pub(super) fn existing_chat_selection(selected: Option<String>, state: &AppState) -> Option<String> {
+    selected.filter(|id| !state.chats_synced || state.chats.iter().any(|chat| chat.id == *id))
 }
 
 impl Shell {
@@ -351,54 +434,23 @@ impl Shell {
             .is_none_or(|s| s.axis == axis && s.panes.len() < MAX_CHAT_PANES)
     }
 
-    /// Split and show `open` in the new, focused pane (`None` = a fresh
-    /// new-session canvas, Ghostty's new surface).
-    pub(super) fn split_chat_opening(
-        &mut self,
-        axis: SplitAxis,
-        open: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !matches!(self.route, Route::Chat) {
-            return;
+    pub(super) fn focus_chat_pane(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.select_chat_pane(ix, cx) {
+            window.focus(&self.composer.focus_handle(cx), cx);
         }
-        // A split is always a split, however narrow (Ghostty's rule): ⌘T is
-        // the way to a tab. Turning a narrow ⌘D into a tab read as panes
-        // jumping into tabs of their own (user report, 2026-09-26).
-        let selected = self.state.read(cx).selected_chat.clone();
-        // Dragging the chat you are in moves it; the pane it leaves empties.
-        let parked = selected.clone().filter(|id| open.as_ref() != Some(id));
-        let project = self.settings.space_filter.clone();
-        let draft = self.current_canvas_draft(cx);
-        // Split a copy: a refused split (at the cap, or across axes) must
-        // leave the existing layout alone, not drop every pane.
-        let Some(mut split) = ChatSplit::split(self.chat_split.clone(), axis, parked, project) else {
-            return;
-        };
-        // The pane left behind keeps its picks, and a fresh canvas starts
-        // from them — never from whichever canvas was picked in last.
-        split.drafts[split.focus - 1] = Some(draft.clone());
-        self.chat_split = Some(split);
-        self.chat_split_selected = None;
-        let fresh = open.is_none();
-        self.state.update(cx, |s, cx| s.select_chat(open, cx));
-        self.adopt_canvas_draft(fresh.then_some(draft), cx);
-        self.sync_chat_panes(cx);
-        window.focus(&self.composer.focus_handle(cx), cx);
-        cx.notify();
     }
 
-    pub(super) fn focus_chat_pane(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn select_chat_pane(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
         let selected = self.state.read(cx).selected_chat.clone();
         let draft = self.current_canvas_draft(cx);
         let Some(split) = self.chat_split.as_mut() else {
-            return;
+            return false;
         };
         let from = split.focus;
-        let Some(target) = split.focus_pane(ix, selected) else {
-            return;
+        let Some(target) = split.focus_pane(ix, selected.clone()) else {
+            return false;
         };
+        let target = existing_chat_selection(target, self.state.read(cx));
         // Each pane keeps its own workspace and composer picks: park the
         // live ones in the pane being left and bring the target pane's back.
         split.projects[from] = self.settings.space_filter.clone();
@@ -406,12 +458,65 @@ impl Shell {
         let project = split.projects[ix].clone();
         let target_draft = split.drafts[ix].take().filter(|_| target.is_none());
         self.chat_split_selected = target.clone();
-        self.state.update(cx, |s, cx| s.select_chat(target, cx));
+        // The clicked transcript must remain the visible entity: its click,
+        // selection, folds, and scroll animation belong to it, not a new view.
+        let incoming = target.as_ref().and_then(|id| self.peer_chat_views.remove(id));
+        if let Some(id) = selected.as_ref() {
+            self.transcript.update(cx, |transcript, _| {
+                transcript.set_split_source(Some(id.clone()));
+            });
+        }
+        self.state.update(cx, |s, cx| s.select_split_chat(target.clone(), cx));
+        let incoming = incoming.unwrap_or_else(|| {
+            let transcript = cx.new(|cx| Transcript::new(self.state.clone(), cx));
+            let links = Self::session_links(None, cx);
+            let views = Self::view_opener(cx);
+            transcript.update(cx, |transcript, _| {
+                transcript.set_workspace_link_handler(links);
+                transcript.set_view_opener(views);
+            });
+            let events = cx.subscribe(&transcript, Self::on_transcript_event);
+            PeerChatView { transcript, _events: events }
+        });
+        incoming.transcript.update(cx, |transcript, _| transcript.set_split_source(None));
+        let outgoing = PeerChatView {
+            transcript: std::mem::replace(&mut self.transcript, incoming.transcript),
+            _events: std::mem::replace(&mut self._transcript_events, incoming._events),
+        };
+        if let Some(id) = selected {
+            self.state.update(cx, |s, cx| s.watch_peer_chat(id.clone(), cx));
+            self.peer_chat_views.insert(id, outgoing);
+        }
+        if let Some(id) = target.as_deref() {
+            self.state.update(cx, |s, _| s.unwatch_peer_chat(id));
+        }
         // Filter first: on a canvas it re-aims the project, and the pane's
         // own parked project must have the last word.
         self.set_space_filter(project, cx);
         self.adopt_canvas_draft(target_draft, cx);
         self.sync_chat_panes(cx);
+        self.focus_composer(cx);
+        cx.notify();
+        true
+    }
+
+    /// Files dropped on unfocused pane `ix`: focus it, then attach them to
+    /// its session (or canvas) exactly as a drop on the focused column does.
+    fn drop_paths_on_pane(
+        &mut self,
+        ix: usize,
+        mut paths: Vec<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        paths.retain(|path| !path.as_os_str().is_empty());
+        if paths.is_empty() || !self.select_chat_pane(ix, cx) {
+            return;
+        }
+        // Synchronize the selected composer, including queued-message editing,
+        // before staging. Selection observers may not have run in this event.
+        self.composer
+            .update(cx, |composer, cx| composer.add_paths(paths, cx));
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
@@ -457,25 +562,105 @@ impl Shell {
         }
     }
 
-    /// ⌘W with a split open closes the focused pane (not the window).
+    /// Close pane `ix`, focused or not (a pane's own close button). Closing an
+    /// unfocused pane focuses it first, so it closes the way ⌘W would.
+    pub(super) fn close_chat_pane(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(split) = self.chat_split.as_ref() else {
+            return false;
+        };
+        if ix >= split.panes.len() {
+            return false;
+        }
+        if split.focus != ix {
+            self.focus_chat_pane(ix, window, cx);
+        }
+        self.close_focused_chat_pane(window, cx)
+    }
+
+    /// ⌘W with a split open closes the focused pane (not the window); with
+    /// one pane left it closes the tab. Either can archive the closed session
+    /// ([`Shell::archive_closed_session`]).
     pub(crate) fn close_focused_chat_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.close_focused_chat_pane_archiving(window, cx).0
+    }
+
+    /// The alternate close shortcut uses the same view removal without
+    /// consulting or changing the archive-on-close preference.
+    pub(crate) fn close_focused_chat_pane_without_archiving(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.close_focused_chat_view(window, cx)
+    }
+
+    /// The two close shortcuts share view/history handling, not their archive
+    /// policy: ⌘W (`may_archive`) follows the archive-on-close setting like
+    /// the ✕ buttons, and ⌘⌥W never archives. Include the final
+    /// session-to-canvas close in both.
+    pub(crate) fn close_chat_view_with_archive(
+        &mut self,
+        may_archive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // A close that went ahead some other way answers nothing.
+        self.archive_choice_prompt = false;
+        let closing = self.state.read(cx).selected_chat.clone();
+        let closed = self.close_focused_chat_pane_without_archiving(window, cx)
+            || self.close_chat_to_new_session(cx);
+        if closed
+            && may_archive
+            && let Some(chat_id) = closing
+        {
+            self.archive_closed_session(chat_id, window, cx);
+        }
+        closed
+    }
+
+    /// [`Self::close_focused_chat_pane`], plus what it did to the session.
+    pub(super) fn close_focused_chat_pane_archiving(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (bool, Option<super::chat_tabs::CloseArchive>) {
+        let closing = self.state.read(cx).selected_chat.clone();
+        let closed = self.close_focused_chat_view(window, cx);
+        let archive = closing
+            .filter(|_| closed)
+            .map(|chat_id| self.archive_closed_session(chat_id, window, cx));
+        (closed, archive)
+    }
+
+    fn close_focused_chat_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.chat_split_active() {
             // One pane left: close its tab while others remain.
             return self.close_chat_tab(window, cx);
+        }
+        if self
+            .chat_split
+            .as_ref()
+            .is_some_and(|split| split.panes.len() > 1)
+        {
+            self.remember_closed_chat_pane(cx);
         }
         let Some(split) = self.chat_split.as_mut() else {
             return false;
         };
         let Some(target) = split.close_focused() else {
             self.chat_split = None;
-            motion::reveal_reset(STRIP_REVEAL_KEY);
             return false;
         };
+        let target = existing_chat_selection(target, self.state.read(cx));
         let project = split.projects[split.focus].clone();
         let draft = split.drafts[split.focus].take().filter(|_| target.is_none());
         if split.panes.len() == 1 {
             self.chat_split = None;
-            motion::reveal_reset(STRIP_REVEAL_KEY);
         }
         self.chat_split_selected = target.clone();
         self.state.update(cx, |s, cx| s.select_chat(target, cx));
@@ -505,14 +690,24 @@ impl Shell {
             }
         }
         if state.chats_synced {
-            for pane in split.panes.iter_mut() {
-                if pane
-                    .as_deref()
-                    .is_some_and(|id| !state.chats.iter().any(|c| c.id == id && !c.archived))
-                {
-                    *pane = None;
-                }
-            }
+            let chat = |id: &str| state.chats.iter().find(|c| c.id == id);
+            // Archived since the pane last saw it live: the pane closes. One
+            // that was archived when it entered the pane is being read, and
+            // emptying its pane turned it into a new session (#489). A pane a
+            // reopen is unarchiving stays either way.
+            let unarchiving = &self.chat_tab_unarchiving;
+            let live = &self.chat_split_live;
+            split.prune(|id| {
+                chat(id).map(|c| c.archived && live.contains(id) && !unarchiving.contains_key(id))
+            });
+            split.restore_returned(|id| {
+                chat(id).is_some_and(|c| !c.archived || unarchiving.contains_key(id))
+            });
+            self.chat_split_live = split
+                .peer_chats()
+                .filter(|id| chat(id).is_some_and(|c| !c.archived))
+                .map(str::to_owned)
+                .collect();
         }
         self.sync_chat_panes(cx);
     }
@@ -552,9 +747,13 @@ impl Shell {
             if self.peer_chat_views.contains_key(&id) {
                 continue;
             }
-            let transcript = cx.new(|cx| Transcript::for_doc(self.state.clone(), id.clone(), true, cx));
+            let transcript = cx.new(|cx| Transcript::for_peer_chat(self.state.clone(), id.clone(), cx));
             let links = Self::session_links(Some(id.clone()), cx);
-            transcript.update(cx, |transcript, _| transcript.set_workspace_link_handler(links));
+            let views = Self::view_opener(cx);
+            transcript.update(cx, |transcript, _| {
+                transcript.set_workspace_link_handler(links);
+                transcript.set_view_opener(views);
+            });
             let events = cx.subscribe(&transcript, Self::on_transcript_event);
             self.state
                 .update(cx, |s, cx| s.watch_peer_chat(id.clone(), cx));
@@ -715,6 +914,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let drop_target = self.attachment_drop_target(Some(ix), cx);
         let title: SharedString = chat_id
             .and_then(|id| {
                 self.state
@@ -751,11 +951,15 @@ impl Shell {
                         .justify_center()
                         .child(self.jump_pill(anim, hover, transcript.clone(), cx))
                 });
+                // Cached: with several panes streaming, a frame redraws only
+                // the panes whose transcript changed; the rest replay their
+                // last frame (their text stays selectable, see
+                // `selection_owner_reset`).
                 div()
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .child(transcript)
+                    .child(transcript.cached(gpui::StyleRefinement::default().size_full()))
                     .children(pill)
                     .into_any_element()
             }
@@ -795,19 +999,129 @@ impl Shell {
                     .flex_none()
                     .px(px(14.0))
                     .pb(px(6.0))
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .text_color(theme.text_muted)
-                    .child(title),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(title),
+                    )
+                    // Closing the other panes is how you get back to one
+                    // column; ⌘W / Ctrl+Shift+W closes the focused pane.
+                    .child(
+                        div()
+                            .id(("chat-peer-pane-close", ix))
+                            .flex_none()
+                            .size(px(20.0))
+                            .rounded(px(5.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.ink(0.08)))
+                            .role(gpui::Role::Button)
+                            .aria_label("Close this pane")
+                            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                                window.prevent_default()
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_chat_pane(ix, window, cx);
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::CLOSE)
+                                    .size(px(12.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    ),
             )
             // Ghostty dims unfocused splits.
             .child(div().flex_1().min_h_0().flex().flex_col().opacity(0.8).child(body))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, _, window, cx| this.focus_chat_pane(ix, window, cx)),
+            // Every visible pane takes dropped files, not just the focused
+            // one; the drop focuses the pane it lands on (#488).
+            .child(attachment_drop_veil(("chat-peer-pane-drop", ix), theme))
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+                    if this.attachment_drop_is_current(&drop_target, cx) {
+                        this.drop_paths_on_pane(ix, paths.paths().to_vec(), window, cx);
+                    }
+                }),
             )
+            // Finish the original click/selection before moving this entity
+            // into the active outlet. Capturing observes consumed child events;
+            // deferring lets their click handlers act on the still-mounted view.
+            // Every mouse button activates, and a text selection is no veto.
+            // But a release here is not a new interaction if its press began
+            // elsewhere (for example, selecting in the active pane across us).
+            .capture_any_mouse_down(cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                this.chat_pane_press = Some((ix, event.button));
+            }))
+            .on_mouse_down_out(cx.listener(move |this, _, _, _| {
+                if this.chat_pane_press.is_some_and(|(pane, _)| pane == ix) {
+                    this.chat_pane_press = None;
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+                if this.chat_pane_press.take() != Some((ix, event.button)) || cx.has_active_drag() {
+                    return;
+                }
+                let tab = this.chat_tab;
+                let selected = this.state.read(cx).selected_chat.clone();
+                let pane = this.chat_split.as_ref().and_then(|split| split.panes.get(ix)).cloned();
+                let shell = cx.entity();
+                cx.defer(move |cx| {
+                    shell.update(cx, |this, cx| {
+                        // A link/control may itself navigate or close the pane.
+                        // Do not apply an old pane index to the resulting layout.
+                        if this.chat_tab == tab
+                            && matches!(this.route, Route::Chat)
+                            && this.state.read(cx).selected_chat == selected
+                            && this.chat_split.as_ref().and_then(|split| split.panes.get(ix)).cloned() == pane
+                        {
+                            this.select_chat_pane(ix, cx);
+                        }
+                    });
+                });
+            }))
             .into_any_element()
     }
+}
+
+/// The "Drop to attach" veil over a conversation column, focused or not. It
+/// shows while OS files are dragged over it; the focused column also adds
+/// its workspace file drags.
+pub(super) fn attachment_drop_veil(
+    id: impl Into<gpui::ElementId>,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .opacity(0.0)
+        .bg(theme.scrim().opacity(0.4 / 0.6))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(crate::typography::ui_rems(13.0))
+        .text_color(theme.text)
+        // GPUI matches these styles against the active payload's concrete
+        // TypeId. Resize markers therefore cannot reveal this overlay, even
+        // after an external drag exits without another move event.
+        .drag_over::<gpui::ExternalPaths>(|style, paths, _, _| {
+            if paths.paths().iter().any(|path| !path.as_os_str().is_empty()) {
+                style.opacity(1.0)
+            } else {
+                style
+            }
+        })
+        .child("Drop to attach")
 }
 
 /// Pane glyph: which part of the split a card or row badge stands for.
@@ -831,37 +1145,23 @@ fn space_label(space: &harness_proto::Space) -> String {
 }
 
 impl Shell {
-    /// The pane glyph for a chat open in an UNFOCUSED pane (sidebar badge).
-    pub(super) fn peer_pane_badge(&self, chat_id: &str) -> Option<SharedString> {
-        let split = self.chat_split.as_ref().filter(|s| !s.zoomed)?;
-        if !matches!(self.route, Route::Chat) {
-            return None;
-        }
-        let ix = split
-            .panes
-            .iter()
-            .enumerate()
-            .position(|(ix, pane)| ix != split.focus && pane.as_deref() == Some(chat_id))?;
-        Some(pane_glyph(split.axis, ix, split.panes.len()).into())
-    }
-
     /// A strip of mini cards mirroring the split above the session list:
-    /// each shows its pane's session and workspace (project), the focused
-    /// one lit. Click a card to move into that pane. Hovering the strip eases
-    /// open a preview of the hovered card's conversation underneath.
+    /// each shows its pane's session, with the focused one lit.
+    /// Click a card to move into that pane.
     pub(super) fn render_pane_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let split = self
             .chat_split
             .clone()
             .filter(|_| matches!(self.route, Route::Chat))?;
         let len = split.panes.len();
-        let hovered = self.pane_strip_hovered.min(len - 1);
-        let t = motion::reveal_t(STRIP_REVEAL_KEY);
+        // Always size two equal tracks from the strip's actual content box,
+        // including inside a tab. Titles truncate; incomplete rows stay compact.
+        let gap = 6.0;
         struct Card {
             title: SharedString,
-            project: SharedString,
+            harness: Option<harness_proto::HarnessId>,
         }
-        let (cards, preview) = {
+        let cards = {
             let state = self.state.read(cx);
             let selected = state.selected_chat.clone();
             let pane_chat = |ix: usize| {
@@ -873,60 +1173,54 @@ impl Shell {
             };
             let cards: Vec<Card> = (0..len)
                 .map(|ix| {
-                    // The focused pane's workspace is the live sidebar filter.
-                    let project = if ix == split.focus {
-                        self.settings.space_filter.clone()
+                    let chat = pane_chat(ix).and_then(|id| state.chats.iter().find(|c| c.id == id));
+                    let harness = if let Some(chat) = chat {
+                        chat.config.as_ref().map(|config| config.harness)
+                    } else if ix == split.focus {
+                        self.current_canvas_draft(cx).harness
                     } else {
-                        split.projects.get(ix).cloned().flatten()
+                        split
+                            .drafts
+                            .get(ix)
+                            .and_then(|draft| draft.as_ref())
+                            .and_then(|draft| draft.harness)
                     };
                     Card {
-                        title: pane_chat(ix)
-                            .and_then(|id| state.chats.iter().find(|c| c.id == id))
-                            .map(|c| transcript::single_line(&c.title.clone().unwrap_or_else(|| "Untitled".into())))
+                        harness,
+                        title: chat
+                            .map(|c| {
+                                transcript::single_line(
+                                    &c.title.clone().unwrap_or_else(|| "Untitled".into()),
+                                )
+                            })
                             .unwrap_or_else(|| "New session".into())
-                            .into(),
-                        project: project
-                            .as_deref()
-                            .and_then(|id| state.spaces.iter().find(|s| s.id == id))
-                            .map(space_label)
-                            .unwrap_or_else(|| "All projects".into())
                             .into(),
                     }
                 })
                 .collect();
-            // Only build the preview while it is (becoming) visible.
-            let preview = (t > 0.001).then(|| match pane_chat(hovered) {
-                Some(_) if hovered == split.focus => conversation_preview(&state.transcript),
-                Some(id) => conversation_preview(state.sub_transcript(&id)),
-                None => ConversationPreview::default(),
-            });
-            (cards, preview)
+            cards
         };
 
         let mut row: Vec<AnyElement> = Vec::with_capacity(len);
         for (ix, card) in cards.into_iter().enumerate() {
             let focused = ix == split.focus;
-            let lit = t > 0.001 && ix == hovered;
             row.push(
                 div()
                     .id(("chat-pane-card", ix))
-                    .flex_1()
-                    .min_w(px(96.0))
+                    .debug_selector(move || format!("chat-pane-card-{ix}"))
+                    .min_w_0()
                     .px(px(8.0))
-                    .py(px(7.0))
-                    .rounded(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(7.0))
                     .border_1()
                     .border_color(if focused { theme.accent.opacity(0.55) } else { theme.border })
-                    .bg(if focused || lit { theme.ink(0.05) } else { theme.ink(0.015) })
+                    .bg(if focused { theme.ink(0.05) } else { theme.ink(0.015) })
+                    .hover(|style| style.bg(theme.ink(0.05)))
                     .cursor_pointer()
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        if *hovered && this.pane_strip_hovered != ix {
-                            this.pane_strip_hovered = ix;
-                            cx.notify();
-                        }
-                    }))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.chat_split.as_ref().is_some_and(|s| s.focus == ix) {
+                            this.composer
+                                .update(cx, |composer, cx| composer.reveal_pending_question(cx));
                             window.focus(&this.composer.focus_handle(cx), cx);
                         } else {
                             this.focus_chat_pane(ix, window, cx);
@@ -934,15 +1228,25 @@ impl Shell {
                     }))
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap(px(5.0))
                             .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(crate::typography::ui_rems(11.0))
-                                    .text_color(if focused { theme.accent } else { theme.text_muted })
-                                    .child(SharedString::from(pane_glyph(split.axis, ix, len))),
+                                {
+                                    let (path, tint) = card.harness
+                                        .map(crate::pickers::harness_brand_icon)
+                                        .unwrap_or((icons::CHAT_ROUND_LINE, None));
+                                    icon(path)
+                                        .size(px(11.0))
+                                        .flex_none()
+                                        .text_color(tint.unwrap_or(if focused {
+                                            theme.accent
+                                        } else {
+                                            theme.text_muted
+                                        }))
+                                },
                             )
                             .child(
                                 div()
@@ -955,69 +1259,21 @@ impl Shell {
                                     .child(card.title),
                             ),
                     )
-                    .child(
-                        div()
-                            .mt(px(2.0))
-                            .pl(px(16.0))
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .text_color(theme.text_muted.opacity(0.75))
-                            .child(card.project),
-                    )
                     .into_any_element(),
             );
         }
 
-        let panel = preview.map(|preview| {
-            let line = |label: &'static str, text: Option<SharedString>, lines: usize| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .text_size(crate::typography::ui_rems(10.5))
-                            .text_color(theme.text_muted.opacity(0.7))
-                            .child(SharedString::from(label)),
-                    )
-                    .child(
-                        div()
-                            .h(px(17.0 * lines as f32))
-                            .overflow_hidden()
-                            .text_size(crate::typography::ui_rems(12.0))
-                            .line_height(px(17.0))
-                            .text_color(theme.text)
-                            .child(text.unwrap_or_else(|| "—".into())),
-                    )
-            };
-            div()
-                .h(px(PREVIEW_HEIGHT * t))
-                .opacity(t)
-                .overflow_hidden()
-                .child(
-                    div()
-                        .mt(px(6.0))
-                        .p(px(10.0))
-                        .rounded(px(10.0))
-                        .bg(theme.ink(0.035))
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.0))
-                        .child(line("You", preview.prompt, 1))
-                        .child(line(if preview.streaming { "Working…" } else { "Reply" }, preview.reply, 3)),
-                )
-        });
-
         Some(
             div()
                 .id("sidebar-pane-strip")
+                .w_full()
+                .min_w_0()
+                .flex_none()
                 .px(px(Theme::SPACE_SM))
                 .pb(px(8.0))
                 .flex()
                 .flex_col()
-                .on_hover(motion::reveal_listener(STRIP_REVEAL_KEY))
-                .child(div().flex().flex_row().flex_wrap().items_start().gap(px(6.0)).children(row))
-                .children(panel)
+                .child(div().w_full().min_w_0().grid().grid_cols(2).items_start().gap(px(gap)).children(row))
                 .into_any_element(),
         )
     }
@@ -1027,14 +1283,22 @@ impl Shell {
     /// While a sidebar session is being dragged, Ghostty-style drop targets
     /// over the chat area: the right edge opens it in a new pane to the
     /// right, the bottom edge in a new pane below.
-    pub(super) fn render_split_drop_zones(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if !matches!(self.route, Route::Chat) || self.sidebar_session_transfer.is_none() {
+    ///
+    /// Keyed on [`Shell::split_drop_session`], not the sidebar's reorder
+    /// transfer: a synced pins or chats frame mid-drag cancels that transfer,
+    /// and the zones vanished under the pointer, so the drop did nothing.
+    pub(super) fn render_split_drop_zones(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if !cx.has_active_drag() {
+            self.split_drop_session = None;
+        }
+        if !matches!(self.route, Route::Chat) || self.split_drop_session.is_none() {
             return Vec::new();
         }
         let zone = |id: &'static str, axis: SplitAxis, label: &'static str| {
             let accent = theme.accent;
             div()
                 .id(id)
+                .debug_selector(move || id.to_owned())
                 .absolute()
                 .flex()
                 .items_center()
@@ -1055,8 +1319,12 @@ impl Shell {
                 })
                 .on_drop(cx.listener(move |this, payload: &SidebarSessionDrag, window, cx| {
                     let chat = payload.chat_id.clone();
+                    this.split_drop_session = None;
                     this.cancel_sidebar_session_transfer(cx);
-                    this.split_chat_opening(axis, Some(chat), window, cx);
+                    // Archived or deleted while it was being dragged.
+                    if this.state.read(cx).visible_chats().any(|c| c.id == chat) {
+                        this.split_chat_opening(axis, Some(chat), window, cx);
+                    }
                 }))
         };
         let mut zones = Vec::new();
@@ -1085,101 +1353,9 @@ impl Shell {
     }
 }
 
-pub(super) const STRIP_REVEAL_KEY: &str = "chat-pane-strip";
-/// Revealed height of the hover preview (prompt line + three reply lines).
-const PREVIEW_HEIGHT: f32 = 132.0;
-
-/// Markdown to one line of prose: drop heading/quote/list markers and
-/// emphasis/code fences, collapse whitespace.
-fn plain_text(markdown: &str) -> String {
-    markdown
-        .lines()
-        .map(|line| {
-            let line = line.trim_start();
-            let line = line.trim_start_matches('#').trim_start_matches('>');
-            let line = line
-                .strip_prefix("- ")
-                .or_else(|| line.strip_prefix("* "))
-                .unwrap_or(line);
-            if line.trim_start().starts_with("```") { "" } else { line }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace("**", "")
-        .replace("__", "")
-        .replace('`', "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[derive(Default)]
-struct ConversationPreview {
-    prompt: Option<SharedString>,
-    reply: Option<SharedString>,
-    streaming: bool,
-}
-
-/// The latest prompt and reply text of a transcript, for the hover preview.
-fn conversation_preview(entries: &[harness_doc::SessionMessageEntry]) -> ConversationPreview {
-    // The latest text part (a reply streams its newest words last), with
-    // markdown markers dropped so the preview reads as prose.
-    let text = |entry: &harness_doc::SessionMessageEntry| {
-        entry
-            .parts
-            .iter()
-            .rev()
-            .find_map(|part| match part {
-                harness_doc::MessagePart::Text { text, .. } => Some(plain_text(text)),
-                _ => None,
-            })
-            .filter(|text| !text.is_empty())
-            .map(SharedString::from)
-    };
-    let mut preview = ConversationPreview {
-        streaming: entries
-            .last()
-            .is_some_and(|e| e.status == Some(harness_doc::MessageStatus::Streaming)),
-        ..Default::default()
-    };
-    for entry in entries.iter().rev() {
-        match entry.role {
-            harness_doc::MessageRole::User if preview.prompt.is_none() => preview.prompt = text(entry),
-            harness_doc::MessageRole::Assistant if preview.reply.is_none() && preview.prompt.is_none() => {
-                preview.reply = text(entry)
-            }
-            _ => {}
-        }
-        if preview.prompt.is_some() {
-            break;
-        }
-    }
-    preview
-}
-
 #[cfg(test)]
 mod chat_split_tests {
     use super::*;
-
-    fn entry(role: harness_doc::MessageRole, text: &str) -> harness_doc::SessionMessageEntry {
-        serde_json::from_value(serde_json::json!({
-            "id": text, "role": role, "createdAt": 0, "deviceId": "d",
-            "parts": [{"kind": "text", "id": "p", "text": text}],
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn preview_takes_the_latest_prompt_and_its_reply() {
-        use harness_doc::MessageRole::{Assistant, User};
-        let entries = [entry(User, "old"), entry(Assistant, "old reply"), entry(User, "fix  the\nbuild"), entry(Assistant, "done")];
-        let p = conversation_preview(&entries);
-        assert_eq!(p.prompt.as_deref(), Some("fix the build"));
-        assert_eq!(p.reply.as_deref(), Some("done"));
-        let p = conversation_preview(&entries[..3]);
-        assert_eq!(p.reply, None, "no reply to the latest prompt yet");
-        assert_eq!(plain_text("## Plan\n- **fix** the `build`\n```rust\nlet x;\n```"), "Plan fix the build let x;");
-    }
 
     fn two(selected: &str) -> ChatSplit {
         ChatSplit::split(None, SplitAxis::Horizontal, Some(selected.into()), Some("p".into())).unwrap()
@@ -1377,6 +1553,24 @@ mod chat_split_tests {
     }
 
     #[test]
+    fn number_keys_pick_tabs_without_taking_the_session_jumps() {
+        for (mac, tab_key, jump_key) in [(true, "ctrl-3", "cmd-3"), (false, "alt-3", "ctrl-3")] {
+            let keymap = gpui::Keymap::new(chat_split_bindings(mac));
+            let stack = [gpui::KeyContext::parse("Shell").unwrap()];
+            let bound = |key: &str| {
+                let (matched, _) =
+                    keymap.bindings_for_input(&[gpui::Keystroke::parse(key).unwrap()], &stack);
+                matched.first().map(|b| b.action().boxed_clone())
+            };
+            let tab = bound(tab_key).expect("tab key bound");
+            assert!(tab.partial_eq(&SelectChatTab(2)), "{tab_key} → third tab");
+            let last = bound(if mac { "ctrl-9" } else { "alt-9" }).expect("nine bound");
+            assert!(last.partial_eq(&SelectChatTab(chat_tabs::LAST_TAB_SLOT)));
+            assert!(bound(jump_key).is_none(), "{jump_key} stays the session jump");
+        }
+    }
+
+    #[test]
     fn layouts_round_trip_and_drop_vanished_chats() {
         let mut split = ChatSplit::split(Some(two("a")), SplitAxis::Horizontal, None, None).unwrap();
         split.panes[1] = Some("gone".into());
@@ -1392,6 +1586,38 @@ mod chat_split_tests {
         broken = saved;
         broken.shares.pop();
         assert!(ChatSplit::from_saved(&broken, |_| true).is_none());
+    }
+
+    fn three() -> ChatSplit {
+        // a | b | (focused)
+        ChatSplit::split(Some(two("a")), SplitAxis::Horizontal, Some("b".into()), None).unwrap()
+    }
+
+    #[test]
+    fn a_chat_that_leaves_the_list_briefly_returns_to_its_pane() {
+        let mut split = three();
+        let listed = |ids: &'static [&'static str]| move |id: &str| ids.contains(&id).then_some(false);
+        split.prune(listed(&["a"]));
+        assert_eq!(split.panes, vec![Some("a".into()), None, None]);
+        split.restore_returned(|id| id == "a");
+        assert_eq!(split.panes[1], None, "still missing");
+        split.restore_returned(|id| ["a", "b"].contains(&id));
+        assert_eq!(split.panes, vec![Some("a".into()), Some("b".into()), None], "back in place, not a canvas");
+    }
+
+    #[test]
+    fn a_returning_chat_never_displaces_a_newer_pick_or_an_archive() {
+        let mut split = three();
+        // `a` is archived: its pane closes for good. `b` leaves the list, and
+        // its emptied pane is focused as a new canvas before `b` returns.
+        split.prune(|id| (id == "a").then_some(true));
+        assert_eq!(split.panes, vec![None, None, None]);
+        split.focus_pane(1, Some("c".into()));
+        split.restore_returned(|_| true);
+        assert_eq!(split.panes, vec![None, None, Some("c".into())]);
+        // Closing a pane keeps the memory aligned with the panes.
+        split.close_focused();
+        assert_eq!(split.vanished.len(), split.panes.len());
     }
 
     #[test]

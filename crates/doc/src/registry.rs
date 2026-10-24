@@ -35,8 +35,9 @@ pub const KIND_PREFERENCES: &str = "preferences";
 /// Readiness only; membership and order live on individual pins.
 pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
 pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
+mod appearance;
 mod sidebar_pins;
-mod sidebar_sections;
+pub use appearance::{APPEARANCE_STATE_ID, SyncedAppearance};
 
 /// Snapshot row id in the local `DocsStore` for the persisted registry state.
 pub const REGISTRY_DOC_ID: &str = "registry1";
@@ -67,6 +68,18 @@ pub struct HlcClock {
 }
 
 impl HlcClock {
+    fn observe(&mut self, hlc: &str) {
+        let mut parts = hlc.splitn(3, '-');
+        if let (Some(ms), Some(counter)) = (parts.next(), parts.next()) {
+            if let (Ok(ms), Ok(counter)) = (ms.parse::<i64>(), counter.parse::<u32>()) {
+                if (ms, counter) > (self.last_ms, self.counter) {
+                    self.last_ms = ms;
+                    self.counter = counter;
+                }
+            }
+        }
+    }
+
     fn next(&mut self, now_ms: i64, device: &str) -> String {
         if now_ms > self.last_ms {
             self.last_ms = now_ms;
@@ -585,12 +598,28 @@ impl RegistryDoc {
         Utc::now().timestamp_millis()
     }
 
-    fn next_hlc(&mut self) -> String {
+    /// A fresh clock from this device's monotonic HLC source.
+    pub fn next_hlc(&mut self) -> String {
         let device = self.device_id.clone();
         self.clock.next(Self::now_ms(), &device)
     }
 
-    fn enqueue_ops(&mut self, mut ops: Vec<RowOp>) {
+    /// Advance the clock past a clock observed on a row, so the next local
+    /// write is causally after it even when the writer's wall clock ran ahead.
+    pub fn observe_hlc(&mut self, hlc: &str) {
+        let mut parts = hlc.splitn(3, '-');
+        if let (Some(ms), Some(counter)) = (
+            parts.next().and_then(|v| v.parse::<i64>().ok()),
+            parts.next().and_then(|v| v.parse::<u32>().ok()),
+        ) && (ms, counter) > (self.clock.last_ms, self.clock.counter)
+        {
+            self.clock.last_ms = ms;
+            self.clock.counter = counter;
+        }
+    }
+
+    /// Queue local ops as pending batches (chunked under the room's op cap).
+    pub fn enqueue_ops(&mut self, mut ops: Vec<RowOp>) {
         if ops.is_empty() {
             return;
         }
@@ -622,7 +651,10 @@ impl RegistryDoc {
         }
     }
 
-    fn write(&mut self, kind: &str, id: &str, op: OpKind, set: BTreeMap<String, Value>) {
+    /// One field-level write as its own batch. The typed API below is built on
+    /// it; a viewer device (crates/mobile) uses it directly for the exact field
+    /// sets its writes carry.
+    pub fn write(&mut self, kind: &str, id: &str, op: OpKind, set: BTreeMap<String, Value>) {
         let hlc = self.next_hlc();
         self.enqueue_ops(vec![RowOp {
             kind: kind.to_string(),
@@ -634,7 +666,8 @@ impl RegistryDoc {
         }]);
     }
 
-    fn delete_row_ops(&mut self, keys: &[(&str, &str)]) {
+    /// Tombstone rows in ONE batch under one clock.
+    pub fn delete_row_ops(&mut self, keys: &[(&str, &str)]) {
         let hlc = self.next_hlc();
         let ops = keys
             .iter()
@@ -653,7 +686,7 @@ impl RegistryDoc {
     // ── overlay reads ───────────────────────────────────────────────────────
 
     /// The row as this device should display it: authoritative + pending ops.
-    fn overlay_row(&self, kind: &str, id: &str) -> Option<RegistryRow> {
+    pub fn overlay_row(&self, kind: &str, id: &str) -> Option<RegistryRow> {
         let mut row = self
             .authoritative
             .get(kind)
@@ -673,7 +706,7 @@ impl RegistryDoc {
     }
 
     /// All live rows of `kind`, overlay applied.
-    fn overlay_rows(&self, kind: &str) -> Vec<RegistryRow> {
+    pub fn overlay_rows(&self, kind: &str) -> Vec<RegistryRow> {
         let mut ids: Vec<String> = self
             .authoritative
             .get(kind)
@@ -705,7 +738,7 @@ impl RegistryDoc {
         out
     }
 
-    fn row_exists(&self, kind: &str, id: &str) -> bool {
+    pub fn row_exists(&self, kind: &str, id: &str) -> bool {
         self.overlay_row(kind, id).is_some()
     }
 
@@ -742,6 +775,17 @@ impl RegistryDoc {
             OpKind::Update,
             fields([("name", json!(name))]),
         );
+        Ok(true)
+    }
+
+    /// Tombstone a device row: an offline device (a finished cloud sandbox, a computer that is
+    /// gone) leaves the list. A device that comes back upserts its row on boot, which revives it.
+    /// `false` when no such row.
+    pub fn forget_device(&mut self, device_id: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_DEVICES, device_id) {
+            return Ok(false);
+        }
+        self.delete_row_ops(&[(KIND_DEVICES, device_id)]);
         Ok(true)
     }
 
@@ -1008,6 +1052,105 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// Automatic archive-on-close keeps the close intent's time, not the later
+    /// RPC arrival time. Sends win same-millisecond ties conservatively.
+    pub fn archive_chat_at(&mut self, chat_id: &str, requested_at_ms: i64) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        let clock = encode_hlc(requested_at_ms, 0, &self.device_id);
+        self.clock.observe(&clock);
+        if hlc_newer(&clock, row.clocks.get("archived").map(String::as_str)) {
+            self.enqueue_ops(vec![RowOp {
+                kind: KIND_CHATS.to_string(),
+                id: chat_id.to_string(),
+                op: OpKind::Update,
+                set: Some(fields([
+                    ("archived", json!(true)),
+                    ("archiveCloseAt", json!(requested_at_ms)),
+                ])),
+                hlc: clock,
+                clocks: None,
+            }]);
+        }
+        Ok(true)
+    }
+
+    /// Archive revision observed by a detached sender before reserving its clock.
+    pub fn chat_archive_clock(&self, chat_id: &str) -> Option<String> {
+        self.overlay_row(KIND_CHATS, chat_id)?
+            .clocks
+            .get("archived")
+            .cloned()
+    }
+
+    /// Reserve send ordering before attempting a restore, including while the
+    /// chat row is absent. A retry must not acquire a newer archive-field clock.
+    pub fn chat_prompt_clock(&mut self, chat_id: &str) -> String {
+        if let Some(row) = self.overlay_row(KIND_CHATS, chat_id) {
+            if let Some(clock) = row.clocks.get("archived") {
+                self.clock.observe(clock);
+            }
+        }
+        // Counter zero is reserved for timestamped automatic close intents;
+        // a prompt wins an ambiguous same-millisecond close on any device.
+        self.next_hlc();
+        self.next_hlc()
+    }
+
+    /// Apply the original send intent, never a fresh write at retry time.
+    /// `false` means metadata has not arrived; no partial chat is fabricated.
+    pub fn restore_chat_on_send(&mut self, chat_id: &str, clock: &str) -> Result<bool, DocError> {
+        self.restore_chat_on_send_from(chat_id, clock, None)
+    }
+
+    /// Detached senders reserve clocks from a durable snapshot, not the live
+    /// clock source. New explicit archive intents fence that independent clock;
+    /// older remote intents and timestamped close ties still obey send ordering.
+    pub fn restore_chat_on_send_from(
+        &mut self,
+        chat_id: &str,
+        clock: &str,
+        archive_basis: Option<&str>,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        let archive_clock = row.clocks.get("archived").map(String::as_str);
+        let physical_ms = |hlc: &str| hlc.split('-').next().and_then(|ms| ms.parse::<i64>().ok());
+        let older_intent = archive_clock
+            .and_then(physical_ms)
+            .zip(physical_ms(clock))
+            .is_some_and(|(archived_at, sent_at)| archived_at < sent_at);
+        // A marker is valid only at this archive revision: a later explicit
+        // archive must not inherit an earlier automatic close's tie policy.
+        let automatic_close = archive_clock.is_some_and(|clock| {
+            row.clocks.get("archiveCloseAt").map(String::as_str) == Some(clock)
+        }) && row
+            .fields
+            .get("archiveCloseAt")
+            .and_then(Value::as_i64)
+            .is_some();
+        if archive_basis.is_some_and(|basis| archive_clock != Some(basis))
+            && !older_intent
+            && !automatic_close
+        {
+            return Ok(true); // New explicit archive supersedes this detached receipt.
+        }
+        self.clock.observe(clock);
+        if hlc_newer(clock, row.clocks.get("archived").map(String::as_str)) {
+            self.enqueue_ops(vec![RowOp {
+                kind: KIND_CHATS.to_string(),
+                id: chat_id.to_string(),
+                op: OpKind::Update,
+                set: Some(fields([("archived", json!(false))])),
+                hlc: clock.to_string(),
+                clocks: None,
+            }]);
+        }
+        Ok(true)
+    }
+
     /// Flip the chat's sync room generation (docs/chat2-sync.md M2). The
     /// host calls this in the same breath as seeding the chat2 checkpoint;
     /// LWW per-field like every registry write, so the flip is per-chat and
@@ -1052,9 +1195,29 @@ impl RegistryDoc {
             OpKind::Update,
             fields([
                 ("sourceContext", serde_json::to_value(context)?),
+                ("sourceContextUnavailableAt", Value::Null),
                 ("branch", json!(context.branch)),
                 ("checkoutId", json!(context.checkout_id)),
             ]),
+        );
+        Ok(true)
+    }
+
+    /// The chat's latest accepted run could not observe its checkout. The
+    /// last known context stays for history, qualified as not current.
+    pub fn mark_chat_source_context_unavailable(
+        &mut self,
+        chat_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("sourceContextUnavailableAt", json!(at.timestamp_millis()))]),
         );
         Ok(true)
     }
@@ -1155,6 +1318,23 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// When the chat was last prompted by a person (a send or steer), as
+    /// opposed to `lastMessageAt`, which agent replies bump too. Lists order
+    /// by it so a session sits where you last called it. Its own field, so
+    /// per-field merging keeps it through full-row upserts.
+    pub fn set_chat_last_prompt(&mut self, chat_id: &str, at: DateTime<Utc>) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("lastPromptAt", json!(at.timestamp_millis()))]),
+        );
+        Ok(true)
+    }
+
     /// Tombstone: delete the chat row (and its session-status row). The
     /// per-chat session doc remains — this removes the index entry only.
     pub fn delete_chat(&mut self, chat_id: &str) -> Result<bool, DocError> {
@@ -1173,6 +1353,10 @@ impl RegistryDoc {
             ("deviceId", json!(session.device_id)),
             ("status", serde_json::to_value(session.status)?),
             ("lastCompletedTurn", json!(session.last_completed_turn)),
+            (
+                "lastCompletedPeerOnly",
+                json!(session.last_completed_peer_only),
+            ),
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
         ]);
@@ -1194,7 +1378,6 @@ impl RegistryDoc {
 
     pub fn sidebar_preferences(&self) -> Option<SidebarPreferences> {
         self.sidebar_pins_initialized().then(|| SidebarPreferences {
-            sections: self.sidebar_sections(),
             pinned_session_ids: self
                 .ordered_sidebar_pins()
                 .into_iter()
@@ -1348,6 +1531,10 @@ impl RegistryDoc {
                     ("deviceId", json!(session.device_id)),
                     ("status", serde_json::to_value(session.status)?),
                     ("lastCompletedTurn", json!(session.last_completed_turn)),
+                    (
+                        "lastCompletedPeerOnly",
+                        json!(session.last_completed_peer_only),
+                    ),
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                 ]),
@@ -1411,3 +1598,5 @@ fn row_to<T: serde::de::DeserializeOwned>(row: &RegistryRow) -> Option<T> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod prompt_restore_tests;

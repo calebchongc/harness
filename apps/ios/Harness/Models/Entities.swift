@@ -92,6 +92,13 @@ struct Chat: Identifiable, Hashable {
     /// Sync room generation (docs/chat2-sync.md M2): absent/1 = legacy s2
     /// (never dialed from mobile), 2 = chat2. The host flips it when seeding.
     var roomGen: Int? = nil
+    /// When a person last prompted this chat (a send or steer). Agent replies
+    /// move `lastMessageAt`, never this. Nil from hosts that predate it.
+    var lastPromptAt: Int64? = nil
+
+    /// Where the chat sits in lists: when you last called it; older hosts
+    /// without the stamp fall back to the last message, then creation.
+    var calledAt: Int64 { lastPromptAt ?? lastMessageAt ?? createdAt }
 
     var displayTitle: String {
         if let title, !title.isEmpty { return title }
@@ -195,16 +202,19 @@ func chatIndicator(chat: Chat, live: SessionStatus?) -> ChatIndicator {
     }
 }
 
-/// The Sessions list order: PURE RECENCY, id tiebreak — a port of state.rs
-/// `sort_active`. Status drives the dot, never the position.
+/// The Sessions list order: when you last CALLED each session (your last
+/// send or steer, `Chat.calledAt`), newest first, id tiebreak. Status drives
+/// the dot, never the position.
 ///
 /// This used to bucket by attention first, which is what the desktop did
 /// before 55e1845: opening a completed session marks it seen (completed →
-/// idle), and the row then dropped a bucket out from under the pointer. The
-/// dots carry urgency instead, so the order never moves on its own.
+/// idle), and the row then dropped a bucket out from under the pointer. It
+/// then sorted by the last message of any kind, so a working agent's replies
+/// kept pulling its row above sessions called more recently. Keyed on your
+/// prompts, the order moves only when you call something.
 func sortActive(_ chats: [Chat]) -> [Chat] {
     chats.sorted { a, b in
-        let ta = a.lastMessageAt ?? a.createdAt, tb = b.lastMessageAt ?? b.createdAt
+        let ta = a.calledAt, tb = b.calledAt
         if ta != tb { return ta > tb }
         return a.id < b.id
     }
@@ -258,6 +268,15 @@ struct RenderToolCall: Hashable {
     var fields: [String: AnyHashable]
 
     var string: (String) -> String? { { key in self.fields[key] as? String } }
+
+    /// A todo call's list (proto `TodoItem`); nil for other calls.
+    var tasks: [TaskItem]? { tag == "todo" ? fields["items"] as? [TaskItem] : nil }
+}
+
+/// One entry of an agent's task list (proto `TodoItem`).
+struct TaskItem: Hashable {
+    var text: String
+    var done: Bool
 }
 
 /// Durable metadata only; bytes remain on the message owner's device.
@@ -274,16 +293,32 @@ struct GeneratedImageReference: Hashable {
     }
 }
 
+/// Only host-classified auth failures can offer agent sign-in. Never infer a
+/// route from an error's prose or execute commands supplied by the transcript.
+enum AgentReauthProvider: String, Hashable, Sendable {
+    case chatGPTNew = "chatgpt-new"
+    case codex
+
+    var startParameters: [String: Any] {
+        switch self {
+        // A host that predates `relayBrowser` ignores it and answers host-browser.
+        case .chatGPTNew: return ["harness": "graff", "provider": "chatgpt-new", "reauthenticate": true,
+                                  "relayBrowser": true]
+        case .codex: return ["harness": "codex", "reauthenticate": true, "deviceAuth": true]
+        }
+    }
+}
+
 enum MessagePart: Hashable, Identifiable {
     case image(id: String, reference: GeneratedImageReference)
     case text(id: String, text: String)
     case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool)
     case input(id: String, requestId: String, questions: [UserInputQuestion], resolved: Bool)
-    case error(id: String, message: String)
+    case error(id: String, message: String, reauth: AgentReauthProvider? = nil)
 
     var id: String {
         switch self {
-        case .text(let id, _), .image(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
+        case .text(let id, _), .image(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _, _):
             return id
         }
     }
@@ -297,6 +332,48 @@ struct MessageEntry: Identifiable, Hashable {
     var deviceId: String
     var status: MessageStatus?
     var continuationOf: String?
+    /// Decode-generation marker, NOT content: a fresh value every time the
+    /// entry is (re)built lets the transcript row cache rebuild only the
+    /// entries a doc update actually touched. Excluded from ==/hash so a
+    /// cached projection still compares equal to a whole-doc decode.
+    var stamp: UInt64
+
+    init(id: String, role: MessageRole, parts: [MessagePart], createdAt: Int64,
+         deviceId: String, status: MessageStatus? = nil, continuationOf: String? = nil) {
+        self.id = id
+        self.role = role
+        self.parts = parts
+        self.createdAt = createdAt
+        self.deviceId = deviceId
+        self.status = status
+        self.continuationOf = continuationOf
+        self.stamp = Self.nextStamp()
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.role == rhs.role && lhs.parts == rhs.parts
+            && lhs.createdAt == rhs.createdAt && lhs.deviceId == rhs.deviceId
+            && lhs.status == rhs.status && lhs.continuationOf == rhs.continuationOf
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(role)
+        hasher.combine(parts)
+        hasher.combine(createdAt)
+        hasher.combine(deviceId)
+        hasher.combine(status)
+        hasher.combine(continuationOf)
+    }
+
+    private static let stampLock = NSLock()
+    nonisolated(unsafe) private static var stampCounter: UInt64 = 0
+    static func nextStamp() -> UInt64 {
+        stampLock.lock()
+        defer { stampLock.unlock() }
+        stampCounter &+= 1
+        return stampCounter
+    }
 }
 
 // MARK: - Folder browsing (add-space palette data)
@@ -310,7 +387,7 @@ struct FolderEntry: Codable, Hashable {
     var isRepo: Bool
 }
 
-struct FolderListing: Codable {
+struct FolderListing: Codable, Equatable {
     var path: String
     var entries: [FolderEntry]
     var truncated: Bool

@@ -1,14 +1,54 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// A stable native editor keeps marked text, selection, and keyboard ownership
 /// in one place. Sending commits and clears this same text storage synchronously.
 @MainActor
-final class ComposerEditorController: NSObject, UITextViewDelegate {
+final class ComposerEditorController: NSObject, UITextViewDelegate, UITextDropDelegate {
     weak var view: UITextView?
     var textChanged: (String) -> Void = { _ in }
     var focusChanged: (Bool) -> Void = { _ in }
     private var applying = false
+    var attachmentDraft: AttachmentDraft?
+
+    // UITextView owns a native drop interaction which wins over SwiftUI's
+    // session-wide target. Route images to attachments, never into text storage.
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           proposalForDrop drop: UITextDropRequest) -> UITextDropProposal {
+        let providers = drop.dropSession.items.map(\.itemProvider)
+        guard providers.contains(where: AttachmentDraft.supports), let attachmentDraft else {
+            return drop.suggestedProposal
+        }
+        let proposal = UITextDropProposal(operation: attachmentDraft.canImport ? .copy : .cancel)
+        proposal.dropPerformer = .delegate
+        proposal.dropProgressMode = .custom
+        return proposal
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           willPerformDrop drop: UITextDropRequest) {
+        let providers = drop.dropSession.items.map(\.itemProvider)
+        guard providers.contains(where: AttachmentDraft.supports) else { return }
+        attachmentDraft?.targeted = false
+        attachmentDraft?.receive(providers)
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           dropSessionDidUpdate session: UIDropSession) {
+        attachmentDraft?.targeted = session.items.contains { AttachmentDraft.supports($0.itemProvider) }
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           dropSessionDidExit session: UIDropSession) {
+        attachmentDraft?.targeted = false
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable,
+                           dropSessionDidEnd session: UIDropSession) {
+        attachmentDraft?.targeted = false
+    }
+
 
     func commit() {
         guard let view else { return }
@@ -41,6 +81,49 @@ final class ComposerEditorController: NSObject, UITextViewDelegate {
 
 final class ComposerTextView: UITextView {
     var modifiedSubmit: () -> Void = {}
+    /// Pasted images go here instead of being dropped (a UITextView only
+    /// pastes text); nil while attachments aren't allowed.
+    var pasteImages: (([Data]) -> Void)?
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)), pasteImages != nil, UIPasteboard.general.hasImages {
+            return true
+        }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    override func paste(_ sender: Any?) {
+        let pasteboard = UIPasteboard.general
+        if let pasteImages, pasteboard.hasImages {
+            let images = Self.imageData(from: pasteboard)
+            if !images.isEmpty { pasteImages(images) }
+            // Text copied alongside the image (a web page selection) still
+            // lands in the box.
+            if pasteboard.hasStrings { super.paste(sender) }
+            return
+        }
+        super.paste(sender)
+    }
+
+    /// The original bytes of each copied image when a concrete format is on
+    /// the pasteboard (screenshots are PNG, Photos copies JPEG/HEIC), else
+    /// the decoded image re-encoded as PNG.
+    static func imageData(from pasteboard: UIPasteboard) -> [Data] {
+        let formats: [UTType] = [.png, .jpeg, .gif, .webP, .heic, .heif]
+        var images: [Data] = []
+        for index in 0..<pasteboard.numberOfItems {
+            let item = IndexSet(integer: index)
+            let types = pasteboard.types(forItemSet: item)?.first ?? []
+            guard let format = formats.first(where: { types.contains($0.identifier) }),
+                  let data = pasteboard.data(forPasteboardType: format.identifier,
+                                             inItemSet: item)?.first else { continue }
+            images.append(data)
+        }
+        if images.isEmpty {
+            images = (pasteboard.images ?? []).compactMap { $0.pngData() }
+        }
+        return images
+    }
     override var keyCommands: [UIKeyCommand]? {
         let command = UIKeyCommand(input: "\r", modifierFlags: .command,
                                    action: #selector(submitFromKeyboard))
@@ -57,7 +140,9 @@ struct ComposerEditor: UIViewRepresentable {
     let placeholder: String
     let maxLines: Int
     let controller: ComposerEditorController
+    var attachmentDraft: AttachmentDraft? = nil
     var onModifiedSubmit: () -> Void = {}
+    var onPasteImages: (([Data]) -> Void)? = nil
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     func makeUIView(context: Context) -> UITextView {
@@ -66,16 +151,19 @@ struct ComposerEditor: UIViewRepresentable {
         view.textContainerInset = .zero
         view.textContainer.lineFragmentPadding = 0
         view.showsVerticalScrollIndicator = false
-        view.keyboardAppearance = .dark
+        view.keyboardAppearance = .default
         view.accessibilityIdentifier = "composer-input"
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         view.delegate = controller
+        view.textDropDelegate = controller
         controller.view = view
         return view
     }
 
     func updateUIView(_ view: UITextView, context: Context) {
         (view as? ComposerTextView)?.modifiedSubmit = onModifiedSubmit
+        (view as? ComposerTextView)?.pasteImages = onPasteImages
+        controller.attachmentDraft = attachmentDraft
         controller.textChanged = { if text != $0 { text = $0 } }
         controller.focusChanged = { if focused != $0 { focused = $0 } }
         view.font = UIFontMetrics(forTextStyle: .body).scaledFont(

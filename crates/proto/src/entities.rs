@@ -32,20 +32,6 @@ pub fn validate_sidebar_pin_update(
 pub struct SidebarPreferences {
     #[serde(default)]
     pub pinned_session_ids: Vec<String>,
-    #[serde(default)]
-    pub sections: Vec<SidebarSection>,
-}
-
-/// A user-named sidebar section. Archived sessions retain membership so restoring
-/// them restores their section; deleting the section never deletes sessions.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SidebarSection {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub session_ids: Vec<String>,
-    #[serde(default)]
-    pub collapsed: bool,
 }
 
 /// Watch payload for pins. `initialized` records known cached state, including
@@ -61,8 +47,6 @@ pub struct SidebarPreferencesState {
     pub initialized: bool,
     #[serde(default)]
     pub pinned_session_ids: Vec<String>,
-    #[serde(default)]
-    pub sections: Vec<SidebarSection>,
 }
 
 impl SidebarPreferencesState {
@@ -194,6 +178,13 @@ pub struct Chat {
     /// chat sharing the same checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_context: Option<ConversationSourceContext>,
+    /// Set when the chat's latest accepted run could not observe its checkout
+    /// (not a repository, or inspection failed): `source_context` is then only
+    /// the last known one, not where the chat runs now, and nothing may treat
+    /// it as current (branch PRs, branch labels). Cleared by the next
+    /// successful capture. Written only by the host, never by row upserts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context_unavailable_at: Option<DateTime<Utc>>,
     pub config: Option<ChatConfig>,
     pub last_message_preview: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
@@ -230,6 +221,11 @@ pub struct Chat {
     /// human started; a dangling id (parent deleted) is tolerated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,
+    /// When a person last prompted this chat (a send or steer); agent
+    /// replies move `last_message_at`, never this. Session lists order by
+    /// it. Written only by the host's registry stamp, never by row upserts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt_at: Option<DateTime<Utc>>,
 }
 
 impl Chat {
@@ -295,6 +291,12 @@ pub struct Session {
     /// Interrupts, failures and liveness expiry never advance this marker.
     #[serde(default)]
     pub last_completed_turn: Option<String>,
+    /// `last_completed_turn` answered peer mail only (another chat's message
+    /// or a room delivery, no person's prompt): clients consume the marker
+    /// without a completion alert. Published with the marker; older hosts
+    /// omit it, which reads as an ordinary completion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_completed_peer_only: bool,
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
@@ -806,6 +808,15 @@ pub struct ChangeRequestSummary {
     pub head_ref: String,
 }
 
+/// Result of merging a checkout's change request on its host. `merged: false`
+/// carries the provider's own reason (checks pending, review required, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRequestMergeResult {
+    pub merged: bool,
+    pub message: String,
+}
+
 /// Latest successful change request resolution for one checkout and branch.
 ///
 /// `change_request: None` is an authoritative successful lookup with no match;
@@ -938,6 +949,10 @@ pub struct AgentLoginStart {
     pub login_id: String,
     pub url: String,
     pub mode: AgentLoginMode,
+    /// Device-code sign-ins (graff's xAI and Kimi) also give the user a short
+    /// code to confirm on the page; the app shows it beside the link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -947,6 +962,29 @@ pub enum AgentLoginMode {
     PasteCode,
     /// Codex: the CLI's loopback callback completes in the browser; poll until done.
     Browser,
+    /// The CLI opens its callback-bound browser on the execution host.
+    /// No authorization URL or callback is sent to a remote viewer.
+    HostBrowser,
+    /// Approve a one-time code on any device; tokens are stored on the host.
+    DeviceCode,
+    /// The CLI's loopback sign-in, finished on the device that asked for it:
+    /// `url` is the provider's authorize page, and that device sends the
+    /// redirect it lands on back with `CompleteAgentLogin`. The host delivers
+    /// it to the CLI's callback, so tokens stay on the host (PKCE).
+    RelayBrowser,
+}
+
+impl AgentLoginStart {
+    /// Device authorization never carries an OAuth redirect, token or arbitrary URL.
+    pub fn is_safe_device_code(&self) -> bool {
+        self.mode == AgentLoginMode::DeviceCode
+            && !self.login_id.is_empty()
+            && self.url == "https://auth.openai.com/codex/device"
+            && self.code.as_deref().is_some_and(|code| {
+                (4..=32).contains(&code.len())
+                    && code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -967,6 +1005,48 @@ pub enum AgentLoginStatus {
     Pending,
     Done,
     Error,
+}
+
+/// The providers `graff login <id>` signs into itself, as `(id, display name)`.
+/// CodeGraff's own account and the legacy Codex login are managed elsewhere.
+pub const GRAFF_LOGIN_PROVIDERS: &[(&str, &str)] = &[
+    ("xai", "xAI"),
+    ("kimi", "Kimi"),
+    ("zai", "Z.AI"),
+    ("chatgpt-new", "ChatGPT"),
+    // An Anthropic Console account, through Anthropic's own `ant` CLI; graff
+    // spends that workspace's API credits (graff ADR 0281).
+    ("anthropic", "Anthropic Console"),
+];
+
+/// Where a person manages their ChatGPT plan's usage (OpenAI's UI guidelines
+/// for Sign in with ChatGPT link here from every plan-usage surface).
+pub const CHATGPT_MANAGE_USAGE_URL: &str = "https://chatgpt.com/settings/usage";
+
+/// The one-time confirmation after graff's first ChatGPT sign-in on a device,
+/// carried as the `Done` poll's message.
+pub const CHATGPT_PLAN_CONFIRMATION: &str = "You're using your ChatGPT plan";
+
+/// A ChatGPT sign-in that succeeded without plan usage (the `Error` poll's
+/// message): it can't run requests on the plan.
+pub const CHATGPT_PLAN_OFF: &str = "Signed in to ChatGPT, but plan usage is off. Continue with ChatGPT again and allow plan usage, or use an API key.";
+
+/// One graff sign-in provider on a device (`ListGraffLogins` row).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraffLoginProvider {
+    pub id: String,
+    pub name: String,
+    /// Ready to use. For ChatGPT that means signed in with plan usage granted.
+    pub signed_in: bool,
+    /// ChatGPT: the signed-in account, when graff's record names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// ChatGPT: whether the stored sign-in was granted plan usage. `None` when
+    /// signed out (and for other providers); `Some(false)` is signed in with
+    /// plan usage off, which can't run requests on the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_usage: Option<bool>,
 }
 
 /// CLI plan rate-limit window (accounts settings meters) — NOT app token accounting.
@@ -1151,6 +1231,26 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn sidebar_preferences_ignore_legacy_section_data() {
+        let legacy = serde_json::json!({
+            "pinnedSessionIds": ["pin"],
+            "sections": [{ "id": "old", "name": "Old", "session_ids": ["session"] }]
+        });
+        let preferences: SidebarPreferences = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(preferences.pinned_session_ids, ["pin"]);
+        assert_eq!(
+            serde_json::to_value(preferences).unwrap(),
+            serde_json::json!({ "pinnedSessionIds": ["pin"] })
+        );
+        let mut state = legacy;
+        state["initialized"] = serde_json::json!(true);
+        state["synced"] = serde_json::json!(false);
+        let state: SidebarPreferencesState = serde_json::from_value(state).unwrap();
+        assert_eq!(state.pinned_session_ids, ["pin"]);
+        assert!(serde_json::to_value(state).unwrap().get("sections").is_none());
+    }
 
     #[test]
     fn checkout_change_request_status_round_trips_all_states_as_camel_case() {

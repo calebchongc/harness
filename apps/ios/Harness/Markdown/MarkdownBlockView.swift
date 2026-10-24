@@ -53,7 +53,11 @@ extension [InlineRun] {
             if let link = run.style.link {
                 // Monochrome links: primary text + muted hairline underline,
                 // never accent (desktop render.rs:536).
+                // Agents link raw host paths (`D:/My Projects/x.html`); keep
+                // them tappable so the transcript's link handler sees them.
                 piece.link = URL(string: link)
+                    ?? link.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+                        .flatMap { URL(string: $0) }
                 piece.foregroundColor = baseColor
                 piece.underlineStyle = Text.LineStyle(pattern: .solid, color: Theme.textMuted)
             }
@@ -199,7 +203,7 @@ struct CodeBlockView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 5)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(whiteAlpha(0.02))
+                    .background(ink(0.02))
                     .overlay(alignment: .bottom) {
                         Rectangle().fill(Theme.border).frame(height: 1)
                     }
@@ -217,11 +221,11 @@ struct CodeBlockView: View {
                 .padding(.vertical, MD.codePaddingY)
             }
         }
-        .background(whiteAlpha(0.035))
+        .background(ink(0.035))
         .clipShape(RoundedRectangle(cornerRadius: Theme.panelRadius))
         .overlay(
             RoundedRectangle(cornerRadius: Theme.panelRadius)
-                .strokeBorder(whiteAlpha(0.06), lineWidth: 1)
+                .strokeBorder(hairline(0.06), lineWidth: 1)
         )
         .contextMenu {
             Button {
@@ -378,7 +382,7 @@ struct TableBlockView: View {
     }
 
     private var divider: some View {
-        Rectangle().fill(whiteAlpha(0.10)).frame(height: 1)
+        Rectangle().fill(hairline(0.10)).frame(height: 1)
             .gridCellUnsizedAxes(.horizontal)
     }
 

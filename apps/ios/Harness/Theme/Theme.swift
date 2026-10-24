@@ -1,56 +1,58 @@
-// Always-dark monochrome theme — a direct port of crates/ui/src/theme.rs.
-//
-// Colors are computed from the same oklch definitions the desktop app uses
-// (Björn Ottosson's OKLab matrices, the ones CSS Color 4 specifies), so every
-// surface and accent lands on identical sRGB values. **Numbers drive layout,
-// colors are paint**: layout constants are plain numbers and never depend on
-// which color is painted.
+// Harness's paint and layout tokens. Paint comes from the active desktop theme
+// variant (ThemeStore, fed by the desktop's own registry in themes.json), so
+// every surface and accent lands on the same sRGB values the desktop paints.
+// **Numbers drive layout, colors are paint**: layout constants are plain
+// numbers and never depend on which color is painted.
 
 import SwiftUI
 
 enum Theme {
-    // ---- paint: neutral surfaces (oklch chroma 0) ----
-    /// Main panel background — sampled #060606.
-    static let bg = grey(6)
-    /// Shell / sidebar surface — sampled #0d0d0d.
-    static let surface = grey(13)
+    private static var palette: ThemePalette { ThemeStore.shared.palette }
+
+    // ---- paint: surfaces ----
+    /// Main panel background.
+    static var bg: Color { palette.bg }
+    /// Shell / sidebar surface.
+    static var surface: Color { palette.surface }
     /// Raised surface: popovers, dialogs, cards.
-    static let surfaceRaised = neutral(0.235)
-    /// Hover/pressed wash for interactive rows (white, low alpha).
-    static let elementHover = whiteAlpha(0.06)
+    static var surfaceRaised: Color { palette.surfaceRaised }
+    /// Sheet and dialog panel.
+    static var surfaceDialog: Color { palette.surfaceDialog }
+    /// Hover/pressed wash for interactive rows.
+    static var elementHover: Color { palette.elementHover }
     /// Active/selected wash.
-    static let elementActive = whiteAlpha(0.10)
-    /// Hairline border — white at low alpha so it reads on any surface.
-    static let border = whiteAlpha(0.08)
+    static var elementActive: Color { palette.elementActive }
+    /// Hairline border.
+    static var border: Color { palette.border }
     /// Stronger border for focused/raised edges.
-    static let borderStrong = whiteAlpha(0.14)
+    static var borderStrong: Color { palette.borderStrong }
 
     // ---- paint: text ----
-    static let text = neutral(0.922)       // ~neutral-200
-    static let textMuted = neutral(0.708)  // ~neutral-400
-    static let textFaint = neutral(0.556)  // ~neutral-500
+    static var text: Color { palette.text }
+    static var textMuted: Color { palette.textMuted }
+    static var textFaint: Color { palette.textFaint }
 
     // ---- paint: accents ----
-    static let accent = oklch(0.673, 0.182, 276.935)        // indigo-400
-    static let accentStrong = oklch(0.585, 0.233, 277.117)  // indigo-500
-    static let danger = oklch(0.704, 0.191, 22.216)         // red-400
-    static let dangerSoft = oklch(0.808, 0.114, 19.571)     // red-300
-    static let warning = oklch(0.828, 0.189, 84.429)        // amber-400
+    static var accent: Color { palette.accent }
+    static var accentStrong: Color { palette.accentStrong }
+    static var danger: Color { palette.danger }
+    static var dangerSoft: Color { palette.dangerSoft }
+    static var warning: Color { palette.warning }
 
     // ---- paint: status dots (shell/spaces.rs status_dot_color) ----
-    static let statusWorking = oklch(0.718, 0.202, 349.761)   // pink-400
-    static let statusCompleted = oklch(0.765, 0.177, 163.223) // emerald-400
-    /// Claude brand orange — kept even on the mono surface.
+    static var statusWorking: Color { palette.statusWorking }
+    static var statusCompleted: Color { palette.statusCompleted }
+    /// Claude brand orange — the same in every theme.
     static let claudeBrand = Color(red: 0xD9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0)
 
-    // ---- paint: markdown inline code (violet family) ----
-    static let inlineCodeText = oklch(0.811, 0.111, 293.571)  // violet-300
-    static let inlineCodeWash = oklch(0.702, 0.183, 293.541).opacity(0.12) // violet-400 @ 0.12
+    // ---- paint: markdown inline code ----
+    static var inlineCodeText: Color { palette.inlineCodeText }
+    static var inlineCodeWash: Color { palette.inlineCodeWash }
 
-    // ---- paint: syntax tokens (soft, paint-only) ----
-    static let tokenKeyword = oklch(0.709, 0.129, 20.0)   // soft rose
-    static let tokenString = oklch(0.770, 0.110, 168.0)   // soft green
-    static let tokenNumber = oklch(0.780, 0.120, 80.0)    // soft amber
+    // ---- paint: syntax tokens ----
+    static var tokenKeyword: Color { palette.tokenKeyword }
+    static var tokenString: Color { palette.tokenString }
+    static var tokenNumber: Color { palette.tokenNumber }
 
     // ---- numbers drive layout (pt) ----
     static let bubbleRadius: CGFloat = 22
@@ -69,19 +71,21 @@ extension Theme {
     static let fontMonoName = "GeistMono-Regular"
 
     static func sans(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .custom(sansName(weight), size: size)
+    }
+
+    /// `sans` that scales with Dynamic Type like `style`, from `size` at the default setting.
+    static func sans(_ size: CGFloat, weight: Font.Weight = .regular, relativeTo style: Font.TextStyle) -> Font {
+        .custom(sansName(weight), size: size, relativeTo: style)
+    }
+
+    private static func sansName(_ weight: Font.Weight) -> String {
         // Static weight cuts register as separate families — select by
         // PostScript name so weights actually resolve.
-        let name: String
-        if weight == .medium {
-            name = "Geist-Medium"
-        } else if weight == .semibold {
-            name = "Geist-SemiBold"
-        } else if weight == .bold {
-            name = "Geist-Bold"
-        } else {
-            name = "Geist-Regular"
-        }
-        return .custom(name, size: size)
+        if weight == .medium { return "Geist-Medium" }
+        if weight == .semibold { return "Geist-SemiBold" }
+        if weight == .bold { return "Geist-Bold" }
+        return "Geist-Regular"
     }
 
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
@@ -103,23 +107,67 @@ extension Theme {
     }
 }
 
+// MARK: - Translucent ink (ported from crates/ui/src/theme.rs)
+//
+// Alphas are quoted in dark-mode terms at every call site — the dark theme is
+// the tuned one — and the light value is derived, exactly as on the desktop.
+
+/// Translucent **fill** ink for washes, chips and pressed states: white on
+/// dark themes, black on light ones.
+func ink(_ alpha: Double) -> Color {
+    ThemeStore.shared.palette.isDark
+        ? Color.white.opacity(alpha)
+        : Color.black.opacity(alpha * inkFillScale)
+}
+
+/// Translucent **hairline** ink for borders, dividers and rings. Separate from
+/// `ink` because a 1pt line needs *more* ink on a bright field, a plate less.
+func hairline(_ alpha: Double) -> Color {
+    ThemeStore.shared.palette.isDark
+        ? Color.white.opacity(alpha)
+        : Color.black.opacity(min(alpha * inkHairlineScale, 0.5))
+}
+
+private let inkFillScale = 1.0
+private let inkHairlineScale = 1.35
+
+// MARK: - Project tints
+
+extension Theme {
+    /// A project's own color, keyed by its space id: the same project reads
+    /// the same on every device, with a deeper cut of each hue for light mode.
+    static func projectTint(_ key: String) -> Color {
+        projectTints[projectTintIndex(key)]
+    }
+
+    /// Which of the tints a project gets (the Live Activity draws its own copy).
+    static func projectTintIndex(_ key: String) -> Int {
+        Int(fnv1a(key) % UInt64(projectTints.count))
+    }
+
+    /// Coral, amber, green, teal, sky, indigo, violet, pink.
+    private static let projectTints: [Color] = [25.0, 70, 145, 185, 235, 265, 300, 340].map { hue in
+        adaptive(dark: oklch(0.76, 0.13, hue), light: oklch(0.52, 0.16, hue))
+    }
+}
+
+/// FNV-1a: a hash that is stable across launches (Swift's `Hasher` is seeded).
+func fnv1a(_ text: String) -> UInt64 {
+    var hash: UInt64 = 0xcbf29ce484222325
+    for byte in text.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x100000001b3
+    }
+    return hash
+}
+
 // MARK: - Color primitives (ported from theme.rs)
 
-/// A neutral (chroma 0) oklch tone. Chroma 0 means r == g == b exactly.
-func neutral(_ lightness: Double) -> Color {
-    let v = Double(oklchToSrgb(l: lightness, c: 0, hDeg: 0)[0])
-    return Color(red: v, green: v, blue: v)
-}
-
-/// White at the given alpha — the hairline/wash primitive.
-func whiteAlpha(_ alpha: Double) -> Color {
-    Color.white.opacity(alpha)
-}
-
-/// An exact achromatic tone from an 8-bit channel value (`grey(13)` ≡ #0d0d0d).
-func grey(_ value: UInt8) -> Color {
-    let v = Double(value) / 255.0
-    return Color(red: v, green: v, blue: v)
+/// One token, two paints: resolves per trait collection, so SwiftUI and
+/// UIKit (`UIColor(Theme.x)`) both follow appearance changes live.
+func adaptive(dark: Color, light: Color) -> Color {
+    let dark = UIColor(dark), light = UIColor(light)
+    return Color(uiColor: UIColor { $0.userInterfaceStyle == .light ? light : dark })
 }
 
 /// oklch (CSS notation: L 0..1, C, H degrees) → sRGB Color.
@@ -151,4 +199,30 @@ func oklchToSrgb(l: Double, c: Double, hDeg: Double) -> [Double] {
 private func gammaEncode(_ x: Double) -> Double {
     let x = min(max(x, 0), 1)
     return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055
+}
+
+// MARK: - Appearance
+
+extension View {
+    /// Apply the chosen appearance mode. Pinned Light/Dark force the scheme so
+    /// system chrome (keyboard, glass, menus) matches the palette; System
+    /// leaves it to the device. Sheets get it too so a presentation never
+    /// disagrees with the screen under it.
+    func harnessAppearance() -> some View {
+        preferredColorScheme(ThemeStore.shared.preferredScheme)
+    }
+
+    /// Grouped lists (Settings, Profile and their pages) on the theme's own
+    /// panel instead of the system's grouped gray, which read as the app
+    /// changing theme whenever Settings opened. Pair with
+    /// [`harnessListRow`] on each section for the card surface.
+    func harnessGroupedList() -> some View {
+        scrollContentBackground(.hidden)
+            .background(Theme.bg.ignoresSafeArea())
+    }
+
+    /// A grouped list section's rows on the theme's raised card surface.
+    func harnessListRow() -> some View {
+        listRowBackground(Theme.surfaceRaised)
+    }
 }

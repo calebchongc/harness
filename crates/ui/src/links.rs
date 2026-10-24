@@ -143,6 +143,7 @@ mod tests {
 
     fn harness_chat(harness: HarnessId) -> Chat {
         Chat {
+            last_prompt_at: None,
             id: "chat".into(),
             device_id: "device".into(),
             title: None,
@@ -167,6 +168,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 

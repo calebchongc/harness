@@ -84,6 +84,12 @@ fn toggle(id: &str, label: &str) -> ModelOption {
     }
 }
 
+/// Start the session with Claude in Chrome (`--chrome`), so it can drive the
+/// user's browser through the extension. Every model carries it.
+pub(crate) fn chrome() -> ModelOption {
+    toggle("chrome", "Chrome")
+}
+
 /// The 200K/1M context-window select carried by the long-context models. The
 /// 1M window is selected via a model-id suffix (`<model>[1m]`), exactly how the
 /// CLI itself does it.
@@ -139,6 +145,8 @@ fn model(
         description: (!description.is_empty()).then(|| description.into()),
         reasoning_levels: ladder.to_vec(),
         options,
+        maker: None,
+        billing: None,
     }
 }
 
@@ -188,7 +196,9 @@ fn models_with_settings(path: &std::path::Path) -> Vec<Model> {
                 label: id.into(),
                 description: None,
                 reasoning_levels: FULL_LADDER.to_vec(),
-                options: vec![],
+                options: vec![chrome()],
+                maker: None,
+                billing: None,
             });
         }
     }
@@ -255,6 +265,11 @@ pub(super) fn with_discovered_models(
             continue;
         }
         valid = true;
+        // The CLI lists some models by dated snapshot ("claude-haiku-4-5-20251001");
+        // fold those into the curated undated row instead of duplicating it.
+        let id = snapshot_base(id)
+            .filter(|base| models.iter().any(|model| model.id == *base))
+            .unwrap_or(id);
         if text("value") == Some("default") {
             default = Some(id.to_owned());
         }
@@ -289,7 +304,9 @@ pub(super) fn with_discovered_models(
             label: text("displayName").unwrap_or(id).into(),
             description: text("description").map(str::to_owned),
             reasoning_levels: ladder,
-            options: vec![],
+            options: vec![chrome()],
+            maker: None,
+            billing: None,
         });
     }
     if !valid {
@@ -315,6 +332,12 @@ pub(super) fn with_discovered_models(
     Ok(models)
 }
 
+/// `claude-haiku-4-5-20251001` -> `claude-haiku-4-5`.
+fn snapshot_base(id: &str) -> Option<&str> {
+    let (base, date) = id.rsplit_once('-')?;
+    (date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit())).then_some(base)
+}
+
 pub fn static_models() -> Vec<Model> {
     vec![
         model(
@@ -322,49 +345,49 @@ pub fn static_models() -> Vec<Model> {
             "Fable 5.1",
             "Most intelligent model for building agents",
             FULL_LADDER,
-            vec![context_window()],
+            vec![context_window(), chrome()],
         ),
         model(
             "claude-fable-5",
             "Fable 5",
             "Previous generation Fable",
             FULL_LADDER,
-            vec![context_window()],
+            vec![context_window(), chrome()],
         ),
         model(
             "claude-opus-5-5",
             "Opus 5.5",
             "Best for everyday, complex tasks",
             FULL_LADDER,
-            vec![context_window(), toggle("fastMode", "Fast Mode")],
+            vec![context_window(), toggle("fastMode", "Fast Mode"), chrome()],
         ),
         model(
             "claude-opus-4-8",
             "Opus 4.8",
             "Previous generation Opus",
             FULL_LADDER,
-            vec![toggle("fastMode", "Fast Mode")],
+            vec![toggle("fastMode", "Fast Mode"), chrome()],
         ),
         model(
             "claude-opus-4-7",
             "Opus 4.7",
             "Older generation Opus",
             XHIGH_LADDER,
-            vec![toggle("fastMode", "Fast Mode")],
+            vec![toggle("fastMode", "Fast Mode"), chrome()],
         ),
         model(
             "claude-sonnet-5",
             "Sonnet 5",
             "Balanced speed and intelligence",
             XHIGH_LADDER,
-            vec![context_window()],
+            vec![context_window(), chrome()],
         ),
         model(
             "claude-haiku-4-5",
             "Haiku 4.5",
             "Fastest model for everyday tasks",
             &[],
-            vec![toggle("thinking", "Thinking")],
+            vec![toggle("thinking", "Thinking"), chrome()],
         ),
     ]
 }
@@ -396,6 +419,19 @@ mod tests {
             Some("max")
         );
         assert_eq!(to_effort(Some(ReasoningLevel::XHigh), None), Some("max"));
+    }
+
+    #[test]
+    fn dated_snapshots_fold_into_curated_rows() {
+        let response = serde_json::json!({"response": {"models": [
+            {"value": "claude-haiku-4-5-20251001", "resolvedModel": "claude-haiku-4-5-20251001",
+             "displayName": "Haiku 4.5", "description": "Fastest for quick answers"},
+            {"value": "claude-haiku-9-9-20990101", "displayName": "Haiku 9.9"},
+        ]}});
+        let models = with_discovered_models(static_models(), &response).unwrap();
+        assert_eq!(models.iter().filter(|m| m.label == "Haiku 4.5").count(), 1);
+        // Snapshots with no curated base still surface as-is.
+        assert!(models.iter().any(|m| m.id == "claude-haiku-9-9-20990101"));
     }
 
     #[test]

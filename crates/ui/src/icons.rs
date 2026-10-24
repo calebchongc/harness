@@ -134,11 +134,14 @@ icon_assets![
     (ARCHIVE_UP_MINIMALISTIC, "archive-up-minimalistic"),
     (REFRESH, "refresh"),
     (RESTART, "restart"),
+    (DOWNLOAD_MINIMALISTIC, "download-minimalistic"),
     (ADD_CIRCLE, "add-circle"),
     (TUNING, "tuning"),
     (EYE, "eye"),
     (EYE_CLOSED, "eye-closed"),
     (PAPERCLIP, "paperclip"),
+    // Hand-drawn microphone in the Solar Linear style for composer dictation.
+    (MICROPHONE, "microphone"),
     // Hand-drawn pushpin in the Solar Linear style for local sidebar pins.
     (PIN, "pin"),
     (PEN, "pen"),
@@ -224,6 +227,17 @@ icon_assets![
     (ANTIGRAVITY_MARK, "antigravity-mark"),
     // Exo's four-facet mark (exoharness/exo docs/images/exo_logo.svg, MIT).
     (EXO_MARK, "exo-mark"),
+    // Model maker marks for the picker (LobeHub Icons, MIT; see
+    // THIRD_PARTY_NOTICES.md). Anthropic, OpenAI and xAI reuse the marks above.
+    (MAKER_DEEPSEEK, "maker-deepseek"),
+    (MAKER_MIMO, "maker-mimo"),
+    (MAKER_KIMI, "maker-kimi"),
+    (MAKER_ZAI, "maker-zai"),
+    (MAKER_QWEN, "maker-qwen"),
+    (MAKER_GEMINI, "maker-gemini"),
+    (MAKER_MINIMAX, "maker-minimax"),
+    (MAKER_MISTRAL, "maker-mistral"),
+    (MAKER_META, "maker-meta"),
 ];
 
 /// Serves both the compact control-icon set and the complete file-identity

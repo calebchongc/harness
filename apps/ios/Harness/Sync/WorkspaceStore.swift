@@ -37,15 +37,10 @@ final class WorkspaceStore {
     /// upgrades it's the only flag that ever would.
     private(set) var synced = false
 
-    /// Presence entries older than this are expired (mirrors the Rust
-    /// client's 30s TTL, measured from RECEIPT — beats carry the sender's
-    /// wall clock, which we never trust for freshness).
-    static let presenceTtlMs: Int64 = 30_000
-    /// Dial-gate thresholds (workspace_host.rs PRESENCE_FRESH_MS /
-    /// DIAL_GATE_DARK_MS / DIAL_GATE_WARMUP_MS, PR #168).
-    static let presenceLiveFreshMs: Int64 = 45_000
-    static let dialGateDarkMs: Int64 = 5 * 60_000
-    static let dialGateWarmupMs: Int64 = 60_000
+    /// Bumped when the clock alone changes what a screen should say about a
+    /// device (a beat aged out) — the only thing a view needs to re-read
+    /// `hostStatus`. Beats and reconnects already change observed state.
+    private(set) var statusEpoch = 0
 
     @ObservationIgnored private var doc: RegistryDoc
     @ObservationIgnored private var client: RegistryClient?
@@ -93,21 +88,42 @@ final class WorkspaceStore {
         // down (airplane wifi strips WS upgrades) a 20s poll keeps rows,
         // presence, and pending writes flowing. The GET doubles as our
         // presence beat, so this device stays visible to peers.
-        pollTask?.cancel()
+        Task { [weak self] in await self?.pullDelta() }
+        startOfflinePoll()
+        scheduleStatusRefresh()
+    }
+
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var statusTask: Task<Void, Never>?
+    /// False while the app is in the background: no wake-up is scheduled
+    /// (iOS suspends us anyway), and one is re-armed on return.
+    @ObservationIgnored private var statusActive = true
+    @ObservationIgnored private var lastStatusSnapshot: [String: HostStatus] = [:]
+
+    /// The 20s HTTPS poll exists only for a socket that is down. It runs while
+    /// disconnected and ends when the socket joins, so a healthy connection
+    /// costs no 20s wake-ups at all; a disconnect or foreground restarts it.
+    /// A rejected sign-in parks it too — every request would only be refused.
+    private func startOfflinePoll() {
+        guard pollTask == nil, client != nil, !connected else { return }
         pollTask = Task { [weak self] in
-            await self?.pullDelta()
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                try? await Task.sleep(for: .seconds(20), tolerance: .seconds(5))
                 guard let self, !Task.isCancelled else { return }
-                if !self.connected {
-                    await self.pushPendingOverHTTP()
-                    await self.pullDelta()
+                if self.connected || self.config.signInRejected {
+                    self.pollTask = nil
+                    return
                 }
+                await self.pushPendingOverHTTP()
+                await self.pullDelta()
             }
         }
     }
 
-    @ObservationIgnored private var pollTask: Task<Void, Never>?
+    private func stopOfflinePoll() {
+        pollTask?.cancel()
+        pollTask = nil
+    }
 
     /// The WS hello's delta answer over plain HTTPS, applied through the
     /// exact state path the socket uses.
@@ -185,12 +201,14 @@ final class WorkspaceStore {
         if let client {
             Task { await client.kick() }
         }
+        startOfflinePoll()
         restartChangeRequestStreams(resetUnsupported: true)
     }
 
     func stop() {
-        pollTask?.cancel()
-        pollTask = nil
+        stopOfflinePoll()
+        statusTask?.cancel()
+        statusTask = nil
         saver?.flush()
         if let client {
             Task { await client.stop() }
@@ -207,7 +225,8 @@ final class WorkspaceStore {
 
     // MARK: Server events (delivered in frame order — rows before ack)
 
-    private func handle(_ event: RegistryEvent) {
+    /// Internal (not private) so tests can feed a store registry events without a socket.
+    func handle(_ event: RegistryEvent) {
         switch event {
         case .state(let seq, let full, let gcFloor, let rows, let beats):
             // On a state frame with full=true and seq < our cursor (server
@@ -227,11 +246,14 @@ final class WorkspaceStore {
             project()
             pruneDeletedPinsIfNeeded()
             saver?.poke()
+            scheduleStatusRefresh()
         case .connected:
             let reconnected = !connected
             connected = true
             retryAt = nil
             registryJoinedAt = nowMs()
+            stopOfflinePoll()
+            scheduleStatusRefresh()
             if reconnected {
                 restartChangeRequestStreams(resetUnsupported: true)
             }
@@ -254,11 +276,14 @@ final class WorkspaceStore {
         case .presence(let device, let at):
             presence[device] = at
             presenceReceivedAt[device] = nowMs()
+            scheduleStatusRefresh()
         case .disconnected(let retryAfterMs):
             connected = false
             retryAt = Date().addingTimeInterval(TimeInterval(retryAfterMs) / 1_000)
             registryJoinedAt = nil
             doc.markDisconnected()
+            startOfflinePoll()
+            scheduleStatusRefresh()
         }
     }
 
@@ -292,9 +317,18 @@ final class WorkspaceStore {
 
     // MARK: Presence
 
+    /// What the screens may say about a device (see PresenceRule): online on a
+    /// beat in the last 45s, offline only on positive evidence of absence,
+    /// otherwise unknown. Reading it registers the observation a view needs
+    /// to refresh: new beats, reconnects, and the clock-only `statusEpoch`.
+    func hostStatus(_ deviceId: String) -> HostStatus {
+        _ = presence[deviceId]
+        _ = statusEpoch
+        return resolveStatus(deviceId, now: nowMs())
+    }
+
     func deviceOnline(_ deviceId: String) -> Bool {
-        guard let received = presenceReceivedAt[deviceId] else { return false }
-        return nowMs() - received < Self.presenceTtlMs
+        hostStatus(deviceId) == .online
     }
 
     /// Dial-gate verdict (workspace_host.rs peer_liveness): `dark` requires
@@ -303,21 +337,75 @@ final class WorkspaceStore {
     /// ambiguity stay `unknown`, so a rows-down/relay-up incident shape can
     /// never park the relay.
     func peerLiveness(_ deviceId: String) -> PeerLiveness {
-        guard connected, let joinedAt = registryJoinedAt else { return .unknown }
+        PresenceRule.liveness(now: nowMs(), received: presenceReceivedAt[deviceId], connected: connected,
+                              joinedAt: registryJoinedAt, rowLastSeen: rowLastSeen(deviceId))
+    }
+
+    private func rowLastSeen(_ deviceId: String) -> Int64? {
+        devices.first(where: { $0.id == deviceId })?.lastSeenAt
+    }
+
+    private func resolveStatus(_ deviceId: String, now: Int64) -> HostStatus {
+        PresenceRule.status(now: now, received: presenceReceivedAt[deviceId], connected: connected,
+                            joinedAt: registryJoinedAt, rowLastSeen: rowLastSeen(deviceId))
+    }
+
+    /// Milliseconds since the last beat from `deviceId` arrived, for the
+    /// Connection screen. nil = none heard this session.
+    func beatAgeMs(_ deviceId: String) -> Int64? {
+        presenceReceivedAt[deviceId].map { max(0, nowMs() - $0) }
+    }
+
+    // MARK: Status wake-up
+    //
+    // One sleeping task, armed for the next instant the clock alone could
+    // change any device's status — never a repeating tick. While peers beat,
+    // every beat re-arms it further out, so it does not fire at all; once a
+    // peer goes quiet it fires at +45s and +5min, then not again. Nothing is
+    // scheduled in the background or when no device can change.
+
+    private func scheduleStatusRefresh() {
+        statusTask?.cancel()
+        statusTask = nil
+        guard statusActive, client != nil else { return }
         let now = nowMs()
-        if let received = presenceReceivedAt[deviceId] {
-            if now - received < Self.presenceLiveFreshMs { return .live }
-            if now - received >= Self.dialGateDarkMs { return .dark }
-            return .unknown
+        let ids = Set(devices.map(\.id)).union(presenceReceivedAt.keys)
+        let next = ids.compactMap {
+            PresenceRule.nextChange(after: now, received: presenceReceivedAt[$0], connected: connected,
+                                    joinedAt: registryJoinedAt, rowLastSeen: rowLastSeen($0))
+        }.min()
+        guard let next else { return }
+        let delayMs = max(500, next - now + 250)
+        statusTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(delayMs), tolerance: .seconds(2))
+            guard !Task.isCancelled, let self else { return }
+            self.refreshStatuses()
         }
-        // Never heard this session: only a warmed-up room may consult the
-        // durable device row's own stamp.
-        guard now - joinedAt >= Self.dialGateWarmupMs else { return .unknown }
-        if let seen = devices.first(where: { $0.id == deviceId })?.lastSeenAt,
-           now - seen >= Self.dialGateDarkMs {
-            return .dark
+    }
+
+    /// Re-read every device's status; publish only if one actually changed,
+    /// so a wake-up that finds nothing new re-renders nothing.
+    private func refreshStatuses() {
+        let now = nowMs()
+        let ids = Set(devices.map(\.id)).union(presenceReceivedAt.keys)
+        let snapshot = Dictionary(uniqueKeysWithValues: ids.map { ($0, resolveStatus($0, now: now)) })
+        if snapshot != lastStatusSnapshot {
+            lastStatusSnapshot = snapshot
+            statusEpoch &+= 1
         }
-        return .unknown
+        scheduleStatusRefresh()
+    }
+
+    /// Foreground/background: no wake-up while backgrounded; on return,
+    /// catch up on whatever aged out while suspended and re-arm.
+    func setActive(_ active: Bool) {
+        statusActive = active
+        if active {
+            refreshStatuses()
+        } else {
+            statusTask?.cancel()
+            statusTask = nil
+        }
     }
 
     /// Version gates (state.rs device_version_at_least): unknown device or an
@@ -383,7 +471,8 @@ final class WorkspaceStore {
                         createdAt: f["createdAt"]?.int64Value ?? 0,
                         spaceId: f["spaceId"]?.stringValue,
                         lastSeenAt: f["lastSeenAt"]?.int64Value,
-                        roomGen: f["roomGen"]?.int64Value.map(Int.init))
+                        roomGen: f["roomGen"]?.int64Value.map(Int.init),
+                        lastPromptAt: f["lastPromptAt"]?.int64Value)
         }
 
         var rows: [String: SessionRow] = [:]
@@ -406,6 +495,7 @@ final class WorkspaceStore {
             sidebarPreferencesInitialized = false
             pinnedSessionIds = []
         }
+        ThemeStore.shared.applyDesktop(doc.desktopAppearance)
         reconcileChangeRequestStreams()
     }
 
@@ -557,24 +647,85 @@ final class WorkspaceStore {
         changeRequestSnapshots.removeAll()
     }
 
-    /// The last relay failure, for surfacing in UI/diagnostics.
-    private(set) var lastRelayError: String?
-
     /// ListFolders on the target device (engine caps at 500 entries, hides
     /// dotfiles, stamps isRepo). nil path = the device's home directory.
-    func listFolders(deviceId: String, path: String?) async -> FolderListing? {
-        do {
-            return try await listFoldersDetailed(deviceId: deviceId, path: path)
-        } catch {
-            lastRelayError = describeTransportError(error)
-            return nil
-        }
-    }
-
-    func listFoldersDetailed(deviceId: String, path: String?) async throws -> FolderListing {
+    /// `dirsOnly` leaves files out on the host (engines that predate it
+    /// ignore the field and send files, which folder pickers filter anyway).
+    func listFoldersDetailed(deviceId: String, path: String?,
+                             dirsOnly: Bool = false) async throws -> FolderListing {
         var params: [String: Any] = [:]
         if let path { params["path"] = path }
+        if dirsOnly { params["dirsOnly"] = true }
         return try await relay(for: deviceId).call(method: "ListFolders", params: params)
+    }
+
+    /// CodegraffUsage on the target device: the CodeGraff account its engine
+    /// is signed in with (nil when that computer is signed out).
+    func codegraffUsage(deviceId: String) async throws -> CodegraffUsage? {
+        try await relay(for: deviceId).call(method: "CodegraffUsage", params: [:],
+                                            timeoutSeconds: 20)
+    }
+
+    /// ListAgentAccounts on the target device — its agent CLI logins with
+    /// rate-limit windows. `forceUsage` reads the limits from each provider
+    /// (one network probe per login, hence the longer deadline); without it
+    /// the engine only returns limits cached in the last few minutes.
+    func agentAccounts(deviceId: String, forceUsage: Bool) async throws -> AgentAccountsSnapshot {
+        try await relay(for: deviceId).call(method: "ListAgentAccounts",
+                                            params: ["forceUsage": forceUsage],
+                                            timeoutSeconds: 45)
+    }
+
+    /// GetGraffCompactAt on the target device: the percent of the context
+    /// window where its graff chats compact, nil for graff's default.
+    func graffCompactAt(deviceId: String) async throws -> Int? {
+        try await relay(for: deviceId).call(method: "GetGraffCompactAt", params: [:])
+    }
+
+    /// SetGraffCompactAt; nil restores the default. Answers with the stored value.
+    func setGraffCompactAt(deviceId: String, pct: Int?) async throws -> Int? {
+        try await relay(for: deviceId).call(method: "SetGraffCompactAt",
+                                            params: ["pct": pct.map { $0 as Any } ?? NSNull()])
+    }
+
+    /// CodegraffSandboxes on the target device: the cloud sandboxes and sizes of
+    /// the Codegraff account its engine is signed in with (nil while signed out).
+    func codegraffSandboxes(deviceId: String) async throws -> CodegraffSandboxes? {
+        try await relay(for: deviceId).call(method: "CodegraffSandboxes", params: [:],
+                                            timeoutSeconds: 30)
+    }
+
+    /// CodegraffCreateSandbox: `size` is a personal size id from the list (the
+    /// default one when nil). The engine boots the machine and sets Harness up in
+    /// it before it answers, which takes minutes.
+    func createCodegraffSandbox(deviceId: String, size: String?) async throws {
+        var params: [String: Any] = [:]
+        if let size { params["size"] = size }
+        let _: JSONValue = try await relay(for: deviceId).call(method: "CodegraffCreateSandbox",
+                                                               params: params, timeoutSeconds: 6 * 60,
+                                                               retry: false)
+    }
+
+    /// CodegraffSandboxAction on one sandbox. A start wakes the machine and sets
+    /// Harness up again, so it gets the create's deadline.
+    func codegraffSandboxAction(deviceId: String, id: String, action: CloudSandboxAction) async throws {
+        let timeout: UInt64 = action == .start ? 6 * 60 : 60
+        let _: JSONValue = try await relay(for: deviceId).call(method: "CodegraffSandboxAction",
+                                                               params: ["id": id, "action": action.rawValue],
+                                                               timeoutSeconds: timeout)
+    }
+
+    /// CodegraffGithubRunners on the target device (nil while signed out;
+    /// `available: false` from a gateway without runners).
+    func codegraffGithubRunners(deviceId: String) async throws -> GithubRunners? {
+        try await relay(for: deviceId).call(method: "CodegraffGithubRunners", params: [:],
+                                            timeoutSeconds: 30)
+    }
+
+    /// CodegraffGithubRunnerAction: budgets, concurrency, one repository, or a disconnect.
+    func codegraffGithubRunnerAction(deviceId: String, action: GithubRunnerAction) async throws {
+        let _: JSONValue = try await relay(for: deviceId).call(method: "CodegraffGithubRunnerAction",
+                                                               params: action.params, timeoutSeconds: 30)
     }
 
     /// ListRefs on the target device — branches with current/worktree markers
@@ -590,24 +741,40 @@ final class WorkspaceStore {
     /// Settings → Agents gate; absent `enabled` falls back to the engine's
     /// `default_enabled()` pair, matching `descriptor_enabled`).
     func listHarnesses(deviceId: String) async -> [HarnessInfo]? {
-        struct WireHarness: Decodable {
-            var id: String
-            var name: String
-            var installed: Bool?
-            var enabled: Bool?
-            var supportsSteering: Bool?
-            var steeringMode: String?
-        }
-        let wire: [WireHarness]? = try? await relay(for: deviceId)
-            .call(method: "ListHarnesses", params: [:])
+        let wire = await wireHarnesses(deviceId: deviceId)
         return wire.map { list in
             list.filter { h in
                 h.id != "mock"
                     && (h.installed ?? true)
-                    && (h.enabled ?? ["claude-code", "codex"].contains(h.id))
+                    && (h.enabled ?? Self.defaultOnAgents.contains(h.id))
             }
             .map { HarnessInfo(id: $0.id, label: $0.name,
                                supportsSteering: $0.supportsSteering, steeringMode: $0.steeringMode) }
+        }
+    }
+
+    /// The three agents a fresh device offers out of the box (the engine's `default_on`).
+    private static let defaultOnAgents = ["graff", "claude-code", "codex"]
+
+    private struct WireHarness: Decodable {
+        var id: String
+        var name: String
+        var installed: Bool?
+        var canInstall: Bool?
+        var enabled: Bool?
+        var supportsSteering: Bool?
+        var steeringMode: String?
+    }
+
+    private func wireHarnesses(deviceId: String) async -> [WireHarness]? {
+        try? await relay(for: deviceId).call(method: "ListHarnesses", params: [:])
+    }
+
+    /// Every agent a device reports, found or not, on or off: what onboarding needs to say what is missing. nil when
+    /// the device cannot be reached.
+    func agentDescriptors(deviceId: String) async -> [AgentDescriptor]? {
+        await wireHarnesses(deviceId: deviceId).map { list in
+            list.map { AgentDescriptor(id: $0.id, installed: $0.installed ?? true, canInstall: $0.canInstall ?? false, enabled: $0.enabled) }
         }
     }
 
@@ -658,7 +825,7 @@ final class WorkspaceStore {
                 .call(method: "SwitchRef", params: ["repoPath": repoPath, "refName": refName])
             return nil
         } catch {
-            return describeTransportError(error)
+            return describeUserFacingError(error)
         }
     }
 
@@ -794,11 +961,22 @@ final class WorkspaceStore {
         updateChat(chatId, set: ["config": value])
     }
 
-    /// Tombstone a chat (and its session-status row) in one batch. The
-    /// per-chat session doc remains — this removes the index entry only.
+    /// Tombstone a chat (and its session-status row) in one batch, so it
+    /// leaves every list at once, offline too. Then ask the chat's host for
+    /// the same `Mutate {op: deleteChat}` the desktop sends, which also drops
+    /// the host's copy of the session doc; an unreachable host still gets
+    /// the tombstone through sync.
     func deleteChat(chatId: String) {
+        let host = chats.first(where: { $0.id == chatId })?.deviceId
         doc.deleteRows([("chats", chatId), ("sessions", chatId)])
         afterLocalWrite()
+        guard let host, !host.isEmpty else { return }
+        let relay = relay(for: host)
+        Task {
+            struct OkReply: Decodable { var ok: Bool? }
+            let _: OkReply? = try? await relay.call(method: "Mutate",
+                                                    params: ["op": "deleteChat", "chatId": chatId])
+        }
     }
 
     /// Hard-delete a space and cascade to its chats: ONE batch tombstones the

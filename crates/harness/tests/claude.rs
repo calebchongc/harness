@@ -38,6 +38,7 @@ fn harness() -> ClaudeHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -59,6 +60,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -290,6 +292,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -434,6 +437,130 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
             ..
         })
     ));
+}
+
+/// Events up to the next Done, interrupting the turn once the scenario's
+/// first turn is streaming.
+async fn next_done(
+    harness: &ClaudeHarness,
+    stream: &mut futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        let ev = ev.expect("stream event");
+        let done = matches!(ev, AgentEvent::Done { .. });
+        if matches!(&ev, AgentEvent::TextDelta { text } if text.starts_with("first")) {
+            assert!(harness.interrupt_turn("turn-chat"));
+        }
+        events.push(ev);
+        if done {
+            break;
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn turn_interrupt_ends_the_turn_and_keeps_the_process() {
+    // #364: an interrupt used to kill the CLI and every background task in it.
+    let harness = ClaudeHarness::new()
+        .with_executable(fixture_path())
+        .with_graces(Duration::from_millis(200), Duration::from_millis(500));
+    let (mut controls, steer, _token) = controls("A");
+    controls.origin = Some(harness_adapters::RunOrigin {
+        chat_id: "turn-chat".into(),
+    });
+    assert!(!harness.interrupt_turn("turn-chat"), "no run yet");
+    let mut stream = harness
+        .run(request("scenario:turn-interrupt"), controls)
+        .await
+        .expect("run starts");
+    let pid = |events: &[AgentEvent], marker: &str| {
+        events.iter().find_map(|e| match e {
+            AgentEvent::TextDelta { text } if text.starts_with(marker) => text
+                .split("pid=")
+                .nth(1)?
+                .split(' ')
+                .next()
+                .map(str::to_owned),
+            _ => None,
+        })
+    };
+    let first = tokio::time::timeout(Duration::from_secs(10), next_done(&harness, &mut stream))
+        .await
+        .expect("interrupted turn ends");
+    assert!(matches!(
+        first.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        })
+    ));
+    // Past the SIGTERM grace: the turn's Done called the fallback off.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    steer
+        .send(SteerMessage {
+            prompt: "second".into(),
+            message_id: None,
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(10), next_done(&harness, &mut stream))
+        .await
+        .expect("next turn ends");
+    assert!(matches!(
+        second.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+    let first_pid = pid(&first, "first").expect("first turn's pid");
+    assert_eq!(
+        pid(&second, "again"),
+        Some(first_pid),
+        "same claude process"
+    );
+    // Closing the mailbox ends the run, and the chat is released.
+    drop(steer);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while stream.next().await.is_some() {}
+    })
+    .await
+    .expect("run ends");
+    assert!(!harness.interrupt_turn("turn-chat"));
+}
+
+/// An image send reaches the live process as a steer (#364): replacing the
+/// run for it would drop the background tasks running inside the CLI.
+#[tokio::test]
+async fn steer_inlines_its_image_attachments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let image = dir.path().join("shot.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\nfake").expect("write image");
+    let (controls, steer, _token) = controls("A");
+    steer
+        .send(SteerMessage {
+            prompt: "what is this?".into(),
+            message_id: None,
+            attachments: vec![image.display().to_string()],
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:steer-image"), controls).await;
+
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "steer-image:yes".into()
+        }),
+        "the steer line carried no image block: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. }))
+    );
 }
 
 #[tokio::test]
@@ -588,7 +715,7 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
             _ => None,
         })
         .expect("Agent spawn tool call in the parent feed");
-    // The synthesized opening user message rides WITH the spawn (before the
+    // The opening user message comes from the spawn's task_started (before the
     // eager done); the child's own interior streams between the two dones.
     let opening: Vec<usize> = events
         .iter()
@@ -603,7 +730,7 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
             .then_some(i)
         })
         .collect();
-    assert_eq!(opening.len(), 1, "one seeded opening prompt: {events:?}");
+    assert_eq!(opening.len(), 1, "one opening prompt: {events:?}");
     assert!(opening[0] < dones[0], "opening rides with the spawn");
     let tagged: Vec<usize> = events
         .iter()
@@ -842,5 +969,96 @@ async fn claude_skills_follow_native_availability_and_dollar_selection_keeps_arg
     assert_eq!(
         harness_prompt(&format!("{} 123", invocation.link()), HarnessId::ClaudeCode),
         "/review 123"
+    );
+}
+
+/// Replay a verbatim CLI capture through the fake-CLI transport (wire parse →
+/// normalize → run loop) and return every event the driver emits.
+async fn replay_capture(name: &str) -> Vec<AgentEvent> {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("claude")
+        .join(name);
+    let dir = std::env::temp_dir().join(format!(
+        "claude-replay-{}-{}",
+        std::process::id(),
+        name.replace('.', "-")
+    ));
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let frames = dir.join("frames.jsonl");
+    std::fs::copy(&fixture, &frames).expect("frames copied");
+    let cli = dir.join("replay.sh");
+    std::fs::write(
+        &cli,
+        format!(
+            "#!/bin/sh\nread -r _first || exit 1\ncat '{}'\n",
+            frames.display()
+        ),
+    )
+    .expect("replayer written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let harness = ClaudeHarness::new().with_executable(&cli);
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness, request("replay"), controls).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    events
+}
+
+/// #517: the engine keeps a parked session alive while the CLI reports work
+/// still running, so that report has to be complete and balanced on the real
+/// wire. Every task the captures start settles (nothing can hold a session
+/// forever), nothing settles that never started, and the background agent's
+/// task is open across the turn's end, which is exactly when the idle reaper
+/// used to stop the CLI under it.
+#[tokio::test]
+async fn captured_background_tasks_start_and_settle_in_balance() {
+    for capture in [
+        "live-2.1.228-background-subagent.jsonl",
+        "live-2.1.285-workflow.jsonl",
+    ] {
+        let events = replay_capture(capture).await;
+        let mut open: Vec<String> = Vec::new();
+        let mut started = 0;
+        for event in &events {
+            if let AgentEvent::BackgroundTask { id, running } = event {
+                if *running {
+                    started += 1;
+                    open.push(id.clone());
+                } else {
+                    let at = open.iter().position(|o| o == id);
+                    assert!(at.is_some(), "{capture}: {id} settled without starting");
+                    open.remove(at.unwrap());
+                }
+            }
+        }
+        assert!(started > 0, "{capture}: the capture's tasks are reported");
+        assert!(open.is_empty(), "{capture}: tasks never settled: {open:?}");
+    }
+
+    // The background agent's task starts before the turn's first Done (the
+    // park) and settles after it.
+    let events = replay_capture("live-2.1.228-background-subagent.jsonl").await;
+    let first_done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("the turn ends");
+    let spans_park = events.iter().enumerate().any(|(start, e)| {
+        let AgentEvent::BackgroundTask { id, running: true } = e else {
+            return false;
+        };
+        start < first_done
+            && events.iter().enumerate().any(|(end, e)| {
+                end > first_done
+                    && matches!(e, AgentEvent::BackgroundTask { id: settled, running: false } if settled == id)
+            })
+    });
+    assert!(
+        spans_park,
+        "a background task is open across the park: {events:?}"
     );
 }

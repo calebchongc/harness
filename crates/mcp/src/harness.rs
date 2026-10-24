@@ -18,6 +18,7 @@ use harness_doc::{
 };
 use harness_proto::{
     Chat, Device, HarnessId, Model, ReasoningLevel, Session, SessionStatus, Space, SteeringMode,
+    TurnOrigin,
 };
 use harness_rpc::{RpcClient, RpcError, RpcSubscription, connect_ws, methods};
 
@@ -302,6 +303,12 @@ impl Harness {
         chat_id: &str,
         payload: &SessionCommandPayload,
     ) -> anyhow::Result<String> {
+        let mut payload = payload.clone();
+        match &mut payload {
+            SessionCommandPayload::Run { request, .. } => request.turn_origin = TurnOrigin::Peer,
+            SessionCommandPayload::Steer { turn_origin, .. } => *turn_origin = TurnOrigin::Peer,
+            _ => {}
+        }
         let command = serde_json::to_value(payload).context("serialize command")?;
         let reply = self
             .call(
@@ -316,13 +323,44 @@ impl Harness {
             .to_owned())
     }
 
+    /// One call to the edge's agent-room routes through the engine's sign-in.
+    /// A room's own refusal (`not_a_member`, `room_destroyed`, …) comes back
+    /// as an error the model can read.
+    pub async fn room_request(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> anyhow::Result<Value> {
+        let query: Vec<(&str, &str)> = query.to_vec();
+        let reply = self
+            .call(
+                methods::ROOM_REQUEST,
+                json!({ "method": method, "path": path, "query": query, "body": body }),
+            )
+            .await?;
+        let status = reply.get("status").and_then(Value::as_u64).unwrap_or(0);
+        let body = reply.get("body").cloned().unwrap_or(Value::Null);
+        if !(200..300).contains(&status) {
+            let code = body.get("error").and_then(Value::as_str).unwrap_or("error");
+            let message = body.get("message").and_then(Value::as_str).unwrap_or(code);
+            if message == code {
+                bail!("room request failed ({status}): {code}");
+            }
+            bail!("room request failed ({status}): {code}: {message}");
+        }
+        Ok(body)
+    }
+
     /// Queue-row send for a busy chat whose harness cannot steer mid-turn:
     /// the host promotes it when the live turn ends.
     pub async fn queue_message(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
         let reply = self
             .call(
                 methods::QUEUE_MESSAGE,
-                json!({ "chatId": chat_id, "text": text, "holdForTurnEnd": true }),
+                json!({ "chatId": chat_id, "text": text, "holdForTurnEnd": true,
+                    "turnOrigin": TurnOrigin::Peer, "peerChatId": self.origin.chat_id }),
             )
             .await?;
         Ok(reply
@@ -402,6 +440,38 @@ impl Harness {
         expect_turn: bool,
         timeout: Duration,
     ) -> anyhow::Result<(TurnOutcome, Option<Session>)> {
+        if timeout.is_zero() {
+            // Agent callers get one bounded RPC snapshot, not a wait that
+            // parks their own conversation behind the recipient's work.
+            let session = session_for(&self.sessions().await?, chat);
+            let outcome = match session.as_ref() {
+                None if !expect_turn => TurnOutcome::Completed,
+                Some(row)
+                    if !expect_turn
+                        || baseline.is_none_or(|b| {
+                            row.updated_at > b.updated_at
+                                || row.last_completed_turn != b.last_completed_turn
+                        }) =>
+                {
+                    match row.status {
+                        SessionStatus::AwaitingInput => TurnOutcome::AwaitingInput,
+                        SessionStatus::Errored => TurnOutcome::Errored,
+                        SessionStatus::Idle
+                            if !expect_turn
+                                || row.last_completed_turn.is_some()
+                                    && baseline.is_none_or(|b| {
+                                        b.last_completed_turn != row.last_completed_turn
+                                    }) =>
+                        {
+                            TurnOutcome::Completed
+                        }
+                        _ => TurnOutcome::TimedOut,
+                    }
+                }
+                _ => TurnOutcome::TimedOut,
+            };
+            return Ok((outcome, session));
+        }
         let deadline = Instant::now() + timeout;
         let mut saw_working = false;
         let mut last: Option<Session> = baseline.cloned();
@@ -630,6 +700,7 @@ mod tests {
 
     fn chat(id: &str, title: Option<&str>) -> Chat {
         Chat {
+            last_prompt_at: None,
             id: id.into(),
             device_id: "dev".into(),
             title: title.map(str::to_owned),
@@ -648,6 +719,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 

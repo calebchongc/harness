@@ -55,6 +55,9 @@ final class AppModel {
     }
 
     var phase: Phase = .signedOut
+    /// The edge rejected the stored sign-in (it was revoked or spent). The app keeps everything it has
+    /// and asks for a fresh sign-in, instead of redialing a dead credential behind "connecting".
+    var sessionExpired = false
     var workspace: WorkspaceStore?
     var demo: DemoDataset?
     var demoPinnedSessionIds: [String] = []
@@ -108,6 +111,7 @@ final class AppModel {
     /// Deep-link target applied by HomeView on first appearance (set by launch
     /// args in demo mode; simulator-driven screenshots use it).
     var launchRoute: Route?
+    @ObservationIgnored let liveActivities = LiveActivities()
     /// Screenshot rig: "newsession" / "newspace" presents that sheet on arrival.
     var launchSheet: String?
     /// Screenshot rig: auto-send a canned prompt from the new-session canvas.
@@ -118,6 +122,13 @@ final class AppModel {
 
     func restore() {
         if demo != nil { return }
+        // After a restart iOS can launch the app in the background before the first unlock, when the
+        // Keychain, the saved account and the cached docs can't be read yet. Read then, a sign-in that is
+        // there looks absent and the phone opens signed out. Wait for the unlock instead.
+        guard UIApplication.shared.isProtectedDataAvailable else {
+            restoreAfterUnlock()
+            return
+        }
         DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
         // Debug-rig config overrides (cfprefsd caching defeats external
@@ -153,9 +164,16 @@ final class AppModel {
         }
         if args.contains("-demo") {
             enterDemoMode()
+            if let index = args.firstIndex(of: "-header-status-count"), index + 1 < args.count,
+               let count = Int(args[index + 1]) {
+                demo?.configureHeaderStatusFixture(count: count, allIdle: args.contains("-header-status-idle"))
+            }
             // Simulator fixtures for both empty-workspace and viewer-only
             // accounts. Apply before Home resolves its initial destination.
             override("-sethomefilter") { UserDefaults.standard.set($0, forKey: "homeSpaceFilter") }
+            override("-setnewsessionharness") { UserDefaults.standard.set($0, forKey: "newSessionHarness") }
+            override("-setnewsessionmodel") { UserDefaults.standard.set($0, forKey: "newSessionModel") }
+            override("-setnewsessionreasoning") { UserDefaults.standard.set($0, forKey: "newSessionReasoning") }
             if args.contains("-no-projects") {
                 demo?.spaces = []
                 demo?.chats = []
@@ -244,14 +262,112 @@ final class AppModel {
             connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,
                     tokens: nil, devBearer: devBearer(userId: storedUserId, orgId: storedOrgId))
         case .codegraff:
-            guard let access = Keychain.load(key: "codegraffAccessToken"),
-                  let refresh = Keychain.load(key: "codegraffRefreshToken") else { return }
+            let refresh = Keychain.read(key: "codegraffRefreshToken")
+            let access = Keychain.read(key: "codegraffAccessToken")
+            if refresh == .unavailable || access == .unavailable {
+                restoreAfterUnlock()
+                return
+            }
+            guard case .found(let access) = access, case .found(let refresh) = refresh else { return }
             connect(url: url, mode: .codegraff, userId: storedUserId, orgId: storedOrgId,
                     tokens: AuthTokens(accessToken: access, refreshToken: refresh), devBearer: nil)
         }
     }
 
+    /// The restore waiting for the Keychain: on the unlock, or the next time the app comes to the front.
+    @ObservationIgnored private var restoreWaitsForUnlock = false
+    @ObservationIgnored private var unlockObserver: NSObjectProtocol?
+
+    private func restoreAfterUnlock() {
+        restoreWaitsForUnlock = true
+        guard unlockObserver == nil else { return }
+        unlockObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.retryRestoreIfWaiting() }
+        }
+    }
+
+    private func retryRestoreIfWaiting() {
+        guard restoreWaitsForUnlock, UIApplication.shared.isProtectedDataAvailable else { return }
+        restoreWaitsForUnlock = false
+        if let unlockObserver { NotificationCenter.default.removeObserver(unlockObserver) }
+        unlockObserver = nil
+        restore()
+    }
+
     // MARK: Sign-in flows
+
+    /// The browser sheet a CodeGraff sign-in runs in.
+    @ObservationIgnored private let authSession = AuthSessionCoordinator()
+    /// A code exchange is under way (from the sheet or from a link that
+    /// finished in Safari): the sheet's own cancel must not reset the screen.
+    @ObservationIgnored private var exchanging = false
+    var signInBusy = false
+    var signInError: String?
+
+    /// CodeGraff browser sign-in → Harness callback → edge exchange with PKCE.
+    func startSignIn() {
+        let pending = PendingSignIn.start()
+        pending.save()
+        signInBusy = true
+        signInError = nil
+        authSession.start(url: Endpoints.authorizeURL(state: pending.state, challenge: pending.challenge),
+                          callbackScheme: Endpoints.callbackScheme) { [weak self] outcome in
+            Task { @MainActor in self?.sheetFinished(outcome) }
+        }
+    }
+
+    private func sheetFinished(_ outcome: AuthSessionCoordinator.Outcome) {
+        switch outcome {
+        case .success(let url):
+            handleSignInCallback(url)
+        case .cancelled:
+            if !exchanging { signInBusy = false }
+        case .failure(let message):
+            if !exchanging {
+                signInBusy = false
+                signInError = message
+            }
+        }
+    }
+
+    /// A `harness://callback` from the sheet, or from Safari when a magic link
+    /// finished the sign-in there. Only the pending sign-in's own state is
+    /// accepted, and only once.
+    func handleSignInCallback(_ url: URL) {
+        guard let pending = PendingSignIn.load() else { return }
+        let code: String
+        do {
+            code = try pending.code(from: url)
+        } catch PendingSignIn.CallbackError.stateMismatch {
+            // Someone else's (or an older) link: keep waiting for ours.
+            signInError = PendingSignIn.CallbackError.stateMismatch.errorDescription
+            return
+        } catch {
+            PendingSignIn.clear()
+            signInBusy = false
+            signInError = error.localizedDescription
+            return
+        }
+        PendingSignIn.clear()
+        exchanging = true
+        signInBusy = true
+        signInError = nil
+        authSession.cancel()
+        Task {
+            defer {
+                exchanging = false
+                signInBusy = false
+            }
+            do {
+                try await signIn(edgeURL: Endpoints.edgeURL, code: code, codeVerifier: pending.verifier,
+                                 redirectURI: Endpoints.redirectURI, nonce: pending.state)
+            } catch {
+                signInError = error.localizedDescription
+            }
+        }
+    }
 
     /// CodeGraff paste-code exchange. Returns the org list for the picker (or
     /// connects straight away when exactly one org exists).
@@ -264,6 +380,8 @@ final class AppModel {
                                                        nonce: nonce)
         edgeURLString = edgeURL.absoluteString
         authModeRaw = AppConfig.Mode.codegraff.rawValue
+        // A different account signing in over an expired session must not inherit its data.
+        if sessionExpired, !storedUserId.isEmpty, storedUserId != user.id { signOut() }
         storedUserId = user.id
         let orgs = try await client.orgs(accessToken: tokens.accessToken)
         if let only = orgs.first, orgs.count == 1 {
@@ -281,9 +399,16 @@ final class AppModel {
         let client = AuthClient(baseURL: url)
         let scoped = try await client.refresh(refreshToken: tokens.refreshToken,
                                               organizationId: org.organizationId)
-        Keychain.save(scoped.accessToken, key: "codegraffAccessToken")
-        Keychain.save(scoped.refreshToken, key: "codegraffRefreshToken")
+        Keychain.saveTokens(scoped)
         storedOrgId = org.organizationId
+        if sessionExpired, let config, config.orgId == org.organizationId {
+            // Same account signing back in: hand the live connection its new credential and keep every
+            // open session, draft and cached doc.
+            config.updateTokens(scoped)
+            sessionExpired = false
+            foregrounded()
+            return
+        }
         connect(url: url, mode: .codegraff, userId: storedUserId, orgId: org.organizationId,
                 tokens: scoped, devBearer: nil)
     }
@@ -299,26 +424,79 @@ final class AppModel {
     }
 
     func enterDemoMode() {
-        demo = DemoDataset.standard()
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("-onboarding-nocomputer") {
+            demo = DemoDataset.onboarding(computerOnline: false, agentReady: false)
+        } else if args.contains("-onboarding-noagent") {
+            demo = DemoDataset.onboarding(computerOnline: true, agentReady: false)
+        } else if args.contains("-onboarding-ready") {
+            demo = DemoDataset.onboarding(computerOnline: true, agentReady: true)
+        } else {
+            demo = DemoDataset.standard()
+        }
         demoPinnedSessionIds = []
+        DraftStore.persistsToDisk = false
         phase = .ready
     }
 
     func signOut() {
+        PushNotifications.shared.signingOut(config: demo == nil ? config : nil)
         workspace?.stop()
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
         storeLastUsed.removeAll()
+        // A new instance, so a reply still in flight lands in the old one.
+        folderListings = FolderListingCache()
         config = nil
         demo = nil
         demoPinnedSessionIds = []
+        DraftStore.wipeAll()
+        DraftStore.persistsToDisk = true
         Keychain.delete(key: "codegraffAccessToken")
         Keychain.delete(key: "codegraffRefreshToken")
         DocDisk.wipeAll()  // local doc state belongs to the signed-in identity
         storedUserId = ""
         storedOrgId = ""
+        sessionExpired = false
         phase = .signedOut
+    }
+
+    // MARK: Account deletion
+
+    var accountDeletionBusy = false
+    var accountDeletionError: String?
+
+    /// Only a real CodeGraff sign-in has an account to delete.
+    var canDeleteAccount: Bool { demo == nil && config?.mode == .codegraff }
+
+    /// Delete the signed-in account. Success signs out and wipes local state;
+    /// a refusal keeps the session but stores the tokens the edge rotated.
+    func deleteAccount() async {
+        guard !accountDeletionBusy else { return }
+        accountDeletionBusy = true
+        accountDeletionError = nil
+        defer { accountDeletionBusy = false }
+        guard let config, let tokens = await config.currentTokens() else {
+            accountDeletionError = "Sign in with CodeGraff to delete your account."
+            return
+        }
+        do {
+            let client = AuthClient(baseURL: config.edgeURL)
+            switch try await client.deleteAccount(accessToken: tokens.accessToken,
+                                                  refreshToken: tokens.refreshToken) {
+            case .deleted:
+                signOut()
+            case .refused(let message, let rotated):
+                if let rotated {
+                    config.updateTokens(rotated)
+                    Keychain.saveTokens(rotated)
+                }
+                accountDeletionError = message
+            }
+        } catch {
+            accountDeletionError = "Couldn't reach Harness. Check your connection and try again."
+        }
     }
 
     private func devBearer(userId: String, orgId: String) -> String {
@@ -331,12 +509,20 @@ final class AppModel {
                                deviceId: deviceId, deviceName: deviceName,
                                tokens: tokens, devBearer: devBearer)
         self.config = config
+        sessionExpired = false
+        config.onSessionExpired = { [weak self] in
+            Task { @MainActor in self?.sessionExpired = true }
+        }
         let store = WorkspaceStore(config: config)
         workspace = store
         store.start()
         startConnectivity()
         phase = .ready
+        PushNotifications.shared.signedIn(model: self)
     }
+
+    /// The live sign-in, for the edge calls notifications make (none in demo mode).
+    var pushConfig: AppConfig? { demo == nil ? config : nil }
 
     /// Wire the graced-connectivity recompute over the live stores (the
     /// engine's 1s compute_connectivity, phone edition).
@@ -401,6 +587,76 @@ final class AppModel {
         return spaces.first { $0.id == spaceId }
     }
 
+    /// Every active session as its Live Activity would show it.
+    /// Whether the lock-screen state can change without any session row changing: an activity is up (its
+    /// detail and elapsed state follow the transcript) or a session is running or waiting. With neither, the
+    /// only thing that can matter is a session starting, which `untilSessionsChange` waits for.
+    var liveActivitiesNeedSampling: Bool {
+        if liveActivities.isShowing { return true }
+        return overviewChats.contains { chat in
+            let phase = LiveActivityPlan.phase(for: indicator(for: chat))
+            return phase == .working || phase == .waiting
+        }
+    }
+
+    /// Suspends until the session rows change (a run starting or finishing arrives as one), then returns.
+    /// No timer: nothing wakes while every session is quiet.
+    func untilSessionsChange() async {
+        let gate = ResumeOnce()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                gate.install(continuation)
+                withObservationTracking {
+                    _ = workspace?.sessions
+                    _ = demo?.sessions
+                } onChange: {
+                    gate.fire()
+                }
+            }
+        } onCancel: {
+            gate.fire()
+        }
+    }
+
+    var liveActivitySnapshots: [LiveActivitySnapshot] {
+        overviewChats.map { chat in
+            let row = demo?.sessions[chat.id] ?? workspace?.sessions[chat.id]
+            let started = row?.startedAt ?? row?.updatedAt ?? chat.createdAt
+            let phase = LiveActivityPlan.phase(for: indicator(for: chat))
+            // Only live runs read the transcript (it changes every token).
+            let tasks = (phase == .working || phase == .waiting)
+                ? sessionStores[chat.id].flatMap { LiveActivityPlan.tasks(in: $0.entries) } : nil
+            let project = chat.spaceId.map { _ in
+                space(for: chat)?.displayName
+                    ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
+                    ?? "?"
+            }
+            return LiveActivitySnapshot(
+                attributes: SessionActivityAttributes(
+                    chatId: chat.id, title: chat.displayTitle, project: project,
+                    device: deviceName(chat.deviceId),
+                    projectTint: chat.spaceId.map(Theme.projectTintIndex),
+                    harness: chat.config?.harness ?? "claude-code"),
+                phase: phase,
+                startedAt: Date(timeIntervalSince1970: Double(started) / 1000),
+                detail: LiveActivityPlan.detail(chat.lastMessagePreview),
+                tasks: tasks)
+        }
+    }
+
+    /// `harness://chat/<id>` (a Live Activity tap) opens that session;
+    /// `harness://callback` finishes a sign-in that ended in Safari.
+    func openDeepLink(_ url: URL) {
+        if PendingSignIn.isCallback(url) {
+            handleSignInCallback(url)
+            return
+        }
+        guard url.scheme == "harness", url.host == "chat" else { return }
+        let chatId = url.lastPathComponent
+        guard !chatId.isEmpty, chatId != "/" else { return }
+        launchRoute = .chat(chatId)
+    }
+
     func indicator(for chat: Chat) -> ChatIndicator {
         if let demo {
             return chatIndicator(chat: chat, live: effectiveStatus(demo.sessions[chat.id], now: nowMs()))
@@ -421,55 +677,122 @@ final class AppModel {
         (demo?.devices ?? workspace?.devices)?.first { $0.id == deviceId }?.name ?? deviceId
     }
 
-    func deviceOnline(_ deviceId: String) -> Bool {
+    /// What a screen may claim about a device: online on a recent beat, offline only on positive evidence
+    /// of absence (a joined room and five quiet minutes), otherwise unknown — see PresenceRule.
+    func hostStatus(_ deviceId: String) -> HostStatus {
         if let demo {
-            guard let seen = demo.devices.first(where: { $0.id == deviceId })?.lastSeenAt else { return false }
-            return nowMs() - seen < presenceFreshMs
+            guard let seen = demo.devices.first(where: { $0.id == deviceId })?.lastSeenAt else { return .offline }
+            return nowMs() - seen < presenceFreshMs ? .online : .offline
         }
-        return workspace?.deviceOnline(deviceId) ?? false
+        return workspace?.hostStatus(deviceId) ?? .unknown
+    }
+
+    func deviceOnline(_ deviceId: String) -> Bool {
+        hostStatus(deviceId) == .online
+    }
+
+    /// The one line the new-session screen may show above the composer, in order of what is actually
+    /// wrong: the sign-in is dead, the phone is not connected, or the host is positively gone. A host that
+    /// is merely unconfirmed (just launched, a beat not yet in) gets no warning at all.
+    enum HostNotice: Equatable {
+        case signedOut
+        case reconnecting
+        case offline
+    }
+
+    func hostNotice(for deviceId: String) -> HostNotice? {
+        guard demo == nil, let workspace else { return nil }
+        if sessionExpired { return .signedOut }
+        let status = workspace.hostStatus(deviceId)
+        if status == .online { return nil }
+        if !workspace.connected { return .reconnecting }
+        return status == .offline ? .offline : nil
+    }
+
+    /// A snapshot for Settings → Connection. Reading it sends nothing and starts no timer.
+    func connectionReport() -> ConnectionReport {
+        ConnectionReport(
+            auth: config?.authDiagnostics(),
+            registryConnected: workspace?.connected ?? false,
+            registrySynced: workspace?.synced ?? false,
+            retryInSeconds: workspace?.retryAt.map { max(0, Int($0.timeIntervalSinceNow.rounded(.up))) },
+            devices: (workspace?.devices ?? []).map { device in
+                ConnectionReport.Device(name: device.name,
+                                        isThisPhone: device.id == config?.deviceId,
+                                        status: workspace?.hostStatus(device.id) ?? .unknown,
+                                        beatAgeSeconds: workspace?.beatAgeMs(device.id).map { Int($0 / 1_000) })
+            })
     }
 
     /// Live harness catalog from the selected execution device (Settings → Agents
-    /// gates which agents a device offers); static pair when unreachable.
-    func listHarnesses(deviceId: String) async -> [HarnessInfo] {
+    /// gates which agents a device offers); the last-seen list when
+    /// unreachable, never a fabricated pair for an unknown device.
+    func listHarnesses(deviceId: String) async -> DeviceCatalog<HarnessInfo> {
         if demo != nil {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            return HarnessCatalog.harnesses
+            try? await Task.sleep(for: .seconds(ProcessInfo.processInfo.arguments.contains("-slow-catalog") ? 15 : 0.1))
+            return DeviceCatalog(items: ProcessInfo.processInfo.arguments.contains("-no-agents") ? [] : HarnessCatalog.harnesses, isLive: true)
         }
-        if let live = await workspace?.listHarnesses(deviceId: deviceId),
-           !live.isEmpty {
-            return live
+        if let live = await workspace?.listHarnesses(deviceId: deviceId) {
+            _ = DocDisk.saveHarnesses(live, deviceId: deviceId)
+            return DeviceCatalog(items: live, isLive: true)
         }
-        return HarnessCatalog.harnesses
+        return DeviceCatalog(items: DocDisk.loadHarnesses(deviceId: deviceId) ?? [], isLive: false)
+    }
+
+    /// Whether an agent has been brought in: every computer's `ListHarnesses`, judged by [AgentReadiness]. A computer
+    /// that cannot be reached counts as having nothing.
+    func agentReadiness() async -> AgentReadiness {
+        var devicesAgents: [DeviceAgents] = []
+        for device in devices {
+            let online = deviceOnline(device.id)
+            var agents: [AgentDescriptor] = []
+            if online {
+                if let demo {
+                    agents = demo.agents[device.id] ?? []
+                } else {
+                    agents = await workspace?.agentDescriptors(deviceId: device.id) ?? []
+                }
+            }
+            devicesAgents.append(DeviceAgents(id: device.id, name: device.name, online: online, agents: agents))
+        }
+        return AgentReadiness.evaluate(devicesAgents)
     }
 
     /// Live model catalog from the selected execution device (the desktop's
-    /// "catalog source = the device that runs the session" rule); static
-    /// fallback when the device is unreachable.
-    func listModels(deviceId: String, harness: String) async -> [ModelInfo] {
+    /// "catalog source = the device that runs the session" rule). A failed
+    /// request can use cached metadata, but must never invent runnable models.
+    @ObservationIgnored private var demoModelFailuresRemaining = 1
+
+    func listModels(deviceId: String, harness: String) async -> DeviceCatalog<ModelInfo> {
         if demo != nil {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            return HarnessCatalog.models(for: harness)
-        }
-        if let live = await workspace?.listModels(deviceId: deviceId, harness: harness),
-           !live.isEmpty {
-            let normalized = HarnessCatalog.normalize(harness: harness, models: live)
-            if !normalized.isEmpty {
-                _ = DocDisk.saveModels(normalized, deviceId: deviceId, harness: harness)
-                return normalized
+            let args = ProcessInfo.processInfo.arguments
+            try? await Task.sleep(for: .seconds(args.contains("-slow-catalog") ? 15 : 0.1))
+            if args.contains("-models-fail-once"), harness == "codex", demoModelFailuresRemaining > 0 {
+                demoModelFailuresRemaining -= 1
+                return DeviceCatalog(items: [], isLive: false)
             }
+            return DeviceCatalog(items: HarnessCatalog.models(for: harness), isLive: true)
         }
-        if let cached = DocDisk.loadModels(deviceId: deviceId, harness: harness),
-           !cached.isEmpty {
-            return cached
+        if let live = await workspace?.listModels(deviceId: deviceId, harness: harness) {
+            let normalized = HarnessCatalog.normalize(harness: harness, models: live)
+            _ = DocDisk.saveModels(normalized, deviceId: deviceId, harness: harness)
+            return DeviceCatalog(items: normalized, isLive: true)
         }
-        return HarnessCatalog.models(for: harness)
+        return DeviceCatalog(items: DocDisk.loadModels(deviceId: deviceId, harness: harness) ?? [], isLive: false)
     }
+
+    @ObservationIgnored private var demoRefFailuresRemaining = 1
 
     /// Refs of the space's repo (git spaces only).
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            let args = ProcessInfo.processInfo.arguments
+            try? await Task.sleep(for: .seconds(args.contains("-slow-refs") ? 2 : 0.12))
+            if args.contains("-refs-empty") { return [] }
+            if args.contains("-refs-fail-once"), demoRefFailuresRemaining > 0 {
+                demoRefFailuresRemaining -= 1
+                return nil
+            }
             return demo.listRefs(spacePath: space.path)
         }
         return await workspace?.listRefs(deviceId: space.deviceId, repoPath: space.path)
@@ -480,6 +803,10 @@ final class AppModel {
     func switchSpaceRef(space: Space, refName: String) async -> String? {
         if let demo {
             try? await Task.sleep(nanoseconds: 200_000_000)
+            // UI-test fixture: a host that refuses every checkout (#424).
+            if ProcessInfo.processInfo.arguments.contains("-checkout-refused") {
+                return describeUserFacingError(RelayError.rpc("git: synthetic checkout refused"))
+            }
             demo.switchRef(path: space.path, refName: refName)
             return nil
         }
@@ -560,6 +887,9 @@ final class AppModel {
                                    roomGen: 2))
             return id
         }
+        // The first session started from the phone is when "tell me when it's
+        // done" makes sense: ask for notification permission then.
+        PushNotifications.shared.askAfterFirstSession()
         if let space {
             return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
         }
@@ -569,13 +899,96 @@ final class AppModel {
     /// Browse folders on a remote device (the desktop add-space palette's data
     /// path). Demo mode serves a canned tree; live mode asks the device over
     /// the relay.
-    func listFolders(deviceId: String, path: String?) async -> FolderListing? {
+    /// Usage as one computer's engine reports it (Settings → Usage). Demo
+    /// mode has no CodeGraff account or agent logins behind it.
+    func codegraffUsage(deviceId: String) async throws -> CodegraffUsage? {
+        if demo != nil { return nil }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.codegraffUsage(deviceId: deviceId)
+    }
+
+    func agentAccounts(deviceId: String, forceUsage: Bool) async throws -> AgentAccountsSnapshot {
+        if demo != nil { return AgentAccountsSnapshot(accounts: []) }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.agentAccounts(deviceId: deviceId, forceUsage: forceUsage)
+    }
+
+    /// The cloud sandboxes of the Codegraff account one computer's engine is
+    /// signed in with (Settings → Cloud sandboxes); nil while it is signed out.
+    /// Demo mode serves a made-up account.
+    func cloudSandboxes(deviceId: String) async throws -> CodegraffSandboxes? {
+        if let demo { return demo.cloud.sandboxes }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.codegraffSandboxes(deviceId: deviceId)
+    }
+
+    func createCloudSandbox(deviceId: String, size: String?) async throws {
         if let demo {
-            try? await Task.sleep(nanoseconds: 120_000_000)  // feel like a network hop
+            try? await Task.sleep(nanoseconds: 1_200_000_000)  // a create takes a while
+            demo.cloud.create(size: size)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.createCodegraffSandbox(deviceId: deviceId, size: size)
+    }
+
+    func cloudSandboxAction(deviceId: String, id: String, action: CloudSandboxAction) async throws {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            demo.cloud.act(id: id, action: action)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.codegraffSandboxAction(deviceId: deviceId, id: id, action: action)
+    }
+
+    /// GitHub CI runners for that account (Settings → GitHub CI); nil while signed out.
+    func githubRunners(deviceId: String) async throws -> GithubRunners? {
+        if let demo { return demo.cloud.runners }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.codegraffGithubRunners(deviceId: deviceId)
+    }
+
+    func githubRunnerAction(deviceId: String, action: GithubRunnerAction) async throws {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            demo.cloud.act(action)
+            return
+        }
+        guard let workspace else { throw RelayError.notConnected }
+        try await workspace.codegraffGithubRunnerAction(deviceId: deviceId, action: action)
+    }
+
+    /// Where graff compacts on one computer (Settings → Graff compaction);
+    /// nil is graff's default. Demo mode keeps the default.
+    func graffCompactAt(deviceId: String) async throws -> Int? {
+        if demo != nil { return nil }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.graffCompactAt(deviceId: deviceId)
+    }
+
+    func setGraffCompactAt(deviceId: String, pct: Int?) async throws -> Int? {
+        if demo != nil { return pct }
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.setGraffCompactAt(deviceId: deviceId, pct: pct)
+    }
+
+    /// Folder listings the New space browser has loaded, per computer and
+    /// path, kept across presentations of the sheet (#420).
+    @ObservationIgnored private(set) var folderListings = FolderListingCache()
+
+    /// Folders only: the browser shows nothing else. Throws the host's or the
+    /// relay's own failure so the browser can say why a folder didn't open.
+    func listFolders(deviceId: String, path: String?) async throws -> FolderListing {
+        if let demo {
+            // Feel like a network hop; `-slow-folders` stands in for a slow host.
+            let slow = ProcessInfo.processInfo.arguments.contains("-slow-folders")
+            try? await Task.sleep(nanoseconds: slow ? 1_500_000_000 : 120_000_000)
             let target = path ?? demo.homePath(deviceId: deviceId)
             return demo.listFolders(deviceId: deviceId, path: target)
         }
-        return await workspace?.listFolders(deviceId: deviceId, path: path)
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.listFoldersDetailed(deviceId: deviceId, path: path, dirsOnly: true)
     }
 
     @discardableResult
@@ -603,8 +1016,40 @@ final class AppModel {
         return workspace?.archivedChats(in: spaceId) ?? []
     }
 
+    /// The archived shelf narrowed by Home's search text.
+    func archivedMatches(in spaceId: String?, query: String) -> [Chat] {
+        let archived = archivedChats(in: spaceId)
+        guard !query.isEmpty else { return archived }
+        return HomeFilter.apply(archived, query: query, names: homeFilterNames)
+    }
+
+    func homeFilterNames(_ chat: Chat) -> HomeFilter.Names {
+        HomeFilter.Names(project: space(for: chat)?.displayName, device: deviceName(chat.deviceId))
+    }
+
     func archive(chatId: String) { setArchived(chatId: chatId, archived: true) }
     func unarchive(chatId: String) { setArchived(chatId: chatId, archived: false) }
+
+    /// Delete a session for good, everywhere (the desktop's Delete session).
+    func delete(chatId: String) {
+        if let demo {
+            demo.chats.removeAll { $0.id == chatId }
+            return
+        }
+        workspace?.deleteChat(chatId: chatId)
+    }
+
+    func rename(chatId: String, title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let chat = chat(id: chatId), chat.title != trimmed else { return }
+        if let demo {
+            if let ix = demo.chats.firstIndex(where: { $0.id == chatId }) {
+                demo.chats[ix].title = trimmed
+            }
+            return
+        }
+        workspace?.rename(chatId: chatId, title: trimmed)
+    }
 
     var pinsReady: Bool {
         if demo != nil { return true }
@@ -697,8 +1142,31 @@ final class AppModel {
     /// online event on success, so every PARKED backoff (not just the rooms
     /// the kick reaches) lands a redial in ~1 RTT.
     func foregrounded() {
+        Keychain.flushPending()
+        retryRestoreIfWaiting()
+        workspace?.setActive(true)
+        refreshSignInIfDue()
         kickAllRooms()
         probeEdgeHealth()
+    }
+
+    /// Background hook: stop scheduling status wake-ups; iOS suspends the app anyway, and `foregrounded()`
+    /// catches up on whatever aged out.
+    func backgrounded() {
+        workspace?.setActive(false)
+    }
+
+    /// Spend the refresh while the app is in front (and may finish it), not on whichever socket redials
+    /// first after the access token has run out.
+    private func refreshSignInIfDue() {
+        guard let config, demo == nil, config.mode == .codegraff else { return }
+        Task { _ = await config.currentToken() }
+    }
+
+    /// The "signed out" pill: the browser sign-in again, keeping everything the app has.
+    func signInAgain() {
+        guard !signInBusy else { return }
+        startSignIn()
     }
 
     private func probeEdgeHealth() {
@@ -884,20 +1352,20 @@ final class AppModel {
         } else if connectivity.state != .connected {
             return true
         }
-        if !deviceOnline(chat.deviceId) { return true }
+        if hostStatus(chat.deviceId) == .offline { return true }
         return false
     }
 
-    /// The user-visible truth of a chat's oldest unadopted send. `failed`
-    /// (unadopted past the 2-minute grace, with a retry affordance) wins over
-    /// `queued` (pending on a degraded path); a healthy in-flight send reads
-    /// `sending`. nil = nothing pending.
+    /// The user-visible truth of a chat's unadopted sends (`SendState.of`).
+    /// `failed` only when the doc says a send can no longer run; past the
+    /// grace a still-pending command reads `waiting` (#413). nil = nothing
+    /// pending.
     func sendState(for chat: Chat, now: Int64 = nowMs()) -> SendState? {
         guard demo == nil, let store = sessionStores[chat.id],
               let oldest = store.pendingSends.map(\.started).min() else { return nil }
-        if now - oldest > undeliveredGraceMs { return .failed }
-        if chatDeliveryDegraded(chat) { return .queued }
-        return .sending
+        return SendState.of(oldestStarted: oldest,
+                            undeliverable: !store.undeliverableSends(now: now).isEmpty,
+                            degraded: chatDeliveryDegraded(chat), now: now)
     }
 
     func releaseSessionStore(chatId: String) {

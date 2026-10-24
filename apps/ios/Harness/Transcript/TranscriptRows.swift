@@ -15,7 +15,7 @@ enum RowKind {
     case markdown(block: MDBlock, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
     case inputChip(header: String, resolved: Bool)
-    case errorChip(message: String)
+    case errorChip(message: String, reauth: AgentReauthProvider?)
 }
 
 struct ToolItem: Hashable {
@@ -50,6 +50,11 @@ struct CompletedParse {
 }
 
 enum TranscriptRowBuilder {
+    /// Rows cached for one entry, replayed verbatim while the entry's decode
+    /// `stamp` is unchanged — a doc update that touches one streaming message
+    /// then rebuilds rows for that entry alone, not the whole transcript.
+    typealias EntryRowCache = (stamp: UInt64, rows: [TranscriptRow])
+
     /// Split entries into rows. `parsers` caches one incremental parser per
     /// "{entryId}#{partId}" so the streaming tail re-parses O(delta + tail);
     /// `completed` memoizes settled parts so they parse exactly once.
@@ -57,11 +62,42 @@ enum TranscriptRowBuilder {
                      pendingSends: [PendingSend],
                      parsers: inout [String: IncrementalMarkdownParser],
                      completed: inout [String: CompletedParse]) -> [TranscriptRow] {
+        var scratch: [String: EntryRowCache] = [:]
+        return rows(entries: entries, pendingSends: pendingSends,
+                    parsers: &parsers, completed: &completed, entryRows: &scratch)
+    }
+
+    /// Same split, reusing `entryRows` across calls: an entry whose stamp is
+    /// unchanged contributes its cached rows without re-walking its parts.
+    /// `live` for a cached entry is rebuilt from its rows' partKeys — exactly
+    /// the keys rowsForEntry would have inserted for its nonempty text parts.
+    static func rows(entries: [MessageEntry],
+                     pendingSends: [PendingSend],
+                     parsers: inout [String: IncrementalMarkdownParser],
+                     completed: inout [String: CompletedParse],
+                     entryRows: inout [String: EntryRowCache]) -> [TranscriptRow] {
         var rows: [TranscriptRow] = []
         var live = Set<String>()
+        var present = Set<String>()
+        present.reserveCapacity(entries.count)
         for entry in entries {
-            rowsForEntry(entry, into: &rows, parsers: &parsers,
-                         completed: &completed, live: &live)
+            present.insert(entry.id)
+            if let hit = entryRows[entry.id], hit.stamp == entry.stamp {
+                for row in hit.rows {
+                    rows.append(row)
+                    if let key = row.partKey { live.insert(key) }
+                }
+            } else {
+                var fresh: [TranscriptRow] = []
+                rowsForEntry(entry, into: &fresh, parsers: &parsers,
+                             completed: &completed, live: &live)
+                entryRows[entry.id] = (entry.stamp, fresh)
+                rows.append(contentsOf: fresh)
+            }
+        }
+        // Evict memos for entries that left the transcript.
+        if entryRows.count > present.count {
+            entryRows = entryRows.filter { present.contains($0.key) }
         }
         // Optimistic echo: pending sends share their client-minted id, so the
         // host's real entry replaces them without a flicker.
@@ -200,11 +236,12 @@ enum TranscriptRowBuilder {
                                           entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
 
-            case .error(let partId, let message):
+            case .error(let partId, let message, let reauth):
                 flushTools(lastIx: ix - 1)
-                rows.append(TranscriptRow(id: "\(entry.id)#\(partId)", version: fnv1a(message),
+                let version = fnv1a(message + "\0" + (reauth?.rawValue ?? ""))
+                rows.append(TranscriptRow(id: "\(entry.id)#\(partId)", version: version,
                                           turnStart: first,
-                                          kind: .errorChip(message: message),
+                                          kind: .errorChip(message: message, reauth: reauth),
                                           entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
             }
@@ -217,7 +254,7 @@ enum TranscriptRowBuilder {
                               completed: inout [String: CompletedParse]) -> [TopBlock] {
         if streaming {
             let parser = parsers[key] ?? IncrementalMarkdownParser()
-            parser.setText(text)
+            Perf.measure(PerfSpan.markdownParse) { parser.setText(text) }
             parsers[key] = parser
             return parser.blocks
         }
@@ -230,9 +267,11 @@ enum TranscriptRowBuilder {
             return hit.blocks
         }
         // Adopt the live parser's tree on the live→complete flip, else parse.
-        let blocks = handoff?.source == text
-            ? (handoff?.blocks ?? MarkdownParser.parse(text))
-            : MarkdownParser.parse(text)
+        let blocks = Perf.measure(PerfSpan.markdownParse) {
+            handoff?.source == text
+                ? (handoff?.blocks ?? MarkdownParser.parse(text))
+                : MarkdownParser.parse(text)
+        }
         completed[key] = CompletedParse(source: text, blocks: blocks)
         return blocks
     }
@@ -269,7 +308,26 @@ enum TranscriptRowBuilder {
 // MARK: - Tool chip content (transcript.rs tool_chip_content_raw)
 
 extension RenderToolCall {
+    /// Presentation only: keep worker IDs in the underlying call, not its chip.
+    private var subagentControlLabel: String? {
+        guard tag == "unknown", let name = string("name") else { return nil }
+        if name.hasPrefix("Wait for ") || name == "agent_output" { return "Waiting on" }
+        for (prefix, label) in [
+            ("Message agent", "Message"),
+            ("Resume agent", "Resume"),
+            ("Close agent", "Close"),
+        ] {
+            if name == prefix || name.hasPrefix(prefix + " ") { return label }
+        }
+        switch name {
+        case "Send agent message", "agent_message": return "Message"
+        case "subagent_resume": return "Resume"
+        default: return nil
+        }
+    }
+
     var chipLabel: String {
+        if let label = subagentControlLabel { return label }
         switch tag {
         case "exec": return "Run"
         case "readFile": return "Read"
@@ -287,6 +345,7 @@ extension RenderToolCall {
     }
 
     var chipDetail: String {
+        if subagentControlLabel != nil { return "subagent" }
         switch tag {
         case "exec": return string("command") ?? ""
         case "readFile", "writeFile", "editFile": return shortPath(string("path") ?? "")
@@ -298,6 +357,9 @@ extension RenderToolCall {
         case "webFetch": return string("url") ?? ""
         case "webSearch": return string("query") ?? ""
         case "todo":
+            if let tasks, !tasks.isEmpty {
+                return "\(tasks.filter(\.done).count)/\(tasks.count) done"
+            }
             return string("summary") ?? "task list"
         case "mcp":
             let server = string("server").map { "\($0) · " } ?? ""

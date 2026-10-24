@@ -21,16 +21,44 @@ enum ConnectivityState: Equatable {
 }
 
 /// A pending send's user-visible truth (state.rs send_pending/send_queued/
-/// send_undelivered). `failed` wins over `queued` in the UI.
+/// send_undelivered).
 enum SendState {
     case sending
     case queued
+    /// Unadopted past the grace, but its command is still pending in the doc
+    /// and can run whenever the host picks it up (#413). Not a failure.
+    case waiting
+    /// No command for the send can run any more: the host rejected or
+    /// expired it, or it outlived its TTL. Retry re-issues it.
     case failed
+
+    /// `failed` needs the doc's word that the send can't run; the grace
+    /// alone only turns Sending into Waiting. A degraded path reads Queued.
+    static func of(oldestStarted: Int64, undeliverable: Bool, degraded: Bool,
+                   now: Int64) -> SendState {
+        if undeliverable { return .failed }
+        if degraded { return .queued }
+        if now - oldestStarted > undeliveredGraceMs { return .waiting }
+        return .sending
+    }
 }
 
-/// state.rs UNDELIVERED_GRACE_MS: a send unadopted past this is explicitly
-/// Failed (with a retry affordance), never a silent forever-spinner.
+/// state.rs UNDELIVERED_GRACE_MS: a send unadopted past this stops reading
+/// "Sending…" and says it is waiting for the host, never a forever-spinner.
 let undeliveredGraceMs: Int64 = 120_000
+
+/// transcript.rs TURN_WAIT_SHOWN_SECS / turn_wait_secs: how long the running
+/// turn's prompt waited before the turn began, when it is worth showing. The
+/// timer counts the run only; nil unless the last user entry started the turn.
+let turnWaitShownSecs: Int64 = 60
+
+func turnWaitSecs(entries: [MessageEntry], turnStartedAt: Int64?) -> Int64? {
+    guard let started = turnStartedAt,
+          let prompt = entries.lastIndex(where: { $0.role == .user }) else { return nil }
+    if entries[(prompt + 1)...].contains(where: { $0.createdAt < started }) { return nil }
+    let waited = (started - entries[prompt].createdAt) / 1000
+    return waited >= turnWaitShownSecs ? waited : nil
+}
 
 @MainActor
 @Observable
@@ -59,12 +87,20 @@ final class ConnectivityCenter {
     @ObservationIgnored private var degradedSince: [String: Int64] = [:]
     @ObservationIgnored private var tickTask: Task<Void, Never>?
 
+    /// Sampling cadence. While anything is degraded, graced or pending the 4s grace and the elapsed-based
+    /// send states need the original 1s samples. A healthy idle app has nothing to time, so it looks every
+    /// 5s: a drop is noticed up to 5s later, and the pill still only shows after the 4s grace.
+    static let busyTick: Duration = .seconds(1)
+    static let idleTick: Duration = .seconds(5)
+
     func start() {
         guard tickTask == nil else { return }
         tickTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                self?.recompute()
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                let busy = self.recompute()
+                try? await Task.sleep(for: busy ? Self.busyTick : Self.idleTick,
+                                      tolerance: busy ? .milliseconds(200) : .seconds(1))
             }
         }
     }
@@ -74,9 +110,16 @@ final class ConnectivityCenter {
         tickTask = nil
     }
 
+    /// The OS path flipped: sample now and drop to the busy cadence if that made anything degraded, instead
+    /// of waiting out an idle sleep.
     func setPathOffline(_ offline: Bool) {
         pathOffline = offline
-        recompute()
+        if tickTask != nil {
+            stop()
+            start()
+        } else {
+            recompute()
+        }
     }
 
     /// DegradeGrace: report degraded only once the raw state has persisted
@@ -93,7 +136,9 @@ final class ConnectivityCenter {
         return now - since >= Self.degradeGraceMs
     }
 
-    private func recompute() {
+    /// Returns whether anything still needs the 1s cadence (see `busyTick`).
+    @discardableResult
+    private func recompute() -> Bool {
         let now = nowMs()
         let offline = graced("os", raw: pathOffline, now: now)
         let registryDown = graced("registry", raw: !(registryConnected?() ?? true), now: now)
@@ -123,9 +168,11 @@ final class ConnectivityCenter {
         if newState != state { state = newState }
         if chats != degradedChats { degradedChats = chats }
         if retryAt != nextRetryAt { retryAt = nextRetryAt }
-        if newState != .connected || !chats.isEmpty || !degradedSince.isEmpty
-            || (hasPendingSends?() ?? false) {
+        let busy = newState != .connected || !chats.isEmpty || !degradedSince.isEmpty
+            || (hasPendingSends?() ?? false)
+        if busy {
             pulse &+= 1
         }
+        return busy
     }
 }

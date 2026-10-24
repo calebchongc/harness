@@ -22,13 +22,18 @@ pub mod change_requests;
 pub mod chat2_host;
 pub mod codegraff_auth;
 mod chat_persistence;
+mod device_login;
 pub mod diff_sync;
 pub mod doc_host;
+pub mod external_history;
+mod graff_logins;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+pub mod mcp_servers;
 mod model_catalogs;
 pub mod profile;
+pub mod agents_prepare;
 pub mod project_actions;
 pub mod registry;
 pub mod repos;
@@ -45,12 +50,12 @@ pub mod workspace_files;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership, lost_session_marker};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
-    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
-    read_diff_file_text, snapshot_tree, working_diff_base,
+    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff,
+    discard_working_tree, merge_base, read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
@@ -104,6 +109,13 @@ pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// The device-nudge id meaning "room wakes are waiting" (edge
+/// `room-actor.ts` `ROOM_WAKES_NUDGE`); chat ids are UUIDs, so it never names a chat.
+pub const ROOM_WAKES_NUDGE: &str = "rooms-wakes";
+
+/// Tries (3 s apart) a starting cloud sandbox makes to reach the edge before it gives up and starts
+/// signed out; the sign-in loop keeps trying afterwards.
+const SANDBOX_SIGN_IN_ATTEMPTS: u32 = 10;
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Data directory (default `~/.harness`, dev `~/.harness-dev`).
@@ -144,6 +156,8 @@ pub struct EngineCore {
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
+    /// Conversations from other tools on this device, importable as chats.
+    pub external_history: external_history::ExternalHistory,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -248,10 +262,15 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        sessions.note_boot_version();
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
+        }
+        match sessions.resume_after_restart() {
+            0 => {}
+            resumed => tracing::info!(resumed, "work cut short by the last shutdown resumed"),
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
@@ -301,6 +320,16 @@ impl EngineCore {
                 uploads.clone(),
             )
         });
+        let external_history = external_history::ExternalHistory::new(
+            external_history::Roots {
+                claude_dir: agent_accounts_config.claude_config_dir.clone(),
+                codex_home: agent_accounts_config.codex_home.clone(),
+                projects: Vec::new(),
+            },
+            &device_id,
+            store_for_import.clone(),
+            workspace.clone(),
+        );
         let agent_accounts = AgentAccounts::new(agent_accounts_config);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
@@ -332,6 +361,7 @@ impl EngineCore {
             agent_accounts,
             device_id,
             local_import,
+            external_history,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -435,6 +465,21 @@ impl EngineCore {
             harness_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let doc_host = self.doc_host.clone();
         let on_nudge: harness_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
+            // Not a chat: another person's agent woke one of this user's
+            // chats in an agent room. Collect those wakes (the drain acks
+            // what it queued; the rest wait for the next nudge).
+            if chat_id == ROOM_WAKES_NUDGE {
+                let host = doc_host.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        match host.drain_room_wakes().await {
+                            Ok(queued) => tracing::info!(queued, "room wakes drained"),
+                            Err(err) => tracing::warn!(%err, "room wakes: drain failed"),
+                        }
+                    });
+                }
+                return true;
+            }
             match doc_host.enqueue_wakeup(&chat_id) {
                 Ok(()) => true,
                 Err(err) => {
@@ -473,6 +518,7 @@ impl EngineCore {
         if let Some(importer) = self.local_import.clone() {
             rpc = rpc.with_local_import(importer);
         }
+        rpc = rpc.with_external_history(self.external_history.clone());
         Arc::new(rpc)
     }
 
@@ -492,12 +538,15 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
-        self.previews.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        // Runs first: recording what this shutdown cuts short (so the next
+        // boot resumes it) must not wait behind anything else. A caller with
+        // a deadline (the app quitting, a service stop) can be cut off later.
         self.sessions.shutdown().await;
+        self.previews.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();
@@ -630,6 +679,30 @@ impl Engine {
         );
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
+        }
+        // A Codegraff cloud sandbox signs in with its lease token, not an OAuth session. The identity is
+        // fixed before the scope is chosen, so the engine opens the synced workspace on its first start.
+        if let Some(file) = std::env::var_os("HARNESS_SANDBOX_TOKEN_FILE")
+            .map(std::path::PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            auth_config.sandbox_token_file = Some(file.clone());
+            for attempt in 0..SANDBOX_SIGN_IN_ATTEMPTS {
+                match crate::auth::sandbox_sign_in(&config.edge_url, &file).await {
+                    Ok(Some(session)) => {
+                        auth_config = auth_config.with_sandbox_session(session);
+                        break;
+                    }
+                    Ok(None) => {
+                        tracing::warn!("sandbox token file has no token yet; starting signed out");
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(attempt, error = %err, "sandbox sign-in failed");
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
+                }
+            }
         }
         Auth::new(auth_config)
     }
@@ -806,14 +879,17 @@ impl Engine {
             tokens: Arc::new(auth.clone()),
         });
         core.previews.start(projects, preview_signaling).await;
-        // Installed desktop bundles use a public stable release feed, so
-        // update checks must also run for local-only, signed-out workspaces.
+        // Installed desktop bundles and managed servers use a public stable
+        // release feed, so update checks also run for local-only, signed-out
+        // workspaces.
+        let install = harness_update::detect_install();
         let check_updates =
-            edge_enabled || harness_update::detect_install().supports_desktop_update();
+            edge_enabled || install.supports_desktop_update() || install.checks_releases();
         if check_updates {
-            // Release checker: polls {edge}/releases on a 6h cadence; headless
-            // installs with HARNESS_AUTO_UPDATE=1 apply + restart themselves — gated
-            // on quiescence so a restart never lands under a live run or open PTY.
+            // Release checker: polls the release feed hourly on the wall clock; managed
+            // headless installs apply + restart themselves (HARNESS_AUTO_UPDATE=0 opts
+            // out) — gated on quiescence so a restart never lands under a live run or
+            // open PTY.
             let quiescent: harness_update::QuiescentCheck = {
                 let sessions = core.sessions.clone();
                 let terminals = core.terminals.clone();
@@ -905,6 +981,9 @@ impl Engine {
                 if requested.is_some() {
                     tracing::info!("headless shutdown requested over IPC");
                 }
+            }
+            _ = harness_update::reexec_requested() => {
+                tracing::info!("update installed; stopping to restart into it");
             }
             _ = wait_for_signed_out(&mut auth_state), if workspace_scope == WorkspaceScope::Synced => {
                 // Edge transports observe the same auth signal and close at

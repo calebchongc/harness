@@ -3,9 +3,19 @@ use super::*;
 use crate::appearance::AppearanceMode;
 
 const HISTORY_RESULT_LIMIT: usize = 30;
+/// Other tools' conversations are listed again when the palette opens only
+/// after this long; until then the last list shows at once.
+const EXTERNAL_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 const RESULTS_FADE_BAND: f32 = 18.0;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteNavigation {
+    PreserveTabs,
+    ReplaceCurrent,
+}
+
 pub(super) struct CommandPalette {
+    navigation: PaletteNavigation,
     search: Entity<ComposerInput>,
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
@@ -15,6 +25,10 @@ pub(super) struct CommandPalette {
     // while this input is still absent from the dispatch tree.
     focus_pending: bool,
     scroll: gpui::ScrollHandle,
+    /// The results as last rendered, and the query they answer; keys act on
+    /// exactly what is on screen.
+    entries: Vec<Entry>,
+    entries_query: String,
     _search_events: Subscription,
 }
 
@@ -36,6 +50,38 @@ impl EnterPress {
     }
 }
 
+/// A conversation another tool kept on this device, as the engine lists it.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ExternalSession {
+    source: String,
+    id: String,
+    cwd: Option<String>,
+    title: String,
+    updated_at: i64,
+}
+
+impl ExternalSession {
+    fn source_label(&self) -> &str {
+        match self.source.as_str() {
+            "claude" => "Claude Code",
+            "codex" => "Codex",
+            "graff" => "graff",
+            other => other,
+        }
+    }
+
+    fn folder(&self) -> &str {
+        self.cwd
+            .as_deref()
+            .and_then(|cwd| cwd.rsplit('/').find(|part| !part.is_empty()))
+            .unwrap_or("")
+    }
+}
+
+/// How many other-tool conversations show before the person types anything.
+const EXTERNAL_IDLE_LIMIT: usize = 5;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Entry {
     NewChat,
@@ -46,6 +92,10 @@ enum Entry {
     /// focus there instead of pulling its chat into the current pane.
     Pane(usize),
     Chat(String),
+    /// A conversation from another tool: picking it imports it, then opens it.
+    External(String, String),
+    /// Import every conversation from other tools.
+    ImportAll,
 }
 
 impl Entry {
@@ -62,7 +112,7 @@ impl Entry {
                 },
                 mode.icon(),
             )),
-            Self::Pane(_) | Self::Chat(_) => None,
+            Self::Pane(_) | Self::Chat(_) | Self::External(..) | Self::ImportAll => None,
         }
     }
 
@@ -71,6 +121,7 @@ impl Entry {
         match self {
             Self::Pane(_) => 0,
             Self::Chat(_) => 2,
+            Self::External(..) => 3,
             _ => 1,
         }
     }
@@ -105,28 +156,53 @@ impl Shell {
     }
 
     pub(super) fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_command_palette_with_navigation(PaletteNavigation::PreserveTabs, window, cx);
+    }
+
+    pub(super) fn toggle_resume_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_command_palette_with_navigation(PaletteNavigation::ReplaceCurrent, window, cx);
+    }
+
+    fn toggle_command_palette_with_navigation(
+        &mut self,
+        navigation: PaletteNavigation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.command_palette.is_some() {
             self.close_command_palette(window, cx);
             return;
         }
         self.add_space = None;
+        self.sidebar_search = None;
         let placeholder = if self.chat_split.as_ref().is_some_and(|split| split.panes.len() > 1) {
             "Search open panes, commands and chats…"
         } else {
             "Search commands and chats…"
         };
         let search = cx.new(|cx| ComposerInput::with_context(placeholder, "PaletteSearch", cx));
-        let events = cx.subscribe(&search, |this, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Edited) {
-                if let Some(palette) = this.command_palette.as_mut() {
-                    palette.active = 0;
-                    palette.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
-                }
-                cx.notify();
+        // Typing and arrowing change only the palette, so they never notify
+        // Shell: the cached sidebar observes Shell and would re-render every
+        // conversation row per key. The search input notifies itself on each
+        // edit, which redraws its ancestors (Shell, this palette) and leaves
+        // sibling caches alone; `window.refresh()` would drop every cache.
+        let events = cx.subscribe(&search, |this, _, event, _| {
+            if matches!(event, ComposerInputEvent::Edited)
+                && let Some(palette) = this.command_palette.as_mut()
+            {
+                palette.active = 0;
+                palette.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
             }
         });
         let previous_focus = window.focused(cx);
+        let stale = self
+            .external_loaded_at
+            .is_none_or(|at| at.elapsed() >= EXTERNAL_REFRESH_AFTER);
+        if stale {
+            self.load_external_sessions(cx);
+        }
         self.command_palette = Some(CommandPalette {
+            navigation,
             search,
             focus: cx.focus_handle(),
             previous_focus,
@@ -134,6 +210,8 @@ impl Shell {
             enter_press: EnterPress::default(),
             focus_pending: true,
             scroll: gpui::ScrollHandle::new(),
+            entries: Vec::new(),
+            entries_query: String::new(),
             _search_events: events,
         });
         cx.notify();
@@ -167,6 +245,11 @@ impl Shell {
             }
         }
         entries.extend(actions_for(&query, Theme::of(cx).appearance.is_dark()));
+        if !self.external_sessions.is_empty()
+            && matches_query(&query, "import conversations from other tools")
+        {
+            entries.push(Entry::ImportAll);
+        }
         let state = self.state.read(cx);
         // Global history deliberately ignores the sidebar's project filter and
         // collapsed groups. Archived conversations remain searchable too.
@@ -208,7 +291,123 @@ impl Shell {
                 .take(HISTORY_RESULT_LIMIT)
                 .map(|chat| Entry::Chat(chat.id.clone())),
         );
+        let external_limit = if query.is_empty() {
+            EXTERNAL_IDLE_LIMIT
+        } else {
+            HISTORY_RESULT_LIMIT
+        };
+        entries.extend(
+            self.external_sessions
+                .iter()
+                .filter(|row| {
+                    matches_query(
+                        &query,
+                        &format!("{} {} {}", row.title, row.source_label(), row.folder()),
+                    )
+                })
+                .take(external_limit)
+                .map(|row| Entry::External(row.source.clone(), row.id.clone())),
+        );
         entries
+    }
+
+    /// Ask the engine which conversations other tools kept on this device.
+    fn load_external_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.external_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    harness_rpc::methods::EXTERNAL_HISTORY_LIST,
+                    serde_json::json!({ "limit": 400 }),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(rows) = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Vec<ExternalSession>>(v).ok())
+                {
+                    shell.external_sessions = rows;
+                    shell.external_loaded_at = Some(std::time::Instant::now());
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Import conversations from other tools: the named ones (then open the first), or all.
+    fn import_external(&mut self, picks: Vec<(String, String)>, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let all = picks.is_empty();
+        let params = if all {
+            serde_json::json!({})
+        } else {
+            let sessions: Vec<_> = picks
+                .iter()
+                .map(|(source, id)| serde_json::json!({ "source": source, "id": id }))
+                .collect();
+            serde_json::json!({ "sessions": sessions })
+        };
+        if all {
+            self.sidebar_notice = Some("Importing conversations from other tools…".into());
+            cx.notify();
+        }
+        self.external_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(harness_rpc::methods::EXTERNAL_HISTORY_IMPORT, params)
+                .await;
+            this.update(cx, |shell, cx| {
+                let summary = result.as_ref().ok();
+                let ids: Vec<String> = summary
+                    .and_then(|v| v["chatIds"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let errors = summary
+                    .and_then(|v| v["errors"].as_array())
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                // Imported ones are in the sidebar now; stop offering them.
+                shell
+                    .external_sessions
+                    .retain(|row| !ids.contains(&format!("ext-{}-{}", row.source, row.id)));
+                match (&result, all) {
+                    (Err(err), _) => {
+                        shell.sidebar_notice = Some(format!("Import failed: {err}").into())
+                    }
+                    (Ok(_), true) => {
+                        shell.sidebar_notice = Some(
+                            match (ids.len(), errors) {
+                                (0, 0) => "Nothing new to import".to_string(),
+                                (n, 0) => format!("Imported {n} conversations"),
+                                (n, e) => {
+                                    format!("Imported {n} conversations; {e} could not be read")
+                                }
+                            }
+                            .into(),
+                        )
+                    }
+                    (Ok(_), false) => match ids.first() {
+                        Some(id) => shell.open_chat(id.clone(), cx),
+                        None => {
+                            shell.sidebar_notice =
+                                Some("That conversation could not be imported".into())
+                        }
+                    },
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn activate_command(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
@@ -218,18 +417,29 @@ impl Shell {
             cx.notify();
             return;
         }
+        // /resume is an intentional current-tab replacement, unlike global
+        // search. Capture the invocation's policy before closing the palette.
+        let replace_current = self.command_palette.as_ref().is_some_and(|palette| {
+            palette.navigation == PaletteNavigation::ReplaceCurrent
+        });
         self.close_command_palette(window, cx);
         match entry {
-            Entry::NewChat => self.open_new_session(cx),
+            Entry::NewChat if replace_current => self.open_new_session(cx),
+            Entry::NewChat => self.new_chat_tab(None, window, cx),
             Entry::NewProject => self.open_add_space(cx),
-            Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
-            Entry::Theme(_) => unreachable!(),
-            Entry::Pane(ix) => self.focus_chat_pane(ix, window, cx),
-            Entry::Chat(id) => {
-                if !self.reveal_chat_in_tabs(&id, window, cx) {
-                    self.open_chat(id, cx)
-                }
+            Entry::Settings => {
+                let section = self.remembered_settings_section();
+                self.open_settings(section, cx)
             }
+            Entry::Theme(_) => unreachable!(),
+            Entry::External(source, id) => self.import_external(vec![(source, id)], cx),
+            Entry::ImportAll => self.import_external(Vec::new(), cx),
+            Entry::Pane(ix) => self.focus_chat_pane(ix, window, cx),
+            Entry::Chat(id) if replace_current => {
+                self.open_chat(id, cx);
+                window.focus(&self.composer.focus_handle(cx), cx);
+            }
+            Entry::Chat(id) => self.open_chat_in_tab(id, window, cx),
         }
     }
 
@@ -267,6 +477,8 @@ impl Shell {
     ) -> Option<AnyElement> {
         let entries = self.command_entries(cx);
         let palette = self.command_palette.as_mut()?;
+        palette.entries = entries.clone();
+        palette.entries_query = palette.search.read(cx).text().to_string();
         if std::mem::take(&mut palette.focus_pending) {
             window.focus(&palette.search.focus_handle(cx), cx);
         }
@@ -384,6 +596,79 @@ impl Shell {
                         row.child(popover::kbd_hint(&theme, &shortcut))
                     })
                     .into_any_element()
+            } else if let Entry::ImportAll = entry {
+                let label = format!(
+                    "Import {} conversations from other tools",
+                    self.external_sessions.len()
+                );
+                popover::menu_row(&theme, ix == active, format!("command-import-{ix}"))
+                    .id(("command-import", ix))
+                    .rounded(px(popover::PALETTE_ITEM_RADIUS))
+                    .role(gpui::Role::Button)
+                    .aria_label(label.clone())
+                    .min_h(px(30.0))
+                    .py(px(4.0))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_command(Entry::ImportAll, window, cx)
+                    }))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .text_center()
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("↓")),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(SharedString::from(label)))
+                    .into_any_element()
+            } else if let Entry::External(source, id) = entry {
+                let row = self
+                    .external_sessions
+                    .iter()
+                    .find(|row| &row.source == source && &row.id == id)?;
+                let title = transcript::single_line(&row.title);
+                let when = chrono::TimeZone::timestamp_millis_opt(&Utc, row.updated_at)
+                    .single()
+                    .map(|at| format_time_ago(at, Utc::now()))
+                    .unwrap_or_default();
+                let trailing = match row.folder() {
+                    "" => format!("{} · {when}", row.source_label()),
+                    folder => format!("{} · {folder} · {when}", row.source_label()),
+                };
+                let entry = entry.clone();
+                popover::menu_row(&theme, ix == active, format!("command-external-{ix}"))
+                    .id(("command-external", ix))
+                    .rounded(px(popover::PALETTE_ITEM_RADIUS))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("Import and open: {title}"))
+                    .min_h(px(30.0))
+                    .py(px(4.0))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_command(entry.clone(), window, cx)
+                    }))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .text_center()
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("↓")),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(popover::search_highlight(
+                        title.into(),
+                        Some(&query),
+                        &theme,
+                    )))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(260.0))
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child(SharedString::from(trailing)),
+                    )
+                    .into_any_element()
             } else if let Entry::Chat(id) = entry {
                 let state = self.state.read(cx);
                 let chat = state.chats.iter().find(|chat| &chat.id == id)?;
@@ -404,11 +689,10 @@ impl Shell {
                     .map(str::trim)
                     .filter(|branch| !branch.is_empty())
                     .map(SharedString::from);
-                let pr = self
-                    .settings
-                    .sidebar_show_pull_request
-                    .then(|| state.change_request_for_chat(chat).cloned())
-                    .flatten();
+                let pr = state
+                    .change_request_for_chat(chat)
+                    .cloned()
+                    .map(|pr| (pr, state.change_request_provenance(chat)));
                 let harness = self
                     .settings
                     .sidebar_show_harness
@@ -429,7 +713,7 @@ impl Shell {
                     false,
                     None,
                     None,
-                    Some(&query),
+                    Some(ChatRowSearch::Palette(&query)),
                     &theme,
                     cx,
                 )
@@ -486,17 +770,18 @@ impl Shell {
                 cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
                     match event.keystroke.key.as_str() {
                         "up" | "down" => {
-                            let count = this.command_entries(cx).len();
-                            if count > 0
-                                && let Some(palette) = this.command_palette.as_mut()
+                            if let Some(palette) = this.command_palette.as_mut()
+                                && !palette.entries.is_empty()
                             {
+                                let count = palette.entries.len();
                                 palette.active = if event.keystroke.key == "down" {
                                     (palette.active + 1) % count
                                 } else {
                                     (palette.active + count - 1) % count
                                 };
                                 palette.scroll.scroll_to_item(palette.active);
-                                cx.notify();
+                                // Redraw through the input, not Shell (see toggle_command_palette).
+                                palette.search.update(cx, |_, cx| cx.notify());
                             }
                         }
                         "enter" => {
@@ -508,11 +793,21 @@ impl Shell {
                                 cx.stop_propagation();
                                 return;
                             }
-                            let entries = this.command_entries(cx);
+                            // Typed and entered within one frame: answer the new query.
+                            let stale = this
+                                .command_palette
+                                .as_ref()
+                                .is_some_and(|p| p.entries_query != p.search.read(cx).text());
+                            if stale {
+                                let entries = this.command_entries(cx);
+                                if let Some(palette) = this.command_palette.as_mut() {
+                                    palette.entries = entries;
+                                }
+                            }
                             if let Some(entry) = this
                                 .command_palette
                                 .as_ref()
-                                .and_then(|p| entries.get(p.active))
+                                .and_then(|p| p.entries.get(p.active))
                                 .cloned()
                             {
                                 this.activate_command(entry, window, cx);
@@ -637,6 +932,66 @@ mod tests {
     use super::*;
     use crate::appearance::AppearanceMode;
 
+    #[gpui::test]
+    fn chat_search_results_preserve_tabs_and_reveal_parked_panes(cx: &mut gpui::TestAppContext) {
+        use crate::shell::chat_tabs::navigation_tests::{assert_target_preserved, fixture};
+        for parked in [None, Some(false), Some(true)] {
+            let (_dir, window) = fixture(cx, true, parked);
+            window.update(cx, |shell, window, cx| {
+                let layout = shell.chat_split.clone();
+                for _ in 0..2 {
+                    shell.toggle_command_palette(window, cx);
+                    shell.activate_command(Entry::Chat("target".into()), window, cx);
+                    assert!(shell.command_palette.is_none());
+                    assert_target_preserved(shell, cx);
+                    assert_eq!(shell.chat_tabs[0].split, layout);
+                }
+            }).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn resume_search_replaces_current_tab_without_revealing_parked_targets(cx: &mut gpui::TestAppContext) {
+        use crate::shell::chat_tabs::navigation_tests::fixture;
+        for split in [false, true] {
+            for parked in [None, Some(false), Some(true)] {
+                let (_dir, window) = fixture(cx, split, parked);
+                cx.run_until_parked();
+                let (tabs, active, layout) = window.update(cx, |shell, _, _| {
+                    (shell.chat_tabs.clone(), shell.chat_tab, shell.chat_split.clone())
+                }).unwrap();
+                for _ in 0..2 {
+                    window.update(cx, |shell, window, cx| {
+                        shell.pending_workspace_command = Some(crate::composer::WorkspaceCommand::Resume);
+                        let _ = shell.render(window, cx);
+                        assert!(shell.command_palette.is_some());
+                        shell.activate_command(Entry::Chat("target".into()), window, cx);
+                        assert!(shell.command_palette.is_none());
+                    }).unwrap();
+                    cx.run_until_parked();
+                    window.update(cx, |shell, _, cx| {
+                        assert_eq!(shell.chat_tabs, tabs, "resume must not add, switch or alter parked tabs");
+                        assert_eq!(shell.chat_tab, active);
+                        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("target"));
+                        assert!(matches!(shell.route, Route::Chat));
+                        assert_eq!(shell.chat_split, layout, "other split panes stay open");
+                    }).unwrap();
+                }
+                // Closing a resume picker must not leak replacement behavior
+                // into the next ordinary command-palette invocation.
+                window.update(cx, |shell, window, cx| {
+                    shell.toggle_resume_palette(window, cx);
+                    shell.close_command_palette(window, cx);
+                    shell.toggle_command_palette(window, cx);
+                    shell.activate_command(Entry::Chat("current".into()), window, cx);
+                    assert_eq!(shell.chat_tab, shell.chat_tabs.len() - 1);
+                    assert_eq!(shell.chat_tabs[active].selected.as_deref(), Some("target"));
+                    assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("current"));
+                }).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn x11_unflagged_enter_repeats_activate_once_until_release() {
         let mut enter = EnterPress::default();
@@ -712,6 +1067,145 @@ mod tests {
         ];
         assert!(order.windows(2).all(|w| w[0].section() < w[1].section()));
         assert_eq!(Entry::Pane(0).action(), None);
+    }
+
+    #[test]
+    fn other_tools_conversations_come_after_chat_history() {
+        let order = [
+            Entry::Chat("a".into()),
+            Entry::External("claude".into(), "s1".into()),
+        ];
+        assert!(order[0].section() < order[1].section());
+        assert_eq!(Entry::ImportAll.section(), Entry::NewChat.section());
+    }
+
+    #[test]
+    fn an_external_row_names_its_tool_and_folder() {
+        let row: ExternalSession = serde_json::from_value(serde_json::json!({
+            "source": "codex", "id": "c1", "cwd": "/work/app/", "title": "add a retry",
+            "updatedAt": 1, "startedAt": 0, "size": 10, "path": "/x"
+        }))
+        .unwrap();
+        assert_eq!(row.source_label(), "Codex");
+        assert_eq!(row.folder(), "app");
+    }
+
+    #[gpui::test]
+    fn resume_replaces_current_tab_even_when_target_is_open_elsewhere(cx: &mut gpui::TestAppContext) {
+        for split in [false, true] {
+            for parked in [None, Some(false), Some(true)] {
+                let (_dir, window) = chat_tabs::navigation_tests::fixture(cx, split, parked);
+                window.update(cx, |shell, window, cx| {
+                    let tabs = shell.chat_tabs.clone();
+                    let pane_count = shell.chat_split.as_ref().map(|split| split.panes.len());
+                    shell.pending_workspace_command = Some(crate::composer::WorkspaceCommand::Resume);
+                    let _ = shell.render(window, cx);
+                    assert!(shell.command_palette.is_some());
+                    shell.activate_command(Entry::Chat("target".into()), window, cx);
+                    assert!(shell.command_palette.is_none());
+                    assert_eq!(shell.chat_tab, 0, "/resume must not switch tabs");
+                    assert_eq!(shell.chat_tabs, tabs, "/resume must not create or modify parked tabs");
+                    assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("target"));
+                    assert_eq!(shell.chat_split.as_ref().map(|split| split.panes.len()), pane_count);
+                }).unwrap();
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn typing_in_the_palette_leaves_the_sidebar_cached(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+        });
+        let data_dir = dir.path().to_path_buf();
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir,
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    codegraff_client_id: None,
+                    default_harness: harness_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            shell.state.update(cx, |state, _| {
+                state.workspace_scope = Some(WorkspaceScope::Local);
+                state.local_device_id = Some("local".into());
+                state.chats_synced = true;
+                state.chats = (0..200)
+                    .map(|i| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": format!("chat-{i}"), "title": format!("Chat number {i}"),
+                            "deviceId": "local", "archived": false,
+                            "createdAt": "2026-09-20T00:00:00Z"
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+            });
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.toggle_command_palette(window, cx);
+        });
+        cx.simulate_resize(gpui::size(px(1200.0), px(800.0)));
+        // Let the sidebar's open animation settle: a moving width re-renders it.
+        for _ in 0..3 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2));
+            cx.run_until_parked();
+        }
+        let before = crate::shell::SIDEBAR_RENDERS.with(|n| n.get());
+        assert!(before > 0, "the window drew the sidebar");
+        for query in ["c", "ch", "chat 1", "chat 19"] {
+            shell.update(cx, |shell, cx| {
+                let search = shell.command_palette.as_ref().unwrap().search.clone();
+                search.update(cx, |input, cx| input.set_text(query, cx));
+            });
+            cx.run_until_parked();
+        }
+        let (query, entries) = shell.read_with(cx, |shell, _| {
+            let palette = shell.command_palette.as_ref().unwrap();
+            (palette.entries_query.clone(), palette.entries.clone())
+        });
+        assert_eq!(query, "chat 19", "the palette redrew for the last query");
+        assert!(entries.contains(&Entry::Chat("chat-19".into())));
+        assert_eq!(
+            crate::shell::SIDEBAR_RENDERS.with(|n| n.get()),
+            before,
+            "typing in the palette re-rendered the sidebar"
+        );
+
+        // The window's first key event settles focus once; count from after it.
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        let before = crate::shell::SIDEBAR_RENDERS.with(|n| n.get());
+        cx.simulate_keystrokes("down down up");
+        cx.run_until_parked();
+        let active = shell.read_with(cx, |shell, _| {
+            shell.command_palette.as_ref().unwrap().active
+        });
+        assert_eq!(active, 2, "arrows moved the selection");
+        assert_eq!(
+            crate::shell::SIDEBAR_RENDERS.with(|n| n.get()),
+            before,
+            "arrowing through results re-rendered the sidebar"
+        );
     }
 
     #[test]

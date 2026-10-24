@@ -48,6 +48,17 @@ final class AppConfig: @unchecked Sendable {
     /// and every socket sat in backoff. That was the 5–10s "connecting"
     /// stall on every app open past token expiry (~5 min).
     private var refreshTask: Task<String?, Never>?
+    /// A refresh token the edge turned down. Spending it again can only fail (and CodeGraff treats a
+    /// replayed token as theft), so it is left alone until a sign-in replaces it.
+    private var rejectedRefreshToken: String?
+    /// Unanswered refresh attempts across rounds, so a rejection right after one gets its second try.
+    private let refreshMemory = TokenRefresh.Memory()
+    /// Called once when the edge rejects the stored sign-in: the person must sign in again. Set by AppModel.
+    var onSessionExpired: (@Sendable () -> Void)? {
+        get { lock.withLock { sessionExpiredHandler } }
+        set { lock.withLock { sessionExpiredHandler = newValue } }
+    }
+    private var sessionExpiredHandler: (@Sendable () -> Void)?
 
     init(edgeURL: URL, mode: Mode, userId: String, orgId: String,
          deviceId: String, deviceName: String,
@@ -65,8 +76,39 @@ final class AppConfig: @unchecked Sendable {
     func updateTokens(_ new: AuthTokens) {
         lock.withLock {
             tokens = new
+            rejectedRefreshToken = nil
         }
     }
+
+    /// The edge turned the stored sign-in down and no new one has replaced it. No request can succeed, so
+    /// none is sent (see `currentToken`), and the connection loops stand down.
+    var signInRejected: Bool {
+        lock.withLock {
+            guard let tokens, let rejectedRefreshToken else { return false }
+            return rejectedRefreshToken == tokens.refreshToken
+        }
+    }
+
+    /// What the Connection screen shows about the sign-in. A snapshot; reading it sends nothing.
+    struct AuthDiagnostics: Equatable {
+        var signedIn: Bool
+        var rejected: Bool
+        var accessExpiresAt: Date?
+        var lastRefreshAt: Date?
+        var lastRefreshOutcome: String?
+    }
+
+    func authDiagnostics() -> AuthDiagnostics {
+        lock.withLock {
+            AuthDiagnostics(signedIn: mode == .dev ? devBearer != nil : tokens != nil,
+                            rejected: tokens.map { rejectedRefreshToken == $0.refreshToken } ?? false,
+                            accessExpiresAt: tokens.flatMap { Self.expiry(ofJWT: $0.accessToken) },
+                            lastRefreshAt: lastRefresh?.at,
+                            lastRefreshOutcome: lastRefresh?.outcome)
+        }
+    }
+
+    private var lastRefresh: (at: Date, outcome: String)?
 
     /// Current bearer, refreshing the CodeGraff access token when needed.
     func currentToken() async -> String? {
@@ -83,32 +125,64 @@ final class AppConfig: @unchecked Sendable {
         }
     }
 
+    /// The CodeGraff pair with an access token good for at least a minute, so
+    /// no room refresh spends the refresh token while a caller holds it.
+    func currentTokens() async -> AuthTokens? {
+        guard mode == .codegraff, await currentToken() != nil else { return nil }
+        return lock.withLock { tokens }
+    }
+
     /// Join (or start) the one in-flight refresh. The task clears itself
     /// under the lock as its last act, so a caller either joins a live
     /// refresh or starts a fresh one — never a second concurrent POST.
     private func refreshedToken(current: AuthTokens) async -> String? {
+        // Nothing to send: the edge already refused this sign-in, and a request with a dead token only
+        // costs radio time. A new sign-in clears this.
+        if lock.withLock({ rejectedRefreshToken }) == current.refreshToken {
+            return nil
+        }
         let task = lock.withLock {
             if let existing = refreshTask {
                 return existing
             }
 
             let task = Task<String?, Never> { [edgeURL, orgId] in
+                // Let a refresh in flight finish if the app is backgrounded: a reply lost after the edge
+                // rotated the credential is a signed-out phone.
+                let grace = await MainActor.run { BackgroundGrace.begin("harness.refreshToken") }
+                defer { grace.end() }
                 let client = AuthClient(baseURL: edgeURL)
-                let refreshed = try? await client.refresh(refreshToken: current.refreshToken,
-                                                          organizationId: orgId)
-                if let refreshed {
+                let outcome = await TokenRefresh.run(memory: self.refreshMemory) {
+                    try await client.refresh(refreshToken: current.refreshToken, organizationId: orgId)
+                }
+                var token: String?
+                let label: String
+                switch outcome {
+                case .refreshed(let refreshed):
+                    Keychain.saveTokens(refreshed)
                     self.updateTokens(refreshed)
-                    Keychain.save(refreshed.accessToken, key: "codegraffAccessToken")
-                    Keychain.save(refreshed.refreshToken, key: "codegraffRefreshToken")
-                } else {
-                    roomLog.error("auth: token refresh failed; using expired access token (server will reject and rooms will redial)")
+                    token = refreshed.accessToken
+                    label = "refreshed"
+                case .rejected:
+                    roomLog.error("auth: the edge rejected the stored sign-in; signing in again is needed")
+                    let notify = self.lock.withLock { () -> (@Sendable () -> Void)? in
+                        self.rejectedRefreshToken = current.refreshToken
+                        return self.sessionExpiredHandler
+                    }
+                    notify?()
+                    label = "rejected"
+                case .unavailable:
+                    roomLog.error("auth: token refresh failed (will retry); using expired access token (server will reject and rooms will redial)")
+                    // Undecided, not refused: fall back to the expired token and let the server answer; the
+                    // rooms' backoff redials retry through here.
+                    token = current.accessToken
+                    label = "edge unreachable"
                 }
                 self.lock.withLock {
+                    self.lastRefresh = (Date(), label)
                     self.refreshTask = nil
                 }
-                // Failure falls back to the expired token: let the server
-                // reject; the rooms' backoff redials retry through here.
-                return refreshed?.accessToken ?? current.accessToken
+                return token
             }
             refreshTask = task
             return task
@@ -207,18 +281,43 @@ final class AppConfig: @unchecked Sendable {
         return request
     }
 
+    /// POST /registry/{orgId}/push-target — this phone's APNs token and
+    /// notification choices; nil registration is the DELETE (sign-out, or
+    /// notifications turned off here).
+    func pushTargetRequest(register registration: PushRegistration?) async -> URLRequest? {
+        guard let token = await currentToken() else { return nil }
+        var url = edgeURL.appending(path: "registry/\(orgId)/push-target")
+        url.append(queryItems: [URLQueryItem(name: "device", value: deviceId)])
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let registration {
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try? JSONEncoder().encode(registration)
+        } else {
+            request.httpMethod = "DELETE"
+        }
+        return request
+    }
+
     /// Decode the JWT payload's `exp` (60s early-refresh margin). Unparseable
     /// tokens read as non-expired — the server is the arbiter.
     private static func isExpired(jwt: String) -> Bool {
+        guard let exp = expiry(ofJWT: jwt) else { return false }
+        return Date() > exp.addingTimeInterval(-60)
+    }
+
+    /// The JWT payload's `exp`, or nil when the token does not parse.
+    static func expiry(ofJWT jwt: String) -> Date? {
         let segments = jwt.split(separator: ".")
-        guard segments.count == 3 else { return false }
+        guard segments.count == 3 else { return nil }
         var base64 = String(segments[1]).replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
         while base64.count % 4 != 0 { base64 += "=" }
         guard let data = Data(base64Encoded: base64),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let exp = obj["exp"] as? TimeInterval else { return false }
-        return Date().timeIntervalSince1970 > exp - 60
+              let exp = obj["exp"] as? TimeInterval else { return nil }
+        return Date(timeIntervalSince1970: exp)
     }
 
     /// GET /device/{deviceId}/status → whether the device's relay HOST socket

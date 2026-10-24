@@ -252,6 +252,7 @@ fn device(id: &str, name: &str) -> Device {
 
 fn chat(id: &str, device_id: &str) -> Chat {
     Chat {
+        last_prompt_at: None,
         id: id.into(),
         device_id: device_id.into(),
         title: Some("First chat".into()),
@@ -276,6 +277,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         space_id: None,
         last_seen_at: None,
         room_gen: None,
+        source_context_unavailable_at: None,
     }
 }
 
@@ -295,6 +297,7 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
         last_completed_turn: None,
+        last_completed_peer_only: false,
         chat_id: chat_id.into(),
         device_id: device_id.into(),
         status,
@@ -508,6 +511,21 @@ fn future_harness_chat_rows_stay_visible_without_their_config() {
 }
 
 #[test]
+fn last_prompt_is_its_own_field_and_survives_upserts() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_device(&device("dev-a", "laptop")).unwrap();
+    ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    assert!(ws.set_chat_last_prompt("chat-1", ts(7_000)).unwrap());
+    // An agent reply moves lastMessageAt, never lastPromptAt.
+    ws.set_chat_last_message("chat-1", "reply", ts(9_000)).unwrap();
+    // A full-row upsert (rename, config change) leaves it alone.
+    ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    let row = ws.overlay_row(KIND_CHATS, "chat-1").unwrap();
+    assert_eq!(row.fields.get("lastPromptAt"), Some(&serde_json::json!(ts(7_000).timestamp_millis())));
+    assert!(!ws.set_chat_last_prompt("nope", ts(1)).unwrap());
+}
+
+#[test]
 fn field_mutators_round_trip() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.upsert_device(&device("dev-a", "laptop")).unwrap();
@@ -534,6 +552,36 @@ fn field_mutators_round_trip() {
     assert_eq!(dev.cursor_sdk_version.as_deref(), Some("1.0.31"));
     assert_eq!(dev.name, "workstation");
     assert_eq!(dev.last_seen_at, Some(ts(6_000)));
+}
+
+#[test]
+fn forget_device_tombstones_the_row_and_a_later_boot_brings_it_back() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_device(&device("dev-a", "studio")).unwrap();
+    ws.upsert_device(&device("dev-b", "cloud sandbox")).unwrap();
+
+    assert!(ws.forget_device("dev-b").unwrap());
+    let ids: Vec<String> = ws
+        .read_devices()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["dev-a".to_string()],
+        "the removed device leaves the list"
+    );
+    assert!(!ws.forget_device("dev-b").unwrap(), "already gone");
+    assert!(!ws.forget_device("nope").unwrap());
+
+    // The device starts Harness again: its boot upsert is newer than the tombstone.
+    ws.upsert_device(&device("dev-b", "cloud sandbox")).unwrap();
+    assert_eq!(
+        ws.read_devices().unwrap().len(),
+        2,
+        "it comes back by itself"
+    );
 }
 
 #[test]
@@ -852,6 +900,50 @@ fn pin_sessions(doc: &mut RegistryDoc, ids: &[&str]) {
         })
         .unwrap();
     }
+}
+
+#[test]
+fn appearance_publishes_only_changed_fields() {
+    let mut doc = RegistryDoc::new("desktop");
+    assert_eq!(doc.appearance(), None);
+    let codegraff = SyncedAppearance {
+        mode: "system".into(),
+        light: "codegraff-light".into(),
+        dark: "codegraff-dark".into(),
+    };
+    doc.set_appearance(&codegraff).unwrap();
+    assert_eq!(doc.appearance(), Some(codegraff.clone()));
+    assert_eq!(doc.pending_len(), 1);
+
+    // Republishing the same choice is free; one changed field is one field.
+    doc.set_appearance(&codegraff).unwrap();
+    assert_eq!(doc.pending_len(), 1);
+    let nord = SyncedAppearance { dark: "nord".into(), ..codegraff };
+    doc.set_appearance(&nord).unwrap();
+    assert_eq!(doc.pending_len(), 2);
+    let last = doc.pending.last().unwrap().ops.last().unwrap();
+    assert_eq!(last.set.as_ref().unwrap().keys().collect::<Vec<_>>(), ["dark"]);
+    assert_eq!(doc.appearance(), Some(nord));
+}
+
+#[test]
+fn appearance_rejects_unknown_modes_and_unsafe_ids() {
+    let mut doc = RegistryDoc::new("desktop");
+    let valid = SyncedAppearance {
+        mode: "dark".into(),
+        light: "github-light".into(),
+        dark: "rose-pine-moon".into(),
+    };
+    for bad in [
+        SyncedAppearance { mode: "sepia".into(), ..valid.clone() },
+        SyncedAppearance { light: String::new(), ..valid.clone() },
+        SyncedAppearance { dark: "../nord".into(), ..valid.clone() },
+    ] {
+        assert!(doc.set_appearance(&bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(doc.appearance(), None);
+    doc.set_appearance(&valid).unwrap();
+    assert_eq!(doc.appearance(), Some(valid));
 }
 
 #[test]
@@ -1235,253 +1327,53 @@ fn completion_marker_replicates_and_survives_next_turn() {
     assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
 }
 
-fn section_change(doc: &mut RegistryDoc, change: harness_proto::SidebarSectionChange) {
-    doc.change_sidebar_pin(&harness_proto::SidebarPinChange::Section { change })
-        .unwrap();
-}
-
 #[test]
-fn sidebar_sections_sync_metadata_membership_and_delete_without_deleting_sessions() {
-    use harness_proto::SidebarSectionChange::*;
-    let mut a = RegistryDoc::new("a");
-    let mut b = RegistryDoc::new("b");
-    let mut server = HashMap::new();
-    let mut seq = 0;
-    pin_sessions(&mut a, &["session"]);
-    section_change(
-        &mut a,
-        Create {
-            id: "focus".into(),
-            name: "Focus".into(),
-        },
-    );
-    section_change(
-        &mut a,
-        Assign {
-            session_id: "session".into(),
-            section_id: Some("focus".into()),
-        },
-    );
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    let prefs = b.sidebar_preferences().unwrap();
-    assert!(prefs.pinned_session_ids.is_empty());
-    assert_eq!(prefs.sections[0].session_ids, ["session"]);
-    section_change(
-        &mut b,
-        Rename {
-            id: "focus".into(),
-            name: "Today".into(),
-        },
-    );
-    section_change(
-        &mut a,
-        Collapse {
-            id: "focus".into(),
-            collapsed: true,
-        },
-    );
-    server_round(&mut server, &mut seq, &mut [&mut b, &mut a]);
-    let prefs = a.sidebar_preferences().unwrap();
-    assert_eq!(prefs, b.sidebar_preferences().unwrap());
-    assert_eq!(prefs.sections[0].name, "Today");
-    assert!(prefs.sections[0].collapsed);
-    let mut archived = a.chat("session").unwrap().unwrap();
-    archived.archived = true;
-    a.upsert_chat(&archived).unwrap();
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert_eq!(
-        b.sidebar_preferences().unwrap().sections[0].session_ids,
-        ["session"]
-    );
-    section_change(&mut b, Delete { id: "focus".into() });
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert!(a.sidebar_preferences().unwrap().sections.is_empty());
-    assert!(a.chat("session").unwrap().is_some());
-}
-
-#[test]
-fn sidebar_sections_concurrent_pin_and_section_moves_converge() {
-    use harness_proto::{SidebarPinChange, SidebarSectionChange::*};
-    for reverse in [false, true] {
-        let mut a = RegistryDoc::new("a");
-        let mut b = RegistryDoc::new("b");
-        let mut server = HashMap::new();
-        let mut seq = 0;
-        pin_sessions(&mut a, &["session"]);
-        for id in ["focus", "later"] {
-            section_change(
-                &mut a,
-                Create {
-                    id: id.into(),
-                    name: id.into(),
-                },
-            );
-        }
-        server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-        section_change(
-            &mut a,
-            Assign {
-                session_id: "session".into(),
-                section_id: Some("focus".into()),
-            },
-        );
-        section_change(
-            &mut b,
-            Assign {
-                session_id: "session".into(),
-                section_id: Some("later".into()),
-            },
-        );
-        if reverse {
-            server_round(&mut server, &mut seq, &mut [&mut b, &mut a]);
-        } else {
-            server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-        }
-        let prefs = a.sidebar_preferences().unwrap();
-        assert_eq!(prefs, b.sidebar_preferences().unwrap());
-        assert_eq!(
-            prefs
-                .sections
-                .iter()
-                .map(|s| s.session_ids.len())
-                .sum::<usize>(),
-            1
-        );
-        a.change_sidebar_pin(&SidebarPinChange::Pin {
-            session_id: "session".into(),
-            after: None,
-            before: None,
-        })
+fn sidebar_ignores_legacy_section_storage_without_deleting_sessions() {
+    use harness_proto::SidebarPinChange;
+    let mut doc = RegistryDoc::new("a");
+    pin_sessions(&mut doc, &["pin"]);
+    doc.upsert_chat(&chat("session", "a")).unwrap();
+    doc.upsert_session(&session("session", "a", SessionStatus::Idle))
         .unwrap();
-        section_change(
-            &mut b,
-            Assign {
-                session_id: "session".into(),
-                section_id: Some("focus".into()),
-            },
-        );
-        if reverse {
-            server_round(&mut server, &mut seq, &mut [&mut b, &mut a]);
-        } else {
-            server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-        }
-        let prefs = a.sidebar_preferences().unwrap();
-        assert_eq!(prefs, b.sidebar_preferences().unwrap());
-        assert_eq!(
-            prefs.pinned_session_ids.len()
-                + prefs
-                    .sections
-                    .iter()
-                    .map(|s| s.session_ids.len())
-                    .sum::<usize>(),
-            1
+    doc.write(
+        "sidebarSections",
+        "old",
+        OpKind::Upsert,
+        fields([("name", json!("Old"))]),
+    );
+    for id in ["pin", "session"] {
+        doc.write(
+            "sidebarLocations",
+            id,
+            OpKind::Upsert,
+            fields([("location", json!("old"))]),
         );
     }
-}
-
-#[test]
-fn sidebar_sections_migration_is_replay_safe_and_preserves_newer_remote_intent() {
-    use harness_proto::SidebarSectionChange::*;
-    let mut a = RegistryDoc::new("a");
-    let mut b = RegistryDoc::new("b");
-    let mut server = HashMap::new();
-    let mut seq = 0;
-    a.upsert_chat(&chat("session", "a")).unwrap();
-    let import = Import {
-        sections: vec![harness_proto::SidebarSection {
-            id: "focus".into(),
-            name: "Focus".into(),
-            collapsed: true,
-            session_ids: vec!["session".into()],
-        }],
-    };
-    section_change(&mut a, import.clone());
-    // Offline outbox survives restart before it reaches the other device.
-    let mut a = RegistryDoc::from_bytes(&a.to_bytes().unwrap(), "a").unwrap();
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert!(b.sidebar_preferences().unwrap().sections[0].collapsed);
-    section_change(
-        &mut b,
-        Assign {
-            session_id: "session".into(),
-            section_id: None,
-        },
-    );
-    section_change(
-        &mut b,
-        Rename {
-            id: "focus".into(),
-            name: "Renamed".into(),
-        },
-    );
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    section_change(&mut a, import.clone());
-    assert_eq!(a.sidebar_preferences().unwrap().sections[0].name, "Renamed");
-    assert!(
-        a.sidebar_preferences().unwrap().sections[0]
-            .session_ids
-            .is_empty()
-    );
-    section_change(&mut b, Delete { id: "focus".into() });
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    section_change(&mut a, import);
-    assert!(a.sidebar_preferences().unwrap().sections.is_empty());
-    assert!(a.chat("session").unwrap().is_some());
-}
-
-#[test]
-fn sidebar_sections_honor_pin_toggles_from_older_clients() {
-    use harness_proto::SidebarSectionChange::*;
-    let mut doc = RegistryDoc::new("a");
-    pin_sessions(&mut doc, &["session"]);
-    section_change(
-        &mut doc,
-        Create {
-            id: "focus".into(),
-            name: "Focus".into(),
-        },
-    );
-    section_change(
-        &mut doc,
-        Assign {
-            session_id: "session".into(),
-            section_id: Some("focus".into()),
-        },
-    );
-    assert!(
-        doc.sidebar_preferences()
-            .unwrap()
-            .pinned_session_ids
-            .is_empty()
-    );
-    // An older client still only writes the existing per-pin fields.
-    doc.write(
-        KIND_SIDEBAR_PINS,
-        "session",
-        OpKind::Upsert,
-        fields([("pinned", json!(true))]),
-    );
-    let prefs = doc.sidebar_preferences().unwrap();
-    assert_eq!(prefs.pinned_session_ids, ["session"]);
-    assert!(prefs.sections[0].session_ids.is_empty());
-    doc.write(
-        KIND_SIDEBAR_PINS,
-        "session",
-        OpKind::Upsert,
-        fields([("pinned", json!(false))]),
-    );
-    let prefs = doc.sidebar_preferences().unwrap();
-    assert!(prefs.pinned_session_ids.is_empty());
-    assert!(prefs.sections[0].session_ids.is_empty());
-    section_change(
-        &mut doc,
-        Assign {
-            session_id: "session".into(),
-            section_id: Some("focus".into()),
-        },
-    );
+    let mut doc = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "a").unwrap();
+    assert_eq!(doc.sidebar_preferences().unwrap().pinned_session_ids, ["pin"]);
+    let chats = doc.read_chats().unwrap();
+    let sessions = doc.read_sessions().unwrap();
+    let pending_before = doc.pending.len();
+    doc.change_sidebar_pin(&SidebarPinChange::Pin {
+        session_id: "session".into(),
+        after: Some("pin".into()),
+        before: None,
+    })
+    .unwrap();
+    doc.change_sidebar_pin(&SidebarPinChange::Unpin {
+        session_id: "pin".into(),
+    })
+    .unwrap();
     assert_eq!(
-        doc.sidebar_preferences().unwrap().sections[0].session_ids,
+        doc.sidebar_preferences().unwrap().pinned_session_ids,
         ["session"]
+    );
+    assert_eq!(doc.read_chats().unwrap(), chats);
+    assert_eq!(doc.read_sessions().unwrap(), sessions);
+    assert!(
+        doc.pending[pending_before..]
+            .iter()
+            .flat_map(|batch| &batch.ops)
+            .all(|op| op.kind == KIND_SIDEBAR_PINS)
     );
 }

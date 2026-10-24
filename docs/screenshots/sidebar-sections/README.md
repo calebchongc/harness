@@ -1,3 +1,6 @@
+Historical screenshots of the removed custom sidebar sections feature. These
+captures do not describe the current UI or backend behavior.
+
 Native GPUI screenshots from the isolated sidebar fixture, with synthetic sessions
 and no signed-in account or connected engine.
 

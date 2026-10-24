@@ -20,6 +20,7 @@ async fn graff_acp_restores_in_the_selected_workspace() {
     let harness = AcpHarness::graff().with_executable(fixture);
     let (_steer_tx, steering) = mpsc::channel(1);
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -30,6 +31,7 @@ async fn graff_acp_restores_in_the_selected_workspace() {
         mcp_servers: Vec::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "Hello".into(),
         harness: None,
         model: None,
@@ -88,6 +90,7 @@ async fn run_graff_worktree_fixture(
     let harness = AcpHarness::graff().with_executable(fixture);
     let (_steer_tx, steering) = mpsc::channel(1);
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -98,6 +101,7 @@ async fn run_graff_worktree_fixture(
         mcp_servers: Vec::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "Hello".into(),
         harness: None,
         model: None,
@@ -161,7 +165,23 @@ async fn graff_runs_and_resumes_in_its_own_named_worktree() {
     let inside = run_graff_worktree_fixture(tree.to_str().unwrap(), Some("saved"), None).await;
     assert_eq!(started_in(&inside), ("saved".to_owned(), tree.clone()), "{inside:?}");
 
-    for events in [&first, &respawned, &inside] {
+    // "Send now" rebuilds the request from the re-homed chat row: the tree as
+    // cwd, with the spec still attached. Graff still launches from the repo,
+    // not inside the tree, where `-w` would collide (codegraff#1693).
+    let send_now =
+        run_graff_worktree_fixture(tree.to_str().unwrap(), Some("saved"), Some("harness-chat1"))
+            .await;
+    assert_eq!(
+        started_in(&send_now),
+        ("saved".to_owned(), tree.clone()),
+        "{send_now:?}"
+    );
+    assert!(
+        !tree.join(".graff").exists(),
+        "no tree nested inside the tree"
+    );
+
+    for events in [&first, &respawned, &inside, &send_now] {
         assert!(
             !events.iter().any(|event| matches!(event, AgentEvent::Error { .. })),
             "no lost-context fallback: {events:?}"

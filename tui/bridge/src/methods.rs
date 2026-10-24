@@ -1,0 +1,230 @@
+//! Request handlers: Codex app-server methods answered from Harness.
+//!
+//! Only the methods the TUI needs to boot and run a text turn are implemented;
+//! anything else answers `-32601` and is logged, so the log is the work list.
+
+use std::sync::Arc;
+
+use harness_engine::HarnessRegistry;
+use harness_proto::HarnessId;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::wire::{After, Conn, RpcError, ThreadState};
+
+type Reply = (Result<Value, RpcError>, After);
+
+fn ok(value: Value) -> Reply {
+    (Ok(value), None)
+}
+
+fn err(error: RpcError) -> Reply {
+    (Err(error), None)
+}
+
+fn wrap(result: Result<Value, RpcError>) -> Reply {
+    (result, None)
+}
+
+pub async fn handle(conn: &std::sync::Arc<Conn>, method: &str, params: Value) -> Reply {
+    // Engine mode: threads are Harness chats (see engine.rs).
+    if let Some(engine) = conn.engine.clone()
+        && let Some(reply) = crate::engine_threads::handle(conn, &engine, method, &params).await
+    {
+        return reply;
+    }
+    match method {
+        "initialize" => ok(json!({
+            // The TUI warns when the server's version differs from its own, so
+            // report the version the bundled Codex source builds as.
+            "userAgent": format!("harness-tui-bridge/{}", codex_compat_version()),
+            "codexHome": codex_home(),
+            "platformFamily": std::env::consts::FAMILY,
+            "platformOs": std::env::consts::OS,
+        })),
+        // No OpenAI account: each agent owns its own sign-in in Harness.
+        "account/read" => ok(json!({ "account": null, "requiresOpenaiAuth": false })),
+        "configRequirements/read" => ok(json!({ "requirements": null })),
+        "collaborationMode/list" => ok(json!({ "data": [] })),
+        // Codex-side config, hooks, skills and plugins have no Harness counterpart yet.
+        "config/read" => ok(json!({ "config": crate::config::read(), "origins": {} })),
+        "config/batchWrite" => match crate::config::batch_write(&params) {
+            Ok(response) => ok(response),
+            Err(error) => err(error),
+        },
+        "thread/settings/update" => thread_settings_update(conn, &params),
+        "hooks/list" | "skills/list" => ok(json!({ "data": [] })),
+        "plugin/list" => ok(json!({ "marketplaces": [] })),
+        "thread/list" => wrap(crate::sessions::list(conn, &params)),
+        "thread/resume" => wrap(crate::sessions::resume(conn, &params)),
+        "thread/loaded/list" => ok(json!({ "data": loaded_threads(conn), "nextCursor": null })),
+        "model/list" => {
+            ok(json!({ "data": crate::models::list(&conn.registry).await, "nextCursor": null }))
+        }
+        "thread/start" => thread_start(conn, params).await,
+        "thread/read" => wrap(crate::sessions::read(conn, &params)),
+        "thread/turns/list" => wrap(crate::sessions::turns(conn, &params)),
+        "turn/start" => crate::turn::start(conn, params),
+        "turn/steer" => crate::turn::steer(conn, params),
+        "turn/interrupt" => turn_interrupt(conn, params),
+        // `/mcp`: graff's MCP servers (crate::mcp).
+        "mcpServerStatus/list" => wrap(crate::mcp::status_list(conn, params).await),
+        "config/mcpServer/reload" => wrap(crate::mcp::reload(conn, params).await),
+        "graff/mcp/reconnect" => wrap(crate::mcp::reconnect(conn, params).await),
+        "graff/mcp/setEnabled" => wrap(crate::mcp::set_enabled(conn, params).await),
+        "mcpServer/oauth/login" => wrap(crate::mcp::oauth_login(conn, params).await),
+        other => err(RpcError::method_not_found(other)),
+    }
+}
+
+/// Source builds of `codex-rs` stamp `0.0.0`; override for a release build.
+fn codex_compat_version() -> String {
+    std::env::var("HARNESS_TUI_CODEX_VERSION").unwrap_or_else(|_| "0.0.0".into())
+}
+
+fn codex_home() -> String {
+    crate::config::codex_home().display().to_string()
+}
+
+/// A model picked in the TUI applies to the thread's next turn.
+fn thread_settings_update(conn: &std::sync::Arc<Conn>, params: &Value) -> Reply {
+    let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+        return err(RpcError::invalid_params("missing threadId"));
+    };
+    let mut threads = conn.threads.lock().expect("threads lock");
+    let Some(thread) = threads.get_mut(thread_id) else {
+        return err(RpcError::invalid_params("unknown threadId"));
+    };
+    if let Some((harness, model)) = params
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(split_model)
+    {
+        if thread.resume.is_some() && harness != thread.harness {
+            return err(RpcError::invalid_params(
+                "cannot resume a session with a different agent",
+            ));
+        }
+        thread.harness = harness;
+        thread.model = Some(model);
+    }
+    if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
+        thread.cwd = cwd.to_owned();
+    }
+    if let Err(error) = crate::sessions::checkpoint(conn, thread_id, thread) {
+        return err(error);
+    }
+    ok(json!({}))
+}
+
+/// A Codex model id is `<harness>/<model>`, so one picker spans every agent.
+pub fn qualified(harness: HarnessId, model: &str) -> String {
+    format!("{}/{model}", harness_slug(harness))
+}
+
+pub fn harness_slug(harness: HarnessId) -> String {
+    serde_json::to_value(harness)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+pub fn split_model(qualified: &str) -> Option<(HarnessId, String)> {
+    let (slug, model) = qualified.split_once('/')?;
+    let harness = serde_json::from_value(Value::String(slug.to_owned())).ok()?;
+    Some((harness, model.to_owned()))
+}
+
+pub async fn harness_ids(registry: &Arc<HarnessRegistry>) -> Vec<HarnessId> {
+    let registry = registry.clone();
+    let mut ids = tokio::task::spawn_blocking(move || registry.enabled_set())
+        .await
+        .unwrap_or_default();
+    ids.retain(|id| *id != HarnessId::Mock);
+    if std::env::var_os("HARNESS_TUI_MOCK").is_some() {
+        ids.push(HarnessId::Mock);
+    }
+    ids
+}
+
+/// The thread's agent and model: the one asked for, else the first entry of
+/// the list `model/list` serves (the TUI sends none on a fresh thread).
+pub async fn pick_model(
+    conn: &std::sync::Arc<Conn>,
+    requested: Option<&str>,
+) -> (HarnessId, Option<String>) {
+    if let Some((harness, model)) = requested.and_then(split_model) {
+        return (harness, Some(model));
+    }
+    let first = crate::models::list(&conn.registry).await.into_iter().next();
+    match first
+        .as_ref()
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+        .and_then(split_model)
+    {
+        Some((harness, model)) => (harness, Some(model)),
+        None => (HarnessId::Graff, None),
+    }
+}
+
+async fn thread_start(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
+    let cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
+        .unwrap_or_else(|| "/".into());
+    let requested = params.get("model").and_then(Value::as_str);
+    tracing::info!(?requested, "thread/start model");
+    let (harness, model) = pick_model(conn, requested).await;
+    let id = Uuid::new_v4().to_string();
+    let shown_model = model.as_ref().map(|m| qualified(harness, m));
+    let state = ThreadState::new(cwd.clone(), harness, model.clone());
+    let thread = crate::sessions::thread_json(&id, &state, false);
+    conn.threads
+        .lock()
+        .expect("threads lock")
+        .insert(id.clone(), state);
+    let response = json!({
+        "thread": thread.clone(),
+        "model": shown_model.clone().unwrap_or_default(),
+        "modelProvider": "harness",
+        "cwd": cwd,
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandbox": { "type": "workspaceWrite" },
+        "disabledPluginIds": [],
+        "instructionSources": [],
+    });
+    let conn = conn.clone();
+    let after: After = Some(Box::pin(async move {
+        conn.notify("thread/started", json!({ "thread": thread }));
+    }));
+    (Ok(response), after)
+}
+
+fn loaded_threads(conn: &std::sync::Arc<Conn>) -> Vec<String> {
+    conn.threads
+        .lock()
+        .expect("threads lock")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn turn_interrupt(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
+    let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+        return err(RpcError::invalid_params("missing threadId"));
+    };
+    if let Some(thread) = conn.threads.lock().expect("threads lock").get(thread_id)
+        && let Some(token) = &thread.interrupt
+    {
+        token.cancel();
+    }
+    ok(json!({}))
+}

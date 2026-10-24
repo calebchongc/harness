@@ -6,8 +6,8 @@
 //! ([`CursorHarness`]), and opencode over its own HTTP/SSE server protocol
 //! ([`OpencodeHarness`] — what the opencode desktop app speaks). The shared
 //! [`AcpHarness`] remains ONLY for agents built ground-up on ACP — Devin
-//! (`devin acp`), Grok (`grok agent stdio`) and Hermes (`hermes acp`) — plus
-//! pi via the community `pi-acp` adapter until a native driver exists.
+//! (`devin acp`), Grok (`grok agent stdio`) Hermes (`hermes acp`) and
+//! Antigravity. Pi uses native JSONL RPC ([`PiHarness`]).
 //! Adapter-mediated ACP for claude/codex/cursor was retired — and opencode's
 //! ACP layer with it: the adapters held prompt turns open for background
 //! work the CLIs themselves settle eagerly (and opencode's settles on the
@@ -30,6 +30,10 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
+    #[error("ChatGPT sign-in expired or was rejected. Sign in again to continue.")]
+    ReauthRequired {
+        provider: harness_proto::ReauthProvider,
+    },
     /// A managed adapter install (npm) failed; carries npm's own output so
     /// the cause is diagnosable from the chat error alone.
     #[error("adapter install failed: {0}")]
@@ -74,6 +78,16 @@ pub struct RunControls {
     pub interrupt: CancellationToken,
     /// Extra MCP servers for this run (empty for most).
     pub mcp_servers: Vec<McpServer>,
+    /// The chat this run belongs to. Drivers that can hand the agent MCP
+    /// servers give it Harness's own (`harness mcp`: agent rooms, chat tools)
+    /// speaking for this chat. None for title runs and tests.
+    pub origin: Option<RunOrigin>,
+}
+
+/// See [`RunControls::origin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOrigin {
+    pub chat_id: String,
 }
 
 /// Catalog provenance stays internal; RPC clients retain the Vec<Model> shape.
@@ -96,6 +110,12 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
     fn steering_mode(&self) -> SteeringMode;
+    /// Whether steers deliver [`SteerMessage::attachments`] to the live run.
+    /// When true, the engine routes a send with images into a steerable run
+    /// instead of replacing it (and its process).
+    fn steers_attachments(&self) -> bool {
+        false
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     /// Whether the agent's own CLI is present on this device — the settings
     /// gate for enabling the harness. Version probes are cached by executable identity.
@@ -116,6 +136,16 @@ pub trait Harness: Send + Sync {
     /// Unlike deterministic_turn_end, this need not cover autonomous activity.
     fn authoritative_prompt_end(&self) -> bool {
         self.deterministic_turn_end()
+    }
+    /// Interrupt only the current turn of `chat_id`'s live run, keeping the
+    /// agent process and its background work (subagents, monitors, background
+    /// shells) alive for the next turn. The turn ends with
+    /// `Done { status: Interrupted }` and the run stays open. Returns false
+    /// when the harness can't do that or has no live turn for the chat; the
+    /// caller then cancels the whole run ([`RunControls::interrupt`]).
+    fn interrupt_turn(&self, chat_id: &str) -> bool {
+        let _ = chat_id;
+        false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
@@ -179,19 +209,23 @@ mod catalog;
 mod catalog_failure;
 pub use catalog_failure::{CatalogFailure, CatalogFailureCode};
 pub mod claude;
+pub mod codedb_bundle;
 pub mod codex;
 pub mod cursor;
 pub mod graff_bundle;
 mod graff_beta;
 pub(crate) mod executable;
 pub mod install;
+pub mod interrupt_reason;
 pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;
 pub mod opencode;
+pub mod pi;
 pub mod process;
 mod scratch;
 pub mod shell_env;
+pub mod tui_bundle;
 pub(crate) mod skills;
 #[cfg(windows)]
 pub mod windows_process;
@@ -215,6 +249,19 @@ pub fn compose_child_path(cmd: &mut process::Command, exe: &std::path::Path) {
     );
 }
 
+/// [`compose_child_path`] with `prefix` ahead of everything else, for a child
+/// that must find a stand-in tool (a no-op `open`) before the real one.
+pub fn compose_child_path_with_prefix(
+    cmd: &mut process::Command,
+    exe: &std::path::Path,
+    prefix: &std::path::Path,
+) {
+    compose_path(
+        cmd.as_std_mut(),
+        std::iter::once(prefix).chain(exe.parent().filter(|d| !d.as_os_str().is_empty())),
+    );
+}
+
 fn compose_path<'a>(
     cmd: &mut std::process::Command,
     executable_dir: impl IntoIterator<Item = &'a std::path::Path>,
@@ -228,6 +275,13 @@ fn compose_path<'a>(
     }
     if let Some(shell_path) = shell_env::login_shell_path() {
         paths.extend(std::env::split_paths(shell_path));
+    }
+    // Harness's own tools (codedb, in ~/.harness/tools/bin) come last: one
+    // the user installed wins.
+    if let Some(managed) = codedb_bundle::managed_path()
+        && let Some(dir) = managed.parent()
+    {
+        paths.push(dir.to_path_buf());
     }
     let mut seen = std::collections::HashSet::new();
     paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
@@ -392,13 +446,19 @@ pub(crate) fn crash_message(
 
 pub use acp::AcpHarness;
 pub use acp::exo_bridge::serve as serve_exo_acp;
+pub use acp::graff_client::set_device_name as set_graff_device_name;
+pub use acp::graff_login::login_command as graff_login_command;
+pub use acp::graff_mcp::mcp_command as graff_mcp_command;
+pub use acp::graff_login::logout_command as graff_logout_command;
 pub use acp::graff_worktree::{
     GraffWorktreeAction, GraffWorktreeOutcome, GraffWorktreeResult, run_graff_worktree_action,
 };
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
+pub use codex::dictation::{Dictation, DictationControls, DictationEvent, DictationRuntime};
 pub use cursor::CursorHarness;
 pub use opencode::OpencodeHarness;
+pub use pi::PiHarness;
 
 // ---------------------------------------------------------------------------
 // Child lifecycle (shared by the codex and ACP harnesses)

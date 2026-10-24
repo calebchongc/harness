@@ -38,6 +38,8 @@ const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
 /// Refresh when the cached token has less than this much life left.
 const TOKEN_SLACK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often a signed-out sandbox looks at its token file again.
+const SANDBOX_RESIGN_INTERVAL: Duration = Duration::from_secs(5);
 const REFRESH_RETRY_BASE: Duration = Duration::from_secs(1);
 /// DNS can recover without an OS path event. Keep polling even at the cap.
 const REFRESH_RETRY_CAP: Duration = Duration::from_secs(5);
@@ -50,6 +52,59 @@ struct RefreshRetry {
     generation: u64,
     failures: u32,
     failure: Option<RefreshFailure>,
+    /// The last refresh that failed without an answer (or was spared). Unlike
+    /// `failure`, an explicit Retry doesn't clear it: only a success does.
+    last_unanswered: Option<tokio::time::Instant>,
+    /// A rejection right after unanswered attempts was retried once already.
+    rejection_spared: bool,
+}
+
+/// How long the edge replays a rotated refresh's answer (`refresh-leeway.ts`).
+/// A rejection this soon after an unanswered attempt may be that rotation's
+/// lost answer, not a revoked session (#331).
+const REFRESH_REPLAY_WINDOW: Duration = Duration::from_secs(120);
+
+/// A refresh rejection's cause, from the edge's own `{error}` text, as a fixed
+/// category: logs name the kind, never the response body (#331).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshRejection {
+    /// The edge could not verify the refresh credential at all.
+    Invalid,
+    /// The credential belongs to another account's workspace.
+    Workspace,
+    /// The request itself was malformed.
+    Malformed,
+    /// CodeGraff refused the grant: revoked, or already rotated by an
+    /// attempt whose answer never arrived.
+    Rejected,
+    Unknown,
+}
+
+impl RefreshRejection {
+    fn from_reason(reason: &str) -> Self {
+        match reason {
+            "invalid refresh credential" => Self::Invalid,
+            "workspace does not belong to this account" => Self::Workspace,
+            "missing refreshToken" | "bad request" => Self::Malformed,
+            _ if reason.starts_with("CodeGraff rejected the grant") => Self::Rejected,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Workspace => "workspace",
+            Self::Malformed => "malformed",
+            Self::Rejected => "rejected",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Retrying cannot change these answers.
+    fn definite(self) -> bool {
+        matches!(self, Self::Invalid | Self::Workspace | Self::Malformed)
+    }
 }
 
 struct RefreshFailure {
@@ -168,6 +223,20 @@ pub struct AuthConfig {
     pub dev_user_id: String,
     /// Loopback callback port; `None` = ephemeral.
     pub callback_port: Option<u16>,
+    /// A Codegraff cloud sandbox signs in with the lease-bound token its host keeps in this file
+    /// (`HARNESS_SANDBOX_TOKEN_FILE`) instead of an OAuth session: no `session.json` is read or
+    /// written, and the token is re-read on every refresh so a re-attached token is picked up.
+    pub sandbox_token_file: Option<PathBuf>,
+    /// The identity the edge vouched for at startup; set by [`Auth::sandbox_session`].
+    sandbox_session: Option<SandboxSession>,
+}
+
+/// What `POST /auth/sandbox` answered at startup.
+#[derive(Debug, Clone)]
+pub struct SandboxSession {
+    user: AuthUser,
+    org_id: Option<String>,
+    access_token: String,
 }
 
 impl AuthConfig {
@@ -179,8 +248,80 @@ impl AuthConfig {
             codegraff_api_base: "https://codegraff.com".into(),
             dev_user_id: "dev-user".into(),
             callback_port: Some(27643),
+            sandbox_token_file: None,
+            sandbox_session: None,
         }
     }
+
+    /// Carry a startup sign-in made with [`sandbox_sign_in`] into [`Auth::new`].
+    pub fn with_sandbox_session(mut self, session: SandboxSession) -> Self {
+        self.sandbox_session = Some(session);
+        self
+    }
+}
+
+/// A sandbox token: the host writes `{"apiKey": "cg_lt_…"}` (or `{"token": …}`, or the bare token).
+fn read_sandbox_token(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = raw.trim();
+    let token = match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => value
+            .get("apiKey")
+            .or_else(|| value.get("token"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)?,
+        Err(_) => raw.to_owned(),
+    };
+    let hex = token.strip_prefix("cg_lt_")?;
+    (hex.len() == 48 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(token)
+}
+
+/// Ask the edge who this sandbox's token belongs to (`POST /auth/sandbox`). `Ok(None)` when the file
+/// holds no token yet; an error is worth retrying (network) or fatal (the edge refused).
+pub async fn sandbox_sign_in(
+    edge_url: &str,
+    token_file: &std::path::Path,
+) -> Result<Option<SandboxSession>, EngineError> {
+    let Some(token) = read_sandbox_token(token_file) else {
+        return Ok(None);
+    };
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Reply {
+        user: AuthUser,
+        org_id: Option<String>,
+        access_token: String,
+    }
+    let http = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+    let res = http
+        .post(format!("{}/auth/sandbox", edge_url.trim_end_matches('/')))
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .map_err(|e| {
+            EngineError::Other(format!(
+                "could not reach the edge to sign this sandbox in: {}",
+                describe_http_error(e)
+            ))
+        })?;
+    if !res.status().is_success() {
+        return Err(EngineError::Other(format!(
+            "the edge refused this sandbox's token ({})",
+            res.status().as_u16()
+        )));
+    }
+    let reply: Reply = res.json().await.map_err(|e| {
+        EngineError::Other(format!("malformed sandbox sign-in response: {}", describe_http_error(e)))
+    })?;
+    Ok(Some(SandboxSession {
+        user: reply.user,
+        org_id: reply.org_id,
+        access_token: reply.access_token,
+    }))
 }
 
 /// The persisted session (refresh token + user + last org scope).
@@ -281,6 +422,12 @@ pub struct Auth {
     inner: Arc<AuthInner>,
 }
 
+/// Present while this device was signed out by a rejected refresh rather
+/// than by the person; the app offers to sign back in until it is gone.
+pub fn lost_session_marker(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("signed-out.notice")
+}
+
 impl Auth {
     /// Build from config: dev mode unless a CodeGraff client id is configured.
     pub fn new(config: AuthConfig) -> Self {
@@ -289,7 +436,18 @@ impl Auth {
             .clone()
             .filter(|s| !s.trim().is_empty());
         let session_file = config.data_dir.join("session.json");
-        let stored: Option<StoredSession> = if codegraff.is_some() {
+        let sandbox_token = config
+            .sandbox_token_file
+            .as_deref()
+            .and_then(read_sandbox_token);
+        let stored: Option<StoredSession> = if codegraff.is_some() && config.sandbox_token_file.is_some() {
+            // A sandbox's identity is its lease token, never a session file.
+            config.sandbox_session.as_ref().zip(sandbox_token).map(|(session, token)| StoredSession {
+                refresh_token: token,
+                user: session.user.clone(),
+                org_id: session.org_id.clone(),
+            })
+        } else if codegraff.is_some() {
             std::fs::read_to_string(&session_file)
                 .ok()
                 .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -313,6 +471,11 @@ impl Auth {
             (Some(_), None) => AuthState::SignedOut,
         };
         let loaded_codegraff_session = codegraff.is_some() && stored.is_some();
+        let initial_access = config
+            .sandbox_session
+            .as_ref()
+            .filter(|_| stored.is_some())
+            .map(|session| AccessEntry::fresh(session.access_token.clone()));
         let (state_tx, _) = watch::channel(initial);
         let (token_tx, _) = watch::channel(0);
         let (retry_tx, _) = watch::channel(0);
@@ -330,7 +493,7 @@ impl Auth {
                 state_tx,
                 token_tx,
                 stored: Mutex::new(stored),
-                access: Mutex::new(None),
+                access: Mutex::new(initial_access),
                 sign_in: Mutex::new(SignInLifecycle::default()),
                 refresh_gate: tokio::sync::Mutex::new(()),
                 refresh_flight: Mutex::new(None),
@@ -461,6 +624,21 @@ impl Auth {
             let mut retry_rx = auth.inner.retry_tx.subscribe();
             loop {
                 if !state_rx.borrow().is_signed_in() {
+                    if auth.inner.config.sandbox_token_file.is_some() {
+                        // A sandbox whose token was refused (paused, re-attached, revoked) signs itself
+                        // back in as soon as its file holds a token the edge accepts.
+                        tokio::select! {
+                            _ = tokio::time::sleep(SANDBOX_RESIGN_INTERVAL) => {
+                                if let Err(err) = auth.resign_sandbox().await {
+                                    tracing::debug!(error = %err, "auth: sandbox sign-in not ready");
+                                }
+                            }
+                            changed = state_rx.changed() => {
+                                if changed.is_err() { return; }
+                            }
+                        }
+                        continue;
+                    }
                     if state_rx.changed().await.is_err() {
                         return;
                     }
@@ -581,6 +759,30 @@ impl Auth {
     pub fn sign_out(&self) {
         let mut sign_in = lock(&self.inner.sign_in);
         self.clear_session(&mut sign_in);
+        // Chosen, not lost: no "you've been signed out" notice.
+        self.set_lost_session(false);
+    }
+
+    /// Leave (or clear) the marker the app shows "You've been signed out"
+    /// from. A refresh the service rejected signs this device out without the
+    /// person asking, and the next launch opens the local workspace: without
+    /// the notice that reads as every chat having vanished.
+    fn set_lost_session(&self, lost: bool) {
+        if self.inner.config.sandbox_token_file.is_some() {
+            return;
+        }
+        let path = lost_session_marker(&self.inner.config.data_dir);
+        let outcome = if lost {
+            std::fs::write(&path, chrono::Utc::now().to_rfc3339())
+        } else {
+            match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+                _ => Ok(()),
+            }
+        };
+        if let Err(err) = outcome {
+            tracing::warn!(error = %err, "auth: failed to update the signed-out notice");
+        }
     }
 
     fn clear_session(&self, sign_in: &mut SignInLifecycle) {
@@ -713,11 +915,24 @@ impl Auth {
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
+        struct GraffKey {
+            api_key: String,
+            email: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Exchange {
             user: WireUser,
             access_token: String,
             refresh_token: String,
+            /// The graff CLI key the edge minted in this sign-in, when asked.
+            #[serde(default)]
+            graff_key: Option<GraffKey>,
         }
+        // One sign-in covers the app and `graff` in the terminal: a device
+        // whose graff has no key asks for one in this exchange.
+        let graff = crate::codegraff_auth::CodegraffAuth::shared(&self.inner.config.data_dir);
+        let want_graff_key = !graff.has_key();
         let url = format!(
             "{}/auth/exchange",
             self.inner.config.edge_url.trim_end_matches('/')
@@ -730,7 +945,9 @@ impl Auth {
                 "code": code,
                 "codeVerifier": pending.verifier,
                 "redirectUri": pending.redirect_uri,
-                "nonce": nonce
+                "nonce": nonce,
+                "graffKey": want_graff_key,
+                "deviceLabel": gethostname::gethostname().to_string_lossy(),
             }))
             .send()
             .await
@@ -752,6 +969,11 @@ impl Auth {
                 describe_http_error(e)
             ))
         })?;
+        if let Some(key) = body.graff_key
+            && let Err(err) = graff.adopt_sign_in_key(&key.api_key, key.email).await
+        {
+            tracing::warn!(error = %err, "couldn't save the graff key from sign-in");
+        }
         let name = [body.user.first_name, body.user.last_name]
             .into_iter()
             .flatten()
@@ -767,6 +989,42 @@ impl Auth {
             access_token: body.access_token,
             refresh_token: body.refresh_token,
         })
+    }
+
+    /// Sign a sandbox back in from its token file (`POST /auth/sandbox`). Does nothing when the file
+    /// holds no token or the session is already live.
+    pub async fn resign_sandbox(&self) -> Result<(), EngineError> {
+        let Some(path) = self.inner.config.sandbox_token_file.clone() else {
+            return Ok(());
+        };
+        if self.state().is_signed_in() {
+            return Ok(());
+        }
+        let Some(session) = sandbox_sign_in(&self.inner.config.edge_url, &path).await? else {
+            return Ok(());
+        };
+        let Some(token) = read_sandbox_token(&path) else {
+            return Ok(());
+        };
+        let org_id = session
+            .org_id
+            .clone()
+            .or_else(|| jwt_claims(&session.access_token).and_then(|c| c.org_id));
+        *lock(&self.inner.access) = Some(AccessEntry::fresh(session.access_token));
+        *lock(&self.inner.stored) = Some(StoredSession {
+            refresh_token: token,
+            user: session.user.clone(),
+            org_id: org_id.clone(),
+        });
+        self.retry_refresh();
+        tracing::info!(email = %session.user.email, "auth: sandbox signed in");
+        self.inner
+            .state_tx
+            .send_replace(state_for(session.user, org_id));
+        self.inner
+            .token_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        Ok(())
     }
 
     fn finish_sign_in(&self, result: SignInResult, generation: u64) -> Result<(), EngineError> {
@@ -787,6 +1045,7 @@ impl Auth {
             org_id: org_id.clone(),
         };
         self.persist(Some(&session));
+        self.set_lost_session(false);
         *lock(&self.inner.stored) = Some(session);
         self.retry_refresh();
         tracing::info!(email = %result.user.email, org = org_id.as_deref().unwrap_or("<none>"),
@@ -863,6 +1122,15 @@ impl Auth {
         let result = self.refresh_locked(organization_id).await;
         let mut retry = lock(&self.inner.refresh_retry);
         // A Retry/sign-in/sign-out during the request invalidates its cooldown.
+        if organization_id.is_none() {
+            match &result {
+                Err(_) => retry.last_unanswered = Some(tokio::time::Instant::now()),
+                Ok(_) => {
+                    retry.last_unanswered = None;
+                    retry.rejection_spared = false;
+                }
+            }
+        }
         if retry.generation == generation {
             match &result {
                 Err(err) if organization_id.is_none() => {
@@ -898,10 +1166,15 @@ impl Auth {
     ) -> Result<Option<String>, EngineError> {
         let (generation, refresh_token) = {
             let sign_in = lock(&self.inner.sign_in);
-            let Some(refresh_token) = lock(&self.inner.stored)
-                .as_ref()
-                .map(|s| s.refresh_token.clone())
-            else {
+            let mut stored = lock(&self.inner.stored);
+            // A re-attached sandbox token replaces the old one in its file; pick it up before asking.
+            if let Some(path) = &self.inner.config.sandbox_token_file
+                && let Some(token) = read_sandbox_token(path)
+                && let Some(session) = stored.as_mut()
+            {
+                session.refresh_token = token;
+            }
+            let Some(refresh_token) = stored.as_ref().map(|s| s.refresh_token.clone()) else {
                 return Ok(None);
             };
             (sign_in.generation, refresh_token)
@@ -941,6 +1214,33 @@ impl Auth {
         let status = res.status().as_u16();
         if (400..500).contains(&status) && !matches!(status, 408 | 429) && organization_id.is_none()
         {
+            // Timeouts/rate limits are retryable. Other 4xx responses mean a
+            // rejected refresh (revoked session, deleted user), which retrying
+            // won't fix: degrade to SignedOut so every downstream retry loop
+            // quiets down. (Org-switch refreshes are exempt: a 4xx there means
+            // "not a member", not a dead session.)
+            // The edge's `{error}` names the cause (an invalid credential,
+            // CodeGraff's grant refusal, a workspace mismatch), which the
+            // status alone cannot tell apart.
+            let reason = res
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            let kind = RefreshRejection::from_reason(&reason);
+            // The lost-answer shape: attempts went unanswered, then the edge
+            // rejects the rotated token. Retry once before signing out; a
+            // definite cause, or a second rejection, still signs out.
+            let spare = !kind.definite() && {
+                let mut retry = lock(&self.inner.refresh_retry);
+                let recent = retry
+                    .last_unanswered
+                    .is_some_and(|at| at.elapsed() < REFRESH_REPLAY_WINDOW);
+                let spare = recent && !retry.rejection_spared;
+                retry.rejection_spared |= spare;
+                spare
+            };
             let mut sign_in = lock(&self.inner.sign_in);
             if sign_in.generation != generation
                 || lock(&self.inner.stored)
@@ -949,16 +1249,24 @@ impl Auth {
             {
                 return Ok(None);
             }
-            // Timeouts/rate limits are retryable. Other 4xx responses mean a
-            // rejected refresh (revoked session,
-            // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
-            // there means "not a member", not a dead session.)
+            if spare {
+                tracing::warn!(
+                    status,
+                    kind = kind.as_str(),
+                    "auth: refresh rejected right after unanswered attempts; retrying once before signing out"
+                );
+                return Err(EngineError::Other(format!(
+                    "refresh rejected ({status}, {}); retrying once",
+                    kind.as_str()
+                )));
+            }
             tracing::warn!(
                 status,
-                "auth: refresh rejected — session revoked; signing out"
+                kind = kind.as_str(),
+                "auth: refresh rejected — signing out"
             );
             self.clear_session(&mut sign_in);
+            self.set_lost_session(true);
             return Ok(None);
         }
         if !res.status().is_success() {
@@ -1017,6 +1325,10 @@ impl Auth {
     /// Persist (0600) or remove the stored session. Never panics: a disk error degrades
     /// to a logged warning, not a crash mid-refresh.
     fn persist<S: std::borrow::Borrow<StoredSession>>(&self, session: Option<S>) {
+        // A sandbox's identity is its lease token: nothing is ever written to (or removed from) disk.
+        if self.inner.config.sandbox_token_file.is_some() {
+            return;
+        }
         let path = self.session_file();
         let outcome = match session {
             Some(session) => serde_json::to_vec(session.borrow())
@@ -1365,6 +1677,26 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_rejections_are_categorized_from_the_edge_text() {
+        for (reason, kind, definite) in [
+            ("invalid refresh credential", "invalid", true),
+            (
+                "workspace does not belong to this account",
+                "workspace",
+                true,
+            ),
+            ("missing refreshToken", "malformed", true),
+            ("CodeGraff rejected the grant (400)", "rejected", false),
+            ("", "unknown", false),
+            ("something new", "unknown", false),
+        ] {
+            let rejection = RefreshRejection::from_reason(reason);
+            assert_eq!(rejection.as_str(), kind, "{reason}");
+            assert_eq!(rejection.definite(), definite, "{reason}");
+        }
+    }
 
     #[test]
     fn oauth_transport_requires_tls_outside_loopback() {

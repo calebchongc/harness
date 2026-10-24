@@ -10,6 +10,9 @@ import SwiftUI
 
 /// Production cloud endpoints — mirrors edge/wrangler.jsonc.
 enum Endpoints {
+    static let privacyURL = URL(string: "https://codegraff.com/privacy#harness")!
+    static let supportURL = URL(string: "https://codegraff.com/support")!
+    static let supportEmailURL = URL(string: "mailto:rach@codegraff.com")!
     static let edgeURL = URL(string: "https://edge.codegraff.com")!
     static let codegraffClientId = "cg_client_43e753878956c2cf7b5b0f53"
     static let codegraffAPIBase = "https://codegraff.com"
@@ -34,9 +37,6 @@ enum Endpoints {
 
 struct SignInView: View {
     @Environment(AppModel.self) private var model
-    @State private var busy = false
-    @State private var error: String?
-    @State private var authSession = AuthSessionCoordinator()
 
     var body: some View {
         ZStack {
@@ -61,10 +61,10 @@ struct SignInView: View {
 
                 VStack(spacing: 12) {
                     Button {
-                        signIn()
+                        model.startSignIn()
                     } label: {
                         Group {
-                            if busy {
+                            if model.signInBusy {
                                 ProgressView()
                                     .tint(Theme.bg)
                             } else {
@@ -78,66 +78,27 @@ struct SignInView: View {
                         .background(Theme.text, in: RoundedRectangle(cornerRadius: 16))
                     }
                     .buttonStyle(.plain)
-                    .disabled(busy)
-                    .opacity(busy ? 0.6 : 1)
+                    .disabled(model.signInBusy)
+                    .opacity(model.signInBusy ? 0.6 : 1)
 
-                    if let error {
+                    if let error = model.signInError {
                         Text(error)
                             .font(Theme.sans(13))
                             .foregroundStyle(Theme.danger)
                             .multilineTextAlignment(.center)
                     }
+                    HStack(spacing: 20) {
+                        Link("Privacy policy", destination: Endpoints.privacyURL)
+                        Link("Help", destination: Endpoints.supportURL)
+                    }
+                    .font(Theme.sans(13))
+                    .foregroundStyle(Theme.textMuted)
                 }
 
                 Spacer()
             }
             .padding(.horizontal, 32)
             .frame(maxWidth: 480)
-        }
-    }
-
-    /// CodeGraff browser sign-in → Harness callback → edge exchange with PKCE.
-    private func signIn() {
-        busy = true
-        error = nil
-        let state = UUID().uuidString
-        let verifier = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-            + UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        let digest = Data(SHA256.hash(data: Data(verifier.utf8)))
-        let challenge = digest.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        authSession.start(url: Endpoints.authorizeURL(state: state, challenge: challenge),
-                          callbackScheme: Endpoints.callbackScheme) { result in
-            Task { @MainActor in
-                switch result {
-                case .cancelled:
-                    busy = false
-                case .failure(let message):
-                    busy = false
-                    error = message
-                case .success(let callbackURL):
-                    let params = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
-                        .queryItems ?? []
-                    let code = params.first { $0.name == "code" }?.value
-                    let cbState = params.first { $0.name == "state" }?.value
-                    guard let code, cbState == state else {
-                        busy = false
-                        error = "Callback missing code or state mismatch"
-                        return
-                    }
-                    do {
-                        try await model.signIn(edgeURL: Endpoints.edgeURL, code: code,
-                                               codeVerifier: verifier,
-                                               redirectURI: Endpoints.redirectURI,
-                                               nonce: state)
-                    } catch {
-                        self.error = error.localizedDescription
-                    }
-                    busy = false
-                }
-            }
         }
     }
 }
@@ -155,6 +116,13 @@ final class AuthSessionCoordinator: NSObject, ASWebAuthenticationPresentationCon
 
     private var session: ASWebAuthenticationSession?
 
+    /// Close the sheet: the sign-in finished somewhere else (a magic link
+    /// opened in Safari). The completion then reports `.cancelled`.
+    func cancel() {
+        session?.cancel()
+        session = nil
+    }
+
     func start(url: URL, callbackScheme: String, completion: @escaping (Outcome) -> Void) {
         let session = ASWebAuthenticationSession(url: url,
                                                  callbackURLScheme: callbackScheme) { callbackURL, error in
@@ -168,7 +136,10 @@ final class AuthSessionCoordinator: NSObject, ASWebAuthenticationPresentationCon
             }
         }
         session.presentationContextProvider = self
-        session.prefersEphemeralWebBrowserSession = false
+        // Private browser session: sharing Safari's cookies meant a signed-in
+        // codegraff.com (or Google) account was reused silently, so signing
+        // out and back in could never switch accounts.
+        session.prefersEphemeralWebBrowserSession = true
         self.session = session
         session.start()
     }

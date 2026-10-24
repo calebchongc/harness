@@ -4,7 +4,7 @@
 
 <p align="center">พื้นที่ทำงานแบบเนทีฟสำหรับเอเจนต์เขียนโค้ดบนเครื่องของคุณ</p>
 
-<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.hindi.md">हिन्दी</a> · ไทย · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
+<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.es.md">Español</a> · <a href="README.hindi.md">हिन्दी</a> · ไทย · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
 
 Harness รวม **CodeGraff (graff)**, Claude Code, Codex, Cursor, Devin, Grok,
 Hermes, Pi, OpenCode และ Antigravity ไว้ในแอปเดสก์ท็อปเดียว เริ่มใช้งานบนเครื่อง
@@ -63,8 +63,26 @@ harness daemon start
 
 ## สัญญาอนุญาต
 
-Harness เผยแพร่ภายใต้ [GNU Affero General Public License รุ่น 3](LICENSE)
-(`AGPL-3.0-only`) ซึ่งเป็น AGPL รุ่นเดียวกับสิทธิ์สาธารณะของ CodeGraff
-Standard Harness Pte. Ltd. สงวนสิทธิ์เฉพาะผลงาน Harness ที่บริษัทเป็นเจ้าของ
-ส่วนผลงานอื่นยังคงประกาศลิขสิทธิ์และสัญญาอนุญาตเดิมไว้ใน
-[ประกาศซอฟต์แวร์ภายนอก](THIRD_PARTY_NOTICES.md)
+Harness เผยแพร่ภายใต้ [GNU Affero General Public License รุ่น 3 ฉบับแก้ไข](LICENSE)
+(AGPL-3.0 พร้อมข้อกำหนดเพิ่มเติม) ซึ่งมีโครงสร้างเดียวกับสัญญาอนุญาตของ
+[CodeGraff](https://github.com/justrach/codegraff) การใช้งานผ่านเครือข่ายจะทำให้
+มาตรา 13 มีผล Standard Harness Pte. Ltd., Rach Pradhan (justrach) และ Yu Xi Lim
+(yxlyx) สงวนสิทธิ์ในการเสนอเวอร์ชันแบบกรรมสิทธิ์หรือแบบโฮสต์สำหรับผลงาน Harness
+ต้นฉบับที่ตนเป็นเจ้าของ สัญญาอนุญาต AGPL ของผู้รับมีผลถาวร เว้นแต่ผู้รับจะละเมิดเอง
+การอนุญาตเชิงพาณิชย์โดยไม่ต้องทำตาม copyleft จะมีได้ก็ต่อเมื่อทั้งสามฝ่ายให้ร่วมกัน
+เป็นลายลักษณ์อักษร และเพิกถอนได้ ส่วนผลงานอื่นยังคงประกาศลิขสิทธิ์และสัญญาอนุญาต
+เดิมไว้ใน [ประกาศซอฟต์แวร์ภายนอก](THIRD_PARTY_NOTICES.md)
+
+**บริษัทต้องมีสัญญาอนุญาตเชิงพาณิชย์** ทุกเวอร์ชันหลัง v0.2.108 มีข้อกำหนดเพิ่ม
+หนึ่งข้อ องค์กรของคุณ เมื่อนับรวมองค์กรที่ควบคุมองค์กรนี้ ถูกองค์กรนี้ควบคุม หรืออยู่ภายใต้การควบคุมเดียวกัน ต้องมีสัญญาอนุญาตเชิงพาณิชย์สำหรับ
+การใช้ Harness ทุกรูปแบบ (รวมถึงบนเครื่อง คลาวด์ CI และเครือข่ายของตนเอง) หากเข้า
+เงื่อนไข**ข้อใดข้อหนึ่ง**ต่อไปนี้
+
+- ระดมทุนจากนักลงทุนหรือผู้ให้กู้รวมกันเกิน **500,000 ดอลลาร์สหรัฐ**
+- มูลค่าทรัพย์สินสุทธิหรือมูลค่าประเมินล่าสุดเกิน **500,000 ดอลลาร์สหรัฐ**
+- รายได้รวมในปีบัญชีล่าสุด หรือในช่วง 12 เดือนใดก็ตาม เกิน
+  **100,000 ดอลลาร์สหรัฐ**
+
+บริษัทที่เข้าเงื่อนไขข้อใดข้อหนึ่งต้องติดต่อเราภายใน 5 วันทำการ บุคคลธรรมดาใช้ Harness ภายใต้ AGPL เสมอ ไม่ว่าจะมีรายได้เท่าใด เช่นเดียวกับองค์กรที่ไม่เข้าเงื่อนไข
+ข้อใดเลย เวอร์ชันจนถึง v0.2.108 ยังคงใช้สัญญาอนุญาตที่มาพร้อมตอนเผยแพร่ หากไม่แน่ใจ
+ให้ถือว่าคุณเข้าเงื่อนไขและติดต่อ [rach@standardharness.com](mailto:rach@standardharness.com)

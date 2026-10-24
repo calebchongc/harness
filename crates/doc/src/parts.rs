@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use harness_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion};
+use harness_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, ToolView, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -164,6 +164,12 @@ pub enum MessagePart {
         name: String,
         mime_type: String,
     },
+    /// Bounded native visual source, stored atomically outside prose fields.
+    Visual {
+        id: String,
+        title: String,
+        script: String,
+    },
     /// Model thinking. Carries its body in a dedicated doc field (`reasoning`,
     /// never `text`) so pre-reasoning desktop builds — whose unknown-kind
     /// fallback renders `text` as prose — degrade to an invisible empty text
@@ -221,6 +227,15 @@ pub enum MessagePart {
         /// its tagged text deltas (capped; display-only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent_tail: Option<String>,
+        /// A page this tool saved on the host (graff views, MCP Apps). The
+        /// chip offers to open it; only kind + id travel (additive).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ToolView>,
+    },
+    /// Small task diagnostics only: never the task answer or caller context.
+    Delegation {
+        id: String,
+        info: harness_proto::DelegationInfo,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -233,6 +248,8 @@ pub enum MessagePart {
     Error {
         id: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reauth: Option<harness_proto::ReauthProvider>,
     },
 }
 
@@ -241,8 +258,10 @@ impl MessagePart {
         match self {
             MessagePart::Text { id, .. }
             | MessagePart::Image { id, .. }
+            | MessagePart::Visual { id, .. }
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
+            | MessagePart::Delegation { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. } => id,
         }
@@ -267,6 +286,7 @@ impl MessagePart {
                         .as_ref()
                         .map_or(0, |s| serde_json::to_vec(s).map_or(0, |v| v.len()))
             }
+            MessagePart::Delegation { info, .. } => serde_json::to_vec(info).map_or(0, |v| v.len()),
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
@@ -276,6 +296,7 @@ impl MessagePart {
                 name,
                 mime_type,
             } => id.len() + path.len() + name.len() + mime_type.len(),
+            MessagePart::Visual { id, title, script } => id.len() + title.len() + script.len(),
             MessagePart::Error { message, .. } => message.len(),
         }
     }
@@ -326,6 +347,21 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 *existing = image;
             } else {
                 out.push(image);
+            }
+        }
+        AgentEvent::GeneratedVisual { id, title, script } => {
+            if harness_proto::visual::validate_visual(title, script).is_err() {
+                return;
+            }
+            let visual = MessagePart::Visual {
+                id: id.clone(),
+                title: title.clone(),
+                script: script.clone(),
+            };
+            if let Some(existing) = out.iter_mut().find(|p| p.id() == id) {
+                *existing = visual;
+            } else {
+                out.push(visual);
             }
         }
         AgentEvent::ReasoningDelta { text } => {
@@ -386,7 +422,28 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                view: None,
             });
+        }
+        AgentEvent::DelegationInfo { id, info } => {
+            // Require the real tool, and upsert by its stable id: replayed
+            // completion metadata must not add a second accounting row.
+            if !out
+                .iter()
+                .any(|p| matches!(p, MessagePart::Tool { id: pid, .. } if pid == id))
+            {
+                return;
+            }
+            let part_id = format!("delegation:{id}");
+            let part = MessagePart::Delegation {
+                id: part_id.clone(),
+                info: info.clone(),
+            };
+            if let Some(existing) = out.iter_mut().find(|p| p.id() == part_id) {
+                *existing = part;
+            } else {
+                out.push(part);
+            }
         }
         AgentEvent::ToolCall { id, call } => {
             if let Some(existing) = out.iter_mut().find_map(|p| match p {
@@ -411,6 +468,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    view: None,
                 });
             }
         }
@@ -450,6 +508,19 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
+        AgentEvent::ToolView { id, view } => {
+            for p in out.iter_mut() {
+                if let MessagePart::Tool {
+                    id: pid,
+                    view: slot,
+                    ..
+                } = p
+                    && pid == id
+                {
+                    *slot = Some(view.clone());
+                }
+            }
+        }
         AgentEvent::InputRequested {
             request_id,
             questions,
@@ -482,6 +553,26 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             out.push(MessagePart::Error {
                 id,
                 message: message.clone(),
+                reauth: None,
+            });
+        }
+        AgentEvent::ReauthRequired { provider } => {
+            let id = format!("e{}", out.len());
+            out.push(MessagePart::Error {
+                id,
+                message: match provider {
+                    // Codex has its own sign-in, separate from graff's ChatGPT
+                    // one, and on a fresh server it was never made at all.
+                    harness_proto::ReauthProvider::Codex => {
+                        "Codex isn't signed in to ChatGPT on the computer running this chat, \
+                         or its sign-in expired. Sign in to continue."
+                    }
+                    harness_proto::ReauthProvider::ChatgptNew => {
+                        "ChatGPT sign-in expired or was rejected. Sign in again to continue."
+                    }
+                }
+                .into(),
+                reauth: Some(*provider),
             });
         }
         AgentEvent::Done { error, .. } => {
@@ -490,6 +581,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 out.push(MessagePart::Error {
                     id,
                     message: message.clone(),
+                    reauth: None,
                 });
             }
         }
@@ -499,7 +591,8 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // was tried and rejected: rewriting the chip per delta batch grew
         // the parent doc's oplog for the whole subagent run and rendered as
         // distracting mid-stream fragments (user call, 2026-08-18). The
-        // `subagent_tail` field stays in the schema for docs that carry it.
+        // `subagent_tail` field is written only by an explicit, low-frequency
+        // [`AgentEvent::SubagentProgress`] (a workflow's agent count moving).
         AgentEvent::Subagent {
             parent_tool_use_id,
             event,
@@ -518,11 +611,16 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
                 _ => None,
             };
+            let summary = match event.as_ref() {
+                AgentEvent::SubagentProgress { summary } => Some(summary),
+                _ => None,
+            };
             for p in out.iter_mut() {
                 if let MessagePart::Tool {
                     id,
                     call,
                     subagent_status,
+                    subagent_tail,
                     ..
                 } = p
                     && id == parent_tool_use_id
@@ -550,6 +648,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                         }
                         None => {}
                     }
+                    if let Some(summary) = summary {
+                        *subagent_tail = Some(summary.clone());
+                    }
                 }
             }
         }
@@ -561,10 +662,15 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::ContextUsage { .. }
+        | AgentEvent::ContextSavings { .. }
         | AgentEvent::AvailableCommands { .. }
         | AgentEvent::ReasoningChanged { .. }
         | AgentEvent::ToolProgress { .. }
-        | AgentEvent::UserMessage { .. } => {}
+        // SubagentProgress only means something tagged (handled above).
+        | AgentEvent::UserMessage { .. }
+        | AgentEvent::SubagentProgress { .. }
+        // Engine bookkeeping for the idle reaper, never transcript content.
+        | AgentEvent::BackgroundTask { .. } => {}
     }
 }
 
@@ -830,6 +936,39 @@ mod tests {
     }
 
     #[test]
+    fn generated_visual_fold_is_ordered_atomic_bounded_and_idempotent() {
+        let mut parts = vec![];
+        fold_event_into_parts(&mut parts, &text_delta("before"));
+        let event = AgentEvent::GeneratedVisual {
+            id: "v".into(),
+            title: "Overview".into(),
+            script: "x".repeat(64 * 1024),
+        };
+        fold_event_into_parts(&mut parts, &event);
+        fold_event_into_parts(&mut parts, &text_delta("after"));
+        fold_event_into_parts(&mut parts, &event);
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[1], MessagePart::Visual { id, .. } if id == "v"));
+        assert_eq!(parts[1].byte_len(), 1 + "Overview".len() + 64 * 1024);
+        assert_eq!(join_continuations(split_parts(&parts)), parts);
+        let serialized = serde_json::to_value(&parts[1]).unwrap();
+        assert_eq!(serialized["kind"], "visual");
+        assert_eq!(
+            serde_json::from_value::<MessagePart>(serialized).unwrap(),
+            parts[1]
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::GeneratedVisual {
+                id: "bad".into(),
+                title: "Overview".into(),
+                script: "x".repeat(64 * 1024 + 1),
+            },
+        );
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
     fn generated_image_fold_is_ordered_atomic_and_idempotent() {
         let mut parts = vec![];
         fold_event_into_parts(&mut parts, &text_delta("before"));
@@ -1050,6 +1189,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                view: None,
             },
         ];
         let chunks = split_parts(&parts);
@@ -1133,6 +1273,42 @@ mod tests {
             new_text: "one\ntwo\n".into(),
         });
         assert_eq!((stat.additions, stat.deletions), (2, 0));
+    }
+
+    #[test]
+    fn a_tool_view_lands_on_its_own_chip_only() {
+        let view = harness_proto::ToolView::new(
+            harness_proto::ToolViewKind::Html,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let mut parts = Vec::new();
+        for id in ["render", "other"] {
+            fold_event_into_parts(
+                &mut parts,
+                &AgentEvent::ToolCall {
+                    id: id.into(),
+                    call: ToolCall::Unknown { name: "render_html".into(), input: None },
+                },
+            );
+        }
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolView { id: "render".into(), view: view.clone() },
+        );
+        // A view for a chip this turn never had changes nothing.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolView { id: "missing".into(), view: view.clone() },
+        );
+        let views: Vec<_> = parts
+            .iter()
+            .map(|p| match p {
+                MessagePart::Tool { view, .. } => view.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(views, vec![Some(view), None]);
     }
 
     #[test]
@@ -1396,6 +1572,57 @@ mod tests {
             } => assert_eq!(*subagent_status, None),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn subagent_progress_stamps_only_a_spawn_chips_tail() {
+        let progress = |id: &str| AgentEvent::Subagent {
+            parent_tool_use_id: id.into(),
+            event: Box::new(AgentEvent::SubagentProgress {
+                summary: "1/2 agents".into(),
+            }),
+        };
+        let mut parts = Vec::new();
+        for (id, call) in [
+            (
+                "toolu_wf",
+                ToolCall::Unknown {
+                    name: "Agent: Repo scan".into(),
+                    input: None,
+                },
+            ),
+            (
+                "toolu_bash",
+                ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            ),
+        ] {
+            fold_event_into_parts(
+                &mut parts,
+                &AgentEvent::ToolCall {
+                    id: id.into(),
+                    call,
+                },
+            );
+            fold_event_into_parts(&mut parts, &progress(id));
+        }
+        let tails: Vec<_> = parts
+            .iter()
+            .map(|p| match p {
+                MessagePart::Tool { subagent_tail, .. } => subagent_tail.as_deref(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(tails, [Some("1/2 agents"), None]);
+        // Untagged, it means nothing and adds no part.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::SubagentProgress {
+                summary: "x".into(),
+            },
+        );
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]

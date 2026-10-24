@@ -41,6 +41,7 @@ fn fixture_path() -> PathBuf {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: Some("grok-4.5".into()),
@@ -59,6 +60,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -117,7 +119,7 @@ fn assert_done(events: &[AgentEvent], expected: DoneStatus) {
 
 async fn delayed_turn(scenario: &str) {
     init_env();
-    let harness = AcpHarness::pi().with_executable(fixture_path());
+    let harness = AcpHarness::hermes().with_executable(fixture_path());
     assert!(harness.authoritative_prompt_end());
     let (controls, steer, token) = controls();
     let mut stream = harness.run(request(scenario), controls).await.unwrap();
@@ -206,7 +208,7 @@ async fn open_tools_then_silence_preserves_prompt() {
 async fn cancel_quiet(scenario: &str) {
     init_env();
     let (controls, steer, token) = controls();
-    let mut stream = AcpHarness::pi()
+    let mut stream = AcpHarness::grok()
         .with_executable(fixture_path())
         .run(request(scenario), controls)
         .await
@@ -259,7 +261,7 @@ async fn unresponsive_quiet_turn_is_killed_on_cancel() {
 async fn missing_response_at_eof_is_error_not_success() {
     init_env();
     let (controls, _steer, _token) = controls();
-    let mut stream = AcpHarness::pi()
+    let mut stream = AcpHarness::grok()
         .with_executable(fixture_path())
         .run(request("eof"), controls)
         .await
@@ -270,7 +272,7 @@ async fn missing_response_at_eof_is_error_not_success() {
 #[tokio::test]
 async fn protocol_error_keeps_code_and_agent_detail() {
     let (controls, _steer, _token) = controls();
-    let mut stream = AcpHarness::pi()
+    let mut stream = AcpHarness::grok()
         .with_executable(fixture_path())
         .run(request("error"), controls)
         .await

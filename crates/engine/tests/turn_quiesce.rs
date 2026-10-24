@@ -30,7 +30,7 @@ use harness_engine::{EngineCore, HarnessRegistry, SteerOutcome};
 use harness_adapters::{Harness, HarnessError, RunControls};
 use harness_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode, ToolCall,
+    SessionStatus, SteeringMode, ToolCall, TurnOrigin,
 };
 
 const CHAT: &str = "chat-quiesce";
@@ -49,6 +49,7 @@ fn init_quiesce_env() {
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -95,6 +96,7 @@ fn text(t: &str) -> AgentEvent {
 /// immediately-completed empty stream instead.
 struct FeedHarness {
     main_prompt: String,
+    confirm_steers: bool,
     feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
 }
 
@@ -135,6 +137,8 @@ impl Harness for FeedHarness {
             .take()
             .expect("FeedHarness serves the main dispatch once per test");
         let (tx, rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(64);
+        let confirm_steers = self.confirm_steers;
+        let interrupt = controls.interrupt.clone();
         tokio::spawn(async move {
             let mut steering_open = true;
             loop {
@@ -142,8 +146,9 @@ impl Harness for FeedHarness {
                     // Steers first: a Steered boundary always precedes feed
                     // events the test sends after steering (determinism).
                     biased;
+                    _ = interrupt.cancelled() => return,
                     steer = controls.steering.recv(), if steering_open => match steer {
-                        Some(_) => {
+                        Some(_) if confirm_steers => {
                             let boundary = AgentEvent::Steered {
                                 assistant_message_id: None,
                                 next_assistant_message_id: None,
@@ -152,6 +157,7 @@ impl Harness for FeedHarness {
                                 return;
                             }
                         }
+                        Some(_) => {},
                         None => steering_open = false,
                     },
                     event = feed.recv() => match event {
@@ -179,11 +185,16 @@ struct Rig {
 }
 
 fn assemble(main_prompt: &str) -> Rig {
+    assemble_with_confirmation(main_prompt, true)
+}
+
+fn assemble_with_confirmation(main_prompt: &str, confirm_steers: bool) -> Rig {
     init_quiesce_env();
     let (feed, rx) = mpsc::unbounded_channel();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(FeedHarness {
         main_prompt: main_prompt.into(),
+        confirm_steers,
         feed: Mutex::new(Some(rx)),
     }));
     let dir = tempfile::tempdir().unwrap();
@@ -311,6 +322,17 @@ async fn parked_self_continuation_folds_and_requiesces() {
         second_completion, first_completion,
         "engine-settled responses still notify"
     );
+    // "Run this in the background and tell me when it's done": the result
+    // arrives on a turn the agent continued on its own, and it belongs to the
+    // person who asked, so it chimes and notifies (#535).
+    assert!(
+        !rig.core
+            .sessions
+            .session_status(CHAT)
+            .unwrap()
+            .last_completed_peer_only,
+        "a self-continued turn keeps the last prompt's human owner"
+    );
 
     // The self-continued output is in the doc as its own COMPLETE entry —
     // this exact text was lost in the incident.
@@ -323,6 +345,448 @@ async fn parked_self_continuation_folds_and_requiesces() {
     );
 
     rig.core.sessions.shutdown().await;
+}
+
+/// A turn the agent continues on its own (a background task finishing, a
+/// task wake) reports to whoever asked for the work: a person's request still
+/// chimes and notifies when its result lands, while a peer-only request stays
+/// silent (#535, #553 review).
+#[tokio::test]
+async fn self_continued_turns_keep_the_last_prompts_owner() {
+    for origin in [TurnOrigin::Human, TurnOrigin::Peer] {
+        let rig = assemble("start the build in the background");
+        let mut request = run_request("start the build in the background");
+        request.turn_origin = origin;
+        rig.core
+            .sessions
+            .dispatch(CHAT, HarnessId::Mock, request, None)
+            .await
+            .unwrap();
+        rig.feed.send(session_started()).unwrap();
+        rig.feed.send(text("Started; I'll report back.")).unwrap();
+        rig.feed.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || status(&rig.core) == Some(SessionStatus::Idle),
+            "park after the opening turn",
+        )
+        .await;
+        let opening = rig.core.sessions.session_status(CHAT).unwrap();
+        assert_eq!(
+            opening.last_completed_peer_only,
+            origin != TurnOrigin::Human
+        );
+
+        // The background work settles and the agent reports on its own.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        rig.feed
+            .send(text("The build finished: all green."))
+            .unwrap();
+        wait_for(
+            || {
+                rig.core.sessions.session_status(CHAT).is_some_and(|s| {
+                    s.status == SessionStatus::Idle
+                        && s.last_completed_turn.is_some()
+                        && s.last_completed_turn != opening.last_completed_turn
+                })
+            },
+            "self-continued completion",
+        )
+        .await;
+        assert_eq!(
+            rig.core
+                .sessions
+                .session_status(CHAT)
+                .unwrap()
+                .last_completed_peer_only,
+            origin != TurnOrigin::Human,
+            "origin={origin:?}: the self-continued result keeps the opening prompt's owner"
+        );
+        rig.core.sessions.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn peer_only_turns_and_later_human_turns_keep_their_own_completion_origin() {
+    let rig = assemble("peer request");
+    let mut request = run_request("peer request");
+    request.turn_origin = TurnOrigin::Peer;
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request, None)
+        .await
+        .unwrap();
+    rig.feed.send(session_started()).unwrap();
+    rig.feed.send(text("Acknowledged.")).unwrap();
+    rig.feed.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || status(&rig.core) == Some(SessionStatus::Idle),
+        "peer completion",
+    )
+    .await;
+    let mut previous = rig.core.sessions.session_status(CHAT).unwrap();
+    assert!(previous.last_completed_peer_only);
+
+    for origin in [TurnOrigin::Human, TurnOrigin::Peer, TurnOrigin::Human] {
+        assert_eq!(
+            rig.core
+                .sessions
+                .steer_with_origin(CHAT, "next", None, Vec::new(), origin)
+                .await
+                .unwrap(),
+            SteerOutcome::Accepted,
+        );
+        wait_for(
+            || status(&rig.core) == Some(SessionStatus::Working),
+            "steer boundary",
+        )
+        .await;
+        // A newly running turn must not relabel a previously consumed marker.
+        let running = rig.core.sessions.session_status(CHAT).unwrap();
+        assert_eq!(running.last_completed_turn, previous.last_completed_turn);
+        assert_eq!(
+            running.last_completed_peer_only,
+            previous.last_completed_peer_only
+        );
+        rig.feed.send(text("Finished next request.")).unwrap();
+        rig.feed.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || status(&rig.core) == Some(SessionStatus::Idle),
+            "next completion",
+        )
+        .await;
+        let completed = rig.core.sessions.session_status(CHAT).unwrap();
+        assert_ne!(completed.last_completed_turn, previous.last_completed_turn);
+        assert_eq!(completed.last_completed_peer_only, origin != TurnOrigin::Human);
+        previous = completed;
+    }
+    rig.core.sessions.shutdown().await;
+}
+
+#[tokio::test]
+async fn quiesced_human_work_keeps_ownership_through_a_delayed_peer_boundary() {
+    let rig = assemble_with_confirmation("human with a delayed peer", false);
+    rig.core
+        .sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            run_request("human with a delayed peer"),
+            None,
+        )
+        .await
+        .unwrap();
+    rig.feed.send(session_started()).unwrap();
+    rig.feed
+        .send(text("Human task is still being handed off."))
+        .unwrap();
+    assert_eq!(
+        rig.core
+            .sessions
+            .steer_with_origin(
+                CHAT,
+                "peer acknowledgement",
+                None,
+                Vec::new(),
+                TurnOrigin::Peer,
+            )
+            .await
+            .unwrap(),
+        SteerOutcome::Accepted
+    );
+
+    // No native Done or steer confirmation arrives before the watchdog.
+    wait_for(
+        || status(&rig.core) == Some(SessionStatus::Idle),
+        "pending handoff quiesces",
+    )
+    .await;
+    assert!(
+        rig.core
+            .sessions
+            .session_status(CHAT)
+            .unwrap()
+            .last_completed_turn
+            .is_none()
+    );
+    rig.feed
+        .send(AgentEvent::Steered {
+            assistant_message_id: None,
+            next_assistant_message_id: Some("delayed-peer".into()),
+        })
+        .unwrap();
+    rig.feed
+        .send(text("Peer-assisted human task finished."))
+        .unwrap();
+    rig.feed.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || {
+            rig.core
+                .sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.last_completed_turn.as_deref() == Some("delayed-peer"))
+        },
+        "handed-off completion",
+    )
+    .await;
+    assert_eq!(
+        rig.core
+            .sessions
+            .session_status(CHAT)
+            .unwrap()
+            .last_completed_peer_only,
+        false,
+        "quiescence must not lose the pending human completion"
+    );
+
+    // A later wake the agent starts on its own continues that human-owned
+    // work, so its result still notifies (#535).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    rig.feed
+        .send(text("Background result for the human task."))
+        .unwrap();
+    wait_for(
+        || {
+            rig.core.sessions.session_status(CHAT).is_some_and(|s| {
+                s.last_completed_turn.as_deref() != Some("delayed-peer")
+                    && s.last_completed_turn.is_some()
+            })
+        },
+        "later self-continued completion",
+    )
+    .await;
+    assert!(
+        !rig.core
+            .sessions
+            .session_status(CHAT)
+            .unwrap()
+            .last_completed_peer_only,
+        "a self-continued wake keeps the human owner"
+    );
+    rig.core.sessions.shutdown().await;
+}
+
+#[tokio::test]
+async fn unconfirmed_steers_publish_recoverable_origin_before_their_boundary() {
+    for (parked, routed_dispatch) in [(false, false), (true, false), (false, true), (true, true)] {
+        for initial in [TurnOrigin::Human, TurnOrigin::Peer, TurnOrigin::Background] {
+            for incoming in [TurnOrigin::Human, TurnOrigin::Peer, TurnOrigin::Background] {
+                let rig = assemble_with_confirmation("origin before boundary", false);
+                let mut request = run_request("origin before boundary");
+                request.turn_origin = initial;
+                let run_id = rig
+                    .core
+                    .sessions
+                    .dispatch(CHAT, HarnessId::Mock, request, Some("opening-id".into()))
+                    .await
+                    .unwrap();
+                let journal = harness_engine::RunJournal::open(
+                    rig._dir.path().join("orgs/dev-org/dev-user/journals"),
+                )
+                .unwrap();
+                rig.feed.send(session_started()).unwrap();
+                rig.feed.send(text("Original work.")).unwrap();
+                wait_for(
+                    || journal.last_event(CHAT).unwrap().is_some(),
+                    "original stream",
+                )
+                .await;
+                if parked {
+                    rig.feed.send(done(DoneStatus::Completed)).unwrap();
+                    wait_for(
+                        || status(&rig.core) == Some(SessionStatus::Idle),
+                        "parked origin",
+                    )
+                    .await;
+                }
+                if routed_dispatch {
+                    let mut request = run_request("accepted, not confirmed");
+                    request.turn_origin = incoming;
+                    assert_eq!(
+                        rig.core
+                            .sessions
+                            .dispatch(CHAT, HarnessId::Mock, request, Some("unconfirmed".into()),)
+                            .await
+                            .unwrap(),
+                        run_id,
+                        "must use the warm steering path"
+                    );
+                } else {
+                    assert_eq!(
+                        rig.core
+                            .sessions
+                            .steer_with_origin(
+                                CHAT,
+                                "accepted, not confirmed",
+                                Some("unconfirmed".into()),
+                                Vec::new(),
+                                incoming,
+                            )
+                            .await
+                            .unwrap(),
+                        SteerOutcome::Accepted
+                    );
+                }
+                let expected = if !parked && initial == TurnOrigin::Human {
+                    TurnOrigin::Human
+                } else {
+                    incoming
+                };
+                // A process crash now recovers the latest User row, not the
+                // previous assistant turn. Its notification ownership must
+                // already be durable, before any Steered acknowledgement.
+                assert_eq!(
+                    journal.turn_origin(CHAT),
+                    expected,
+                    "initial={initial:?}, incoming={incoming:?}, parked={parked}, routed={routed_dispatch}"
+                );
+                assert_eq!(
+                    journal.turn_origin_for_prompt(CHAT, "unconfirmed"),
+                    expected
+                );
+                assert_eq!(
+                    journal.turn_origin_for_prompt(CHAT, "opening-id"),
+                    initial,
+                    "pending provenance must be bound to its own User row"
+                );
+                rig.core.sessions.shutdown().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn idle_peer_acceptance_preserves_carried_human_origin_before_and_after_delayed_boundary() {
+    let mut observed = Vec::new();
+    for routed_dispatch in [false, true] {
+        let rig = assemble_with_confirmation("human awaiting peer handoff", false);
+        let run_id = rig
+            .core
+            .sessions
+            .dispatch(
+                CHAT,
+                HarnessId::Mock,
+                run_request("human awaiting peer handoff"),
+                Some("opening-human".into()),
+            )
+            .await
+            .unwrap();
+        let journal = harness_engine::RunJournal::open(
+            rig._dir.path().join("orgs/dev-org/dev-user/journals"),
+        )
+        .unwrap();
+        rig.feed.send(session_started()).unwrap();
+        // Keep the original turn active while the test thread is scheduled;
+        // readiness must not race this fixture's short quiesce watchdog.
+        rig.feed.send(AgentEvent::ToolCall {
+            id: "handoff-in-progress".into(),
+            call: ToolCall::Exec { command: "work".into() },
+        }).unwrap();
+        rig.feed.send(text("Human work in progress.")).unwrap();
+        wait_for(
+            || matches!(
+                journal.last_event(CHAT).unwrap(),
+                Some((_, AgentEvent::TextDelta { text })) if text == "Human work in progress."
+            ),
+            "original human output",
+        )
+        .await;
+        assert_eq!(status(&rig.core), Some(SessionStatus::Working));
+        assert_eq!(
+            rig.core
+                .sessions
+                .steer_with_origin(
+                    CHAT,
+                    "peer A joins human work",
+                    Some("peer-a".into()),
+                    Vec::new(),
+                    TurnOrigin::Peer,
+                )
+                .await
+                .unwrap(),
+            SteerOutcome::Accepted
+        );
+        assert_eq!(journal.turn_origin_for_prompt(CHAT, "peer-a"), TurnOrigin::Human);
+
+        // The original Done is an internal handoff: A remains unconfirmed,
+        // so Idle carries unfinished human work and publishes no completion.
+        rig.feed.send(AgentEvent::ToolResult {
+            id: "handoff-in-progress".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+        }).unwrap();
+        rig.feed.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || status(&rig.core) == Some(SessionStatus::Idle),
+            "original turn parks with a pending human handoff",
+        )
+        .await;
+        assert!(
+            rig.core.sessions.session_status(CHAT).unwrap().last_completed_turn.is_none()
+        );
+
+        if routed_dispatch {
+            let mut request = run_request("peer B joins carried human work");
+            request.turn_origin = TurnOrigin::Peer;
+            assert_eq!(
+                rig.core
+                    .sessions
+                    .dispatch(CHAT, HarnessId::Mock, request, Some("peer-b".into()))
+                    .await
+                    .unwrap(),
+                run_id,
+                "B must use the warm dispatch path"
+            );
+        } else {
+            assert_eq!(
+                rig.core
+                    .sessions
+                    .steer_with_origin(
+                        CHAT,
+                        "peer B joins carried human work",
+                        Some("peer-b".into()),
+                        Vec::new(),
+                        TurnOrigin::Peer,
+                    )
+                    .await
+                    .unwrap(),
+                SteerOutcome::Accepted
+            );
+        }
+        let before = journal.turn_origin_for_prompt(CHAT, "peer-b");
+        rig.feed
+            .send(AgentEvent::Steered {
+                assistant_message_id: None,
+                next_assistant_message_id: Some("delayed-peer-a".into()),
+            })
+            .unwrap();
+        rig.feed.send(text("A boundary has been processed.")).unwrap();
+        wait_for(
+            || journal.replay(CHAT, 0).unwrap().iter().any(|(_, event)| matches!(
+                event,
+                AgentEvent::TextDelta { text } if text == "A boundary has been processed."
+            )),
+            "streamed output after delayed A boundary",
+        )
+        .await;
+        let after = journal.turn_origin_for_prompt(CHAT, "peer-b");
+        // B is still unconfirmed. Exercise both acceptance paths and shut
+        // down before asserting, without completing B to repair its ledger.
+        rig.core.sessions.shutdown().await;
+        observed.push((routed_dispatch, before, after));
+    }
+    for (routed_dispatch, before, after) in observed {
+        assert_eq!(
+            before,
+            TurnOrigin::Human,
+            "B must inherit carried human work before A's boundary; routed_dispatch={routed_dispatch}"
+        );
+        assert_eq!(
+            after,
+            TurnOrigin::Human,
+            "A's delayed boundary must preserve B's human ownership; routed_dispatch={routed_dispatch}"
+        );
+    }
 }
 
 /// Step 3 of the incident: a steer becomes the next turn, the agent answers,

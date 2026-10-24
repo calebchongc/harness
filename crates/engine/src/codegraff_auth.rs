@@ -20,6 +20,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod github_runners;
+mod sandboxes;
+pub use github_runners::{
+    GithubRunners, RunnerAction, RunnerInstallation, RunnerJob, RunnerRepo, RunnerSize,
+};
+pub use sandboxes::{CodegraffSandbox, CodegraffSandboxes, PersonalSize, cloud_sandboxes_enabled};
+
 pub const GATEWAY: &str = "https://gateway.codegraff.com";
 /// The graff CLI's credential file, relative to the home directory.
 pub const KEY_FILE: &str = ".simple-harness-codegraff.json";
@@ -39,8 +46,23 @@ fn gateway() -> String {
 }
 
 fn default_key_file() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    default_key_file_with(&|key| std::env::var_os(key), cfg!(windows))
+}
+
+fn default_key_file_with(
+    env: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    windows: bool,
+) -> Option<PathBuf> {
+    env("HOME")
         .filter(|home| !home.is_empty())
+        .or_else(|| {
+            // Match executable discovery: preserve HOME overrides, but stock
+            // Windows provides USERPROFILE instead. Never use the working dir
+            // when neither is set: this file contains credentials.
+            windows
+                .then(|| env("USERPROFILE").filter(|home| !home.is_empty()))
+                .flatten()
+        })
         .map(|home| PathBuf::from(home).join(KEY_FILE))
 }
 
@@ -83,6 +105,40 @@ pub struct CodegraffUsage {
     pub key_budget_monthly_micro_usd: Option<i64>,
     pub key_spend_monthly_micro_usd: i64,
     pub key_budget_resets_at: String,
+}
+
+/// A CodeGraff PR-agent run (`GET /v1/jobs`): a PR review or description the
+/// account's agent is working on or finished. Tolerant: fields the gateway
+/// adds later are ignored, and missing ones default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CodegraffJob {
+    pub id: String,
+    /// `pr_review` | `pr_describe`.
+    pub kind: String,
+    /// `queued` | `pending` | `running` | `completed` | `error` | `cancelled`.
+    pub status: String,
+    /// Only then may the job be cancelled (it is not already posting).
+    pub cancellable: bool,
+    /// `starting` | `reviewing` | `describing` | `posting`, while running.
+    pub step: Option<String>,
+    pub repo: Option<String>,
+    /// The PR number (or a string the gateway sends for it).
+    pub pr: Option<serde_json::Value>,
+    pub title: Option<String>,
+    /// Where the posted review or description lives, once settled.
+    pub result_url: Option<String>,
+    pub error: Option<String>,
+    pub created_at: Option<serde_json::Value>,
+    pub updated_at: Option<serde_json::Value>,
+}
+
+/// One `GET /v1/jobs` page. `next_updated_since` feeds the next poll.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CodegraffJobs {
+    pub jobs: Vec<CodegraffJob>,
+    pub next_updated_since: Option<serde_json::Value>,
 }
 
 pub struct CodegraffAuth {
@@ -253,6 +309,64 @@ impl CodegraffAuth {
         Ok(Some(usage))
     }
 
+    /// The account's recent PR-agent runs, newest first (`None` when signed
+    /// out). `state=all` keeps a just-finished job in the list. With
+    /// `updated_since` (unix seconds, inclusive) only jobs changed since
+    /// then come back, oldest change first, and `next_updated_since` is the
+    /// cursor for the next poll.
+    pub async fn jobs(
+        &self,
+        limit: u32,
+        updated_since: Option<i64>,
+    ) -> Result<Option<CodegraffJobs>, String> {
+        let Some(key) = self.current_key() else {
+            return Ok(None);
+        };
+        crate::auth::validate_secure_url("CodeGraff gateway", &self.gateway)?;
+        let mut query = vec![
+            ("state", "all".to_string()),
+            ("limit", limit.clamp(1, 100).to_string()),
+        ];
+        if let Some(since) = updated_since {
+            query.push(("updated_since", since.to_string()));
+        }
+        let response = http()
+            .get(format!("{}/v1/jobs", self.gateway))
+            .query(&query)
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|e| format!("couldn't reach CodeGraff: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("CodeGraff jobs are unavailable: {e}"))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("unexpected CodeGraff jobs response: {e}"))?;
+        Ok(Some(parse_jobs(response)))
+    }
+
+    /// Ask the gateway to stop a job. A job already posting its result, or
+    /// already finished, can't be stopped (409); the gateway's message says
+    /// which.
+    pub async fn cancel_job(&self, id: &str) -> Result<(), String> {
+        let key = self
+            .current_key()
+            .ok_or_else(|| "Sign in with Codegraff first".to_string())?;
+        crate::auth::validate_secure_url("CodeGraff gateway", &self.gateway)?;
+        let response = http()
+            .post(format!("{}/v1/jobs/{}/cancel", self.gateway, urlencode(id)))
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|e| format!("couldn't reach CodeGraff: {e}"))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = response.json::<serde_json::Value>().await.ok();
+        Err(cancel_error(status.as_u16(), body.as_ref()))
+    }
+
     /// Revoke the key server-side (best effort — an unreachable gateway must
     /// not keep anyone signed in), then remove it from graff's file.
     pub async fn sign_out(&self) {
@@ -352,6 +466,25 @@ impl CodegraffAuth {
         }
     }
 
+    /// graff has a key on this machine (its credential file, or
+    /// `CODEGRAFF_API_KEY`).
+    pub fn has_key(&self) -> bool {
+        self.current_key().is_some()
+    }
+
+    /// Adopt the graff key a Harness sign-in minted for this device, so one
+    /// sign-in covers the app and `graff` in the terminal. A key graff
+    /// already has is never replaced.
+    pub async fn adopt_sign_in_key(&self, key: &str, email: String) -> Result<(), String> {
+        if !key.starts_with("cg_sk_") {
+            return Err("not a Codegraff key".into());
+        }
+        if self.has_key() {
+            return Ok(());
+        }
+        self.finish(key, Some(email), None).await
+    }
+
     async fn finish(
         &self,
         key: &str,
@@ -378,6 +511,54 @@ impl CodegraffAuth {
         });
         Ok(())
     }
+}
+
+/// A jobs page, whether the gateway wraps it (`{jobs: [...]}`) or not.
+/// A failed cancel as a sentence: the gateway's own `error.message` ("too
+/// late to cancel: it's already posting its result", "couldn't reach the
+/// job's runner; try again", ...) when it sent one.
+fn cancel_error(status: u16, body: Option<&serde_json::Value>) -> String {
+    let message = body
+        .and_then(|body| body.pointer("/error/message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    match message {
+        Some(message) => {
+            let mut chars = message.chars();
+            let first = chars.next().map(|c| c.to_uppercase().to_string());
+            format!(
+                "{}{}.",
+                first.unwrap_or_default(),
+                chars.as_str().trim_end_matches('.')
+            )
+        }
+        None if status == 409 => "This job is already posting its result or has finished.".into(),
+        None => format!("CodeGraff couldn't cancel the job ({status})."),
+    }
+}
+
+fn parse_jobs(value: serde_json::Value) -> CodegraffJobs {
+    match value {
+        serde_json::Value::Array(_) => CodegraffJobs {
+            jobs: serde_json::from_value(value).unwrap_or_default(),
+            next_updated_since: None,
+        },
+        other => serde_json::from_value(other).unwrap_or_default(),
+    }
+}
+
+/// Job ids are gateway-minted; still keep them one path segment.
+fn urlencode(segment: &str) -> String {
+    segment
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 fn http() -> reqwest::Client {
@@ -437,6 +618,149 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn windows_key_file_uses_userprofile_when_home_is_missing_or_empty() {
+        let profile = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let path = profile.path().join(KEY_FILE);
+        std::fs::write(&path, r#"{"api_key":"cg_sk_profile"}"#).unwrap();
+        for home in [None, Some(std::ffi::OsString::new())] {
+            let env = |key: &str| match key {
+                "HOME" => home.clone(),
+                "USERPROFILE" => Some(profile.path().as_os_str().to_owned()),
+                _ => panic!("unexpected environment lookup: {key}"),
+            };
+            let resolved = default_key_file_with(&env, true);
+            assert_eq!(resolved.as_ref(), Some(&path));
+            let auth = CodegraffAuth::new(data.path(), resolved, GATEWAY.into());
+            assert_eq!(auth.current_key().as_deref(), Some("cg_sk_profile"));
+        }
+    }
+
+    #[test]
+    fn key_file_preserves_home_priority_on_unix_and_windows() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(KEY_FILE), r#"{"api_key":"cg_sk_home"}"#).unwrap();
+        std::fs::write(
+            profile.path().join(KEY_FILE),
+            r#"{"api_key":"cg_sk_profile"}"#,
+        )
+        .unwrap();
+        let env = |key: &str| match key {
+            "HOME" => Some(home.path().as_os_str().to_owned()),
+            "USERPROFILE" => Some(profile.path().as_os_str().to_owned()),
+            _ => panic!("unexpected environment lookup: {key}"),
+        };
+        for windows in [false, true] {
+            let resolved = default_key_file_with(&env, windows);
+            assert_eq!(resolved, Some(home.path().join(KEY_FILE)));
+            let auth = CodegraffAuth::new(data.path(), resolved, GATEWAY.into());
+            assert_eq!(auth.current_key().as_deref(), Some("cg_sk_home"));
+        }
+    }
+
+    #[test]
+    fn key_file_requires_a_nonempty_platform_home() {
+        for windows in [false, true] {
+            for home in [None, Some(std::ffi::OsString::new())] {
+                for profile in [
+                    None,
+                    Some(std::ffi::OsString::new()),
+                    Some("profile".into()),
+                ] {
+                    let env = |key: &str| match key {
+                        "HOME" => home.clone(),
+                        "USERPROFILE" => profile.clone(),
+                        _ => panic!("unexpected environment lookup: {key}"),
+                    };
+                    let expected = if windows && profile.as_ref().is_some_and(|p| !p.is_empty()) {
+                        Some(PathBuf::from("profile").join(KEY_FILE))
+                    } else {
+                        None
+                    };
+                    assert_eq!(default_key_file_with(&env, windows), expected);
+                }
+            }
+        }
+    }
+
+    /// The real process environment on Windows. CI runs this with HOME
+    /// cleared, as a stock Windows session has it, where sign-in used to fail
+    /// with "no home directory to store the Codegraff key in".
+    #[cfg(windows)]
+    #[test]
+    fn windows_real_environment_has_a_key_file() {
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+        let profile = std::env::var_os("USERPROFILE").filter(|p| !p.is_empty());
+        let expected = home.or(profile).map(|h| PathBuf::from(h).join(KEY_FILE));
+        assert!(expected.is_some(), "a Windows session has USERPROFILE");
+        assert_eq!(default_key_file(), expected);
+    }
+
+    #[test]
+    fn jobs_parse_wrapped_bare_and_with_unknown_fields() {
+        let wrapped = parse_jobs(serde_json::json!({
+            "jobs": [{
+                "id": "job_1", "kind": "pr_review", "status": "running",
+                "cancellable": true, "step": "reviewing", "repo": "acme/api",
+                "pr": 42, "title": "Fix login", "new_field": {"ignored": true}
+            }],
+            "next_updated_since": "2026-09-27T09:00:00Z"
+        }));
+        assert_eq!(wrapped.jobs.len(), 1);
+        let job = &wrapped.jobs[0];
+        assert_eq!((job.id.as_str(), job.status.as_str()), ("job_1", "running"));
+        assert!(job.cancellable);
+        assert_eq!(job.pr, Some(serde_json::json!(42)));
+        assert!(wrapped.next_updated_since.is_some());
+        let bare = parse_jobs(serde_json::json!([{ "id": "job_2", "status": "completed" }]));
+        assert_eq!(bare.jobs[0].id, "job_2");
+        assert!(
+            !bare.jobs[0].cancellable,
+            "missing cancellable means no Cancel"
+        );
+        assert!(
+            parse_jobs(serde_json::json!({ "error": "nope" }))
+                .jobs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cancel_failures_say_why_in_the_gateways_words() {
+        let posting = serde_json::json!({"error": {
+            "message": "too late to cancel: it's already posting its result",
+            "type": "too_late",
+        }});
+        assert_eq!(
+            cancel_error(409, Some(&posting)),
+            "Too late to cancel: it's already posting its result."
+        );
+        let runner = serde_json::json!({"error": {
+            "message": "couldn't reach the job's runner; try again",
+        }});
+        assert_eq!(
+            cancel_error(502, Some(&runner)),
+            "Couldn't reach the job's runner; try again."
+        );
+        assert_eq!(
+            cancel_error(409, None),
+            "This job is already posting its result or has finished."
+        );
+        assert_eq!(
+            cancel_error(500, Some(&serde_json::json!({}))),
+            "CodeGraff couldn't cancel the job (500)."
+        );
+    }
+
+    #[test]
+    fn job_ids_stay_one_path_segment() {
+        assert_eq!(urlencode("job_1-a.b~c"), "job_1-a.b~c");
+        assert_eq!(urlencode("../x/y"), "..%2Fx%2Fy");
+    }
 
     /// A fake gateway: answers device start/poll, /v1/me, usage, and revoke, and
     /// records every request line + body it saw.
@@ -572,9 +896,11 @@ mod tests {
             request.starts_with("GET /v1/usage/summary")
                 && request.contains("Bearer cg_sk_usage_test")
         }));
-        assert!(!serde_json::to_string(&usage)
-            .unwrap()
-            .contains("cg_sk_usage_test"));
+        assert!(
+            !serde_json::to_string(&usage)
+                .unwrap()
+                .contains("cg_sk_usage_test")
+        );
     }
 
     #[cfg(unix)]

@@ -3,6 +3,8 @@
   "name": "harness-edge",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
+  // `pg` (agent rooms' PostgreSQL client) needs node:net/node:tls shims.
+  "compatibility_flags": ["nodejs_compat"],
   "account_id": "d87222df6f3f663e802014f8eb5a274e",
   "workers_dev": true,
   "routes": [
@@ -17,7 +19,10 @@
       { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
       { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
       { "name": "CHAT_ROOMS", "class_name": "ChatRoom" },
-      { "name": "VAULT_ROOMS", "class_name": "VaultRoom" }
+      { "name": "VAULT_ROOMS", "class_name": "VaultRoom" },
+      { "name": "ROOM_ACTORS", "class_name": "RoomActor" },
+      { "name": "ACCOUNT_PURGE", "class_name": "AccountPurge" },
+      { "name": "REFRESH_LEEWAY", "class_name": "RefreshLeeway" }
     ]
   },
   "migrations": [
@@ -25,12 +30,29 @@
     { "tag": "v2", "new_sqlite_classes": ["RegistryRoom"] },
     { "tag": "v3", "new_sqlite_classes": ["ChatRoom"] },
     { "tag": "v4", "new_sqlite_classes": ["PreviewRoom"] },
-    { "tag": "v5", "new_sqlite_classes": ["VaultRoom"] }
+    { "tag": "v5", "new_sqlite_classes": ["VaultRoom"] },
+    { "tag": "v6", "new_sqlite_classes": ["RoomActor"] },
+    { "tag": "v7", "new_sqlite_classes": ["AccountPurge"] },
+    { "tag": "v8", "new_sqlite_classes": ["RefreshLeeway"] }
   ],
+  // PostgreSQL (caching off): agent rooms' store of record, through the edge's
+  // own Hyperdrive config (origin connections capped at 8) so room bursts
+  // can't take the pool other services share. The id is not a secret; the
+  // connection string lives only in the Hyperdrive config.
+  "hyperdrive": [
+    { "binding": "HYPERDRIVE", "id": "d2a07d784bad47b8aabecf8565fa03a2" }
+  ],
+  // Agent-room sweeper (room-actor.ts): expired ephemeral rooms whose actors
+  // never woke.
+  "triggers": { "crons": ["*/10 * * * *"] },
   "r2_buckets": [
     { "binding": "BLOBS", "bucket_name": "harness-blobs" },
     { "binding": "RELEASES", "bucket_name": "harness-releases" }
   ],
+  // Session push notifications (registry-room.ts) need two secrets:
+  // `wrangler secret put APNS_KEY_P8` (the AuthKey_XXXX.p8 file's contents)
+  // and `wrangler secret put APNS_KEY_ID`. Unset ⇒ decided and logged on
+  // /registry/:org/stats, not sent.
   "vars": {
     "CODEGRAFF_OAUTH_CLIENT_ID": "cg_client_43e753878956c2cf7b5b0f53",
     "AUTH_MODE": "codegraff"

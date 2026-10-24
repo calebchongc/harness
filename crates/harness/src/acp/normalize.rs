@@ -8,7 +8,7 @@
 //! tagged `sessionUpdate`/snake_case; structs are camelCase; tool kinds and
 //! statuses are snake_case).
 
-use harness_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
+use harness_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff, ToolView, ToolViewKind};
 use serde_json::Value;
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
@@ -39,7 +39,7 @@ pub(crate) fn cap_text(text: &str, cap: usize) -> String {
 
 /// The text of a `ContentBlock` (`{type: "text", text}`); non-text blocks
 /// (image, audio, resource, resource_link) render as nothing.
-fn content_block_text(block: &Value) -> Option<&str> {
+pub(crate) fn content_block_text(block: &Value) -> Option<&str> {
     (block.get("type").and_then(Value::as_str) == Some("text"))
         .then(|| block.get("text").and_then(Value::as_str))
         .flatten()
@@ -231,16 +231,19 @@ fn typed_call(update: &Value) -> ToolCall {
             // A diff pins down the file and shape; otherwise fall back to the
             // location/rawInput path with unknown content.
             if let Some(diff) = tool_diff(update) {
+                // Some agents (graff) attach the diff to the opening call and not to the
+                // completion, where it would reach the result. The inputs stay on the call
+                // for live viewers; the doc's render policy strips them before they persist.
                 if diff.old_text.is_none() {
                     ToolCall::WriteFile {
                         path: diff.path,
-                        content: None,
+                        content: Some(diff.new_text),
                     }
                 } else {
                     ToolCall::EditFile {
                         path: diff.path,
-                        old_string: None,
-                        new_string: None,
+                        old_string: diff.old_text,
+                        new_string: Some(diff.new_text),
                     }
                 }
             } else {
@@ -291,13 +294,13 @@ fn typed_call(update: &Value) -> ToolCall {
             if diff.old_text.is_none() {
                 ToolCall::WriteFile {
                     path: diff.path,
-                    content: None,
+                    content: Some(diff.new_text),
                 }
             } else {
                 ToolCall::EditFile {
                     path: diff.path,
-                    old_string: None,
-                    new_string: None,
+                    old_string: diff.old_text,
+                    new_string: Some(diff.new_text),
                 }
             }
         }
@@ -416,8 +419,10 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             }];
             // Some agents send a single terminal-status `tool_call` with the
             // result inline instead of a follow-up update.
-            if let Some(resolved) = resolved_result(update, id) {
+            if let Some(resolved) = resolved_result(update, id.clone()) {
                 events.push(resolved);
+                events.extend(tool_view(update, id.clone()));
+                events.extend(tool_delegation(update, id));
             }
             events
         }
@@ -440,6 +445,8 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             }
             if let Some(resolved) = resolved_result(update, id.clone()) {
                 events.push(resolved);
+                events.extend(tool_view(update, id.clone()));
+                events.extend(tool_delegation(update, id));
             } else if let Some(output) = tool_output(update) {
                 // Content with no terminal status: the tool is still running
                 // and this is its live output (graff streams a subagent's
@@ -493,11 +500,12 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                 .iter()
                 .find_map(|key| update.get(*key).and_then(Value::as_u64))
                 .filter(|n| *n > 0);
+            let mut events = Vec::new();
             if tokens.is_some() || window.is_some() {
-                vec![AgentEvent::ContextUsage { tokens, window }]
-            } else {
-                Vec::new()
+                events.push(AgentEvent::ContextUsage { tokens, window });
             }
+            events.extend(context_savings(update));
+            events
         }
         "config_option_update" => match update.get("configOptions").and_then(Value::as_array) {
             Some(options) => {
@@ -520,6 +528,8 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             None => Vec::new(),
         },
         "current_mode_update" | "session_info_update" => Vec::new(),
+        // Stateful across frames: the session loop's CompactionTracker.
+        "compaction_update" | "compaction_summary_chunk" => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -538,6 +548,52 @@ fn resolved_result(update: &Value, id: String) -> Option<AgentEvent> {
         is_error,
         output: tool_output(update),
         diff: tool_diff(update),
+    })
+}
+
+/// graff's `_meta["codegraff/savings"]` on its context meter: what it kept
+/// out of the model's context so far. A malformed object yields nothing.
+fn context_savings(update: &Value) -> Option<AgentEvent> {
+    let meta = update.pointer("/_meta/codegraff~1savings")?;
+    let savings: harness_proto::ContextSavings = serde_json::from_value(meta.clone()).ok()?;
+    Some(AgentEvent::ContextSavings { savings })
+}
+
+/// graff's `_meta["graff/view"]` on a finished tool: the page it saved, as
+/// `{kind: "html" | "mcp_app", id, path}`. The path is informational and never
+/// used; an unknown kind or a malformed id yields nothing.
+fn tool_view(update: &Value, id: String) -> Option<AgentEvent> {
+    let meta = update.pointer("/_meta/graff~1view")?;
+    let kind = match meta.get("kind").and_then(Value::as_str)? {
+        "html" => ToolViewKind::Html,
+        "mcp_app" => ToolViewKind::McpApp,
+        _ => return None,
+    };
+    let view = ToolView::new(kind, meta.get("id").and_then(Value::as_str)?)?;
+    Some(AgentEvent::ToolView { id, view })
+}
+
+/// Graff's MCP diagnostics forwarded on the completed ACP update. Whitelist
+/// scalars only: neither the answer nor the caller's context enters the doc.
+fn tool_delegation(update: &Value, id: String) -> Option<AgentEvent> {
+    let meta = update.pointer("/_meta/codegraff~1runTask")?;
+    let usage_reported = meta.get("usage_reported")?.as_bool()?;
+    Some(AgentEvent::DelegationInfo {
+        id,
+        info: harness_proto::DelegationInfo {
+            context_bytes: meta.get("context_chars")?.as_u64()?,
+            used_bytes: meta.get("context_used_chars")?.as_u64()?,
+            summarized: meta.get("context_summarized")?.as_bool()?,
+            usage_reported,
+            usage_unavailable_reason: if usage_reported {
+                None
+            } else {
+                meta.get("usage_unavailable_reason")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| cap_text(s, 512))
+            },
+        },
     })
 }
 
@@ -583,6 +639,81 @@ mod tests {
     use super::*;
     use harness_proto::ReasoningLevel;
     use serde_json::json;
+
+    #[test]
+    fn run_task_context_metadata_is_bounded_and_never_billing_usage() {
+        let input = json!({"prompt":"Task", "context":"Reference only", "model":"existing-choice"});
+        let opening = map_update(&json!({
+            "sessionUpdate":"tool_call", "toolCallId":"task-1", "title":"run_task",
+            "kind":"other", "rawInput":input,
+        }));
+        assert!(
+            matches!(&opening[0], AgentEvent::ToolCall { call: ToolCall::Unknown { input: Some(raw), .. }, .. } if raw == &input)
+        );
+        let mut update = json!({
+            "sessionUpdate":"tool_call_update", "toolCallId":"task-1", "status":"completed",
+            "content":[{"type":"content", "content":{"type":"text","text":"Task answer"}}],
+            "_meta":{
+                "graff/view":{"kind":"html","id":"0123456789abcdef0123456789abcdef"},
+                "codegraff/runTask":{
+                    "context_chars":32768, "context_used_chars":4096, "context_summarized":true,
+                    "usage_reported":false, "usage_unavailable_reason":"Print mode exposes no settled charge.",
+                    "text":"Task answer", "context":"private-reference", "cost_usd":99.0,
+                },
+            },
+        });
+        let events = map_update(&update);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolView { .. }))
+        );
+        let info = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::DelegationInfo { id, info } => {
+                    assert_eq!(id, "task-1");
+                    Some(info)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(info.context_bytes, 32768);
+        assert_eq!(info.used_bytes, 4096);
+        assert!(info.summarized);
+        assert!(!info.usage_reported);
+        let stored = serde_json::to_string(info).unwrap();
+        assert!(!stored.contains("private-reference"));
+        assert!(!stored.contains("Task answer"));
+        assert!(!stored.contains("cost_usd"));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Usage { .. } | AgentEvent::ContextUsage { .. }
+        )));
+        update["_meta"]["codegraff/runTask"]["usage_unavailable_reason"] = json!("é".repeat(1000));
+        let events = map_update(&update);
+        let reason = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::DelegationInfo { info, .. } => info.usage_unavailable_reason.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+        assert!(reason.len() < 550);
+        update["_meta"]["codegraff/runTask"]["context_chars"] = json!(-1);
+        assert!(
+            !map_update(&update)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::DelegationInfo { .. }))
+        );
+        update["_meta"]["codegraff/runTask"]["context_chars"] = json!(0);
+        update["status"] = json!("in_progress");
+        assert!(
+            !map_update(&update)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::DelegationInfo { .. }))
+        );
+    }
 
     #[test]
     fn message_and_thought_chunks_map_to_deltas() {
@@ -688,6 +819,79 @@ mod tests {
     }
 
     #[test]
+    fn graff_savings_ride_its_context_meter() {
+        let events = map_update(&json!({
+            "sessionUpdate": "usage_update",
+            "used": 40_000,
+            "size": 200_000,
+            "_meta": {"codegraff/savings": {
+                "handleBytes": 96_000, "compactedTokens": 78_000, "cacheReadTokens": 4_000
+            }},
+        }));
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ContextUsage {
+                    tokens: Some(40_000),
+                    window: Some(200_000),
+                },
+                AgentEvent::ContextSavings {
+                    savings: harness_proto::ContextSavings {
+                        handle_bytes: 96_000,
+                        compacted_tokens: 78_000,
+                        cache_read_tokens: 4_000,
+                    },
+                },
+            ]
+        );
+        // Another agent's meter, or a malformed object, carries no savings.
+        let plain = map_update(&json!({"sessionUpdate": "usage_update", "used": 1, "size": 2}));
+        assert_eq!(plain.len(), 1);
+        let bad = map_update(&json!({
+            "sessionUpdate": "usage_update", "used": 1, "size": 2,
+            "_meta": {"codegraff/savings": "lots"},
+        }));
+        assert_eq!(bad.len(), 1);
+    }
+
+    #[test]
+    fn graff_view_meta_on_a_finished_tool_becomes_a_tool_view() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let update = |status: &str, meta: Value| {
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "t9",
+                "status": status,
+                "content": [{"type": "content", "content": {"type": "text", "text": "[Rendered view](/h/.graff/views/x.html)"}}],
+                "_meta": {"graff/view": meta},
+            })
+        };
+        let events = map_update(&update("completed", json!({"kind": "html", "id": id, "path": "/elsewhere"})));
+        assert_eq!(
+            events.last(),
+            Some(&AgentEvent::ToolView {
+                id: "t9".into(),
+                view: ToolView::new(ToolViewKind::Html, id).unwrap(),
+            })
+        );
+        let app = map_update(&update("failed", json!({"kind": "mcp_app", "id": id})));
+        assert!(matches!(app.last(), Some(AgentEvent::ToolView { view, .. }) if view.kind == ToolViewKind::McpApp));
+        // Nothing for a running tool, an unknown kind, or an id that isn't
+        // 32 lowercase hex (it becomes a file name on the host).
+        for (status, meta) in [
+            ("in_progress", json!({"kind": "html", "id": id})),
+            ("completed", json!({"kind": "pdf", "id": id})),
+            ("completed", json!({"kind": "html", "id": "../../etc/passwd"})),
+            ("completed", json!({"kind": "html", "id": id.to_uppercase()})),
+        ] {
+            assert!(
+                !map_update(&update(status, meta.clone())).iter().any(|e| matches!(e, AgentEvent::ToolView { .. })),
+                "{status} {meta}"
+            );
+        }
+    }
+
+    #[test]
     fn edit_with_diff_content_maps_to_edit_file_and_carries_diff() {
         let update = json!({
             "sessionUpdate": "tool_call_update",
@@ -709,8 +913,8 @@ mod tests {
                 id: "t2".into(),
                 call: ToolCall::EditFile {
                     path: "/w/src/main.rs".into(),
-                    old_string: None,
-                    new_string: None,
+                    old_string: Some("fn old() {}".into()),
+                    new_string: Some("fn new() {}".into()),
                 },
             }
         );
@@ -743,7 +947,7 @@ mod tests {
                 id: "t3".into(),
                 call: ToolCall::WriteFile {
                     path: "/w/new.rs".into(),
-                    content: None
+                    content: Some("x".into())
                 },
             }]
         );

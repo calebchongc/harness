@@ -37,6 +37,7 @@ fn harness() -> CodexHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: Some("gpt-5.6-sol".into()),
@@ -58,6 +59,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -411,6 +413,7 @@ async fn approvals_round_trip_as_input_requests() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -560,6 +563,31 @@ async fn turn_failed_maps_to_errored_done() {
             error: Some("boom".into()),
             session_id: Some("th-1".into()),
         })
+    );
+}
+
+#[tokio::test]
+async fn signed_out_codex_asks_for_sign_in_instead_of_retry_errors() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:signed-out"), controls).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "the 401 retries and the final 401 are not error rows: {events:?}"
+    );
+    let tail: Vec<_> = events.iter().rev().take(2).rev().collect();
+    assert_eq!(
+        tail,
+        [
+            &AgentEvent::ReauthRequired {
+                provider: harness_proto::ReauthProvider::Codex
+            },
+            &AgentEvent::Done {
+                status: DoneStatus::Errored,
+                result: None,
+                error: None,
+                session_id: Some("th-1".into()),
+            },
+        ]
     );
 }
 

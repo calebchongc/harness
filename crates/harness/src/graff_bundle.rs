@@ -23,6 +23,9 @@ struct GitHubRelease {
     tag_name: String,
 }
 
+/// graff's executable name on this platform.
+const GRAFF_EXE: &str = if cfg!(windows) { "graff.exe" } else { "graff" };
+
 /// `Contents/Resources/bin/graff` next to the running executable, when this
 /// process is a bundled app that ships one.
 pub fn bundled() -> Option<PathBuf> {
@@ -38,7 +41,7 @@ pub fn bundled() -> Option<PathBuf> {
 
 /// Where the app keeps its own graff (whether or not it exists yet).
 pub fn managed_path() -> Option<PathBuf> {
-    crate::executable::home_dir().map(|home| home.join(".harness").join("bin").join("graff"))
+    crate::executable::home_dir().map(|home| home.join(".harness").join("bin").join(GRAFF_EXE))
 }
 
 /// `graff --version`'s dotted number as integers (`0.0.302.4` → [0,0,302,4]),
@@ -52,7 +55,7 @@ pub fn version_of(path: &Path) -> Option<Vec<u64>> {
     parse_dotted(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse_dotted(text: &str) -> Option<Vec<u64>> {
+pub fn parse_dotted(text: &str) -> Option<Vec<u64>> {
     text.split_whitespace().find_map(|word| {
         let parts: Option<Vec<u64>> = word
             .trim_start_matches('v')
@@ -65,6 +68,50 @@ fn parse_dotted(text: &str) -> Option<Vec<u64>> {
     })
 }
 
+/// The "What's new" lines `graff --version` lists for releases after `from`,
+/// up to and including `to`, newest first. With no `from`, only `to`'s own
+/// lines. Release headers are bare dotted versions; their lines start with `•`.
+pub fn whats_new(version_output: &str, from: Option<&str>, to: &str) -> Vec<String> {
+    let Some(to) = parse_dotted(to) else {
+        return Vec::new();
+    };
+    let from = from.and_then(parse_dotted);
+    let mut lines = Vec::new();
+    let mut in_range = false;
+    for line in version_output.lines() {
+        if let Some(item) = line.trim_start().strip_prefix('•') {
+            if in_range && !item.trim().is_empty() {
+                lines.push(item.trim().to_string());
+            }
+        } else if !line.starts_with(char::is_whitespace) && line.split_whitespace().count() == 1 {
+            if let Some(version) = parse_dotted(line) {
+                in_range = version <= to
+                    && match &from {
+                        Some(from) => version > *from,
+                        None => version == to,
+                    };
+            }
+        }
+    }
+    lines
+}
+
+/// [`whats_new`] read from the managed graff's own `--version`. Empty when
+/// the binary is missing or prints no matching release.
+pub fn release_highlights(from: Option<&str>, to: &str) -> Vec<String> {
+    let Some(path) = managed_path() else {
+        return Vec::new();
+    };
+    let Ok(output) = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    whats_new(&String::from_utf8_lossy(&output.stdout), from, to)
+}
+
 pub fn display_version(version: &[u64]) -> String {
     version
         .iter()
@@ -73,7 +120,7 @@ pub fn display_version(version: &[u64]) -> String {
         .join(".")
 }
 
-fn installed_beta_tag(managed: &Path) -> Option<String> {
+pub fn installed_beta_tag(managed: &Path) -> Option<String> {
     if !managed.is_file() {
         return None;
     }
@@ -146,7 +193,41 @@ fn install_file(source: &Path, target: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::fs::rename(&staged, target)
+    replace_file(&staged, target)
+}
+
+/// Move `staged` over `target`. Windows refuses to replace an executable
+/// that is running (Harness keeps `graff acp` processes alive), but it lets
+/// one be renamed: move it aside first, put it back if the swap fails, and
+/// clear older moved-aside copies once they are no longer in use.
+fn replace_file(staged: &Path, target: &Path) -> std::io::Result<()> {
+    replace_file_with(staged, target, cfg!(windows))
+}
+
+fn replace_file_with(staged: &Path, target: &Path, move_aside: bool) -> std::io::Result<()> {
+    if !move_aside || !target.exists() {
+        return std::fs::rename(staged, target);
+    }
+    let dir = target.parent().expect("managed path has a parent");
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&format!("{name}.old-")) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let aside = dir.join(format!("{name}.old-{}", uuid::Uuid::new_v4()));
+    std::fs::rename(target, &aside)?;
+    if let Err(err) = std::fs::rename(staged, target) {
+        let _ = std::fs::rename(&aside, target);
+        return Err(err);
+    }
+    let _ = std::fs::remove_file(&aside);
+    Ok(())
 }
 
 /// codegraff's release asset for this machine (`graff-aarch64-macos.tar.gz`).
@@ -159,6 +240,7 @@ fn asset_name() -> Option<String> {
     let os = match std::env::consts::OS {
         "macos" => "macos",
         "linux" => "linux",
+        "windows" => "windows",
         _ => return None,
     };
     Some(format!("graff-{arch}-{os}.tar.gz"))
@@ -170,18 +252,48 @@ pub enum UpdateOutcome {
     AlreadyCurrent { version: String },
 }
 
-/// Check CodeGraff's latest stable GitHub release before fetching any assets.
-/// GitHub's `/releases/latest` excludes prereleases, so an automatic update
-/// never silently changes the user to a beta channel.
-pub async fn check_and_update_managed() -> anyhow::Result<UpdateOutcome> {
-    let managed = managed_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    if let Some(tag) = installed_beta_tag(&managed) {
-        return Ok(UpdateOutcome::AlreadyCurrent { version: tag });
-    }
-    let client = reqwest::Client::builder()
+/// A graff engine lifecycle event worth surfacing in the UI. The app's
+/// background updater publishes; the Shell subscribes. The channel retains
+/// the latest notice, so a UI opened after the fact still sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraffNotice {
+    /// The managed graff was replaced by a newer stable release.
+    Updated { from: Option<String>, to: String },
+    /// Auto-update is off; a newer stable exists but nothing was installed.
+    Available {
+        current: Option<String>,
+        latest: String,
+    },
+}
+
+fn notice_sender() -> &'static tokio::sync::watch::Sender<Option<GraffNotice>> {
+    static SENDER: std::sync::OnceLock<tokio::sync::watch::Sender<Option<GraffNotice>>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| tokio::sync::watch::channel(None).0)
+}
+
+/// Subscribe to graff lifecycle notices; `borrow()` yields the latest.
+pub fn notices() -> tokio::sync::watch::Receiver<Option<GraffNotice>> {
+    notice_sender().subscribe()
+}
+
+pub fn publish_notice(notice: GraffNotice) {
+    // Receivers are optional; a send without any is a no-op.
+    let _ = notice_sender().send(Some(notice));
+}
+
+fn release_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
         .user_agent("harness-graff-updater")
         .timeout(Duration::from_secs(15 * 60))
-        .build()?;
+        .build()
+}
+
+/// The newest stable release's tag and dotted version. GitHub's
+/// `/releases/latest` excludes prereleases, so this never names a beta.
+/// Invalid tags are errors — an update on a malformed version would be
+/// arbitrary.
+async fn latest_stable_release(client: &reqwest::Client) -> anyhow::Result<(String, Vec<u64>)> {
     let release: GitHubRelease = client
         .get(LATEST_RELEASE)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -190,16 +302,126 @@ pub async fn check_and_update_managed() -> anyhow::Result<UpdateOutcome> {
         .error_for_status()?
         .json()
         .await?;
-    let latest = parse_dotted(&release.tag_name)
-        .ok_or_else(|| anyhow::anyhow!("CodeGraff release has an invalid version tag"))?;
-    anyhow::ensure!(
-        release
-            .tag_name
-            .strip_prefix('v')
-            .and_then(crate::graff_beta::numeric_version)
-            .is_some(),
-        "CodeGraff release has an invalid stable version tag"
-    );
+    let version = parse_dotted(&release.tag_name)
+        .filter(|_| {
+            release
+                .tag_name
+                .strip_prefix('v')
+                .and_then(crate::graff_beta::numeric_version)
+                .is_some()
+        })
+        .ok_or_else(|| anyhow::anyhow!("CodeGraff release has an invalid stable version tag"))?;
+    Ok((release.tag_name, version))
+}
+
+/// The newest stable release's display version, without the `v` — the
+/// check-only path the auto-update-off loop and the notice card use.
+pub async fn latest_stable() -> anyhow::Result<String> {
+    let client = release_client()?;
+    let (_, version) = latest_stable_release(&client).await?;
+    Ok(display_version(&version))
+}
+
+/// Whether this process may touch the managed graff copy: it runs from an
+/// app bundle that ships graff, and no `GRAFF_EXECUTABLE` selects a custom
+/// binary (that graff is entirely the user's).
+pub fn managed_updates_allowed() -> bool {
+    (bundled().is_some() || windows_managed_install())
+        && std::env::var_os("GRAFF_EXECUTABLE").is_none_or(|value| value.is_empty())
+}
+
+/// A Windows package installed from the release zip: `harness-update.json`
+/// beside `harness.exe` marks it as following the release feed (the same
+/// test Harness's own updater uses). It ships no graff, so the app keeps its
+/// own copy current, as the macOS app does.
+fn windows_managed_install() -> bool {
+    cfg!(windows)
+        && std::env::current_exe().ok().is_some_and(|exe| {
+            exe.file_name().is_some_and(|name| name == "harness.exe")
+                && exe.with_file_name("harness-update.json").is_file()
+        })
+}
+
+/// Whether the app should install graff updates itself. With
+/// `HARNESS_GRAFF_AUTO_UPDATE` off the managed copy is still checked — a
+/// newer stable surfaces as an `Available` notice instead.
+pub fn auto_update_enabled() -> bool {
+    managed_updates_allowed()
+        && !std::env::var("HARNESS_GRAFF_AUTO_UPDATE").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+}
+
+/// When the last managed-graff check started; the periodic loop and
+/// [`maybe_check_soon`] share it so they never overlap.
+static LAST_CHECK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+const CHECK_DEBOUNCE: Duration = Duration::from_secs(10 * 60);
+
+/// Record that a managed-graff check just started.
+pub fn note_check_started() {
+    *LAST_CHECK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::time::Instant::now());
+}
+
+#[cfg(test)]
+fn reset_check_clock() {
+    *LAST_CHECK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+fn maybe_check_soon_inner(run: impl FnOnce()) {
+    {
+        let mut last = LAST_CHECK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.is_some_and(|when| when.elapsed() < CHECK_DEBOUNCE) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    run();
+}
+
+/// Check for a graff update right now — e.g. when a graff session starts —
+/// if the last check began more than ten minutes ago. Never blocks: the
+/// check runs on the current tokio runtime, and with no runtime it does
+/// nothing. The session in flight keeps the binary it already resolved.
+pub fn maybe_check_soon() {
+    if !auto_update_enabled() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    maybe_check_soon_inner(move || {
+        handle.spawn(async {
+            match check_and_update_managed().await {
+                Ok(UpdateOutcome::Updated { from, to }) => {
+                    tracing::info!(?from, %to, "graff updated from CodeGraff GitHub release");
+                    publish_notice(GraffNotice::Updated { from, to });
+                }
+                Ok(UpdateOutcome::AlreadyCurrent { .. }) => {}
+                Err(error) => tracing::warn!(%error, "graff update check failed"),
+            }
+        });
+    });
+}
+
+/// Check CodeGraff's latest stable GitHub release before fetching any assets.
+/// GitHub's `/releases/latest` excludes prereleases, so an automatic update
+/// never silently changes the user to a beta channel.
+pub async fn check_and_update_managed() -> anyhow::Result<UpdateOutcome> {
+    let managed = managed_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    if let Some(tag) = installed_beta_tag(&managed) {
+        return Ok(UpdateOutcome::AlreadyCurrent { version: tag });
+    }
+    let client = release_client()?;
+    let (tag, latest) = latest_stable_release(&client).await?;
     if let Some(current) = version_of(&managed)
         && current >= latest
     {
@@ -207,7 +429,7 @@ pub async fn check_and_update_managed() -> anyhow::Result<UpdateOutcome> {
             version: display_version(&current),
         });
     }
-    let outcome = install_release(&client, &release.tag_name, false, false).await?;
+    let outcome = install_release(&client, &tag, false, false).await?;
     if matches!(outcome, UpdateOutcome::Updated { .. }) {
         crate::executable::invalidate_versions(&["graff"]);
     }
@@ -217,27 +439,9 @@ pub async fn check_and_update_managed() -> anyhow::Result<UpdateOutcome> {
 /// Download the latest graff release, verify it against the release's
 /// SHA256SUMS, check the binary runs, and swap it in as the managed copy.
 pub async fn update_managed() -> anyhow::Result<UpdateOutcome> {
-    let client = reqwest::Client::builder()
-        .user_agent("harness-graff-updater")
-        .timeout(Duration::from_secs(15 * 60))
-        .build()?;
-    let release: GitHubRelease = client
-        .get(LATEST_RELEASE)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    anyhow::ensure!(
-        release
-            .tag_name
-            .strip_prefix('v')
-            .and_then(crate::graff_beta::numeric_version)
-            .is_some(),
-        "invalid stable release tag"
-    );
-    install_release(&client, &release.tag_name, false, true).await
+    let client = release_client()?;
+    let (tag, _) = latest_stable_release(&client).await?;
+    install_release(&client, &tag, false, true).await
 }
 
 /// Explicit opt-in to the newest published beta of the newest release branch.
@@ -317,11 +521,11 @@ async fn install_release(
             anyhow::ensure!(status.success(), "couldn't unpack {asset}");
             // Release tarballs nest `graff-<target>/graff`; hand-repacked ones
             // put it at the root.
-            let nested = work.join(asset.trim_end_matches(".tar.gz")).join("graff");
+            let nested = work.join(asset.trim_end_matches(".tar.gz")).join(GRAFF_EXE);
             let binary = if nested.is_file() {
                 nested
             } else {
-                work.join("graff")
+                work.join(GRAFF_EXE)
             };
             anyhow::ensure!(binary.is_file(), "{asset} has no graff binary");
             let fetched = version_of(&binary)
@@ -387,6 +591,8 @@ async fn install_release(
     .await??;
     if matches!(outcome, UpdateOutcome::Updated { .. }) {
         crate::executable::invalidate_versions(&["graff"]);
+        // A new graff is the moment to bring its codedb up to date too.
+        crate::codedb_bundle::maybe_check_soon();
     }
     Ok(outcome)
 }
@@ -403,6 +609,79 @@ fn expected_sha(sums: &str, asset: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn notices_channel_delivers_and_remembers_the_latest() {
+        let mut rx = notices();
+        let notice = GraffNotice::Updated {
+            from: Some("0.0.302.4".into()),
+            to: "0.0.303.0".into(),
+        };
+        publish_notice(notice.clone());
+        rx.changed().await.unwrap();
+        assert_eq!(rx.borrow().clone(), Some(notice.clone()));
+        // A UI that subscribes after the fact still sees the latest notice.
+        let late = notices();
+        assert_eq!(late.borrow().clone(), Some(notice));
+
+        let mut rx = notices();
+        publish_notice(GraffNotice::Available {
+            current: Some("0.0.303.0".into()),
+            latest: "0.0.304.1".into(),
+        });
+        rx.changed().await.unwrap();
+        assert_eq!(
+            rx.borrow().clone(),
+            Some(GraffNotice::Available {
+                current: Some("0.0.303.0".into()),
+                latest: "0.0.304.1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn maybe_check_soon_debounces_within_ten_minutes() {
+        reset_check_clock();
+        let checks = std::cell::Cell::new(0);
+        let count = || checks.set(checks.get() + 1);
+        // First call is due; it stamps the clock.
+        maybe_check_soon_inner(&count);
+        assert_eq!(checks.get(), 1);
+        // Anything within the debounce window — including a call racing the
+        // still-running check — is skipped.
+        maybe_check_soon_inner(&count);
+        maybe_check_soon_inner(&count);
+        assert_eq!(checks.get(), 1);
+        reset_check_clock();
+    }
+
+    #[test]
+    fn whats_new_lists_the_releases_since_the_previous_version() {
+        let output = "graff 0.0.302.25\n\nWhat's new\n──────────\n0.0.302.25\n  • compaction fix\n  • server-only routes\n\n0.0.302.24\n  • native wire\n\n0.0.302.23\n  • cache again\n";
+        assert_eq!(
+            whats_new(output, Some("0.0.302.23"), "0.0.302.25"),
+            ["compaction fix", "server-only routes", "native wire"]
+        );
+        assert_eq!(
+            whats_new(output, None, "0.0.302.25"),
+            ["compaction fix", "server-only routes"]
+        );
+        assert!(whats_new(output, Some("0.0.302.25"), "0.0.302.25").is_empty());
+        assert!(whats_new("graff 0.0.302.25\n", Some("0.0.302.24"), "0.0.302.25").is_empty());
+    }
+
+    #[test]
+    fn stable_release_tags_parse_to_dotted_versions() {
+        // The tag shape latest_stable_release accepts.
+        assert_eq!(parse_dotted("v0.0.302.4"), Some(vec![0, 0, 302, 4]));
+        assert_eq!(display_version(&[0, 0, 302, 4]), "0.0.302.4");
+        // A beta suffix parses to the base version; the stability check lives
+        // in numeric_version, exercised by graff_beta's tests.
+        assert_eq!(
+            parse_dotted("v0.0.302.6-beta.26.1"),
+            Some(vec![0, 0, 302, 6])
+        );
+    }
 
     #[test]
     fn dotted_versions_compare_all_four_parts() {
@@ -490,6 +769,33 @@ mod tests {
         let outcome = update_managed().await.unwrap();
         eprintln!("{outcome:?}");
         assert!(version_of(&managed_path().unwrap()).is_some());
+    }
+
+    #[test]
+    fn windows_style_swap_moves_the_old_binary_aside_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("graff.exe");
+        std::fs::write(&target, "old").unwrap();
+        // A copy left aside by an earlier swap (once its process exited).
+        let stale = dir.path().join("graff.exe.old-earlier");
+        std::fs::write(&stale, "older").unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, "new").unwrap();
+        replace_file_with(&staged, &target, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(!staged.exists());
+        assert!(!stale.exists(), "earlier moved-aside copy cleared");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["graff.exe".to_string()]);
+
+        // A failed swap puts the old binary back.
+        let missing = dir.path().join("not-there");
+        assert!(replace_file_with(&missing, &target, true).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
     }
 
     #[test]

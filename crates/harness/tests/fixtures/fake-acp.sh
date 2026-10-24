@@ -112,6 +112,24 @@ pid=$(rid "$promptline")
 
 case "$promptline" in
 
+*scenario:reauth-*)
+  if has "$promptline" 'reauth-legacy-token-expired'; then
+    emit "{\"id\":$pid,\"error\":{\"code\":-32603,\"message\":\"chatgpt-new api error [token_expired]: Provided authentication token is expired.\"}}"
+    exit 0
+  fi
+  provider='chatgpt-new'
+  command='graff'
+  args='["login","chatgpt-new"]'
+  if has "$promptline" 'reauth-codex'; then
+    provider='codex'
+    command='codex'
+    args='["login"]'
+  fi
+  emit "{\"id\":$pid,\"error\":{\"code\":-32000,\"message\":\"Authentication required\",\"data\":{\"kind\":\"reauth_required\",\"provider\":\"$provider\",\"login\":{\"command\":\"$command\",\"args\":$args}}}}"
+  # Race the final error response with EOF as a real agent can.
+  exit 0
+  ;;
+
 *scenario:model-api*)
   if has "$MODEL_SETS" '"modelId":"grok-4.5"'; then
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"model switched"}}'
@@ -237,6 +255,31 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:elicit-interrupted*)
+  emit "{\"id\":\"graff-elicit-1\",\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"mode\":\"form\",\"message\":\"Which database should I use?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\",\"enum\":[\"Postgres\",\"SQLite\"]}},\"required\":[\"answer\"]}}}"
+  read -r ans || exit 1
+  { has "$ans" '"action":"accept"' && has "$ans" '"answer":"SQLite"'; } || exit 1
+  if has "$promptline" 'explicit'; then
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"cancelled\",\"_meta\":{\"graff/cancelSource\":\"acp_cancel\"}}}"
+    exit 0
+  fi
+  if has "$promptline" 'progress'; then
+    update '{"sessionUpdate":"tool_call","toolCallId":"after-answer","title":"Work after answer","kind":"execute","status":"in_progress"}'
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"cancelled\"}}"
+    exit 0
+  fi
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"cancelled\"}}"
+  read -r resumed || exit 1
+  has "$resumed" '"method":"session/prompt"' && has "$resumed" '[Harness recovery]' || exit 1
+  if has "$promptline" 'again'; then
+    emit "{\"id\":$(rid "$resumed"),\"result\":{\"stopReason\":\"cancelled\"}}"
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"resumed after answer"}}'
+    emit "{\"id\":$(rid "$resumed"),\"result\":{\"stopReason\":\"end_turn\"}}"
+  fi
+  exit 0
+  ;;
+
 *scenario:elicit*)
   # graff 0.0.302.6's ask_user: a form elicitation with one required answer.
   # The test's bridge picks "SQLite".
@@ -344,15 +387,20 @@ case "$promptline" in
   # Prevention: the turn settles, then the agent SELF-CONTINUES (a turn no
   # prompt started, visible as an open tool call). A steer arriving now
   # must NOT become a session/prompt (the adapter drops that reply — the
-  # verified starve): the harness cancels the unowned turn first, then
-  # prompts after the flush window.
+  # verified starve) and must NOT cancel the agent's work: the harness holds
+  # it until the agent goes quiet, then prompts.
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   update '{"sessionUpdate":"tool_call","toolCallId":"sc-1","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
-  read -r cancelline || exit 1
-  has "$cancelline" '"method":"session/cancel"' || exit 1
+  # The steer arrives while the tool runs; anything it writes buffers here.
+  sleep 1
   update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-1","status":"completed","content":[]}'
   read -r followline || exit 1
+  if has "$followline" '"method":"session/cancel"'; then
+    # Cancelling would kill the agent's in-flight work: fail loudly.
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"CANCELLED-SELF-CONTINUED-WORK"}}'
+    exit 1
+  fi
   fid=$(rid "$followline")
   if has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; then
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh answer"}}'
@@ -360,6 +408,35 @@ case "$promptline" in
   else
     emit "{\"id\":$fid,\"result\":{\"stopReason\":\"refusal\"}}"
   fi
+  ;;
+
+*scenario:busy-burst*)
+  # Several messages land while a self-continued turn streams and runs a
+  # long tool. None may cancel it; all go out afterwards, once each, in order.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  update '{"sessionUpdate":"tool_call","toolCallId":"sc-3","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
+  for i in 1 2 3 4; do
+    sleep 0.5
+    update "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"tick-$i\"}}"
+  done
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-3","status":"completed","content":[]}'
+  for word in one two three; do
+    read -r followline || exit 1
+    if has "$followline" '"method":"session/cancel"'; then
+      update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"CANCELLED-SELF-CONTINUED-WORK"}}'
+      exit 1
+    fi
+    fid=$(rid "$followline")
+    if has "$followline" '"method":"session/prompt"' && has "$followline" "msg $word"; then
+      update "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"reply $word\"}}"
+      emit "{\"id\":$fid,\"result\":{\"stopReason\":\"end_turn\"}}"
+    else
+      update "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"OUT-OF-ORDER-$word\"}}"
+      emit "{\"id\":$fid,\"result\":{\"stopReason\":\"refusal\"}}"
+      exit 1
+    fi
+  done
   ;;
 
 *scenario:native-busy-steer*)

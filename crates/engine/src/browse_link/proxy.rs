@@ -148,6 +148,7 @@ pub(super) async fn read_request(
     Ok(Some((head, body)))
 }
 
+#[cfg(test)]
 pub(super) fn response(status: u16, body: &[u8]) -> Vec<u8> {
     response_with(status, body, false)
 }

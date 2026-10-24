@@ -104,6 +104,7 @@ for line in sys.stdin:
 fn controls() -> RunControls {
     let (_, rx) = mpsc::channel(8);
     RunControls {
+        origin: None,
         request_input: Box::new(|_: Vec<_>| {
             let (tx, rx) = oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());
@@ -117,6 +118,7 @@ fn controls() -> RunControls {
 
 fn request(root: &Path, level: ReasoningLevel) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: "hello".into(),
         harness: None,
         model: Some("p1/shared".into()),

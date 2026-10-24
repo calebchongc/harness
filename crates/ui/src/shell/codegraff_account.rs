@@ -96,6 +96,12 @@ impl Shell {
                     if settled && let Some(error) = status.error.clone() {
                         shell.sidebar_notice = Some(format!("Codegraff sign-in failed: {error}").into());
                     }
+                    if settled && status.signed_in {
+                        // The account may already have a sandbox running.
+                        shell
+                            .state
+                            .update(cx, |state, cx| state.refresh_cloud_sandboxes(cx));
+                    }
                     shell.codegraff = Some(status);
                     cx.notify();
                 })
@@ -104,21 +110,6 @@ impl Shell {
                     break;
                 }
             }
-        }));
-    }
-
-    fn codegraff_sign_out(&mut self, cx: &mut Context<Self>) {
-        self.close_user_menu(cx);
-        self.codegraff_flow = None;
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        self.codegraff_status_task = Some(cx.spawn(async move |this, cx| {
-            let _ = engine
-                .client()
-                .call(methods::CODEGRAFF_SIGN_OUT, serde_json::json!({}))
-                .await;
-            this.update(cx, |shell, cx| shell.refresh_codegraff_status(cx)).ok();
         }));
     }
 
@@ -132,9 +123,15 @@ impl Shell {
                 .clone()
                 .or(status.name.clone())
                 .unwrap_or_else(|| "Signed in".into());
+            // One "Sign out" in this menu (Harness's own): the Codegraff sign-in is managed in
+            // Settings → Accounts, beside its usage and cloud sandboxes.
             rows.push(
                 popover::menu_row(theme, false, "user-menu-codegraff-account")
                     .id("user-menu-codegraff-account")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_user_menu(cx);
+                        this.open_settings(SettingsSection::Agents, cx);
+                    }))
                     .child(icon(icons::GLOBAL).size(px(16.0)).text_color(theme.accent))
                     .child(
                         div()
@@ -142,14 +139,6 @@ impl Shell {
                             .truncate()
                             .child(SharedString::from(format!("Codegraff · {who}"))),
                     )
-                    .into_any_element(),
-            );
-            rows.push(
-                popover::menu_row(theme, false, "user-menu-codegraff-signout")
-                    .id("user-menu-codegraff-signout")
-                    .on_click(cx.listener(|this, _, _, cx| this.codegraff_sign_out(cx)))
-                    .child(icon(icons::LOGOUT_2).size(px(16.0)).text_color(theme.text_muted))
-                    .child(SharedString::from("Sign out of Codegraff"))
                     .into_any_element(),
             );
         } else if status.pending {

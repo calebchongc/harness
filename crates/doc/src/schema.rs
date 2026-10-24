@@ -10,7 +10,7 @@
 //! - `queue`:    LoroMovableList of LoroMap {
 //!   id, text, attachments?, issuedBy, issuedAt, editedAt? }        (any device writes)
 //!
-//! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error"|"image", text?: LoroText,
+//! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error"|"image"|"visual"|"delegation", text?: LoroText,
 //! reasoning?: LoroText, call?: json, isError?, questions?: json, resolved?, message? }.
 //! Text bodies are **LoroText** so streaming appends RLE-merge (1.03x oplog overhead vs
 //! 125x for whole-value rewrites).
@@ -75,6 +75,10 @@ struct DocPartJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mime_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    script: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     /// Thinking body for `kind: "reasoning"` (additive). Deliberately NOT the
     /// `text` field: old readers' unknown-kind fallback renders `text` as
@@ -92,6 +96,8 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reauth: Option<String>,
     /// Tool output summary (additive — absent on old rows and old writers;
     /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +126,12 @@ struct DocPartJson {
     /// One-line live tail of the subagent's output (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_tail: Option<String>,
+    /// A page the tool saved on the host: `{kind, id}` (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    view: Option<serde_json::Value>,
+    /// Bounded delegated-task diagnostics; old readers ignore this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delegation: Option<harness_proto::DelegationInfo>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -138,6 +150,17 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             mime_type: Some(mime_type.clone()),
             ..Default::default()
         },
+        MessagePart::Visual { id, title, script } => {
+            harness_proto::visual::validate_visual(title, script)
+                .map_err(|error| DocError::Schema(error.into()))?;
+            DocPartJson {
+                id: id.clone(),
+                kind: "visual".into(),
+                title: Some(title.clone()),
+                script: Some(script.clone()),
+                ..Default::default()
+            }
+        }
         MessagePart::Text { id, text } => DocPartJson {
             id: id.clone(),
             kind: "text".into(),
@@ -164,6 +187,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             subagent_ref,
             subagent_status,
             subagent_tail,
+            view,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -189,6 +213,13 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
                 .to_owned()
             }),
             subagent_tail: subagent_tail.clone(),
+            view: view.as_ref().map(serde_json::to_value).transpose()?,
+            ..Default::default()
+        },
+        MessagePart::Delegation { id, info } => DocPartJson {
+            id: id.clone(),
+            kind: "delegation".into(),
+            delegation: Some(info.clone()),
             ..Default::default()
         },
         MessagePart::Input {
@@ -203,19 +234,40 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             resolved: Some(*resolved),
             ..Default::default()
         },
-        MessagePart::Error { id, message } => DocPartJson {
+        MessagePart::Error {
+            id,
+            message,
+            reauth,
+        } => DocPartJson {
             id: id.clone(),
             kind: "error".into(),
             message: Some(message.clone()),
+            reauth: reauth.map(|provider| provider.as_str().to_owned()),
             ..Default::default()
         },
     })
+}
+
+/// Keep invalid/oversized visual source out of rendering, including salvage reads.
+fn visual_part(id: String, title: Option<String>, script: Option<String>) -> MessagePart {
+    match (title, script) {
+        (Some(title), Some(script))
+            if harness_proto::visual::validate_visual(&title, &script).is_ok() =>
+        {
+            MessagePart::Visual { id, title, script }
+        }
+        _ => MessagePart::Text {
+            id,
+            text: String::new(),
+        },
+    }
 }
 
 /// Doc part json → app part (mirror of `fromDocParts`; malformed degrades to empty text).
 fn from_doc_part(p: DocPartJson) -> MessagePart {
     match p.kind.as_str() {
         "image" => image_part(p.id, p.path, p.name, p.mime_type),
+        "visual" => visual_part(p.id, p.title, p.script),
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
             Some(call) => MessagePart::Tool {
                 id: p.id,
@@ -238,7 +290,19 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                     _ => None,
                 }),
                 subagent_tail: p.subagent_tail,
+                // A doc can come from any device: keep only a well-formed id.
+                view: p
+                    .view
+                    .and_then(|v| serde_json::from_value::<harness_proto::ToolView>(v).ok())
+                    .filter(harness_proto::ToolView::is_valid),
             },
+            None => MessagePart::Text {
+                id: p.id,
+                text: String::new(),
+            },
+        },
+        "delegation" => match p.delegation {
+            Some(info) => MessagePart::Delegation { id: p.id, info },
             None => MessagePart::Text {
                 id: p.id,
                 text: String::new(),
@@ -256,6 +320,9 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "error" => MessagePart::Error {
             id: p.id,
             message: p.message.unwrap_or_default(),
+            reauth: p
+                .reauth
+                .and_then(|provider| serde_json::from_value(serde_json::json!(provider)).ok()),
         },
         "reasoning" => MessagePart::Reasoning {
             id: p.id,
@@ -293,6 +360,7 @@ fn image_part(
         _ => MessagePart::Error {
             id,
             message: "Generated image unavailable".into(),
+            reauth: None,
         },
     }
 }
@@ -341,7 +409,29 @@ impl SessionDoc {
         let next = harness_proto::ContextUsage {
             tokens: tokens.or(previous.tokens),
             window: window.filter(|n| *n > 0).or(previous.window),
+            ..previous
         };
+        self.write_context_usage(previous, next)
+    }
+
+    /// The agent's latest cumulative savings replace the previous ones.
+    pub fn update_context_savings(
+        &self,
+        savings: harness_proto::ContextSavings,
+    ) -> Result<(), DocError> {
+        let previous = self.context_usage().unwrap_or_default();
+        let next = harness_proto::ContextUsage {
+            savings: Some(savings),
+            ..previous
+        };
+        self.write_context_usage(previous, next)
+    }
+
+    fn write_context_usage(
+        &self,
+        previous: harness_proto::ContextUsage,
+        next: harness_proto::ContextUsage,
+    ) -> Result<(), DocError> {
         if next != previous {
             self.doc
                 .get_map("meta")
@@ -674,6 +764,7 @@ impl SessionDoc {
                 &MessagePart::Error {
                     id: part_id.to_string(),
                     message: message.to_string(),
+                    reauth: None,
                 },
             )?;
             self.doc.commit();
@@ -838,8 +929,8 @@ fn status_str(status: MessageStatus) -> &'static str {
 
 /// Append one part map to a parts list; text bodies become LoroText containers.
 fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
-    let map = parts.push_container(LoroMap::new())?;
     let doc_part = to_doc_part(part)?;
+    let map = parts.push_container(LoroMap::new())?;
     map.insert("id", doc_part.id.as_str())?;
     map.insert("kind", doc_part.kind.as_str())?;
     if let Some(text) = &doc_part.text {
@@ -856,6 +947,8 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
         ("path", &doc_part.path),
         ("name", &doc_part.name),
         ("mimeType", &doc_part.mime_type),
+        ("title", &doc_part.title),
+        ("script", &doc_part.script),
     ] {
         if let Some(value) = value {
             map.insert(key, value.as_str())?;
@@ -875,6 +968,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
+    }
+    if let Some(reauth) = &doc_part.reauth {
+        map.insert("reauth", reauth.as_str())?;
     }
     if let Some(output) = &doc_part.output {
         map.insert("output", output.as_str())?;
@@ -902,6 +998,15 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(subagent_tail) = &doc_part.subagent_tail {
         map.insert("subagentTail", subagent_tail.as_str())?;
+    }
+    if let Some(view) = &doc_part.view {
+        map.insert("view", loro_value_from_json(view))?;
+    }
+    if let Some(info) = &doc_part.delegation {
+        map.insert(
+            "delegation",
+            loro_value_from_json(&serde_json::to_value(info)?),
+        )?;
     }
     Ok(())
 }
@@ -1035,6 +1140,10 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         .and_then(|x| x.as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{entry_id}#recovered-{ix}"));
+    if obj.get("kind").and_then(|v| v.as_str()) == Some("visual") {
+        let field = |key| obj.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        return Some(visual_part(id, field("title"), field("script")));
+    }
     if obj.get("kind").and_then(|v| v.as_str()) == Some("image") {
         let field = |key| obj.get(key).and_then(|v| v.as_str()).map(str::to_owned);
         return Some(image_part(
@@ -1083,12 +1192,16 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            view: None,
         });
     }
     if let Some(message) = obj.get("message").and_then(|x| x.as_str()) {
         return Some(MessagePart::Error {
             id,
             message: message.to_owned(),
+            reauth: obj
+                .get("reauth")
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
         });
     }
     None
@@ -1322,6 +1435,8 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
         ("path", &doc_part.path),
         ("name", &doc_part.name),
         ("mimeType", &doc_part.mime_type),
+        ("title", &doc_part.title),
+        ("script", &doc_part.script),
     ] {
         if let Some(value) = value {
             map.insert(key, value.as_str())?;
@@ -1341,6 +1456,9 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     }
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
+    }
+    if let Some(reauth) = &doc_part.reauth {
+        map.insert("reauth", reauth.as_str())?;
     }
     if let Some(output) = &doc_part.output {
         map.insert("output", output.as_str())?;
@@ -1368,6 +1486,15 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     }
     if let Some(subagent_tail) = &doc_part.subagent_tail {
         map.insert("subagentTail", subagent_tail.as_str())?;
+    }
+    if let Some(view) = &doc_part.view {
+        map.insert("view", loro_value_from_json(view))?;
+    }
+    if let Some(info) = &doc_part.delegation {
+        map.insert(
+            "delegation",
+            loro_value_from_json(&serde_json::to_value(info)?),
+        )?;
     }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
@@ -1430,6 +1557,109 @@ mod tests {
     use super::*;
     use crate::parts::fold_event_into_parts;
     use harness_proto::{AgentEvent, ToolCall};
+
+    #[test]
+    fn delegation_metadata_survives_sync_without_duplicate_accounting_rows() {
+        let mut parts = Vec::new();
+        let diagnostic = AgentEvent::DelegationInfo {
+            id: "task-1".into(),
+            info: harness_proto::DelegationInfo {
+                context_bytes: 32768,
+                used_bytes: 4096,
+                summarized: true,
+                usage_reported: false,
+                usage_unavailable_reason: Some("No settled charge reported.".into()),
+            },
+        };
+        fold_event_into_parts(&mut parts, &diagnostic);
+        assert!(parts.is_empty(), "orphan metadata cannot invent a tool");
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "task-1".into(),
+                call: ToolCall::Unknown {
+                    name: "run_task".into(),
+                    input: None,
+                },
+            },
+        );
+        fold_event_into_parts(&mut parts, &diagnostic);
+        fold_event_into_parts(&mut parts, &diagnostic);
+        assert_eq!(parts.len(), 2);
+        let doc = SessionDoc::init("host").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "assistant", "host", 1).unwrap();
+        writer.sync(&parts).unwrap();
+        writer.sync(&parts).unwrap();
+        let peer = SessionDoc::init("viewer").unwrap();
+        peer.doc().import(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(peer.read_entries().unwrap()[0].parts, parts);
+        let MessagePart::Delegation { id, info } = &parts[1] else {
+            panic!("missing diagnostics")
+        };
+        let raw = serde_json::to_value(to_doc_part(&parts[1]).unwrap()).unwrap();
+        assert!(
+            raw.get("text").is_none(),
+            "old readers must not treat diagnostics as an answer"
+        );
+        let mut changed = info.clone();
+        changed.used_bytes = 2048;
+        parts[1] = MessagePart::Delegation {
+            id: id.clone(),
+            info: changed,
+        };
+        writer.sync(&parts).unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, parts);
+    }
+
+    #[test]
+    fn reauth_survives_event_fold_document_sync_and_plain_errors() {
+        for provider in [
+            harness_proto::ReauthProvider::ChatgptNew,
+            harness_proto::ReauthProvider::Codex,
+        ] {
+            let mut parts = Vec::new();
+            fold_event_into_parts(&mut parts, &AgentEvent::ReauthRequired { provider });
+            fold_event_into_parts(
+                &mut parts,
+                &AgentEvent::Done {
+                    status: harness_proto::DoneStatus::Errored,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            );
+            assert_eq!(parts.len(), 1);
+            let doc = SessionDoc::init("host").unwrap();
+            doc.push_message(&SessionMessageEntry {
+                id: "auth-error".into(),
+                role: MessageRole::Assistant,
+                parts: parts.clone(),
+                created_at: 1,
+                device_id: "host".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            })
+            .unwrap();
+            let peer = SessionDoc::init("viewer").unwrap();
+            peer.doc().import(&doc.export_snapshot().unwrap()).unwrap();
+            assert_eq!(peer.read_entries().unwrap()[0].parts, parts);
+        }
+        let plain = from_doc_part(
+            serde_json::from_value(serde_json::json!({
+                "kind":"error","id":"old","message":"HTTP 429"
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(plain, MessagePart::Error { reauth: None, .. }));
+        let unknown = from_doc_part(
+            serde_json::from_value(serde_json::json!({
+                "kind":"error","id":"unknown","message":"rejected","reauth":"arbitrary-command"
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(unknown, MessagePart::Error { reauth: None, .. }));
+    }
 
     #[test]
     fn opening_tail_bounds_parts_and_preserves_continuation_ids() {
@@ -1561,6 +1791,56 @@ mod tests {
     }
 
     #[test]
+    fn generated_visual_persists_updates_roundtrips_and_salvages() {
+        let doc = SessionDoc::init("visuals").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![MessagePart::Visual {
+            id: "v".into(),
+            title: "Overview".into(),
+            script: "source one".into(),
+        }];
+        writer.sync(&parts).unwrap();
+        if let MessagePart::Visual { title, script, .. } = &mut parts[0] {
+            *title = "Updated".into();
+            *script = "source two".into();
+        }
+        writer.sync(&parts).unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, parts);
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            SessionDoc::from_doc(imported).read_entries().unwrap()[0].parts,
+            parts
+        );
+        let valid = serde_json::json!({"kind":"visual", "id":"v", "title":"Overview", "script":"source", "isError":42});
+        assert!(serde_json::from_value::<DocPartJson>(valid.clone()).is_err());
+        assert!(matches!(
+            salvage_part(&valid, "a", 0),
+            Some(MessagePart::Visual { .. })
+        ));
+        for bad in [
+            serde_json::json!({"kind":"visual", "id":"v", "text":"must not leak"}),
+            serde_json::json!({"kind":"visual", "id":"v", "title":" ", "script":"source"}),
+            serde_json::json!({"kind":"visual", "id":"v", "title":"Overview", "script":"é".repeat(32769)}),
+        ] {
+            assert!(
+                matches!(from_doc_part(serde_json::from_value(bad.clone()).unwrap()), MessagePart::Text { text, .. } if text.is_empty())
+            );
+            assert!(
+                matches!(salvage_part(&bad, "a", 0), Some(MessagePart::Text { text, .. }) if text.is_empty())
+            );
+        }
+        assert!(
+            to_doc_part(&MessagePart::Visual {
+                id: "bad".into(),
+                title: "Overview".into(),
+                script: "x".repeat(65537),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn generated_image_persists_updates_and_salvages() {
         let doc = SessionDoc::init("images").unwrap();
         let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
@@ -1636,6 +1916,52 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_view_round_trips_and_a_malformed_one_is_dropped() {
+        use harness_proto::{ToolView, ToolViewKind};
+        let doc = SessionDoc::init("c1").unwrap();
+        let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
+        let tool = |id: &str, view: Option<ToolView>| MessagePart::Tool {
+            id: id.into(),
+            call: harness_proto::ToolCall::Unknown {
+                name: "render_html".into(),
+                input: None,
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            view,
+        };
+        let good = ToolView::new(ToolViewKind::McpApp, "0123456789abcdef0123456789abcdef").unwrap();
+        // Another device's doc could carry anything; only a valid id is kept.
+        let bad = ToolView {
+            kind: ToolViewKind::Html,
+            id: "../../.ssh/id_ed25519".into(),
+        };
+        // The view arrives after the chip first synced (the live-patch path).
+        let mut parts = vec![tool("a", None), tool("b", None)];
+        w.sync(&parts).unwrap();
+        parts = vec![tool("a", Some(good.clone())), tool("b", Some(bad))];
+        w.sync(&parts).unwrap();
+        let views: Vec<_> = doc.read_entries().unwrap()[0]
+            .parts
+            .iter()
+            .map(|p| match p {
+                MessagePart::Tool { view, .. } => view.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(views, vec![Some(good), None]);
+    }
+
+    #[test]
     fn segment_sync_persists_subagent_chip_fields_on_live_parts() {
         // The eager-done world's OTHER path: the chip mutates while its
         // segment still streams (codex fan-outs) — update_part_fields must
@@ -1659,6 +1985,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            view: None,
         };
         w.sync(std::slice::from_ref(&part)).unwrap();
         if let MessagePart::Tool {
@@ -1726,6 +2053,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            view: None,
         };
         let parts = vec![
             tool(
@@ -2061,6 +2389,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                view: None,
             }],
             created_at: 1,
             device_id: "dev-a".into(),
@@ -2106,6 +2435,7 @@ mod tests {
         let entry = SessionCommandEntry {
             id: "c1".into(),
             payload: SessionCommandPayload::Steer {
+                turn_origin: Default::default(),
                 prompt: "focus".into(),
                 message_id: None,
             },
@@ -2227,11 +2557,22 @@ mod context_usage_tests {
             replica.context_usage(),
             Some(harness_proto::ContextUsage {
                 tokens: Some(0),
-                window: Some(200_000)
+                window: Some(200_000),
+                savings: None,
             })
         );
         host.update_context_usage(None, Some(1_000_000)).unwrap();
         assert_eq!(host.context_usage().unwrap().tokens, Some(0));
+        // Savings replace the previous snapshot and survive later meter updates.
+        let savings = harness_proto::ContextSavings {
+            handle_bytes: 4_000,
+            compacted_tokens: 9_000,
+            cache_read_tokens: 0,
+        };
+        host.update_context_savings(savings).unwrap();
+        host.update_context_usage(Some(5), None).unwrap();
+        assert_eq!(host.context_usage().unwrap().savings, Some(savings));
+        assert_eq!(host.context_usage().unwrap().tokens, Some(5));
         let rebuilt = crate::rebuild_thin_doc(&host).unwrap().doc;
         assert_eq!(rebuilt.context_usage(), host.context_usage());
         rebuilt.clear_context_usage().unwrap();

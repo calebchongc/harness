@@ -48,9 +48,21 @@ private func nameFromPath(_ path: String) -> String {
     return name.isEmpty ? "image" : name
 }
 
+/// An agent-room delivery opens with a machine tag line for the agent
+/// (`<!--harness-room {…} -->`, harness-proto `room_delivery`); the framed
+/// header under it already says where the post came from, so readers skip it.
+func stripRoomDeliveryTag(_ content: String) -> String {
+    let open = "<!--harness-room {", close = "} -->"
+    guard content.hasPrefix(open), let end = content.range(of: close) else { return content }
+    var rest = content[end.upperBound...]
+    if rest.first == "\n" { rest = rest.dropFirst() }
+    return String(rest)
+}
+
 /// message-attachments.ts `parseUserMessageImages`: split the visible prompt
 /// from its attachment-ref trailer (case-insensitive marker, `- path` lines).
-func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
+func parseUserMessageImages(_ rawContent: String) -> ParsedUserMessage {
+    let content = stripRoomDeliveryTag(rawContent)
     let presentations = AppshotContext.presentations(content)
     let lines = content.components(separatedBy: "\n")
     var markerIx: Int?
@@ -121,6 +133,7 @@ struct StagedAttachment: Identifiable, Hashable {
     /// serves (png/jpg/gif/webp) as-is; transcode everything else (HEIC
     /// camera shots, mainly) to JPEG.
     static func stage(data: Data) -> StagedAttachment? {
+        guard data.count <= maxAttachmentBytes else { return nil }
         var bytes = data
         var ext = sniffExtension(data)
         if ext == nil {
@@ -134,6 +147,25 @@ struct StagedAttachment: Identifiable, Hashable {
         let id = UUID().uuidString.lowercased()
         return StagedAttachment(id: id, name: "photo-\(id.prefix(8)).\(ext)",
                                 data: bytes, image: image)
+    }
+
+    /// Stage several images (a paste); how many couldn't be attached.
+    static func stage(images: [Data]) -> (staged: [StagedAttachment], failed: Int) {
+        var staged: [StagedAttachment] = []
+        var failed = 0
+        for data in images {
+            if let attachment = stage(data: data) { staged.append(attachment) } else { failed += 1 }
+        }
+        return (staged, failed)
+    }
+
+    /// The error line for images that couldn't be attached; nil when all were.
+    static func failureMessage(_ failed: Int) -> String? {
+        switch failed {
+        case 0: return nil
+        case 1: return "One image couldn't be attached (unsupported or over 24 MB)."
+        default: return "\(failed) images couldn't be attached (unsupported or over 24 MB)."
+        }
     }
 
     /// Magic-byte sniff for the formats both ends support.
@@ -486,9 +518,11 @@ struct AttachmentStripView: View {
                         .frame(width: 56, height: 56)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .overlay(RoundedRectangle(cornerRadius: 10)
-                            .strokeBorder(whiteAlpha(0.11), lineWidth: 1))
+                            .strokeBorder(hairline(0.11), lineWidth: 1))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Preview attached image")
+                .accessibilityIdentifier("composer-attachment-\(att.id)")
                 .overlay(alignment: .topTrailing) {
                     Button {
                         remove(att.id)
@@ -498,10 +532,12 @@ struct AttachmentStripView: View {
                             .foregroundStyle(Theme.text)
                             .frame(width: 18, height: 18)
                             .background(.black.opacity(0.65), in: Circle())
-                            .overlay(Circle().strokeBorder(whiteAlpha(0.2), lineWidth: 1))
+                            .overlay(Circle().strokeBorder(hairline(0.2), lineWidth: 1))
                     }
                     .buttonStyle(.plain)
                     .offset(x: 5, y: -5)
+                    .accessibilityLabel("Remove attached image")
+                    .accessibilityIdentifier("composer-remove-attachment-\(att.id)")
                 }
             }
         }
@@ -572,6 +608,7 @@ struct AttachmentThumbView: View {
                         .clipped()
                 }
                 .buttonStyle(.plain)
+                .contextMenu { ImageActionsMenu(name: name, image: image) }
             case .loading:
                 ProgressView()
                     .controlSize(.small)
@@ -590,9 +627,9 @@ struct AttachmentThumbView: View {
                 .buttonStyle(.plain)
             }
         }
-        .background(whiteAlpha(0.035))
+        .background(ink(0.035))
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(whiteAlpha(0.11), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(hairline(0.11), lineWidth: 1))
         .task(id: "\(deviceId)|\(path)") {
             cache.load(deviceId: deviceId, path: path)
         }
@@ -660,6 +697,7 @@ struct GeneratedImageView: View {
                         .frame(maxWidth: 512, maxHeight: 420)
                 }
                 .buttonStyle(.plain)
+                .contextMenu { ImageActionsMenu(name: reference.name, image: image) }
                 .accessibilityLabel("Preview generated image")
                 .accessibilityHint(reference.name)
             case .loading:
@@ -667,7 +705,7 @@ struct GeneratedImageView: View {
                     .tint(Theme.textFaint)
                     .frame(maxWidth: .infinity)
                     .frame(height: 220)
-                    .background(whiteAlpha(0.035), in: RoundedRectangle(cornerRadius: 12))
+                    .background(ink(0.035), in: RoundedRectangle(cornerRadius: 12))
                     .accessibilityLabel("Loading generated image")
             case .error:
                 Button {
@@ -681,7 +719,7 @@ struct GeneratedImageView: View {
                         .foregroundStyle(Theme.textFaint)
                         .frame(maxWidth: .infinity)
                         .frame(height: 220)
-                        .background(whiteAlpha(0.035), in: RoundedRectangle(cornerRadius: 12))
+                        .background(ink(0.035), in: RoundedRectangle(cornerRadius: 12))
                 }
                 .buttonStyle(.plain)
                 .accessibilityHint("Tap to retry")
@@ -711,6 +749,66 @@ struct GeneratedImageView: View {
     }
 }
 
+// MARK: - Saving and sharing images
+
+enum ImageSaveOutcome: Equatable {
+    case saved
+    case denied
+    case failed(String)
+
+    var message: String {
+        switch self {
+        case .saved: return "Saved to Photos"
+        case .denied: return "Allow Harness to add photos in Settings to save images."
+        case .failed(let reason): return "Couldn't save the image: \(reason)"
+        }
+    }
+}
+
+/// Add-only Photos access: Harness never reads the library back.
+@MainActor
+func saveImageToPhotos(_ image: UIImage) async -> ImageSaveOutcome {
+    let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+    guard status == .authorized || status == .limited else { return .denied }
+    do {
+        try await PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.creationRequestForAsset(from: image)
+        }
+        return .saved
+    } catch {
+        return .failed(error.localizedDescription)
+    }
+}
+
+/// Long-press actions on transcript images (thumbs and generated output);
+/// the tap still opens the lightbox, which shows the save outcome in words.
+/// Here a menu has already closed, so the outcome is a haptic.
+struct ImageActionsMenu: View {
+    let name: String
+    let image: UIImage
+
+    var body: some View {
+        Button {
+            Task {
+                let outcome = await saveImageToPhotos(image)
+                UINotificationFeedbackGenerator()
+                    .notificationOccurred(outcome == .saved ? .success : .error)
+            }
+        } label: {
+            Label("Save to Photos", systemImage: "square.and.arrow.down")
+        }
+        ShareLink(item: Image(uiImage: image),
+                  preview: SharePreview(name, image: Image(uiImage: image))) {
+            Label("Share…", systemImage: "square.and.arrow.up")
+        }
+        Button {
+            UIPasteboard.general.image = image
+        } label: {
+            Label("Copy", systemImage: "doc.on.doc")
+        }
+    }
+}
+
 // MARK: - Lightbox (attachments.rs lightbox: dim scrim, image ≤85vh/90vw,
 // name under it, any tap closes)
 
@@ -723,6 +821,8 @@ struct AttachmentPreview: Identifiable {
 struct AttachmentLightbox: View {
     let preview: AttachmentPreview
     @Environment(\.dismiss) private var dismiss
+    @State private var saveOutcome: ImageSaveOutcome?
+    @State private var saving = false
 
     var body: some View {
         GeometryReader { geo in
@@ -752,7 +852,50 @@ struct AttachmentLightbox: View {
                 .accessibilityLabel("Close image preview")
                 .padding(12)
             }
+            .overlay(alignment: .bottom) {
+                VStack(spacing: 10) {
+                    if let saveOutcome {
+                        Text(saveOutcome.message)
+                            .font(Theme.sans(13))
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(.black.opacity(0.7), in: Capsule())
+                            .accessibilityIdentifier("image-save-outcome")
+                    }
+                    HStack(spacing: 12) {
+                        Button {
+                            saving = true
+                            Task {
+                                saveOutcome = await saveImageToPhotos(preview.image)
+                                saving = false
+                            }
+                        } label: {
+                            lightboxAction(saving ? "Saving…" : "Save", systemImage: "square.and.arrow.down")
+                        }
+                        .disabled(saving)
+                        .accessibilityIdentifier("image-save")
+                        ShareLink(item: Image(uiImage: preview.image),
+                                  preview: SharePreview(preview.name, image: Image(uiImage: preview.image))) {
+                            lightboxAction("Share", systemImage: "square.and.arrow.up")
+                        }
+                        .accessibilityIdentifier("image-share")
+                    }
+                }
+                .padding(.bottom, 20)
+            }
         }
         .presentationBackground(.clear)
+    }
+
+    private func lightboxAction(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(Theme.sans(15, weight: .medium))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 18)
+            .frame(height: 44)
+            .background(.black.opacity(0.6), in: Capsule())
+            .overlay(Capsule().strokeBorder(.white.opacity(0.15), lineWidth: 1))
     }
 }

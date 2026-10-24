@@ -27,12 +27,45 @@ final class GeneratedImageTests: XCTestCase {
                                    ("name", ""), ("mimeType", "image/svg+xml"), ("mimeType", "")] {
             var value = fields
             value[key] = replacement
-            guard case .error(let id, let message)? = SessionStore.partFrom(.fromJSON(value)) else {
+            guard case .error(let id, let message, let reauth)? = SessionStore.partFrom(.fromJSON(value)) else {
                 XCTFail("malformed \(key) must not silently disappear")
                 continue
             }
             XCTAssertEqual(id, "image-1")
             XCTAssertEqual(message, "Generated image unavailable")
+            XCTAssertNil(reauth)
+        }
+    }
+
+    func testVisualFallbackPreservesMixedPartsWithoutExposingSource() throws {
+        let value: [String: Any] = ["id": "reply", "role": "assistant", "parts": [
+            ["id": "before", "kind": "text", "text": "Before"],
+            ["id": "v", "kind": "visual", "title": "Overview",
+             "script": "error('must not run or display')", "text": "must not display"],
+            ["id": "unknown", "kind": "future", "text": "hidden"],
+            ["id": "bad", "kind": "visual", "title": "  "],
+            ["id": "after", "kind": "text", "text": "After"]
+        ]]
+        let entry = try XCTUnwrap(SessionStore.entryFrom(.fromJSON(value)))
+        XCTAssertEqual(entry.parts, [
+            .text(id: "before", text: "Before"),
+            .text(id: "v", text: "Native visual: Overview — open in Harness desktop"),
+            .text(id: "after", text: "After")
+        ])
+    }
+
+    func testVisualFallbackRequiresABoundedNonblankTitleOnly() {
+        let invalid: [Any] = [NSNull(), 42, "", " \n\t", String(repeating: "界", count: 201),
+                              String(repeating: "e\u{301}", count: 101)]
+        for title in invalid {
+            XCTAssertNil(SessionStore.partFrom(.fromJSON(["id": "v", "kind": "visual", "title": title])))
+        }
+        XCTAssertNil(SessionStore.partFrom(.fromJSON(["id": "v", "kind": "visual"])))
+        for title in [String(repeating: "界", count: 200), String(repeating: "😀", count: 200),
+                      String(repeating: "e\u{301}", count: 100)] {
+            // A fallback requires no script and counts Unicode scalars, not grapheme clusters.
+            XCTAssertEqual(SessionStore.partFrom(.fromJSON(["id": "v", "kind": "visual", "title": title])),
+                           .text(id: "v", text: "Native visual: \(title) — open in Harness desktop"))
         }
     }
 

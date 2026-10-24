@@ -24,15 +24,76 @@ desktop's pulldown-cmark config).
 
 The Xcode project, scheme, and application use the Harness name.
 
+### Walk through the app after a change
+
+```sh
+scripts/ios-walkthrough.sh --open
+```
+
+Installs the app fresh on a simulator, walks it the way a new install meets
+it (Home, a session, Settings → Split view → Stacked, the split button, closing
+each pane, typing and sending, rotating) in the offline demo, and writes a
+numbered screenshot per step plus notes on what got in the way to
+`apps/ios/build/walkthrough/<time>/`. Notes don't fail the run; they are for
+reading. `--args "-rollout.stackedSplitDrag off"` walks the other half of a
+rollout, and `--device "iPhone 17"` picks another simulator. The walk itself is
+`HarnessUITests/WalkthroughUITests`.
+
 ## TestFlight release
 
 Run the **TestFlight** workflow from GitHub Actions on `main`. It compiles the
 iOS app and tests, selects the next numeric build number from App Store
 Connect, archives with automatic signing, uploads an internal-only TestFlight
-build, and waits for Apple processing to report `VALID`.
+build, and waits for Apple processing to report `VALID`. Select `external`
+to upload an externally distributable build, add it to the external beta
+group, and submit it for TestFlight review. Internal-only builds cannot later
+be made external; upload a new build with the correct audience.
 
-The workflow uses the `AC_API_KEY_P8`, `AC_API_KEY_ID`, and
-`AC_API_ISSUER_ID` repository secrets.
+The workflow executes the mobile contract/parity and performance tests before
+archiving, including the requirement for explicit performance-sharing consent.
+The broader iOS job in `ui-tests.yml` is still disabled; passing this narrow
+release check does not establish that every layout/UI test passes.
+
+### Privacy and beta metadata
+
+- Privacy policy: https://codegraff.com/privacy#harness
+- Support: https://codegraff.com/support
+- Feedback and privacy contact: rach@codegraff.com
+
+The pages are static assets in `apps/landing/public`. Sign-in and Settings link
+to them. `Harness/PrivacyInfo.xcprivacy` is included by the project's synchronized
+app folder and declares app-local UserDefaults (`CA92.1`) and elapsed-time
+measurement (`35F9.1`). Check the built app contains the manifest after changing
+project membership or packaging.
+
+App Store privacy answers describe name/email, account and app-generated device
+IDs, messages, photos, other user content, support requests, and interaction
+metadata as linked to the user for app functionality. Optional performance
+reports are unlinked analytics. None of these categories is used for advertising
+tracking. Keep the manifest, public policy, and App Store Connect answers aligned
+when changing collection or providers.
+
+iOS performance sharing starts off under `share-performance-consent-v1` and is
+enabled only by choosing the toggle in Settings → Diagnostics → Performance.
+The older `share-performance` setting is not treated as consent. Reports contain
+histograms, app/OS versions, hardware model, refresh rate, and a per-launch random
+ID, and the statistics service retains them for 90 days. Android's existing
+default remains represented separately in the shared parity fixtures.
+
+Before submitting a build, check TestFlight's beta description, feedback email,
+privacy URL, review contact, review notes, and build-specific What to Test. Live
+review requires a working CodeGraff account and an online execution host with
+an enabled agent. Offline launch-argument fixtures are not reviewer credentials.
+Never put credentials in this repository. App Store Connect's final privacy
+Publish action also includes an accuracy/compliance agreement; saved draft
+answers and published responses are different states.
+
+The app is **Harness by CodeGraff** (App Store Connect app 6816844026) on
+team `WWP9DLJ27P`. The workflow uses the `IOS_AC_API_KEY_P8`,
+`IOS_AC_API_KEY_ID`, and `IOS_AC_API_ISSUER_ID` repository secrets: an App
+Store Connect API key with the Admin role, which automatic signing needs to
+create the distribution certificate and profiles. They are separate from the
+Developer-role `AC_API_KEY_*` secrets the macOS release notarizes with.
 
 ### Connecting
 

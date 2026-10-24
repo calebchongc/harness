@@ -37,6 +37,7 @@ fn harness() -> AcpHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: Some("grok-4.5".into()),
@@ -55,6 +56,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -96,6 +98,50 @@ fn dones(events: &[AgentEvent]) -> Vec<(DoneStatus, Option<String>)> {
             _ => None,
         })
         .collect()
+}
+
+#[tokio::test]
+async fn reauth_required_preserves_route_through_prompt_dispatch_and_eof() {
+    for (scenario, provider) in [
+        (
+            "scenario:reauth-chatgpt-new",
+            harness_proto::ReauthProvider::ChatgptNew,
+        ),
+        (
+            "scenario:reauth-codex",
+            harness_proto::ReauthProvider::Codex,
+        ),
+        (
+            "scenario:reauth-legacy-token-expired",
+            harness_proto::ReauthProvider::ChatgptNew,
+        ),
+    ] {
+        let (controls, _steer, _token) = controls();
+        let events = run_to_end(&harness(), request(scenario), controls).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ReauthRequired { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&AgentEvent::ReauthRequired { provider }),
+            "{events:?}"
+        );
+        assert_eq!(
+            dones(&events),
+            vec![(DoneStatus::Errored, None)],
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. })),
+            "{events:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -164,15 +210,25 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     assert!(exec_output.starts_with("   Compiling harness-adapters"));
     assert_eq!(exec_output.lines().count(), 6, "{exec_output:?}");
 
-    // Edit tool: single-shot completed call carries the inline diff.
-    assert!(events.contains(&AgentEvent::ToolCall {
-        id: "t2".into(),
-        call: ToolCall::EditFile {
-            path: "/w/src/resolve.rs".into(),
-            old_string: None,
-            new_string: None,
-        },
-    }));
+    // Edit tool: single-shot completed call carries the inline diff, and the
+    // opening call carries the same old/new text so a terminal UI can draw it.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall {
+                id,
+                call: ToolCall::EditFile {
+                    path,
+                    old_string: Some(old),
+                    new_string: Some(new),
+                },
+            } if id == "t2"
+                && path == "/w/src/resolve.rs"
+                && old.contains(".filter(|p| p.exists())")
+                && new.contains("split_paths")
+        )),
+        "{events:?}"
+    );
     let diff = events
         .iter()
         .find_map(|e| match e {
@@ -392,6 +448,150 @@ async fn steer_racing_the_turn_end_never_emits_steered_after_done() {
     );
 }
 
+/// A message arriving while the agent runs a turn it started itself (a
+/// background-task wake) must not cancel that work: it waits for the agent
+/// to go quiet, then goes out as the next prompt.
+#[tokio::test]
+async fn steer_into_self_continued_turn_waits_instead_of_cancelling() {
+    let (controls, steer, _token) = controls();
+    let harness = harness();
+    let stream = harness
+        .run(request("scenario:busy-steer"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        let mut steer = Some(steer);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::ToolCall { ref id, .. } if id == "sc-1")
+                && let Some(steer) = &steer
+            {
+                steer
+                    .send(SteerMessage {
+                        prompt: "what about now".into(),
+                        message_id: None,
+                        attachments: Vec::new(),
+                    })
+                    .await
+                    .expect("steer sent");
+            }
+            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "fresh answer") {
+                steer = None;
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    assert!(
+        !events.contains(&AgentEvent::TextDelta {
+            text: "CANCELLED-SELF-CONTINUED-WORK".into()
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "fresh answer".into()
+        }),
+        "{events:?}"
+    );
+    let finished = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolResult { id, .. } if id == "sc-1"))
+        .expect("self-continued tool finished");
+    let steered = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .expect("held steer delivered");
+    assert!(
+        finished < steered,
+        "steer must wait for the self-continued work: {events:?}"
+    );
+}
+
+/// Several messages during one self-continued turn: no cancel, and each goes
+/// out once, in order, after the agent's own work finishes.
+#[tokio::test]
+async fn burst_of_steers_into_self_continued_turn_all_deliver_in_order() {
+    let (controls, steer, _token) = controls();
+    let harness = harness();
+    let stream = harness
+        .run(request("scenario:busy-burst"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(30), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        let mut steer = Some(steer);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            let word = match &ev {
+                AgentEvent::ToolCall { id, .. } if id == "sc-3" => Some("one"),
+                AgentEvent::TextDelta { text } if text == "tick-1" => Some("two"),
+                AgentEvent::TextDelta { text } if text == "tick-3" => Some("three"),
+                _ => None,
+            };
+            if let (Some(word), Some(steer)) = (word, &steer) {
+                steer
+                    .send(SteerMessage {
+                        prompt: format!("msg {word}"),
+                        message_id: None,
+                        attachments: Vec::new(),
+                    })
+                    .await
+                    .expect("steer sent");
+            }
+            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "reply three") {
+                steer = None;
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    let texts: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.starts_with("CANCELLED") || t.starts_with("OUT-OF-ORDER")),
+        "{events:?}"
+    );
+    let replies: Vec<&str> = texts
+        .iter()
+        .copied()
+        .filter(|t| t.starts_with("reply "))
+        .collect();
+    assert_eq!(
+        replies,
+        ["reply one", "reply two", "reply three"],
+        "{events:?}"
+    );
+    let finished = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolResult { id, .. } if id == "sc-3"))
+        .expect("self-continued tool finished");
+    let first_steered = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .expect("held steers delivered");
+    assert!(
+        finished < first_steered,
+        "steers must wait for the self-continued work: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn rejected_steer_queues_and_delivers_at_the_turn_boundary() {
     let (controls, steer, _token) = controls();
@@ -597,14 +797,14 @@ async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
     // after launch, and the static catalog is served instead.
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let broken = dir.path().join("broken-pi-acp");
+    let broken = dir.path().join("broken-acp");
     std::fs::write(&broken, "#!/bin/sh\nexit 1\n").unwrap();
     std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let harness = AcpHarness::pi().with_executable(broken);
+    let harness = AcpHarness::hermes().with_executable(broken);
     assert!(harness.installed());
     let models = harness.models().await.expect("static fallback");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, vec!["default"], "{models:?}");
+    assert_eq!(ids, vec!["hermes-4-405b", "hermes-4-70b"], "{models:?}");
 }
 
 #[tokio::test]
@@ -612,7 +812,7 @@ async fn missing_override_is_not_installed_and_fails_discovery() {
     // An override that points at nothing is not an installed agent: the
     // registry must not offer it, and discovery names the problem instead of
     // quietly serving a catalog for a binary that can never launch.
-    let harness = AcpHarness::pi().with_executable("/nonexistent/never-a-pi-acp");
+    let harness = AcpHarness::hermes().with_executable("/nonexistent/never-an-acp");
     assert!(!harness.installed());
     let err = harness.models().await.expect_err("missing override");
     assert!(
@@ -666,22 +866,12 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
     assert!(hermes.reasoning_levels().is_empty());
 
-    let pi = AcpHarness::pi();
+    let pi = harness_adapters::PiHarness::new();
     assert_eq!(pi.id(), HarnessId::Pi);
     assert_eq!(pi.display_name(), "Pi");
     assert!(pi.supports_steering());
-    assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
-    assert_eq!(
-        pi.reasoning_levels(),
-        &[
-            harness_proto::ReasoningLevel::Minimal,
-            harness_proto::ReasoningLevel::Low,
-            harness_proto::ReasoningLevel::Medium,
-            harness_proto::ReasoningLevel::High,
-            harness_proto::ReasoningLevel::XHigh,
-            harness_proto::ReasoningLevel::Max,
-        ]
-    );
+    assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
+    assert!(pi.reasoning_levels().is_empty());
 }
 
 fn antigravity_harness() -> AcpHarness {
@@ -1262,6 +1452,655 @@ async fn devin_missing_variant_is_bounded_and_never_prompts() {
     assert!(!dir.path().join("prompted").exists());
 }
 
+#[cfg(unix)]
+fn devin_grouped_fixture() -> (tempfile::TempDir, AcpHarness) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("devin.py");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import json, pathlib, sys
+root = pathlib.Path(__file__).parent
+
+def emit(frame):
+    print(json.dumps(dict(jsonrpc='2.0', **frame)), flush=True)
+
+def options(model, thought, thoughts, speed, speeds):
+    result = [
+        {'id':'model', 'category':'model', 'type':'select', 'currentValue':model,
+         'options':[{'value':v, 'name':v} for v in [
+             'fusion-lead-model-1-high-sidekick-worker-model-2-high',
+             'fusion-lead-model-1-high-sidekick-worker-model-2-medium',
+             'swe-1-7', 'swe-2-high', 'adaptive']]},
+        {'id':'thinking', 'category':'thought_level', 'type':'select',
+         'currentValue':thought,
+         'options':[{'value':t, 'name':t} for t in thoughts]},
+    ]
+    state = (root / 'state').read_text().strip()
+    if model.startswith('fusion-') and state != 'speed-unavailable':
+        shown = {'speed-few-choices':['fast'], 'speed-standard-only':['standard']}.get(state, speeds)
+        result.append({'id':'speed', 'category':'model_config', 'type':'select',
+                       'currentValue':speed,
+                       'options':[{'value':s, 'name':s} for s in shown]})
+    return result
+
+if sys.argv[1:] == ['models', 'list', '--format', 'json']:
+    print(json.dumps({'families':[{'variants':[
+        {'model_uid':'swe-2-high','label':'SWE-2 High'},
+        {'model_uid':'swe-2-max','label':'SWE-2 Max'}]}]}))
+    sys.exit(0)
+assert sys.argv[1:] == ['acp'], sys.argv
+model = 'swe-1-7'
+thought = 'high'
+thoughts = ['low','medium','high','xhigh','max']
+speed = 'standard'
+speeds = ['standard','fast']
+
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get('method')
+    result = {}
+    if method == 'initialize':
+        result = {'protocolVersion':1, 'agentCapabilities':{}}
+    elif method == 'session/new':
+        thought = (root / 'thought').read_text().strip()
+        model = (root / 'start-model').read_text().strip()
+        speed = (root / 'start-speed').read_text().strip()
+        emit({'method':'session/update', 'params':{'sessionId':'other', 'update':{
+            'sessionUpdate':'config_option_update', 'configOptions':[
+                {'id':'model', 'category':'model', 'type':'select',
+                 'currentValue':'swe-9-high',
+                 'options':[{'value':'swe-9-high', 'name':'SWE-9 High'}]}]}}})
+        result = {'sessionId':'s-1', 'configOptions':options(model, thought, thoughts, speed, speeds)}
+    elif method == 'session/set_config_option':
+        state = (root / 'state').read_text().strip()
+        config_id = req['params']['configId']
+        value = req['params']['value']
+        with (root / 'sets').open('a') as f: f.write(config_id + '=' + value + '\n')
+        if config_id == 'model':
+            if state == 'reject-model':
+                emit({'id':req['id'], 'error':{'code':-32602, 'message':'model unavailable'}})
+                continue
+            assert value in ('swe-2-high', 'adaptive',
+                             'fusion-lead-model-1-high-sidekick-worker-model-2-high',
+                             'fusion-lead-model-1-high-sidekick-worker-model-2-medium'), value
+            thought = 'high'
+            thoughts = ['medium','high'] if state == 'nomax' else ['medium','high','max']
+            if state == 'model-noconfig':
+                model = value
+                result = {}
+            elif state == 'wrong-model':
+                result = {'configOptions':options('swe-1-7', thought, thoughts, speed, speeds)}
+            else:
+                model = value
+                result = {'configOptions':options(model, thought, thoughts, speed, speeds)}
+        elif config_id == 'thinking':
+            if state == 'reject-thought':
+                emit({'id':req['id'], 'error':{'code':-32602, 'message':'thinking unavailable'}})
+                continue
+            if state == 'thought-noconfig':
+                result = {}
+            elif state == 'wrong-thought':
+                result = {'configOptions':options(model, 'high', ['medium','high','max'], speed, speeds)}
+            else:
+                thought = value
+                result = {'configOptions':options(model, thought, ['medium','high','max'], speed, speeds)}
+        elif config_id == 'speed':
+            if state == 'reject-speed':
+                emit({'id':req['id'], 'error':{'code':-32602, 'message':'speed unavailable'}})
+                continue
+            assert model.startswith('fusion-'), model
+            if state == 'speed-noconfig':
+                result = {}
+            elif state == 'wrong-speed':
+                result = {'configOptions':options(
+                    model, thought, thoughts,
+                    'fast' if value == 'standard' else 'standard', speeds)}
+            elif state == 'wrong-model-after-speed':
+                speed = value
+                result = {'configOptions':options('swe-1-7', thought, thoughts, speed, speeds)}
+            else:
+                speed = value
+                result = {'configOptions':options(model, thought, thoughts, speed, speeds)}
+        else:
+            raise AssertionError(config_id)
+    elif method == 'session/prompt':
+        suffix = ':' + speed if model.startswith('fusion-') else ''
+        (root / 'prompted').write_text(model + ':' + thought + suffix)
+        result = {'stopReason':'end_turn'}
+    emit({'id':req['id'], 'result':result})
+    if method == 'session/prompt': break
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.path().join("state"), "ok").unwrap();
+    std::fs::write(dir.path().join("thought"), "high").unwrap();
+    std::fs::write(dir.path().join("start-model"), "swe-1-7").unwrap();
+    std::fs::write(dir.path().join("start-speed"), "standard").unwrap();
+    let harness = AcpHarness::devin().with_executable(script);
+    (dir, harness)
+}
+
+async fn devin_grouped_run(
+    dir: &tempfile::TempDir,
+    harness: &AcpHarness,
+    model: &str,
+    reasoning: Option<ReasoningLevel>,
+) -> Vec<AgentEvent> {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("Say hello");
+    req.model = Some(model.into());
+    req.reasoning = reasoning;
+    req.cwd = dir.path().display().to_string();
+    run_to_end(harness, req, controls).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_selects_representative_and_encoded_effort() {
+    let (dir, harness) = devin_grouped_fixture();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-max", Some(ReasoningLevel::XHigh)).await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("prompted")).unwrap(),
+        "swe-2-high:max"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_inherited_effort_returns_to_the_encoded_level() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("thought"), "medium").unwrap();
+    std::fs::write(dir.path().join("start-model"), "swe-2-high").unwrap();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-high", None).await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("prompted")).unwrap(),
+        "swe-2-high:high"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sets")).unwrap(),
+        "thinking=high\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_suffix_less_model_keeps_generic_effort() {
+    let (dir, harness) = devin_grouped_fixture();
+    let events = devin_grouped_run(&dir, &harness, "adaptive", Some(ReasoningLevel::Medium)).await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("prompted")).unwrap(),
+        "adaptive:medium"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sets")).unwrap(),
+        "model=adaptive\nthinking=medium\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_missing_effort_after_the_model_switch_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "nomax").unwrap();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("thinking level max"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_rejected_model_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "reject-model").unwrap();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("model unavailable"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_rejected_thought_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "reject-thought").unwrap();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("thinking unavailable"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_unconfirmed_thought_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "wrong-thought").unwrap();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("did not confirm"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_model_setter_without_config_options_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "model-noconfig").unwrap();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("refreshed config options"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_thought_setter_without_config_options_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "thought-noconfig").unwrap();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("refreshed config options"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_unconfirmed_model_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "wrong-model").unwrap();
+    let events = devin_grouped_run(&dir, &harness, "swe-2-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("did not confirm"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_missing_family_is_bounded_and_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    let harness = harness.with_handshake_timeout(Duration::from_millis(300));
+    let events = devin_grouped_run(&dir, &harness, "swe-3-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, _)| *status == DoneStatus::Errored),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_disjoint_family_is_never_selected() {
+    let (dir, harness) = devin_grouped_fixture();
+    let harness = harness.with_handshake_timeout(Duration::from_millis(300));
+    let events = devin_grouped_run(&dir, &harness, "gpt-5-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, _)| *status == DoneStatus::Errored),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_grouped_other_session_updates_do_not_satisfy_readiness() {
+    let (dir, harness) = devin_grouped_fixture();
+    let harness = harness.with_handshake_timeout(Duration::from_millis(300));
+    let events = devin_grouped_run(&dir, &harness, "swe-9-max", None).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, _)| *status == DoneStatus::Errored),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+const FUSION_REP_MEDIUM: &str = "fusion-lead-model-1-high-sidekick-worker-model-2-medium";
+const FUSION_REQ_MEDIUM: &str = "fusion-lead-model-1-medium-sidekick-worker-model-2-medium";
+const FUSION_REQ_FAST_MEDIUM: &str =
+    "fusion-lead-model-1-medium-fast-sidekick-worker-model-2-medium";
+
+async fn devin_paired_run(
+    dir: &tempfile::TempDir,
+    harness: &AcpHarness,
+    model: &str,
+    reasoning: Option<ReasoningLevel>,
+    model_options: &[(&str, &str)],
+) -> Vec<AgentEvent> {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("Say hello");
+    req.model = Some(model.into());
+    req.reasoning = reasoning;
+    req.cwd = dir.path().display().to_string();
+    for (opt_id, choice) in model_options {
+        req.model_options
+            .insert((*opt_id).to_owned(), (*choice).into());
+    }
+    run_to_end(harness, req, controls).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_medium_selects_same_worker_representative() {
+    let (dir, harness) = devin_grouped_fixture();
+    let events = devin_paired_run(
+        &dir,
+        &harness,
+        FUSION_REQ_MEDIUM,
+        Some(ReasoningLevel::XHigh),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("prompted")).unwrap(),
+        format!("{FUSION_REP_MEDIUM}:medium:standard")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sets")).unwrap(),
+        format!("model={FUSION_REP_MEDIUM}\nthinking=medium\n")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_exact_representative_resets_effort_and_speed() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("thought"), "medium").unwrap();
+    std::fs::write(dir.path().join("start-speed"), "fast").unwrap();
+    std::fs::write(dir.path().join("start-model"), FUSION_REP_MEDIUM).unwrap();
+    let events = devin_paired_run(&dir, &harness, FUSION_REP_MEDIUM, None, &[]).await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("prompted")).unwrap(),
+        format!("{FUSION_REP_MEDIUM}:high:standard")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sets")).unwrap(),
+        "thinking=high\nspeed=standard\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_fast_variant_overrides_model_options_speed() {
+    let (dir, harness) = devin_grouped_fixture();
+    let events = devin_paired_run(
+        &dir,
+        &harness,
+        FUSION_REQ_FAST_MEDIUM,
+        None,
+        &[("speed", "standard")],
+    )
+    .await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("prompted")).unwrap(),
+        format!("{FUSION_REP_MEDIUM}:medium:fast")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sets")).unwrap(),
+        format!("model={FUSION_REP_MEDIUM}\nthinking=medium\nspeed=fast\n")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_standard_variant_ignores_model_options_speed() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("start-speed"), "fast").unwrap();
+    let events = devin_paired_run(
+        &dir,
+        &harness,
+        FUSION_REQ_MEDIUM,
+        None,
+        &[("speed", "fast")],
+    )
+    .await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("prompted")).unwrap(),
+        format!("{FUSION_REP_MEDIUM}:medium:standard")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sets")).unwrap(),
+        format!("model={FUSION_REP_MEDIUM}\nthinking=medium\nspeed=standard\n")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_disjoint_worker_or_lead_is_bounded() {
+    let (dir, harness) = devin_grouped_fixture();
+    let harness = harness.with_handshake_timeout(Duration::from_millis(300));
+    for model in [
+        "fusion-lead-model-1-medium-sidekick-worker-model-2-low",
+        "fusion-lead-model-1-medium-sidekick-worker-model-3-medium",
+        "fusion-lead-model-2-medium-sidekick-worker-model-2-medium",
+    ] {
+        let events = devin_paired_run(&dir, &harness, model, None, &[]).await;
+        assert!(
+            dones(&events)
+                .iter()
+                .any(|(status, _)| *status == DoneStatus::Errored),
+            "{model}: {events:?}"
+        );
+    }
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_rejected_speed_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "reject-speed").unwrap();
+    std::fs::write(dir.path().join("start-speed"), "fast").unwrap();
+    let events = devin_paired_run(&dir, &harness, FUSION_REQ_MEDIUM, None, &[]).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("speed unavailable"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_speed_setter_without_config_options_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "speed-noconfig").unwrap();
+    std::fs::write(dir.path().join("start-speed"), "fast").unwrap();
+    let events = devin_paired_run(&dir, &harness, FUSION_REQ_MEDIUM, None, &[]).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("refreshed config options"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_unconfirmed_speed_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "wrong-speed").unwrap();
+    std::fs::write(dir.path().join("start-speed"), "fast").unwrap();
+    let events = devin_paired_run(&dir, &harness, FUSION_REQ_MEDIUM, None, &[]).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("did not confirm"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_missing_speed_option_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "speed-unavailable").unwrap();
+    let events = devin_paired_run(&dir, &harness, FUSION_REQ_MEDIUM, None, &[]).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error.as_deref().is_some_and(|e| e.contains("speed"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_missing_speed_choice_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "speed-few-choices").unwrap();
+    std::fs::write(dir.path().join("start-speed"), "fast").unwrap();
+    let events = devin_paired_run(&dir, &harness, FUSION_REQ_MEDIUM, None, &[]).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error.as_deref().is_some_and(|e| e.contains("speed"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_missing_fast_speed_choice_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "speed-standard-only").unwrap();
+    let events = devin_paired_run(&dir, &harness, FUSION_REQ_FAST_MEDIUM, None, &[]).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error.as_deref().is_some_and(|e| e.contains("speed"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devin_paired_speed_setter_changing_model_never_prompts() {
+    let (dir, harness) = devin_grouped_fixture();
+    std::fs::write(dir.path().join("state"), "wrong-model-after-speed").unwrap();
+    std::fs::write(dir.path().join("start-speed"), "fast").unwrap();
+    let events = devin_paired_run(&dir, &harness, FUSION_REQ_MEDIUM, None, &[]).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, error)| *status == DoneStatus::Errored
+                && error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("did not confirm"))),
+        "{events:?}"
+    );
+    assert!(!dir.path().join("prompted").exists());
+}
+
 #[test]
 fn antigravity_sign_in_preserves_relative_home_auth_in_a_separate_process() {
     let parent_cwd = tempfile::tempdir().unwrap();
@@ -1406,16 +2245,16 @@ async fn antigravity_spawn_failure_returns_an_error_for_the_engine_to_surface() 
     assert!(error.to_string().contains("missing-acp-server"), "{error}");
 }
 
-fn pi_fixture() -> AcpHarness {
-    AcpHarness::pi()
+fn lifecycle_fixture() -> AcpHarness {
+    AcpHarness::hermes()
         .with_executable(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-pi-acp.sh"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-lifecycle-acp.sh"),
         )
         .with_graces(Duration::from_millis(100), Duration::from_millis(150))
 }
 
 #[tokio::test]
-async fn pi_crash_reports_status_and_stderr_once() {
+async fn acp_crash_reports_status_and_stderr_once() {
     for (prompt, status, tail) in [
         ("crash", "exit code 23", "last stderr context"),
         ("signal-crash", "signal 9", "signal context"),
@@ -1426,7 +2265,7 @@ async fn pi_crash_reports_status_and_stderr_once() {
         ),
     ] {
         let (controls, _steer, _) = controls();
-        let events = run_to_end(&pi_fixture(), request(prompt), controls).await;
+        let events = run_to_end(&lifecycle_fixture(), request(prompt), controls).await;
         let done = dones(&events);
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].0, DoneStatus::Errored);
@@ -1436,9 +2275,9 @@ async fn pi_crash_reports_status_and_stderr_once() {
 }
 
 #[tokio::test]
-async fn pi_idle_crash_then_load_preserves_session() {
+async fn acp_idle_crash_then_load_preserves_session() {
     let (ctl, _steer, _) = controls();
-    let events = run_to_end(&pi_fixture(), request("idle-crash"), ctl).await;
+    let events = run_to_end(&lifecycle_fixture(), request("idle-crash"), ctl).await;
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
     let session = events
         .iter()
@@ -1451,7 +2290,7 @@ async fn pi_idle_crash_then_load_preserves_session() {
     drop(steer);
     let mut req = request("resumed");
     req.resume = Some(session);
-    let events = run_to_end(&pi_fixture(), req, ctl).await;
+    let events = run_to_end(&lifecycle_fixture(), req, ctl).await;
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "reply:resumed".into()
@@ -1459,45 +2298,48 @@ async fn pi_idle_crash_then_load_preserves_session() {
 }
 
 #[tokio::test]
-async fn pi_failed_load_announces_lost_context() {
+async fn acp_failed_load_announces_lost_context() {
     let (ctl, steer, _) = controls();
     drop(steer);
     let mut req = request("fresh");
     req.resume = Some("missing".into());
-    let events = run_to_end(&pi_fixture(), req, ctl).await;
+    let events = run_to_end(&lifecycle_fixture(), req, ctl).await;
     assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { message } if message.contains("without the previous context"))));
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
 #[tokio::test]
-async fn pi_frames_and_model_effort_round_trip() {
+async fn acp_frames_and_model_effort_round_trip() {
     let (ctl, steer, _) = controls();
     drop(steer);
     let mut req = request("frames");
     req.model = Some("mock/model".into());
     req.reasoning = Some(ReasoningLevel::Max);
-    let events = run_to_end(&pi_fixture(), req, ctl).await;
+    let events = run_to_end(&lifecycle_fixture(), req, ctl).await;
     assert!(
         events
             .iter()
             .any(|e| matches!(e, AgentEvent::TextDelta { text } if text.len() == 1024 * 1024 + 17))
     );
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
-    assert_eq!(pi_fixture().models().await.unwrap()[0].id, "mock/model");
+    assert_eq!(
+        lifecycle_fixture().models().await.unwrap()[0].id,
+        "mock/model"
+    );
 }
 
 #[tokio::test]
-async fn pi_error_stop_reason_is_failed() {
+async fn acp_error_stop_reason_is_failed() {
     let (ctl, steer, _) = controls();
     drop(steer);
-    let events = run_to_end(&pi_fixture(), request("error"), ctl).await;
+    let events = run_to_end(&lifecycle_fixture(), request("error"), ctl).await;
     assert_eq!(dones(&events)[0].0, DoneStatus::Errored);
 }
 
 #[tokio::test]
-async fn pi_interrupt_error_and_duplicate_terminal_settle_once() {
+async fn acp_interrupt_error_and_duplicate_terminal_settle_once() {
     let (ctl, _steer, token) = controls();
-    let mut stream = pi_fixture()
+    let mut stream = lifecycle_fixture()
         .run(request("interrupt-error"), ctl)
         .await
         .unwrap();
@@ -1518,9 +2360,9 @@ async fn pi_interrupt_error_and_duplicate_terminal_settle_once() {
 }
 
 #[tokio::test]
-async fn pi_interrupt_kills_tool_process_group() {
+async fn acp_interrupt_kills_tool_process_group() {
     let (ctl, _steer, token) = controls();
-    let mut stream = pi_fixture().run(request("tree"), ctl).await.unwrap();
+    let mut stream = lifecycle_fixture().run(request("tree"), ctl).await.unwrap();
     let mut tree_pids = Vec::new();
     let events = tokio::time::timeout(Duration::from_secs(5), async {
         let mut events = Vec::new();
@@ -1551,20 +2393,20 @@ async fn pi_interrupt_kills_tool_process_group() {
 }
 
 #[tokio::test]
-async fn pi_rejected_model_config_keeps_default_and_runs_prompt() {
+async fn acp_rejected_model_config_keeps_default_and_runs_prompt() {
     let (ctl, steer, _) = controls();
     drop(steer);
     let mut req = request("config-rejected");
     req.model = Some("mock/reject".into());
-    let events = run_to_end(&pi_fixture(), req, ctl).await;
+    let events = run_to_end(&lifecycle_fixture(), req, ctl).await;
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
 }
 
 #[tokio::test]
-async fn pi_dropping_stream_terminates_tool_tree() {
+async fn acp_dropping_stream_terminates_tool_tree() {
     let (ctl, _steer, _) = controls();
-    let mut stream = pi_fixture().run(request("tree"), ctl).await.unwrap();
+    let mut stream = lifecycle_fixture().run(request("tree"), ctl).await.unwrap();
     let mut pids = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while pids.len() < 2 {
@@ -1697,7 +2539,7 @@ async fn foreign_notifications_and_permissions_cannot_affect_parent_turn() {
 async fn cancel_watchdog_ignores_late_settlement_for_all_acp_specs() {
     for adapter in [
         AcpHarness::grok(),
-        AcpHarness::pi(),
+        AcpHarness::devin(),
         AcpHarness::antigravity(),
     ] {
         let adapter = adapter
@@ -1821,8 +2663,8 @@ async fn antigravity_stdout_sign_in_and_sibling_environment_on_every_spawn() {
     );
 }
 
-async fn pi_boundary_steer(scenario: &str, trigger_on_done: bool) {
-    let adapter = AcpHarness::pi().with_executable(
+async fn acp_boundary_steer(scenario: &str, trigger_on_done: bool) {
+    let adapter = AcpHarness::devin().with_executable(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-robust-acp.py"),
     );
     let (ctl, steer, _) = controls();
@@ -1875,13 +2717,13 @@ async fn pi_boundary_steer(scenario: &str, trigger_on_done: bool) {
 }
 
 #[tokio::test]
-async fn pi_without_steering_extension_queues_live_steer_once() {
-    pi_boundary_steer("steer-live", false).await;
+async fn acp_without_steering_extension_queues_live_steer_once() {
+    acp_boundary_steer("steer-live", false).await;
 }
 
 #[tokio::test]
-async fn pi_without_steering_extension_dispatches_idle_steer_immediately() {
-    pi_boundary_steer("steer-idle", true).await;
+async fn acp_without_steering_extension_dispatches_idle_steer_immediately() {
+    acp_boundary_steer("steer-idle", true).await;
 }
 
 #[test]
@@ -1995,7 +2837,6 @@ async fn all_acp_harnesses_use_project_scoped_session_command_updates() {
         AcpHarness::devin(),
         AcpHarness::grok(),
         AcpHarness::hermes(),
-        AcpHarness::pi(),
         AcpHarness::antigravity(),
     ] {
         let h = h.with_executable(fixture_path());
@@ -2019,7 +2860,6 @@ async fn shared_acp_skills_require_explicit_native_command_classification() {
         AcpHarness::devin(),
         AcpHarness::grok(),
         AcpHarness::hermes(),
-        AcpHarness::pi(),
         AcpHarness::antigravity(),
     ] {
         let h = h.with_executable(fixture_path());
@@ -2027,11 +2867,7 @@ async fn shared_acp_skills_require_explicit_native_command_classification() {
         let skill_dir = cwd.path().join(".agents/skills/harness-fixture-review");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), "---\nname: harness-fixture-review\ndescription: Review changes\n---\nReview the changes.").unwrap();
-        let command_name = if h.id() == HarnessId::Pi {
-            "skill:harness-fixture-review"
-        } else {
-            "harness-fixture-review"
-        };
+        let command_name = "harness-fixture-review";
         std::fs::write(cwd.path().join(".command-fixture"), command_name).unwrap();
         let skills = h
             .skills(&cwd.path().canonicalize().unwrap())
@@ -2042,7 +2878,7 @@ async fn shared_acp_skills_require_explicit_native_command_classification() {
             .into_iter()
             .find(|s| s.name == "harness-fixture-review")
             .unwrap();
-        assert_eq!(skill.command.is_some(), h.id() == HarnessId::Pi);
+        assert!(skill.command.is_none());
         let invocation = Invocation::Skill {
             name: skill.name,
             path: skill.path,
@@ -2050,11 +2886,93 @@ async fn shared_acp_skills_require_explicit_native_command_classification() {
         };
         assert_eq!(
             harness_prompt(&format!("{} inspect tests", invocation.link()), h.id()),
-            if h.id() == HarnessId::Pi {
-                format!("/{command_name} inspect tests")
-            } else {
-                format!("Use the skill {} inspect tests", invocation.prompt_text())
-            }
+            format!("Use the skill {} inspect tests", invocation.prompt_text())
         );
     }
+}
+
+async fn interrupted_elicitation_events(suffix: &str) -> Vec<AgentEvent> {
+    let (mut controls, _steer, _token) = controls();
+    controls.request_input = Box::new(|questions| {
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            // Keep the real input bridge parked before accepting the form.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = tx.send(
+                questions
+                    .into_iter()
+                    .map(|q| UserInputAnswer {
+                        question_id: q.id,
+                        labels: vec!["SQLite".into()],
+                    })
+                    .collect(),
+            );
+        });
+        rx
+    });
+    run_to_end(
+        &harness(),
+        request(&format!("scenario:elicit-interrupted{suffix}")),
+        controls,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn accepted_clarification_recovers_an_unsolicited_interruption() {
+    let events = interrupted_elicitation_events("").await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "resumed after answer".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn repeated_clarification_interruption_surfaces_an_error_without_looping() {
+    let events = interrupted_elicitation_events("-again").await;
+    let notices = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("continuing once")))
+        .count();
+    assert_eq!(notices, 1, "{events:?}");
+    let finished = dones(&events);
+    assert_eq!(finished.len(), 1, "{events:?}");
+    assert_eq!(finished[0].0, DoneStatus::Errored);
+    assert!(
+        finished[0]
+            .1
+            .as_ref()
+            .is_some_and(|error| error.contains("unexpectedly"))
+    );
+}
+
+#[tokio::test]
+async fn explicit_clarification_cancellation_is_not_overridden() {
+    let events = interrupted_elicitation_events("-explicit").await;
+    assert_eq!(dones(&events), vec![(DoneStatus::Interrupted, None)]);
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, AgentEvent::TextDelta { text } if text.contains("continuing once"))
+        )
+    );
+}
+
+#[tokio::test]
+async fn clarification_recovery_does_not_replay_reported_post_answer_work() {
+    let events = interrupted_elicitation_events("-progress").await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { id, .. } if id == "after-answer")),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events)[0].0, DoneStatus::Errored, "{events:?}");
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, AgentEvent::TextDelta { text } if text.contains("continuing once"))
+        )
+    );
 }

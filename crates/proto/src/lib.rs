@@ -4,18 +4,26 @@
 //! Context occupancy is replicated per chat; billing `Usage` remains a harness passthrough.
 
 pub mod agent;
+pub mod delegation;
 pub mod entities;
 pub mod file_mentions;
 pub mod graff_worktree;
 pub mod invocation;
+pub mod mcp_servers;
 pub mod motion;
+pub mod peer_mail;
 pub mod preview;
+pub mod room_delivery;
+pub mod run_errors;
 pub mod sidebar_pins;
 pub mod view;
+pub mod visual;
 pub mod workspace;
 
 pub use agent::*;
+pub use delegation::*;
 pub use entities::*;
+pub use mcp_servers::*;
 pub use preview::*;
 pub use sidebar_pins::*;
 pub use workspace::*;

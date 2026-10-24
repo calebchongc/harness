@@ -2,8 +2,11 @@ name: release
 
 # Build release artifacts and publish them:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
+#   - Arch Linux packages (.pkg.tar.zst, x86_64 + aarch64) via scripts/package-arch.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
 #   - Windows portable zip (x86_64) via scripts/package-windows.ps1
+#   - TUI tarballs (macOS arm64, Linux x86_64 + aarch64) via the tui-release
+#     workflow, called after publish so a TUI failure cannot hold up the app
 # then create a GitHub Release AND upload everything to the
 # `harness-releases` R2 bucket (served at edge.codegraff.com/releases/* for
 # `curl -fsSL https://edge.codegraff.com/install.sh | sh`), bumping latest.txt.
@@ -23,18 +26,26 @@ permissions:
 jobs:
   cursor-compatibility:
     uses: ./.github/workflows/cursor-compatibility.yml
+    secrets: inherit
 
   linux:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04 # x86_64
-          - runner: ubuntu-24.04-arm # aarch64
+          # Built on the oldest runner we can: the binary links the runner's glibc, so a newer
+          # runner (24.04 = glibc 2.39) produces a tarball that will not start on Debian 12
+          # (glibc 2.36), which Codegraff cloud sandboxes run. 22.04 is glibc 2.35.
+          - runner: ubuntu-22.04 # x86_64
+          - runner: ubuntu-22.04-arm # aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # Package install overlaps the toolchain and cache restore; the job
+      # waits for it before the first compile.
       - name: gpui system deps
+        id: system-deps
+        background: true
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -45,13 +56,52 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/kache
+        with:
+          access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
+      - wait: system-deps
+      - name: Native visual sandbox regressions
+        run: cargo test --locked -p harness-visual
       - name: package
-        run: scripts/package-linux.sh
+        run: |
+          scripts/package-linux.sh
+          scripts/package-arch.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ runner.arch }}
-          path: target/package/*.tar.gz
+          path: |
+            target/package/*.tar.gz
+            target/package/*.pkg.tar.zst
           if-no-files-found: error
+
+  # Real pacman install check on the x86_64 package. aarch64 is not covered:
+  # there is no official Arch Linux ARM container image.
+  arch-install-test:
+    needs: linux
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-X64
+      - name: pacman install
+        run: |
+          pacman -Syu --noconfirm
+          pacman -U --noconfirm ./harness-*-linux-x86_64.pkg.tar.zst
+      - name: verify install
+        run: |
+          pacman -Qi harness
+          pacman -Ql harness
+          test -x /usr/bin/harness
+          if ldd /usr/bin/harness | grep 'not found'; then
+            echo "unresolved shared libraries" >&2
+            exit 1
+          fi
 
   # Every platform must build before publishing the release and updater manifest.
   #
@@ -91,6 +141,15 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         if: steps.signing.outputs.enabled == 'true'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/kache
+        if: steps.signing.outputs.enabled == 'true'
+        with:
+          access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: import Developer ID certificate
         if: steps.signing.outputs.enabled == 'true'
         run: |
@@ -155,6 +214,16 @@ jobs:
           if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/kache
+        with:
+          access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          endpoint: ${{ secrets.KACHE_S3_ENDPOINT }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
+      - name: Native visual sandbox regressions
+        run: cargo test --locked -p harness-visual
       - name: package portable app
         run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
       - uses: actions/upload-artifact@v4
@@ -167,7 +236,7 @@ jobs:
 
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.macos.outputs.signed == 'true'
-    needs: [cursor-compatibility, linux, macos, windows]
+    needs: [cursor-compatibility, linux, arch-install-test, macos, windows]
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface
@@ -175,6 +244,9 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CODEGRAFF_CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: d87222df6f3f663e802014f8eb5a274e
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs/releases
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -184,6 +256,7 @@ jobs:
           ver="${GITHUB_REF_NAME#v}"
           ls dist/
           for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
+              linux-x86_64.pkg.tar.zst linux-aarch64.pkg.tar.zst \
               windows-x86_64.zip windows-x86_64.exe; do
             test -f "dist/harness-$ver-$platform" \
               || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
@@ -195,6 +268,10 @@ jobs:
           # This is a byte-for-byte alias of the notarized, stapled DMG from
           # the macOS job. The stable download link does not change per tag.
           cp "dist/harness-$ver-macos-arm64.dmg" dist/Harness-macos-arm64.dmg
+          # The stable Windows link the site and the Windows updater use.
+          cp "dist/harness-$ver-windows-x86_64.zip" dist/Harness-windows-x86_64.zip
+          test -f "docs/releases/v$ver.md" \
+            || { echo "missing docs/releases/v$ver.md (the release notes)"; exit 1; }
           echo "VERSION=$ver" >> "$GITHUB_ENV"
       - name: updater manifest
         run: |
@@ -207,10 +284,11 @@ jobs:
           printf '%s' "$manifest" > manifest.json
       - uses: softprops/action-gh-release@v2
         with:
+          name: Harness v${{ env.VERSION }}
+          body_path: docs/releases/v${{ env.VERSION }}.md
           files: |
             dist/*
             manifest.json
-          generate_release_notes: true
       - name: upload to R2 (edge.codegraff.com/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
@@ -226,3 +304,14 @@ jobs:
           printf '%s' "$VERSION" > latest.txt
           npx wrangler@4 r2 object put harness-releases/latest.txt \
             --file latest.txt --remote
+
+  # The TUI builds last, attached to the just-published release; it is a heavy
+  # build, so it must never block the app artifacts publish already uploaded.
+  tui:
+    needs: publish
+    permissions:
+      contents: write
+    uses: ./.github/workflows/tui-release.yml
+    secrets: inherit
+    with:
+      tag: ${{ github.ref_name }}

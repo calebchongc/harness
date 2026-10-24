@@ -15,6 +15,11 @@ final class DemoDataset {
     var chats: [Chat]
     var sessions: [String: SessionRow]
     var changeRequests: [String: ChangeRequestSummary]
+    /// What each computer reports in `ListHarnesses`, by device id (onboarding).
+    var agents: [String: [AgentDescriptor]]
+    /// The Codegraff account behind Settings → Cloud sandboxes and GitHub CI.
+    @ObservationIgnored lazy var cloud = DemoCloud.standard(
+        connected: !ProcessInfo.processInfo.arguments.contains("-github-ci-new"))
     private var stores: [String: SessionStore] = [:]
     private var streamTask: Task<Void, Never>?
 
@@ -23,19 +28,64 @@ final class DemoDataset {
         userId: "demo", orgId: "demo", deviceId: "ios-demo", deviceName: "iPhone")
 
     init(devices: [DeviceRow], spaces: [Space], chats: [Chat], sessions: [String: SessionRow],
-         changeRequests: [String: ChangeRequestSummary] = [:]) {
+         changeRequests: [String: ChangeRequestSummary] = [:], agents: [String: [AgentDescriptor]] = [:]) {
         self.devices = devices
         self.spaces = spaces
         self.chats = chats
         self.sessions = sessions
         self.changeRequests = changeRequests
+        self.agents = agents
+    }
+
+    /// Deterministic header fixtures for overflow, all-idle fallback and long titles.
+    func configureHeaderStatusFixture(count: Int, allIdle: Bool) {
+        guard let template = chats.first else { return }
+        let now = nowMs()
+        let count = max(1, min(24, count))
+        sessions = [:]
+        chats = (0..<count).map { index in
+            var chat = template
+            chat.id = index == 0 ? "chat-veil" : "header-status-\(index)"
+            chat.title = "Session \(index + 1) — A long planning conversation 📝"
+            chat.lastPromptAt = now - Int64(index * 1_000)
+            chat.lastMessageAt = now - Int64(index * 1_000)
+            chat.lastSeenAt = allIdle ? now : now - 100_000
+            let status: SessionStatus
+            switch index % 4 {
+            case 0: status = .working
+            case 1: status = .awaitingInput
+            case 2: status = .idle
+            default: status = .errored
+            }
+            sessions[chat.id] = SessionRow(chatId: chat.id, deviceId: chat.deviceId,
+                                          status: allIdle ? .idle : status,
+                                          startedAt: now, updatedAt: now)
+            return chat
+        }
+        changeRequests = [:]
+    }
+
+    /// The three onboarding agents, all found and on.
+    private static let allAgentsReady = [AgentDescriptor(id: "graff"), AgentDescriptor(id: "claude-code"), AgentDescriptor(id: "codex")]
+
+    /// A signed-in account with nothing in it yet, for the "Bring in your agent" screen (launch args
+    /// `-onboarding-nocomputer`, `-onboarding-noagent`).
+    static func onboarding(computerOnline: Bool, agentReady: Bool) -> DemoDataset {
+        let now = nowMs()
+        let mac = DeviceRow(id: "dev-mac", name: "MacBook Pro", platform: "macos",
+                            lastSeenAt: computerOnline ? now : now - 86_400_000, createdAt: now - 86_400_000 * 2)
+        let agents: [AgentDescriptor] = agentReady ? allAgentsReady : [
+            AgentDescriptor(id: "graff", installed: true, enabled: false),
+            AgentDescriptor(id: "claude-code", installed: false, canInstall: true),
+        ]
+        return DemoDataset(devices: [mac], spaces: [], chats: [], sessions: [:], agents: ["dev-mac": agents])
     }
 
     static func standard() -> DemoDataset {
         let now = nowMs()
         let mac = DeviceRow(id: "dev-mac", name: "MacBook Pro", platform: "macos",
                             lastSeenAt: now, createdAt: now - 86_400_000 * 30)
-        let vps = DeviceRow(id: "dev-vps", name: "hetzner-01", platform: "linux",
+        let vps = DeviceRow(id: "dev-vps", name: "Codegraff Cloud", platform: "linux",
                             lastSeenAt: now - 600_000, createdAt: now - 86_400_000 * 12)
         let harness = Space(id: "space-harness", deviceId: "dev-mac",
                           path: "/Users/dev/harness", name: nil, gitDetected: true,
@@ -108,7 +158,8 @@ final class DemoDataset {
             ),
         ]
         return DemoDataset(devices: [mac, vps], spaces: [harness, edge],
-                           chats: chats, sessions: sessions, changeRequests: changeRequests)
+                           chats: chats, sessions: sessions, changeRequests: changeRequests,
+                           agents: ["dev-mac": allAgentsReady, "dev-vps": [AgentDescriptor(id: "graff")]])
     }
 
     // MARK: Fake filesystem (folder browser demo)
@@ -140,7 +191,7 @@ final class DemoDataset {
 
     func listRefs(spacePath: String) -> [RepoRef] {
         if let cached = refsByPath[spacePath] { return cached }
-        let seeded: [RepoRef]
+        var seeded: [RepoRef]
         if spacePath.contains("harness") {
             seeded = [
                 RepoRef(name: "main", current: true, worktreePath: nil),
@@ -149,6 +200,12 @@ final class DemoDataset {
                 RepoRef(name: "feature/diff-pane", current: false, worktreePath: nil),
                 RepoRef(name: "fix/tool-colors", current: false, worktreePath: nil),
             ]
+            // UI-test fixture: more refs than the medium detent shows.
+            if ProcessInfo.processInfo.arguments.contains("-many-refs") {
+                seeded += (1...30).map {
+                    RepoRef(name: "chore/batch-\($0)", current: false, worktreePath: nil)
+                }
+            }
         } else {
             seeded = [
                 RepoRef(name: "main", current: true, worktreePath: nil),
@@ -186,6 +243,36 @@ final class DemoDataset {
             seedAppshots(store)
         } else if ProcessInfo.processInfo.arguments.contains("-longhistory") {
             store.setEntries(BenchRunner.syntheticEntries(turns: 200))
+        } else if ProcessInfo.processInfo.arguments.contains("-links") {
+            // Link-tap UI checks: a settled reply with a bare URL and a
+            // markdown link, both loopback so a tap opens the host-link sheet.
+            store.setEntries([
+                MessageEntry(id: "links-ask", role: .user,
+                    parts: [.text(id: "t0", text: "Where is the preview?")],
+                    createdAt: nowMs(), deviceId: "demo", status: .complete, continuationOf: nil),
+                MessageEntry(id: "links-reply", role: .assistant,
+                    parts: [.text(id: "t0", text: "Bare: http://127.0.0.1:3777/bare and markdown: [the preview](http://127.0.0.1:3777/md).")],
+                    createdAt: nowMs(), deviceId: "demo", status: .complete, continuationOf: nil)
+            ])
+        } else if ProcessInfo.processInfo.arguments.contains("-errors") {
+            // Error-card checks: signed out and a usage limit read as such;
+            // a plain failure stays an Error.
+            let error = { (id: String, message: String) in
+                MessageEntry(id: id, role: .assistant, parts: [.error(id: "e0", message: message)],
+                    createdAt: nowMs(), deviceId: "demo", status: .aborted, continuationOf: nil)
+            }
+            let ask = { (id: String, text: String) in
+                MessageEntry(id: id, role: .user, parts: [.text(id: "t0", text: text)],
+                    createdAt: nowMs(), deviceId: "demo", status: .complete, continuationOf: nil)
+            }
+            store.setEntries([
+                ask("errors-ask-1", "Add a retry to the upload step."),
+                error("errors-signed-out", "Not logged in · Please run /login"),
+                ask("errors-ask-2", "Signed in, try again."),
+                error("errors-limit", "Claude usage limit reached — try again after the limit resets."),
+                ask("errors-ask-3", "And once more."),
+                error("errors-plain", "Claude Code exited with status 1: the upload test crashed"),
+            ])
         } else if ProcessInfo.processInfo.arguments.contains("-longprompt") {
             store.setEntries([
                 MessageEntry(id: "long-prompt", role: .user,

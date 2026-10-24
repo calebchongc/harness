@@ -27,6 +27,7 @@ const VIEWER: &str = "viewer-device";
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -376,9 +377,15 @@ async fn queued_run_command_executes_end_to_end() {
         Some((SessionCommandStatus::Applied, None))
     );
 
-    // Journal replay: the full script in order, terminal Done last.
+    // Journal replay: the full script in order, terminal Done last, with the two
+    // consecutive text deltas journaled as one row (#341).
+    let journaled = mock_script().len() - 1;
     let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
-    assert_eq!(replay.len(), mock_script().len());
+    assert_eq!(replay.len(), journaled);
+    assert!(matches!(
+        &replay[1].event,
+        AgentEvent::TextDelta { text } if text == "Hello"
+    ));
     assert!(matches!(
         replay.last().map(|j| &j.event),
         Some(AgentEvent::Done {
@@ -387,7 +394,7 @@ async fn queued_run_command_executes_end_to_end() {
         })
     ));
     let seqs: Vec<u64> = replay.iter().map(|j| j.seq).collect();
-    assert_eq!(seqs, (1..=mock_script().len() as u64).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=journaled as u64).collect::<Vec<_>>());
 
     // The live broadcast delivered the same events.
     let mut broadcast_count = 0usize;
@@ -395,7 +402,7 @@ async fn queued_run_command_executes_end_to_end() {
         assert!(event.seq >= 1);
         broadcast_count += 1;
     }
-    assert_eq!(broadcast_count, mock_script().len());
+    assert_eq!(broadcast_count, journaled);
 
     // Final session status: Idle.
     assert_eq!(
@@ -654,6 +661,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
         handle.doc(),
         "cmd-steer-1",
         SessionCommandPayload::Steer {
+            turn_origin: Default::default(),
             prompt: "also do this".into(),
             message_id: Some("m-2".into()),
         },
@@ -1074,6 +1082,8 @@ async fn respond_input_resolves_pending_question() {
                     header: "Pick".into(),
                     question: "Which one?".into(),
                     options: vec!["a".into(), "b".into()],
+                    prefill: None,
+                    multiline: false,
                     multi_select: false,
                 }])
                 .await
@@ -1227,6 +1237,8 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
                     header: "Pick".into(),
                     question: "Which one?".into(),
                     options: vec!["a".into(), "b".into()],
+                    prefill: None,
+                    multiline: false,
                     multi_select: false,
                 }])
                 .await
@@ -1363,6 +1375,191 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn dismiss_input_cancels_without_answering_and_rejects_stale_requests() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct AskingHarness {
+        runs: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Harness for AskingHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Asking"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let cancelled = self.cancelled.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            tokio::spawn(async move {
+                let answer = (controls.request_input)(vec![harness_proto::UserInputQuestion {
+                    id: "q1".into(),
+                    header: "Publish".into(),
+                    question: "Publish this change?".into(),
+                    options: vec!["Yes".into(), "No".into()],
+                    prefill: None,
+                    multiline: false,
+                    multi_select: false,
+                }])
+                .await;
+                cancelled.store(answer.is_err(), Ordering::SeqCst);
+                controls.interrupt.cancelled().await;
+                drop(tx);
+            });
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let core = assemble(
+        dir.path(),
+        Arc::new(AskingHarness {
+            runs: runs.clone(),
+            cancelled: cancelled.clone(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "run-dismiss",
+        SessionCommandPayload::Run {
+            request: run_request("ask before publishing"),
+            message_id: "m-dismiss".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        MessagePart::Input {
+                            resolved: false,
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "pending question",
+    )
+    .await;
+    let request_id = entries(&core)
+        .iter()
+        .find_map(|entry| {
+            entry.parts.iter().find_map(|part| match part {
+                MessagePart::Input {
+                    request_id,
+                    resolved: false,
+                    ..
+                } => Some(request_id.clone()),
+                _ => None,
+            })
+        })
+        .unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "dismiss-wrong",
+        SessionCommandPayload::DismissInput {
+            request_id: "wrong-request".into(),
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, "dismiss-wrong")
+                .is_some_and(|(status, _)| status == SessionCommandStatus::Rejected)
+        },
+        "wrong dismissal rejected",
+    )
+    .await;
+    assert!(!cancelled.load(Ordering::SeqCst));
+    assert_eq!(
+        core.sessions.session_status(CHAT).unwrap().status,
+        SessionStatus::AwaitingInput
+    );
+
+    queue_as_viewer(
+        handle.doc(),
+        "dismiss-right",
+        SessionCommandPayload::DismissInput {
+            request_id: request_id.clone(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|row| row.status) == Some(SessionStatus::Idle),
+        "dismissed turn settled",
+    )
+    .await;
+    wait_for(
+        || cancelled.load(Ordering::SeqCst),
+        "resolver cancelled rather than answered",
+    )
+    .await;
+    assert!(
+        entries(&core)
+            .iter()
+            .all(|entry| entry.parts.iter().all(|part| {
+                !matches!(
+                    part,
+                    MessagePart::Input {
+                        resolved: false,
+                        ..
+                    }
+                )
+            }))
+    );
+    assert!(
+        entries(&core)
+            .iter()
+            .any(|entry| entry.status == Some(MessageStatus::Aborted))
+    );
+    assert_eq!(
+        command_status(&core, "dismiss-right"),
+        Some((SessionCommandStatus::Applied, None))
+    );
+    queue_as_viewer(
+        handle.doc(),
+        "dismiss-again",
+        SessionCommandPayload::DismissInput { request_id },
+    );
+    wait_for(
+        || {
+            command_status(&core, "dismiss-again")
+                .is_some_and(|(status, _)| status == SessionCommandStatus::Rejected)
+        },
+        "duplicate dismissal rejected",
+    )
+    .await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "dismissal must never replay a prompt or start a turn"
+    );
+}
+
 /// Resilience: interrupting a run that is BLOCKED on a question unparks the
 /// harness immediately (the pending resolver is failed with empty answers),
 /// the entry settles `aborted`, the chip flips terminal (never dangles
@@ -1418,6 +1615,8 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
                         header: "Pick".into(),
                         question: "Which one?".into(),
                         options: vec!["a".into(), "b".into()],
+                        prefill: None,
+                        multiline: false,
                         multi_select: false,
                     }])
                     .await;
@@ -1565,6 +1764,8 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
                     header: "Pick".into(),
                     question: "Which one?".into(),
                     options: vec!["a".into(), "b".into()],
+                    prefill: None,
+                    multiline: false,
                     multi_select: false,
                 };
                 // The pre-fix Claude/Codex shape: surface the question under
@@ -1918,6 +2119,7 @@ async fn real_claude_sees_uploaded_image_inline() {
          Attached images (local files — open them to view):\n- {path}"
     );
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt,
         harness: None,
         model: Some("haiku".into()),
@@ -2383,6 +2585,7 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
         handle.doc(),
         "cmd-steer-park-timer",
         SessionCommandPayload::Steer {
+            turn_origin: Default::default(),
             prompt: "next".into(),
             message_id: Some("m-2".into()),
         },
@@ -2461,7 +2664,8 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
         handle.doc().context_usage(),
         Some(harness_proto::ContextUsage {
             tokens: Some(0),
-            window: Some(200000)
+            window: Some(200000),
+            savings: None,
         })
     );
     assert_eq!(
@@ -2892,4 +3096,162 @@ async fn tool_progress_streams_live_and_never_reaches_the_doc() {
     let doc = serde_json::to_string(&entries(&core)).unwrap();
     assert!(!doc.contains("LIVE-LOG"), "live output leaked into the doc: {doc}");
     assert!(doc.contains("tool-1"), "the tool chip itself still folds");
+}
+
+/// A persistent harness that can end just its current turn
+/// (`Harness::interrupt_turn`), like the Claude CLI: its process (here, the
+/// run task) outlives the interrupted turn and takes the next prompt as a
+/// steer. Counts runs, i.e. agent processes.
+struct TurnInterruptHarness {
+    runs: Arc<std::sync::atomic::AtomicUsize>,
+    turn_interrupt: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Harness for TurnInterruptHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Turn interrupt"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    fn interrupt_turn(&self, _chat_id: &str) -> bool {
+        self.turn_interrupt.notify_one();
+        true
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        mut controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(8);
+        let turn_interrupt = self.turn_interrupt.clone();
+        let token = controls.interrupt.clone();
+        tokio::spawn(async move {
+            let text = format!("{} started", request.prompt);
+            if tx.send(Ok(AgentEvent::TextDelta { text })).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                _ = turn_interrupt.notified() => {}
+                _ = token.cancelled() => {
+                    let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+                    return;
+                }
+            }
+            if tx.send(Ok(done(DoneStatus::Interrupted))).await.is_err() {
+                return;
+            }
+            // The same "process" takes the next prompt.
+            while let Some(steer) = tokio::select! {
+                steer = controls.steering.recv() => steer,
+                _ = token.cancelled() => None,
+            } {
+                let events = [
+                    AgentEvent::Steered {
+                        assistant_message_id: None,
+                        next_assistant_message_id: None,
+                    },
+                    AgentEvent::TextDelta {
+                        text: format!("{} answered", steer.prompt),
+                    },
+                    done(DoneStatus::Completed),
+                ];
+                for event in events {
+                    if tx.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_ends_only_the_turn_when_the_harness_keeps_its_process() {
+    // #364: Stop used to end the whole run, killing the agent process and
+    // every background task in it.
+    const TURN_CHAT: &str = "chat-turn-interrupt";
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let core = assemble(
+        dir.path(),
+        Arc::new(TurnInterruptHarness {
+            runs: runs.clone(),
+            turn_interrupt: Arc::new(tokio::sync::Notify::new()),
+        }),
+    );
+    let handle = core.doc_host.open(TURN_CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-first",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "message-first".into(),
+        },
+    );
+    wait_for(
+        || {
+            core.sessions.session_status(TURN_CHAT).map(|s| s.status)
+                == Some(SessionStatus::Working)
+                && entries_for(&core, TURN_CHAT)
+                    .iter()
+                    .any(|entry| entry.status == Some(MessageStatus::Streaming))
+        },
+        "the first turn to stream",
+    )
+    .await;
+
+    assert!(core.sessions.interrupt(TURN_CHAT).await.unwrap());
+    assert_eq!(
+        core.sessions.session_status(TURN_CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
+    assert!(
+        entries_for(&core, TURN_CHAT)
+            .iter()
+            .any(|entry| entry.status == Some(MessageStatus::Aborted)),
+        "the interrupted turn is stamped aborted"
+    );
+
+    // The parked run takes the next message through its mailbox: no new
+    // process, so background tasks would have survived.
+    core.sessions
+        .dispatch(TURN_CHAT, HarnessId::Mock, run_request("second"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            entries_for(&core, TURN_CHAT).iter().any(|entry| {
+                entry.status == Some(MessageStatus::Complete)
+                    && entry.parts.iter().any(|part| {
+                        matches!(part, MessagePart::Text { text, .. } if text.contains("second answered"))
+                    })
+            })
+        },
+        "the next turn to complete in the same run",
+    )
+    .await;
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one agent process"
+    );
 }

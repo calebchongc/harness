@@ -43,7 +43,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -54,9 +54,11 @@ use sha2::{Digest, Sha256};
 
 use harness_proto::{
     AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
-    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, CHATGPT_PLAN_CONFIRMATION,
+    CHATGPT_PLAN_OFF, GraffLoginProvider, HarnessId,
 };
 
+use crate::graff_logins;
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
 
@@ -90,6 +92,10 @@ const CLAUDE_SHARED_CREDENTIAL_KEYS: &[&str] = &[
 const USAGE_TTL: Duration = Duration::from_secs(60);
 /// An abandoned login flow (dialog dismissed without Cancel) is reaped past this.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
+/// How long a relayed sign-in may take to finish once its redirect reaches
+/// graff: the code exchange, registration and plan check. Inside the
+/// forwarding deadline for CompleteAgentLogin.
+const RELAY_FINISH_WAIT: Duration = Duration::from_secs(90);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Filesystem knobs — env-resolved in production ([`AgentAccountsConfig::detect`]),
@@ -108,6 +114,9 @@ pub struct AgentAccountsConfig {
     /// named, expiring API key minted by its browser login. SEPARATE from
     /// `cursor-agent login`'s session tokens — deliberately never read.
     pub cursor_sdk_auth_file: PathBuf,
+    /// The home dir graff's own sign-ins live under (`~/.xai`, `~/.kimi`,
+    /// `~/.zai`), and the home its login child runs with.
+    pub graff_home: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -130,6 +139,7 @@ impl AgentAccountsConfig {
             claude_config_file,
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
             cursor_sdk_auth_file: home_dir().join(".cursor").join("sdk").join("auth.json"),
+            graff_home: home_dir(),
         }
     }
 
@@ -205,6 +215,8 @@ enum LoginFlow {
     /// completion is the credential file appearing under `home`.
     Spawned {
         harness: HarnessId,
+        /// Only explicit reauthentication replaces the live Codex login.
+        reauthenticate: bool,
         /// The login child; monitored (try_wait) + killable from cancel.
         child: Arc<Mutex<Option<harness_adapters::process::Child>>>,
         /// Throwaway credential dir, reclaimed on cancel/completion.
@@ -223,6 +235,29 @@ enum LoginFlow {
         /// aborting drops the sign-in future, which kills its agent child.
         handle: tokio::task::JoinHandle<()>,
     },
+    /// `graff login <provider>` against the real home. graff writes the
+    /// credential itself, atomically and only on success, so cancelling or a
+    /// failed sign-in leaves the current login alone. Finished means the child
+    /// exited AND the credential changed (or graff printed its `✓` line):
+    /// graff exits 0 even when it refuses.
+    Graff {
+        provider: String,
+        child: Arc<Mutex<Option<harness_adapters::process::Child>>>,
+        started_at: Instant,
+        output: Arc<Mutex<String>>,
+        exit: Arc<Mutex<Option<Option<i32>>>>,
+        /// The credential's stamp when the login started.
+        before: Option<SystemTime>,
+        /// ChatGPT: graff had not registered in the account yet, so this
+        /// sign-in is the first (and shows the one-time plan confirmation).
+        first_registration: bool,
+        /// A ChatGPT sign-in being finished on another device: the only
+        /// callback the host will deliver for it.
+        relay: Option<graff_logins::ChatgptRelay>,
+        /// Anthropic Console: `ant auth login` (run by graff) ends with the
+        /// user pasting a code; it is written here.
+        stdin: Arc<Mutex<Option<harness_adapters::process::ChildStdin>>>,
+    },
 }
 
 #[derive(Default)]
@@ -237,7 +272,17 @@ impl LoginFlow {
         match self {
             LoginFlow::Claude { started_at, .. }
             | LoginFlow::Spawned { started_at, .. }
-            | LoginFlow::Task { started_at, .. } => *started_at,
+            | LoginFlow::Task { started_at, .. }
+            | LoginFlow::Graff { started_at, .. } => *started_at,
+        }
+    }
+
+    /// Still waiting on the user: the child has not exited, or the task has no outcome yet.
+    fn pending(&self) -> bool {
+        match self {
+            LoginFlow::Claude { .. } => true,
+            LoginFlow::Spawned { exit, .. } | LoginFlow::Graff { exit, .. } => lock(exit).is_none(),
+            LoginFlow::Task { state, .. } => lock(state).outcome.is_none(),
         }
     }
 }
@@ -260,7 +305,16 @@ struct UsageSnapshot {
 struct Inner {
     config: AgentAccountsConfig,
     http: reqwest::Client,
+    /// Serializes operations that inspect and then mutate live credential
+    /// stores and slots. Without it a concurrent list can snapshot stale
+    /// credentials over a freshly signed-in slot, or a switch can race a
+    /// removal and sign the wrong live account out.
+    ops: tokio::sync::Mutex<()>,
     flows: Mutex<HashMap<String, LoginFlow>>,
+    /// Explicit recoveries in progress, one per route and account on this execution host
+    /// ([`reauth_route`]): a second viewer (another chat, the phone) attaches to the approval
+    /// already waiting instead of starting another and cancelling the first.
+    reauth_starts: Mutex<HashMap<String, AgentLoginStart>>,
     /// `"{harness}:{accountKey}"` → cached usage windows.
     usage_cache: Mutex<HashMap<String, CachedUsage>>,
     /// Slots with a token refresh in flight — a second refresh of the same
@@ -299,7 +353,9 @@ impl AgentAccounts {
             inner: Arc::new(Inner {
                 config,
                 http,
+                ops: tokio::sync::Mutex::new(()),
                 flows: Mutex::new(HashMap::new()),
+                reauth_starts: Mutex::new(HashMap::new()),
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
             }),
@@ -310,6 +366,12 @@ impl AgentAccounts {
 
     /// Detect both CLIs, auto-snapshot the live logins, and assemble the view.
     pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
+        let _ops = self.inner.ops.lock().await;
+        self.list_locked(force_usage).await
+    }
+
+    /// Caller holds [`Inner::ops`].
+    async fn list_locked(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
         if force_usage {
             lock(&self.inner.usage_cache).clear();
         }
@@ -412,7 +474,8 @@ impl AgentAccounts {
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
-        self.list(false).await?;
+        let _ops = self.inner.ops.lock().await;
+        self.list_locked(false).await?;
         let slot = self
             .read_slots(harness)
             .into_iter()
@@ -432,7 +495,7 @@ impl AgentAccounts {
                 )));
             }
         }
-        self.list(false).await
+        self.list_locked(false).await
     }
 
     async fn activate_claude(&self, slot: &Slot) -> Result<(), EngineError> {
@@ -514,23 +577,124 @@ impl AgentAccounts {
         {
             return Err(EngineError::Other("Unknown account.".into()));
         }
-        let snapshot = self.list(false).await?;
+        let _ops = self.inner.ops.lock().await;
+        let snapshot = self.list_locked(false).await?;
         let active = snapshot
             .accounts
             .iter()
             .any(|a| a.harness == harness && a.id == account_id && a.active);
         if active {
-            return Err(EngineError::Other(
-                "That's the live login — switch to another account first (it would just be \
-                 re-detected)."
-                    .into(),
-            ));
+            // Removing the live login signs the CLI out: dropping only the
+            // slot would re-detect (and re-snapshot) it on the next list, and
+            // the only account must stay removable.
+            let changed = || {
+                EngineError::Other(
+                    "The live login changed while it was being removed — refresh and try again."
+                        .into(),
+                )
+            };
+            let expected = self.live_account_key(harness).ok_or_else(changed)?;
+            if slot_id_for(harness, &expected) != account_id {
+                return Err(changed());
+            }
+            self.sign_out(harness, &expected).await?;
         }
         let file = self.slots_dir(harness)?.join(format!("{account_id}.json"));
         if file.exists() {
             std::fs::remove_file(&file)?;
         }
-        self.list(false).await
+        self.list_locked(false).await
+    }
+
+    /// The live login's account key, from the identity alone (no secret read).
+    fn live_account_key(&self, harness: HarnessId) -> Option<String> {
+        match harness {
+            HarnessId::ClaudeCode => {
+                let cfg = read_json(&self.inner.config.claude_config_file)?;
+                let oauth = cfg.get("oauthAccount")?;
+                str_field(oauth, "accountUuid").or_else(|| str_field(oauth, "emailAddress"))
+            }
+            HarnessId::Codex => self.detect_codex().map(|d| d.account_key),
+            HarnessId::Cursor => self.detect_cursor().map(|d| d.account_key),
+            _ => None,
+        }
+    }
+
+    /// A fresh sign-in replaces the live login when it IS the live account (a
+    /// re-login — otherwise the next list would snapshot the old, possibly
+    /// revoked, live tokens straight back over the fresh slot) or when there
+    /// is no live login at all (nothing to strand; "add" must mean "works").
+    /// Any other live login stays untouched — switching remains explicit.
+    /// Caller holds [`Inner::ops`].
+    async fn adopt_if_live(&self, slot: &Slot) -> Result<(), EngineError> {
+        let live = self.live_account_key(slot.harness);
+        let usable = match slot.harness {
+            HarnessId::Cursor => self.cursor_live_usable(),
+            _ => live.is_some(),
+        };
+        if usable && live.as_deref() != Some(slot.account_key.as_str()) {
+            return Ok(());
+        }
+        match slot.harness {
+            HarnessId::ClaudeCode => self.activate_claude(slot).await?,
+            HarnessId::Codex => self.activate_codex(slot)?,
+            HarnessId::Cursor => self.write_cursor_auth(&slot.credentials)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Sign the CLI's live login out, so removing its slot sticks. Refuses if
+    /// the live login is no longer the one being removed. Caller holds
+    /// [`Inner::ops`].
+    async fn sign_out(
+        &self,
+        harness: HarnessId,
+        expected_account_key: &str,
+    ) -> Result<(), EngineError> {
+        let changed = || {
+            EngineError::Other(
+                "The live login changed while it was being removed — refresh and try again.".into(),
+            )
+        };
+        if self.live_account_key(harness).as_deref() != Some(expected_account_key) {
+            return Err(changed());
+        }
+        match harness {
+            HarnessId::ClaudeCode => {
+                let (live, warning) = self.read_claude_credentials().await;
+                if self.live_account_key(harness).as_deref() != Some(expected_account_key) {
+                    return Err(changed());
+                }
+                if let Some(mut credentials) = live {
+                    // Only the account login goes — machine-shared MCP/plugin
+                    // OAuth in the same blob stays.
+                    if let Some(map) = credentials.as_object_mut() {
+                        map.remove("claudeAiOauth");
+                    }
+                    self.write_claude_credentials(&credentials).await?;
+                } else if let Some(warning) = warning {
+                    return Err(EngineError::Other(format!(
+                        "Couldn't sign Claude out: {warning}"
+                    )));
+                }
+                let file = &self.inner.config.claude_config_file;
+                if let Some(mut cfg) = read_json(file)
+                    && let Some(map) = cfg.as_object_mut()
+                    && map.remove("oauthAccount").is_some()
+                {
+                    write_file_atomic(file, cfg.to_string().as_bytes(), false)?;
+                }
+            }
+            HarnessId::Codex => remove_if_exists(&self.inner.config.codex_auth_file())?,
+            HarnessId::Cursor => remove_if_exists(&self.inner.config.cursor_sdk_auth_file)?,
+            _ => {
+                return Err(EngineError::Other(
+                    "That's the live login — it can't be removed here.".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     // ── add-account OAuth flows ─────────────────────────────────────────────
@@ -539,7 +703,7 @@ impl AgentAccounts {
         self.sweep_flows();
         match harness {
             HarnessId::ClaudeCode => Ok(self.start_claude_login()),
-            HarnessId::Codex => self.start_codex_login().await,
+            HarnessId::Codex => self.start_codex_login(false, false).await,
             HarnessId::Cursor => self.start_cursor_login().await,
             HarnessId::Antigravity => Ok(self.start_antigravity_login()),
             other => Err(EngineError::Other(format!(
@@ -577,6 +741,7 @@ impl AgentAccounts {
             login_id,
             url,
             mode: AgentLoginMode::PasteCode,
+            code: None,
         }
     }
 
@@ -601,7 +766,65 @@ impl AgentAccounts {
         }
     }
 
-    async fn start_codex_login(&self) -> Result<AgentLoginStart, EngineError> {
+    pub async fn start_codex_reauth(
+        &self,
+        device_auth: bool,
+    ) -> Result<AgentLoginStart, EngineError> {
+        let account = self
+            .detect_codex()
+            .map(|d| d.account_key)
+            .unwrap_or_default();
+        let route = reauth_route("codex", device_auth, &account);
+        if let Some(start) = self.pending_reauth(&route) {
+            return Ok(start);
+        }
+        // Preserve the existing live account before an approved recovery replaces it.
+        self.list(false).await?;
+        let start = self.start_codex_login(true, device_auth).await?;
+        lock(&self.inner.reauth_starts).insert(route, start.clone());
+        Ok(start)
+    }
+
+    /// Explicit recovery of a graff provider's sign-in (the ChatGPT route): attaches to a recovery
+    /// already waiting on this host, else starts one. An ordinary sign-in from Accounts still
+    /// supersedes ([`Self::start_graff_login`]). `relay_browser` finishes the ChatGPT sign-in on
+    /// the device that asked (a phone), instead of in the host's browser.
+    pub async fn start_graff_reauth(
+        &self,
+        provider: &str,
+        relay_browser: bool,
+    ) -> Result<AgentLoginStart, EngineError> {
+        // graff keeps one registration per provider per home, so the provider names the account.
+        let route = reauth_route("graff", relay_browser, provider);
+        if let Some(start) = self.pending_reauth(&route) {
+            return Ok(start);
+        }
+        let start = self.start_graff_login_with(provider, relay_browser).await?;
+        lock(&self.inner.reauth_starts).insert(route, start.clone());
+        Ok(start)
+    }
+
+    /// The recovery already waiting for `route`, if its flow is still pending. A finished,
+    /// cancelled or expired flow drops out, so the next demand starts a fresh one.
+    fn pending_reauth(&self, route: &str) -> Option<AgentLoginStart> {
+        self.sweep_flows();
+        let start = lock(&self.inner.reauth_starts).get(route).cloned()?;
+        let pending = lock(&self.inner.flows)
+            .get(&start.login_id)
+            .is_some_and(LoginFlow::pending);
+        if pending {
+            Some(start)
+        } else {
+            lock(&self.inner.reauth_starts).remove(route);
+            None
+        }
+    }
+
+    async fn start_codex_login(
+        &self,
+        reauthenticate: bool,
+        device_auth: bool,
+    ) -> Result<AgentLoginStart, EngineError> {
         self.reap_spawned_flows(HarnessId::Codex);
         let login_id = new_id();
         // A throwaway CODEX_HOME isolates the new login completely — the live
@@ -634,6 +857,9 @@ impl AgentAccounts {
             .stdin(harness_adapters::process::Stdio::null())
             .stdout(harness_adapters::process::Stdio::piped())
             .stderr(harness_adapters::process::Stdio::piped());
+        if device_auth {
+            command.arg("--device-auth");
+        }
         // The CLI opens the authorization tab itself (via the `webbrowser`
         // crate) AND the app opens the page when this start reply lands —
         // users got TWO identical auth.openai.com tabs. `webbrowser` prefers
@@ -641,7 +867,9 @@ impl AgentAccounts {
         // open quiet; a failed open is advisory to `codex login` (it prints
         // the URL and keeps serving the loopback callback either way).
         #[cfg(unix)]
-        if let Some(noop_browser) = ensure_noop_browser(&self.inner.config.root_dir()) {
+        if !reauthenticate
+            && let Some(noop_browser) = ensure_noop_browser(&self.inner.config.root_dir())
+        {
             command.env("BROWSER", noop_browser);
         }
         let child = match command.spawn() {
@@ -666,6 +894,7 @@ impl AgentAccounts {
             login_id.clone(),
             LoginFlow::Spawned {
                 harness: HarnessId::Codex,
+                reauthenticate,
                 child,
                 home,
                 started_at: Instant::now(),
@@ -673,12 +902,48 @@ impl AgentAccounts {
                 exit: exit.clone(),
             },
         );
-        let url = await_login_url(&output, &exit, scan_openai_url).await;
+        if device_auth {
+            return self
+                .await_device_login(&login_id, &output, &exit, crate::device_login::codex_prompt)
+                .await;
+        }
+        let url = if reauthenticate {
+            String::new()
+        } else {
+            await_login_url(&output, &exit, scan_openai_url).await
+        };
         Ok(AgentLoginStart {
             login_id,
             url,
-            mode: AgentLoginMode::Browser,
+            mode: if reauthenticate {
+                AgentLoginMode::HostBrowser
+            } else {
+                AgentLoginMode::Browser
+            },
+            code: None,
         })
+    }
+
+    async fn await_device_login(
+        &self,
+        login_id: &str,
+        output: &Arc<Mutex<String>>,
+        exit: &Arc<Mutex<Option<Option<i32>>>>,
+        parse: fn(&str, &str) -> Option<AgentLoginStart>,
+    ) -> Result<AgentLoginStart, EngineError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(start) = parse(login_id, &lock(output)) {
+                return Ok(start);
+            }
+            if lock(exit).is_some() || Instant::now() > deadline {
+                self.cancel_login(login_id);
+                return Err(EngineError::Other(
+                    "Device sign-in did not start. Update the agent CLI and enable device-code login in your ChatGPT security settings, then try again.".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// antigravity: the acp server's own google sign-in, run when the agent is
@@ -727,6 +992,7 @@ impl AgentAccounts {
             login_id,
             url: String::new(),
             mode: AgentLoginMode::Browser,
+            code: None,
         }
     }
 
@@ -766,6 +1032,7 @@ impl AgentAccounts {
             login_id.clone(),
             LoginFlow::Spawned {
                 harness: HarnessId::Cursor,
+                reauthenticate: false,
                 child,
                 home,
                 started_at: Instant::now(),
@@ -778,6 +1045,474 @@ impl AgentAccounts {
             login_id,
             url,
             mode: AgentLoginMode::Browser,
+            code: None,
+        })
+    }
+
+    // ── graff's own provider sign-ins (xAI, Kimi, Z.AI) ─────────────────────
+
+    /// graff's sign-in providers on this device, and whether each has a login.
+    pub fn list_graff_logins(&self) -> Vec<GraffLoginProvider> {
+        graff_logins::list(&self.inner.config.graff_home)
+    }
+
+    /// Sign out of one graff provider by removing its credential file. A
+    /// sign-in still waiting on that provider is dropped first, so it can't
+    /// write the credential back after the user asked for it gone.
+    ///
+    /// ChatGPT signs out through `graff logout chatgpt-new` instead: graff
+    /// revokes the session and keeps its app registration and account, so the
+    /// next sign-in on this device skips the consent screen. Deleting the
+    /// record would leave the session live and register graff again.
+    pub async fn sign_out_graff_login(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<GraffLoginProvider>, EngineError> {
+        self.reap_graff_flows(provider);
+        if provider == "chatgpt-new" {
+            self.graff_logout(provider).await?;
+            return Ok(self.list_graff_logins());
+        }
+        graff_logins::sign_out(&self.inner.config.graff_home, provider).map_err(|err| {
+            EngineError::Other(format!("Could not sign out of {provider}: {err}"))
+        })?;
+        Ok(self.list_graff_logins())
+    }
+
+    /// Run `graff logout <provider>` against this service's graff home.
+    async fn graff_logout(&self, provider: &str) -> Result<(), EngineError> {
+        let mut command = harness_adapters::graff_logout_command(provider)
+            .await
+            .map_err(|err| {
+                EngineError::Other(match err {
+                    harness_adapters::HarnessError::NotInstalled(_) => {
+                        "The `graff` CLI was not found on this device.".to_string()
+                    }
+                    other => format!("Could not resolve the graff CLI to sign out: {other}"),
+                })
+            })?;
+        command.stdin(harness_adapters::process::Stdio::null());
+        #[cfg(unix)]
+        command.env("HOME", &self.inner.config.graff_home);
+        // Revoking is one request to OpenAI; don't hold the RPC forever.
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .map_err(|_| EngineError::Other("graff did not finish signing out.".into()))?
+            .map_err(|err| EngineError::Other(format!("Could not run graff logout: {err}")))?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let signed_out = graff_logins::chatgpt_record(&self.inner.config.graff_home)
+            .is_none_or(|record| !record.signed_in);
+        if output.status.success() && signed_out {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!(
+                "Could not sign out of ChatGPT: {}",
+                graff_logins::failure_message(&text)
+            )))
+        }
+    }
+
+    /// `graff login anthropic`: hand the code Anthropic's page showed to the
+    /// waiting `ant auth login`, then wait for graff to report the sign-in.
+    /// None when `login_id` is not such a sign-in.
+    async fn complete_graff_paste(
+        &self,
+        login_id: &str,
+        code: &str,
+    ) -> Option<Result<(), EngineError>> {
+        let (stdin, output, exit) = match lock(&self.inner.flows).get(login_id) {
+            Some(LoginFlow::Graff {
+                provider,
+                stdin,
+                output,
+                exit,
+                ..
+            }) if provider == "anthropic" => (stdin.clone(), output.clone(), exit.clone()),
+            _ => return None,
+        };
+        let code = code.trim();
+        if code.is_empty() {
+            return Some(Err(EngineError::Other(
+                "That code looks empty — paste the whole code.".into(),
+            )));
+        }
+        let Some(mut pipe) = lock(&stdin).take() else {
+            return Some(Err(EngineError::Other(
+                "This sign-in attempt expired — start again.".into(),
+            )));
+        };
+        use tokio::io::AsyncWriteExt;
+        if let Err(err) = pipe.write_all(format!("{code}\n").as_bytes()).await {
+            return Some(Err(EngineError::Other(format!(
+                "Could not hand the code to the sign-in: {err}"
+            ))));
+        }
+        let _ = pipe.flush().await;
+        drop(pipe);
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while lock(&exit).is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let text = lock(&output).clone();
+        Some(if graff_logins::saw_success(&text) {
+            Ok(())
+        } else {
+            Err(EngineError::Other(graff_logins::failure_message(&text)))
+        })
+    }
+
+    /// Drop a pending sign-in for one graff provider: two children racing to
+    /// write the same credential would confuse both.
+    fn reap_graff_flows(&self, provider: &str) {
+        let stale: Vec<String> = lock(&self.inner.flows)
+            .iter()
+            .filter(|(_, f)| matches!(f, LoginFlow::Graff { provider: p, .. } if p == provider))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.cancel_login(&id);
+        }
+    }
+
+    /// `graff login <provider>`: graff prints the sign-in link (and, for xAI
+    /// and Kimi, a code to confirm), the app shows them, and the flow finishes
+    /// when graff writes its credential. graff runs against the real home, so
+    /// nothing is imported afterwards, and this service never reads the token.
+    /// The home graff runs with on this device (sign-ins, MCP config and caches).
+    pub fn graff_home(&self) -> std::path::PathBuf {
+        self.inner.config.graff_home.clone()
+    }
+
+    pub async fn start_graff_login(&self, provider: &str) -> Result<AgentLoginStart, EngineError> {
+        self.start_graff_login_with(provider, false).await
+    }
+
+    /// An ordinary graff sign-in finished on the device that asked: Settings
+    /// on another computer can't reach this host's browser, whose loopback
+    /// callback ChatGPT's sign-in must land on.
+    pub async fn start_graff_login_relayed(
+        &self,
+        provider: &str,
+    ) -> Result<AgentLoginStart, EngineError> {
+        self.start_graff_login_with(provider, true).await
+    }
+
+    async fn start_graff_login_with(
+        &self,
+        provider: &str,
+        relay_browser: bool,
+    ) -> Result<AgentLoginStart, EngineError> {
+        self.sweep_flows();
+        let home = self.inner.config.graff_home.clone();
+        if graff_logins::credential_path(&home, provider).is_none() {
+            return Err(EngineError::Other(format!(
+                "graff can't sign in to {provider} from here"
+            )));
+        }
+        if relay_browser && provider != "chatgpt-new" {
+            return Err(EngineError::Other(format!(
+                "{provider} sign-in can't be finished on another device"
+            )));
+        }
+        self.reap_graff_flows(provider);
+        let root = self.inner.config.root_dir();
+        let no_open = std::fs::create_dir_all(&root)
+            .ok()
+            .and_then(|()| graff_logins::no_open_dir(&root));
+        if relay_browser && no_open.is_none() {
+            return Err(EngineError::Other(
+                "This execution device can't hand its ChatGPT sign-in to another device.".into(),
+            ));
+        }
+        let mut command = harness_adapters::graff_login_command(
+            provider,
+            // The ChatGPT sign-in opens the host's browser unless another
+            // device is finishing it.
+            if provider == "chatgpt-new" && !relay_browser {
+                None
+            } else {
+                no_open.as_deref()
+            },
+        )
+        .await
+        .map_err(|err| {
+            EngineError::Other(match err {
+                harness_adapters::HarnessError::NotInstalled(hint) => format!(
+                    "The `graff` CLI was not found on this device — install it first. ({hint})"
+                ),
+                other => format!("Could not resolve the graff CLI for sign-in: {other}"),
+            })
+        })?;
+        let pastes_code = provider == "anthropic";
+        command
+            .stdin(if pastes_code {
+                harness_adapters::process::Stdio::piped()
+            } else {
+                harness_adapters::process::Stdio::null()
+            })
+            .stdout(harness_adapters::process::Stdio::piped())
+            .stderr(harness_adapters::process::Stdio::piped());
+        // graff finds its credential dir from HOME: pin it to the home this
+        // service lists and signs out of.
+        #[cfg(unix)]
+        command.env("HOME", &home);
+        let before = graff_logins::credential_stamp(&home, provider);
+        let first_registration = provider == "chatgpt-new"
+            && !graff_logins::chatgpt_record(&home).is_some_and(|record| record.registered);
+        let mut child = command.spawn().map_err(|err| {
+            EngineError::Other(if err.kind() == std::io::ErrorKind::NotFound {
+                "The `graff` CLI was not found on this device — install it first.".into()
+            } else {
+                format!("Could not start graff login: {err}")
+            })
+        })?;
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let (child, output, exit) = wire_login_child(child);
+        let login_id = new_id();
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::Graff {
+                provider: provider.to_string(),
+                child,
+                started_at: Instant::now(),
+                output: output.clone(),
+                exit: exit.clone(),
+                before,
+                first_registration,
+                relay: None,
+                stdin,
+            },
+        );
+        // graff asks the provider for the link first, which takes longer than
+        // a local spawn, and a sign-in without a link can't proceed.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        if relay_browser {
+            // Hand out the page only once graff listens for its callback.
+            let relay = loop {
+                if let Some(relay) = graff_logins::scan_chatgpt_relay(&lock(&output)) {
+                    break relay;
+                }
+                if lock(&exit).is_some() || Instant::now() > deadline {
+                    self.cancel_login(&login_id);
+                    return Err(EngineError::Other(
+                        "ChatGPT sign-in did not start on the execution device. Update graff there and try again."
+                            .into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            let url = relay.url.clone();
+            if let Some(LoginFlow::Graff { relay: slot, .. }) =
+                lock(&self.inner.flows).get_mut(&login_id)
+            {
+                *slot = Some(relay);
+            }
+            return Ok(AgentLoginStart {
+                login_id,
+                url,
+                mode: AgentLoginMode::RelayBrowser,
+                code: None,
+            });
+        }
+        if provider == "chatgpt-new" {
+            loop {
+                let waiting = lock(&output).contains("waiting for the sign-in on ");
+                if waiting || lock(&exit).is_some() {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    self.cancel_login(&login_id);
+                    return Err(EngineError::Other(
+                        "ChatGPT sign-in did not start on the execution device. Try again there."
+                            .into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // Returning authorization URLs can carry id_token_hint. Keep all
+            // URLs, callbacks and stdout on the host; its CLI opens the browser.
+            return Ok(AgentLoginStart {
+                login_id,
+                url: String::new(),
+                mode: AgentLoginMode::HostBrowser,
+                code: None,
+            });
+        }
+        let url = loop {
+            if let Some(url) = graff_logins::scan_login_url(&lock(&output)) {
+                break Some(url);
+            }
+            if lock(&exit).is_some() || Instant::now() > deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let Some(url) = url else {
+            let message = {
+                let output = lock(&output);
+                if output.trim().is_empty() && lock(&exit).is_none() {
+                    "graff did not offer a sign-in link in time — check the connection and try again."
+                        .to_string()
+                } else {
+                    graff_logins::failure_message(&output)
+                }
+            };
+            self.cancel_login(&login_id);
+            return Err(EngineError::Other(message));
+        };
+        let code = graff_logins::scan_device_code(&lock(&output));
+        Ok(AgentLoginStart {
+            login_id,
+            url,
+            // Anthropic's page shows a code to paste back (CompleteAgentLogin).
+            mode: if pastes_code {
+                AgentLoginMode::PasteCode
+            } else {
+                AgentLoginMode::Browser
+            },
+            code,
+        })
+    }
+
+    /// poll a graff sign-in; `None` when `login_id` isn't one.
+    fn poll_graff_login(&self, login_id: &str) -> Option<AgentLoginPoll> {
+        let (provider, exit, output, before, first_registration) =
+            match lock(&self.inner.flows).get(login_id) {
+                Some(LoginFlow::Graff {
+                    provider,
+                    exit,
+                    output,
+                    before,
+                    first_registration,
+                    ..
+                }) => (
+                    provider.clone(),
+                    exit.clone(),
+                    output.clone(),
+                    *before,
+                    *first_registration,
+                ),
+                _ => return None,
+            };
+        let exited = *lock(&exit);
+        let Some(code) = exited else {
+            return Some(AgentLoginPoll {
+                status: AgentLoginStatus::Pending,
+                message: None,
+                url: None,
+            });
+        };
+        let output = lock(&output).clone();
+        // graff exits 0 even when it refuses, so a sign-in only counts when
+        // the credential changed (or graff said so).
+        let stamp = graff_logins::credential_stamp(&self.inner.config.graff_home, &provider);
+        let landed = code == Some(0)
+            && if provider == "chatgpt-new" {
+                stamp.is_some() && stamp != before && graff_logins::chatgpt_plan_granted(&output)
+            } else {
+                (stamp.is_some() && stamp != before) || graff_logins::saw_success(&output)
+            };
+        self.cancel_login(login_id);
+        Some(if landed {
+            AgentLoginPoll {
+                status: AgentLoginStatus::Done,
+                // The one-time confirmation OpenAI's guidelines ask for after
+                // the first sign-in; returning sign-ins finish quietly.
+                message: (provider == "chatgpt-new" && first_registration)
+                    .then(|| CHATGPT_PLAN_CONFIRMATION.to_string()),
+                url: None,
+            }
+        } else {
+            AgentLoginPoll {
+                status: AgentLoginStatus::Error,
+                message: Some(if provider == "chatgpt-new" {
+                    if graff_logins::chatgpt_plan_denied(&output) {
+                        CHATGPT_PLAN_OFF.into()
+                    } else {
+                        "ChatGPT sign-in did not grant plan access. Sign in again and allow plan usage.".into()
+                    }
+                } else {
+                    graff_logins::failure_message(&output)
+                }),
+                url: None,
+            }
+        })
+    }
+
+    /// Finish a ChatGPT sign-in another device completed: deliver the redirect
+    /// its browser landed on to graff's loopback callback on this host. graff
+    /// holds the PKCE verifier, so it alone exchanges the code; polling then
+    /// reports the outcome. `None` when `login_id` isn't a relayed sign-in.
+    pub async fn complete_relayed_login(
+        &self,
+        login_id: &str,
+        landed: &str,
+    ) -> Option<Result<(), EngineError>> {
+        let (relay, exit) = match lock(&self.inner.flows).get(login_id) {
+            Some(LoginFlow::Graff {
+                relay: Some(relay),
+                exit,
+                ..
+            }) => (relay.clone(), exit.clone()),
+            Some(LoginFlow::Graff { .. }) => {
+                return Some(Err(EngineError::Other(
+                    "This sign-in finishes in the execution device's browser.".into(),
+                )));
+            }
+            _ => return None,
+        };
+        let callback = match graff_logins::relayed_callback(&relay, landed) {
+            Ok(callback) => callback,
+            Err(message) => return Some(Err(EngineError::Other(message.into()))),
+        };
+        // Straight to graff's listener: no proxy, and no following a redirect
+        // off this machine.
+        let client = match reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(RELAY_FINISH_WAIT)
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => return Some(Err(EngineError::Other(err.to_string()))),
+        };
+        let started = Instant::now();
+        // graff answers only after it has exchanged the code with OpenAI
+        // (token, registration, plan check), which can outlast a short
+        // timeout. Only a refused connection means its listener is gone.
+        if let Err(err) = client.get(callback).send().await
+            && err.is_connect()
+        {
+            return Some(Err(EngineError::Other(
+                match self.poll_graff_login(login_id) {
+                    Some(AgentLoginPoll {
+                        status: AgentLoginStatus::Error,
+                        message: Some(message),
+                        ..
+                    }) => format!("The sign-in on the execution device already ended: {message}"),
+                    _ => "The execution device is no longer waiting for this sign-in. Start again."
+                        .into(),
+                },
+            )));
+        }
+        while lock(&exit).is_none() && started.elapsed() < RELAY_FINISH_WAIT {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // graff's own verdict; still running means it is finishing up and the
+        // account list picks the sign-in up when it lands.
+        Some(match self.poll_graff_login(login_id) {
+            Some(AgentLoginPoll {
+                status: AgentLoginStatus::Error,
+                message,
+                ..
+            }) => Err(EngineError::Other(
+                message.unwrap_or_else(|| "The sign-in did not finish.".into()),
+            )),
+            _ => Ok(()),
         })
     }
 
@@ -788,6 +1523,10 @@ impl AgentAccounts {
         login_id: &str,
         code: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        if let Some(done) = self.complete_graff_paste(login_id, code).await {
+            done?;
+            return self.list(false).await;
+        }
         let verifier = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Claude { verifier, .. }) => verifier.clone(),
             _ => {
@@ -922,7 +1661,7 @@ impl AgentAccounts {
             }
         }
 
-        self.write_slot(&Slot {
+        let slot = Slot {
             id: slot_id_for(HarnessId::ClaudeCode, &account_uuid),
             harness: HarnessId::ClaudeCode,
             account_key: account_uuid.clone(),
@@ -937,9 +1676,12 @@ impl AgentAccounts {
             claude_config: Some(serde_json::json!({ "oauthAccount": oauth_account })),
             saved_at: now_ms(),
             created_at: None,
-        })?;
+        };
+        let _ops = self.inner.ops.lock().await;
+        self.write_slot(&slot)?;
+        self.adopt_if_live(&slot).await?;
         lock(&self.inner.flows).remove(login_id);
-        self.list(false).await
+        self.list_locked(false).await
     }
 
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
@@ -947,44 +1689,58 @@ impl AgentAccounts {
         if let Some(poll) = self.poll_task_login(login_id) {
             return Ok(poll);
         }
-        let (harness, home, exit, output) = match lock(&self.inner.flows).get(login_id) {
-            None => {
-                return Err(EngineError::Other(
-                    "This sign-in attempt expired — start again.".into(),
-                ));
-            }
-            Some(LoginFlow::Claude { .. }) => {
-                return Ok(AgentLoginPoll {
-                    status: AgentLoginStatus::Pending,
-                    message: None,
-                    url: None,
-                });
-            }
-            Some(LoginFlow::Task { .. }) => unreachable!("task logins poll above"),
-            Some(LoginFlow::Spawned {
-                harness,
-                home,
-                exit,
-                output,
-                ..
-            }) => (*harness, home.clone(), exit.clone(), output.clone()),
-        };
+        if let Some(poll) = self.poll_graff_login(login_id) {
+            return Ok(poll);
+        }
+        let (harness, home, exit, output, reauthenticate) =
+            match lock(&self.inner.flows).get(login_id) {
+                None => {
+                    return Err(EngineError::Other(
+                        "This sign-in attempt expired — start again.".into(),
+                    ));
+                }
+                Some(LoginFlow::Claude { .. }) => {
+                    return Ok(AgentLoginPoll {
+                        status: AgentLoginStatus::Pending,
+                        message: None,
+                        url: None,
+                    });
+                }
+                Some(LoginFlow::Task { .. }) => unreachable!("task logins poll above"),
+                Some(LoginFlow::Graff { .. }) => unreachable!("graff logins poll above"),
+                Some(LoginFlow::Spawned {
+                    harness,
+                    home,
+                    exit,
+                    output,
+                    reauthenticate,
+                    ..
+                }) => (
+                    *harness,
+                    home.clone(),
+                    exit.clone(),
+                    output.clone(),
+                    *reauthenticate,
+                ),
+            };
         let detected = read_json(&home.join("auth.json")).and_then(|auth| match harness {
             HarnessId::Codex => parse_codex_auth(auth),
             HarnessId::Cursor => parse_cursor_auth(auth),
             _ => None,
         });
         if let Some(detected) = detected {
+            let _ops = self.inner.ops.lock().await;
             self.snapshot_detected(harness, &detected)?;
-            // Cursor "Connect" semantics: with no (usable) live login, the
-            // fresh key becomes the live one immediately — the page's CTA is
-            // "connect so runs work", not "add a spare". A live login stays
-            // untouched (switching remains explicit, codex parity).
-            if harness == HarnessId::Cursor
-                && !self.cursor_live_usable()
-                && let Some(credentials) = &detected.credentials
-            {
-                self.write_cursor_auth(credentials)?;
+            let id = slot_id_for(harness, &detected.account_key);
+            if let Some(slot) = self.read_slots(harness).into_iter().find(|s| s.id == id) {
+                if reauthenticate && harness == HarnessId::Codex {
+                    // Approval explicitly replaces the expired login. Avoid activate(),
+                    // which would snapshot the old credentials over this renewed slot.
+                    self.activate_codex(&slot)?;
+                } else {
+                    // Preserve existing connect/same-account re-login semantics.
+                    self.adopt_if_live(&slot).await?;
+                }
             }
             self.cancel_login(login_id);
             return Ok(AgentLoginPoll {
@@ -1069,6 +1825,13 @@ impl AgentAccounts {
                 let _ = std::fs::remove_dir_all(&home);
             }
             Some(LoginFlow::Task { handle, .. }) => handle.abort(),
+            // graff's credential is written atomically and only on success:
+            // killing the child leaves the current login as it was.
+            Some(LoginFlow::Graff { child, .. }) => {
+                if let Some(c) = lock(&child).as_mut() {
+                    let _ = c.start_kill();
+                }
+            }
             _ => {}
         }
     }
@@ -1201,7 +1964,30 @@ impl AgentAccounts {
             // claude-swap's primitive: update the Keychain item in place — but only
             // when no credentials FILE exists (the file wins when present).
             if !self.inner.config.claude_creds_file().exists() {
-                return keychain::write_credentials(&json).await;
+                match keychain::write_credentials(&json).await {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        // Claude Code reads the Keychain first and its
+                        // credentials file whenever the Keychain holds
+                        // nothing. With no item there, the file is Claude
+                        // Code's own fallback when the Keychain can't be used
+                        // (writes refused, e.g. an engine outside the login
+                        // session): a failed write must not leave the CLI
+                        // signed out. An item we can't update would shadow
+                        // the file, so then say how to recover instead.
+                        if keychain::has_item().await {
+                            return Err(EngineError::Other(format!(
+                                "macOS Keychain wouldn't update the Claude Code login, so it \
+                                 can't be switched here. Run `claude` in a terminal and sign \
+                                 in with /login, then refresh. ({err})"
+                            )));
+                        }
+                        tracing::warn!(
+                            error = %err,
+                            "Keychain write failed; using Claude Code's credentials file"
+                        );
+                    }
+                }
             }
         }
         std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
@@ -1533,8 +2319,24 @@ mod keychain {
 
     const EXEC_TIMEOUT: Duration = Duration::from_secs(15);
 
+    // Tests stand a fake `security` in (never a real Keychain). Per thread:
+    // a `#[tokio::test]` runs on one thread, so other tests never see it.
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static SECURITY_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn security_bin() -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(path) = SECURITY_OVERRIDE.with(|path| path.borrow().clone()) {
+            return path;
+        }
+        std::path::PathBuf::from("security")
+    }
+
     async fn exec(args: &[&str]) -> (bool, String, String) {
-        let run = tokio::process::Command::new("security")
+        let run = tokio::process::Command::new(security_bin())
             .args(args)
             .stdin(std::process::Stdio::null())
             .output();
@@ -1583,6 +2385,14 @@ mod keychain {
                 Some("The Claude Code Keychain entry could not be parsed.".into()),
             ),
         }
+    }
+
+    /// Whether a Claude Code Keychain item exists (no secret is read, so this
+    /// needs no authorization).
+    pub(super) async fn has_item() -> bool {
+        exec(&["find-generic-password", "-s", KEYCHAIN_SERVICE])
+            .await
+            .0
     }
 
     pub(super) async fn write_credentials(json: &str) -> Result<(), EngineError> {
@@ -1997,6 +2807,17 @@ type LoginChildHandles = (
 /// (the URL can land on either stream), and a monitor polls `try_wait` so the
 /// child is reaped without owning it — the cancel path needs concurrent kill
 /// access.
+/// The coalescing key for an explicit recovery on this host: the route (harness, and whether it is
+/// device authorization) and the account it renews.
+/// `remote` = approved on another device (device code, or a relayed browser
+/// sign-in), so it never attaches to a recovery whose browser is on the host.
+fn reauth_route(harness: &str, remote: bool, account: &str) -> String {
+    format!(
+        "{harness}:{}:{account}",
+        if remote { "device" } else { "browser" }
+    )
+}
+
 fn wire_login_child(mut child: harness_adapters::process::Child) -> LoginChildHandles {
     let output = Arc::new(Mutex::new(String::new()));
     for pipe in [
@@ -2101,6 +2922,13 @@ fn urlencode(input: &str) -> String {
 }
 
 /// Atomic write via a same-dir temp file + rename; `secret` = 0600 from birth.
+fn remove_if_exists(file: &Path) -> Result<(), EngineError> {
+    match std::fs::remove_file(file) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), EngineError> {
     let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
     {
@@ -2124,6 +2952,206 @@ fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Keychain the engine can't use (the search and the write both
+    /// refused, as from an engine outside the login session) must not leave
+    /// Claude Code signed out: the login lands in its credentials file,
+    /// Claude Code's own fallback. An item it can't update would shadow that
+    /// file, so then it errs with the way out.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn claude_login_falls_back_to_the_file_when_the_keychain_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let security = home.join("security");
+        let item = home.join("item-exists");
+        std::fs::write(
+            &security,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 find-generic-password) [ -f '{}' ] && exit 0; exit 44 ;;\n\
+                 add-generic-password) echo 'security: SecKeychainItemCreateFromContent (<default>): Unable to obtain authorization for this operation.' >&2; exit 1 ;;\n\
+                 esac\nexit 1\n",
+                item.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+        keychain::SECURITY_OVERRIDE.with(|path| *path.borrow_mut() = Some(security));
+
+        let config = AgentAccountsConfig {
+            data_dir: home.join("data"),
+            claude_config_dir: home.join("claude"),
+            claude_config_file: home.join("claude.json"),
+            codex_home: home.join("codex"),
+            cursor_sdk_auth_file: home.join("cursor.json"),
+            graff_home: home.to_path_buf(),
+        };
+        let accounts = AgentAccounts::new(config.clone());
+        let creds =
+            serde_json::json!({ "claudeAiOauth": { "accessToken": "a", "refreshToken": "r" } });
+
+        accounts
+            .write_claude_credentials(&creds)
+            .await
+            .expect("falls back to the file");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.claude_creds_file()).unwrap()).unwrap();
+        assert_eq!(written, creds);
+        assert_eq!(
+            std::fs::metadata(config.claude_creds_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            accounts.read_claude_credentials().await.0,
+            Some(creds.clone())
+        );
+
+        std::fs::remove_file(config.claude_creds_file()).unwrap();
+        std::fs::write(&item, "").unwrap();
+        let err = accounts.write_claude_credentials(&creds).await.unwrap_err();
+        assert!(err.to_string().contains("/login"), "{err}");
+        assert!(
+            !config.claude_creds_file().exists(),
+            "no file the Keychain item would shadow"
+        );
+
+        keychain::SECURITY_OVERRIDE.with(|path| *path.borrow_mut() = None);
+    }
+
+    #[test]
+    fn recoveries_only_join_on_the_same_route_and_account() {
+        let codex = reauth_route("codex", true, "account-a");
+        assert_eq!(codex, reauth_route("codex", true, "account-a"));
+        assert_ne!(
+            codex,
+            reauth_route("codex", true, "account-b"),
+            "another account never joins"
+        );
+        assert_ne!(
+            codex,
+            reauth_route("codex", false, "account-a"),
+            "nor another route"
+        );
+        assert_ne!(
+            reauth_route("graff", false, "chatgpt-new"),
+            reauth_route("graff", false, "xai"),
+            "each graff provider is its own registration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_anthropic_console_sign_in_takes_the_pasted_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let accounts = AgentAccounts::new(AgentAccountsConfig {
+            data_dir: home.join("data"),
+            claude_config_dir: home.join("claude"),
+            claude_config_file: home.join("claude.json"),
+            codex_home: home.join("codex"),
+            cursor_sdk_auth_file: home.join("cursor.json"),
+            graff_home: home.to_path_buf(),
+        });
+        // Stands in for `graff login anthropic`: reads the code `ant` asks for.
+        let mut command = harness_adapters::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read code; echo \"✓ graff will use your Anthropic Console sign-in ($code)\""])
+            .stdin(harness_adapters::process::Stdio::piped())
+            .stdout(harness_adapters::process::Stdio::piped())
+            .stderr(harness_adapters::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let (child, output, exit) = wire_login_child(child);
+        lock(&accounts.inner.flows).insert(
+            "fixture".into(),
+            LoginFlow::Graff {
+                provider: "anthropic".into(),
+                child,
+                started_at: Instant::now(),
+                output: output.clone(),
+                exit,
+                before: None,
+                first_registration: false,
+                relay: None,
+                stdin,
+            },
+        );
+        assert!(accounts.complete_graff_paste("other", "x").await.is_none());
+        accounts
+            .complete_graff_paste("fixture", "  pasted-code#state \n")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lock(&output).contains("(pasted-code#state)"));
+        // The code went in once; a second paste has nothing to write to.
+        assert!(accounts.complete_graff_paste("fixture", "again").await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn reauth_poll_activates_renewed_credentials_without_overwriting_them() {
+        for (reauthenticate, same_account) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path();
+            let config = AgentAccountsConfig {
+                data_dir: home.join("data"),
+                claude_config_dir: home.join("claude"),
+                claude_config_file: home.join("claude.json"),
+                codex_home: home.join("codex"),
+                cursor_sdk_auth_file: home.join("cursor.json"),
+                graff_home: home.to_path_buf(),
+            };
+            let live_file = config.codex_auth_file();
+            let accounts = AgentAccounts::new(config);
+            let claims = BASE64_URL.encode(br#"{"email":"fixture@example.invalid","https://api.openai.com/auth":{"chatgpt_account_id":"same-account"}}"#);
+            let auth = |access: &str| serde_json::json!({"tokens":{"id_token":format!("header.{claims}.signature"),"access_token":access,"refresh_token":"fixture-refresh"}});
+            let mut old = auth("expired-fixture");
+            if !same_account {
+                let claims = BASE64_URL.encode(br#"{"email":"other@example.invalid","https://api.openai.com/auth":{"chatgpt_account_id":"other-account"}}"#);
+                old["tokens"]["id_token"] = serde_json::json!(format!("header.{claims}.signature"));
+            }
+            let renewed = auth("renewed-fixture");
+            std::fs::create_dir_all(live_file.parent().unwrap()).unwrap();
+            std::fs::write(&live_file, old.to_string()).unwrap();
+            let temporary = home.join("login");
+            std::fs::create_dir_all(&temporary).unwrap();
+            std::fs::write(temporary.join("auth.json"), renewed.to_string()).unwrap();
+            lock(&accounts.inner.flows).insert(
+                "fixture".into(),
+                LoginFlow::Spawned {
+                    harness: HarnessId::Codex,
+                    reauthenticate,
+                    child: Arc::new(Mutex::new(None)),
+                    home: temporary.clone(),
+                    started_at: Instant::now(),
+                    output: Arc::default(),
+                    exit: Arc::new(Mutex::new(Some(Some(0)))),
+                },
+            );
+            assert_eq!(
+                accounts.poll_login("fixture").await.unwrap().status,
+                AgentLoginStatus::Done
+            );
+            assert_eq!(
+                read_json(&live_file).unwrap(),
+                if reauthenticate || same_account {
+                    renewed
+                } else {
+                    old
+                }
+            );
+            assert!(!temporary.exists());
+            assert!(!lock(&accounts.inner.flows).contains_key("fixture"));
+        }
+    }
 
     #[test]
     fn plan_labels() {

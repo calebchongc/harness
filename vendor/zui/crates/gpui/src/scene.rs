@@ -189,12 +189,34 @@ impl Scene {
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        // Sprites of one order are grouped by texture: a batch draws from one
+        // texture, and tile ids, numbered per texture, would interleave them.
+        // Unstable: primitives that overlap never share an order (the bounds
+        // tree orders each above what it overlaps), so sprites with equal
+        // keys never overlap and their relative order draws nothing
+        // differently. Every glyph on screen is sorted each frame, including
+        // those of views replayed from the last frame.
+        self.monochrome_sprites.sort_unstable_by_key(|sprite| {
+            (
+                sprite.order,
+                sprite.tile.texture_id.index,
+                sprite.tile.tile_id,
+            )
+        });
+        self.subpixel_sprites.sort_unstable_by_key(|sprite| {
+            (
+                sprite.order,
+                sprite.tile.texture_id.index,
+                sprite.tile.tile_id,
+            )
+        });
+        self.polychrome_sprites.sort_unstable_by_key(|sprite| {
+            (
+                sprite.order,
+                sprite.tile.texture_id.index,
+                sprite.tile.tile_id,
+            )
+        });
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
     }

@@ -36,12 +36,14 @@ async fn exo_turn_runs_through_the_harness_bridge() {
     assert_eq!(harness.id(), HarnessId::Exo);
     let (_steer_tx, steering) = tokio::sync::mpsc::channel(4);
     let controls = RunControls {
+        origin: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
         mcp_servers: Vec::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "summarize the repo".into(),
         harness: Some(HarnessId::Exo),
         model: Some("default".into()),

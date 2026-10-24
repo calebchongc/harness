@@ -7,6 +7,11 @@ Copyright (c) 2026 Wing. The original MIT license, including its permission
 and warranty notice, is retained verbatim in
 [`third_party/licenses/Zeron-MIT.txt`](third_party/licenses/Zeron-MIT.txt).
 The Harness license does not erase the MIT rights in that upstream material.
+The content-reference parser, HTML document wrapper, carousel and scoped design
+controls in `crates/ui/src/markdown/content_reference.rs` and
+`crates/ui/src/browser/{document.rs,visualize.js,visualize-controls.js}` also adapt
+Zeron's MIT-licensed design stack (zeronsh/zeron #933–#935, authored in the
+sheauhuu/zeron fork). The same retained MIT notice applies.
 
 The CodeGraff emblem and workshop/context illustrations reproduced in
 `docs/brand/` come from [justrach/codegraff](https://github.com/justrach/codegraff)
@@ -49,6 +54,15 @@ Harness bundles the SVG icon set and filename/folder associations from
 [Symbols](https://github.com/miguelsolorio/vscode-symbols/tree/296ef1b62287fb2315cb5651e552e09e8c8e1de8).
 Symbols is MIT licensed. The complete upstream license and copyright notice is
 retained at `crates/ui/assets/file-icons/LICENSE.symbols`.
+
+## Model maker marks
+
+The model picker's maker marks (`crates/ui/assets/icons/maker-*.svg`) are the
+monochrome SVGs from [LobeHub Icons](https://github.com/lobehub/lobe-icons)
+(`@lobehub/icons-static-svg` 1.95.1), reduced to a fixed 24px frame. LobeHub
+Icons is MIT licensed, Copyright (c) 2023 LobeHub; the complete license is
+retained at `crates/ui/assets/icons/LICENSE.lobehub`. The marks identify each
+model's maker and imply no affiliation or endorsement.
 
 ## Bundled theme palette adaptations
 
@@ -156,3 +170,13 @@ Harness code.
 The Zui native overlay renderer adapts Apache-2.0 GPUI code from
 [`egoist/zed` at `57bd4fe`](https://github.com/egoist/zed/tree/57bd4fe181639797d395978d5de17bc9e10a6219/crates/gpui_macos).
 Attribution is retained in the pinned Zui dependency’s `NOTICE`.
+
+## Fonts
+
+The mobile apps bundle [Geist](https://github.com/vercel/geist-font) (sans),
+Copyright 2024 The Geist Project Authors, and the Android app bundles
+[Google Sans Code](https://github.com/googlefonts/googlesans-code) (code),
+Copyright 2025 The Google Sans Code Project Authors. Both are licensed under the
+SIL Open Font License 1.1; the notices are retained in
+[`third_party/licenses/Geist-OFL.txt`](third_party/licenses/Geist-OFL.txt) and
+[`third_party/licenses/GoogleSansCode-OFL.txt`](third_party/licenses/GoogleSansCode-OFL.txt).

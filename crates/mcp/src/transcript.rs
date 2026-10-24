@@ -116,6 +116,7 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
                 }
             }
             MessagePart::Image { name, .. } => tools.push(format!("image: {name}")),
+            MessagePart::Visual { title, .. } => tools.push(format!("visual: {title}")),
             MessagePart::Reasoning { text, .. } => {
                 if options.include_reasoning && !text.trim().is_empty() {
                     reasoning_parts.push(text.as_str());
@@ -143,6 +144,11 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
                         "requestId": request_id,
                         "questions": questions,
                     }));
+                }
+            }
+            MessagePart::Delegation { info, .. } => {
+                if options.include_tools {
+                    tools.push(info.caption());
                 }
             }
             MessagePart::Error { message, .. } => errors.push(message.clone()),
@@ -234,6 +240,29 @@ mod tests {
     }
 
     #[test]
+    fn visual_transcript_contains_only_short_summary_not_source() {
+        let rendered = render_entries(
+            &[entry(
+                "a",
+                MessageRole::Assistant,
+                vec![MessagePart::Visual {
+                    id: "v".into(),
+                    title: "Overview".into(),
+                    script: "private native source".into(),
+                }],
+            )],
+            RenderOptions::default(),
+        );
+        assert!(rendered[0].text.is_empty());
+        assert_eq!(rendered[0].tools, vec!["visual: Overview"]);
+        assert!(
+            !serde_json::to_string(&rendered)
+                .unwrap()
+                .contains("private native source")
+        );
+    }
+
+    #[test]
     fn folds_text_tools_and_pending_input() {
         let entries = vec![
             entry(
@@ -268,6 +297,7 @@ mod tests {
                         subagent_ref: None,
                         subagent_status: None,
                         subagent_tail: None,
+                        view: None,
                     },
                     MessagePart::Text {
                         id: "t2".into(),

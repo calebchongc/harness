@@ -145,6 +145,7 @@ where
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -340,6 +341,24 @@ async fn two_engines_share_a_workspace() {
     )
     .await;
 
+    // A device can't remove itself from the list (Settings → Devices only offers Remove on
+    // other, offline devices).
+    let refused = client_b
+        .call(
+            methods::MUTATE,
+            serde_json::json!({ "op": "forgetDevice", "deviceId": "dev-b" }),
+        )
+        .await;
+    assert!(refused.is_err(), "B removed itself: {refused:?}");
+    assert!(
+        b.workspace
+            .read_devices()
+            .unwrap_or_default()
+            .iter()
+            .any(|d| d.id == "dev-b"),
+        "B is still listed"
+    );
+
     drop(link);
     a.shutdown().await;
     b.shutdown().await;
@@ -458,6 +477,7 @@ async fn claim_resolves_a_worktree_cwd_to_the_repo_root_space() {
         .expect("create space");
 
     let request = RunRequest {
+        turn_origin: Default::default(),
         cwd: wt.to_string_lossy().into_owned(),
         ..run_request("go do it")
     };
@@ -491,6 +511,7 @@ async fn claimed_chat_row_records_the_run_harness() {
     let core = assemble(dir.path(), "dev-a");
 
     let request = RunRequest {
+        turn_origin: Default::default(),
         harness: Some(HarnessId::Cursor),
         ..run_request("go do it")
     };
@@ -697,6 +718,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
             .unwrap();
         legacy
             .upsert_chat(&Chat {
+                last_prompt_at: None,
                 id: "chat-legacy".into(),
                 device_id: "dev-a".into(),
                 title: Some("Migrated chat".into()),
@@ -711,6 +733,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 created_at: now,
                 harness_session_id: Some("hs-9".into()),
                 room_gen: None,
+                source_context_unavailable_at: None,
                 harness_session_cwd: Some("/tmp/legacy".into()),
                 parent_chat_id: None,
                 space_id: Some("space-legacy".into()),
@@ -720,6 +743,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
         legacy
             .upsert_session(&Session {
                 last_completed_turn: None,
+                last_completed_peer_only: false,
                 chat_id: "chat-legacy".into(),
                 device_id: "dev-a".into(),
                 status: SessionStatus::Idle,

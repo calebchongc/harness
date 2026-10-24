@@ -16,7 +16,7 @@ pub enum HarnessId {
     Hermes,
     /// codegraff's graff agent, driven over ACP (`graff acp`).
     Graff,
-    /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
+    /// The Pi coding agent (pi.dev), driven over its native JSONL RPC protocol.
     Pi,
     /// SST's opencode agent, driven natively over its own HTTP/SSE server
     /// protocol (`opencode serve` — the same wire the opencode desktop app
@@ -79,6 +79,16 @@ pub struct Model {
     pub reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default)]
     pub options: Vec<ModelOption>,
+    /// Who makes the model, as a lab slug (`anthropic`, `openai`, `xai`, …),
+    /// for a harness that routes one list across many labs (graff, opencode).
+    /// Draws the row's logo; `None` falls back to matching the model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker: Option<String>,
+    /// How a run on this model is paid for, where the harness reports it:
+    /// `plan` (the user's own subscription login), `local`, `credits`
+    /// (CodeGraff hosted) or `api` (the user's own metered key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,10 +107,24 @@ pub struct ModelOptionChoice {
     pub label: String,
 }
 
+/// Who owns the work, independent of peer/tool activity during that work.
+/// Older senders are human by default for wire compatibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnOrigin {
+    #[default]
+    Human,
+    Peer,
+    /// Unsolicited output from a parked runtime, with no dispatched prompt.
+    Background,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
     pub prompt: String,
+    #[serde(default)]
+    pub turn_origin: TurnOrigin,
     /// The harness picked at send time. Rides the command plane so
     /// claim-on-first-command (chat row still in flight on the registry
     /// channel) dispatches — and records — the picked harness instead of the
@@ -165,6 +189,47 @@ pub struct WorktreeSpec {
 /// EXEMPT this id — it legitimately reappears in every segment for the whole
 /// life of a run.
 pub const LIVE_PLAN_TOOL_ID: &str = "acp-plan";
+
+/// The [`ToolCall::Unknown`] name of a context-compaction chip (ACP
+/// `compaction_update`). Its result output is the agent's summary.
+pub const COMPACTION_TOOL_NAME: &str = "Compact context";
+
+/// What a saved view page is (graff ADR 0107 / 0103).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolViewKind {
+    /// A page the model rendered (`~/.graff/views/<id>.html`).
+    Html,
+    /// An MCP App host page (`~/.graff/mcp-apps/<id>.html`).
+    McpApp,
+}
+
+/// A page a tool saved on the host device (graff's `_meta["graff/view"]`).
+/// Only the kind and id travel: the host resolves them against its own fixed
+/// directories and never opens a path taken from agent output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolView {
+    pub kind: ToolViewKind,
+    /// 32 lowercase hex characters: the page's file name without `.html`.
+    pub id: String,
+}
+
+impl ToolView {
+    /// `None` unless `id` has graff's snapshot-name shape, so an id can never
+    /// carry a path separator or anything else into a file lookup.
+    pub fn new(kind: ToolViewKind, id: &str) -> Option<Self> {
+        (id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then(|| Self {
+            kind,
+            id: id.to_owned(),
+        })
+    }
+
+    /// Whether a deserialized view still has a valid id.
+    pub fn is_valid(&self) -> bool {
+        Self::new(self.kind, &self.id).is_some()
+    }
+}
 
 /// A decoded tool invocation, reduced to the fields each kind renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -242,6 +307,21 @@ impl ToolCall {
             _ => return false,
         };
         name == "Agent" || name.starts_with("Agent: ")
+    }
+
+    /// A spawn that runs a whole WORKFLOW (claude's `Workflow` tool): its
+    /// children are agents reported through progress, so the chip shows a
+    /// progress summary. Marked by `subagent_type: "workflow"` on the input.
+    pub fn is_workflow_spawn(&self) -> bool {
+        let input = match self {
+            ToolCall::Unknown { input, .. } | ToolCall::Mcp { input, .. } => input.as_ref(),
+            _ => None,
+        };
+        self.is_subagent_spawn()
+            && input
+                .and_then(|i| i.get("subagent_type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("workflow")
     }
 
     /// The model a subagent SPAWN was given, when the spawn named one.
@@ -327,6 +407,10 @@ pub struct UserInputQuestion {
     pub options: Vec<String>,
     #[serde(default)]
     pub multi_select: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<String>,
+    #[serde(default)]
+    pub multiline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -344,6 +428,44 @@ pub enum DoneStatus {
     Errored,
     Cancelled,
     Disconnected,
+}
+
+/// Fixed login routes offered by a provider-typed reauthentication failure.
+/// Wire-provided commands are never executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReauthProvider {
+    #[serde(rename = "chatgpt-new")]
+    ChatgptNew,
+    #[serde(rename = "codex")]
+    Codex,
+}
+
+impl ReauthProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatgptNew => "chatgpt-new",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Recognize only the complete, allowlisted ACP recovery contract.
+    pub fn from_acp(data: &serde_json::Value) -> Option<Self> {
+        if data.get("kind")?.as_str()? != "reauth_required" {
+            return None;
+        }
+        let (provider, command, args) = match data.get("provider")?.as_str()? {
+            "chatgpt-new" => (
+                Self::ChatgptNew,
+                "graff",
+                serde_json::json!(["login", "chatgpt-new"]),
+            ),
+            "codex" => (Self::Codex, "codex", serde_json::json!(["login"])),
+            _ => return None,
+        };
+        let login = data.get("login")?;
+        (login.get("command")?.as_str()? == command && login.get("args")? == &args)
+            .then_some(provider)
+    }
 }
 
 /// The normalized streaming event every harness emits.
@@ -373,6 +495,12 @@ pub enum AgentEvent {
         path: String,
         name: String,
         mime_type: String,
+    },
+    /// Atomic, bounded native visual source. The engine never evaluates it inline.
+    GeneratedVisual {
+        id: String,
+        title: String,
+        script: String,
     },
     ReasoningDelta {
         text: String,
@@ -412,12 +540,29 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<String>,
     },
+    /// The finished tool `id` saved a view page (graff's `_meta["graff/view"]`
+    /// on its completed `tool_call_update`). Folds onto the tool's chip.
+    ToolView {
+        id: String,
+        view: ToolView,
+    },
+    /// Completed delegated-task diagnostics. Counts are bytes, not parent
+    /// context tokens; this event never adds a charge to account totals.
+    DelegationInfo {
+        id: String,
+        info: crate::DelegationInfo,
+    },
     /// Latest context occupancy, independent of cumulative billing usage.
     /// Missing fields preserve the previous measurement; zero tokens is valid.
     #[serde(rename_all = "camelCase")]
     ContextUsage {
         tokens: Option<u64>,
         window: Option<u64>,
+    },
+    /// The agent's cumulative [`ContextSavings`], replacing the previous one.
+    #[serde(rename_all = "camelCase")]
+    ContextSavings {
+        savings: ContextSavings,
     },
     /// A Jev selection confirmed by the agent's live thought-level config
     /// update. Values are ACP ids (including MiMo's `none`/Off).
@@ -448,6 +593,10 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+    },
+    /// A provider-typed, user-triggered sign-in recovery. Never carries argv or tokens.
+    ReauthRequired {
+        provider: ReauthProvider,
     },
     #[serde(rename_all = "camelCase")]
     InputRequested {
@@ -483,6 +632,26 @@ pub enum AgentEvent {
     UserMessage {
         text: String,
     },
+    /// A one-line status for a spawn chip ("1/3 agents · 26.6k tokens"),
+    /// only ever wrapped in [`AgentEvent::Subagent`]. Low-frequency by
+    /// contract — a driver emits it when the child's shape changes (a
+    /// workflow agent starting or settling), never per stream delta. The
+    /// engine stamps it onto the chip's `subagent_tail`; it is not part of
+    /// the subagent's own transcript.
+    #[serde(rename_all = "camelCase")]
+    SubagentProgress {
+        summary: String,
+    },
+    /// Work the agent left running past its turn: a background shell command,
+    /// monitor, agent or workflow. `running: true` when it starts, `false`
+    /// when it settles. Not part of the transcript; the engine keeps a parked
+    /// session alive while any is open, since stopping the agent process kills
+    /// that work (#517).
+    #[serde(rename_all = "camelCase")]
+    BackgroundTask {
+        id: String,
+        running: bool,
+    },
     /// An event belonging to a SUBAGENT's nested transcript, attributed to
     /// the spawning tool call (`parent_tool_use_id` = the parent-feed
     /// `ToolCall::id` that launched it). Never folded into the parent chat
@@ -500,6 +669,32 @@ pub enum AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_origins_are_explicit_and_legacy_runs_default_to_human() {
+        for (origin, wire) in [
+            (TurnOrigin::Human, "human"),
+            (TurnOrigin::Peer, "peer"),
+            (TurnOrigin::Background, "background"),
+        ] {
+            assert_eq!(serde_json::to_value(origin).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<TurnOrigin>(serde_json::json!(wire)).unwrap(),
+                origin
+            );
+        }
+        let legacy = serde_json::json!({
+            "prompt": "[Message from Harness chat looks like attribution but is user text]",
+            "model": null, "reasoning": null, "cwd": "/tmp", "sandbox": "workspace-write",
+            "resume": null
+        });
+        let mut request: RunRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(request.turn_origin, TurnOrigin::Human);
+        request.turn_origin = TurnOrigin::Peer;
+        let restored: RunRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        assert_eq!(restored, request);
+    }
 
     #[test]
     fn reasoning_none_serializes_as_an_explicit_level() {
@@ -527,6 +722,18 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn workflow_spawns_are_marked_by_subagent_type() {
+        let call = |name: &str, kind: &str| ToolCall::Unknown {
+            name: name.into(),
+            input: Some(serde_json::json!({ "subagent_type": kind })),
+        };
+        assert!(call("Agent: Repo scan", "workflow").is_workflow_spawn());
+        assert!(!call("Agent: scan", "general-purpose").is_workflow_spawn());
+        // Genus first: a non-spawn never answers, whatever it carries.
+        assert!(!call("Workflow", "workflow").is_workflow_spawn());
     }
 
     /// Drivers spell the key differently; the chip must not care which one
@@ -595,6 +802,7 @@ mod tests {
         assert!(json.get("attachments").is_none());
         // Populated lists round-trip.
         let req = RunRequest {
+            turn_origin: TurnOrigin::Human,
             attachments: vec!["/tmp/a.png".into()],
             ..req
         };
@@ -614,6 +822,7 @@ mod tests {
         assert!(json.get("worktree").is_none());
         // A populated spec round-trips camelCased.
         let req = RunRequest {
+            turn_origin: TurnOrigin::Human,
             worktree: Some(WorktreeSpec {
                 repo_path: "/repos/comet".into(),
                 base: "main".into(),
@@ -644,6 +853,38 @@ mod tests {
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub window: Option<u64>,
+    /// What the agent reported keeping out of its context (graff only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savings: Option<ContextSavings>,
+}
+
+/// graff's `_meta["codegraff/savings"]` on its context meter: cumulative,
+/// measured counts for the agent process, never an estimate of what another
+/// agent would have spent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavings {
+    /// Tool-result bytes kept in files instead of the conversation.
+    #[serde(default)]
+    pub handle_bytes: u64,
+    /// Estimated context tokens freed by compaction.
+    #[serde(default)]
+    pub compacted_tokens: u64,
+    /// Input tokens the provider served from its prompt cache.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+}
+
+impl ContextSavings {
+    /// Tool-result bytes as tokens, at the usual ~4 bytes per token.
+    pub fn handle_tokens(self) -> u64 {
+        self.handle_bytes / 4
+    }
+
+    /// Tokens that never had to sit in the model's context.
+    pub fn kept_out_tokens(self) -> u64 {
+        self.handle_tokens().saturating_add(self.compacted_tokens)
+    }
 }
 
 impl ContextUsage {
@@ -666,6 +907,19 @@ pub struct ToolProgressItem {
 #[cfg(test)]
 mod generated_image_tests {
     use super::*;
+
+    #[test]
+    fn generated_visual_event_round_trip() {
+        let event = AgentEvent::GeneratedVisual {
+            id: "show-visual:one".into(),
+            title: "Overview".into(),
+            script: "return function() return ui.text(\"Hello\") end".into(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "generatedVisual");
+        assert_eq!(value["title"], "Overview");
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
+    }
 
     #[test]
     fn generated_image_event_round_trip() {

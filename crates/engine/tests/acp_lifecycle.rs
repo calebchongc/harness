@@ -30,8 +30,9 @@ async fn quiet_acp_prompt_stays_working_until_response() {
     let registry = HarnessRegistry::new();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../harness/tests/fixtures/acp-lifecycle.py");
-    registry.register(Arc::new(AcpHarness::pi().with_executable(fixture)));
-    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Pi, None).unwrap();
+    registry.register(Arc::new(AcpHarness::devin().with_executable(fixture)));
+    let core =
+        EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Devin, None).unwrap();
     let chat = "acp-quiet-regression";
     let handle = core.doc_host.open(chat).unwrap();
     let doc = handle.doc();
@@ -53,6 +54,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
         SessionCommandPayload::Run {
             message_id: "first-user".into(),
             request: RunRequest {
+                turn_origin: Default::default(),
                 prompt: "tools".into(),
                 harness: None,
                 model: None,
@@ -94,6 +96,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
     queue(
         "followup",
         SessionCommandPayload::Steer {
+            turn_origin: Default::default(),
             prompt: "second".into(),
             message_id: Some("second-user".into()),
         },
@@ -136,6 +139,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
     queue(
         "self-continue",
         SessionCommandPayload::Steer {
+            turn_origin: Default::default(),
             prompt: "self-continue".into(),
             message_id: Some("third-user".into()),
         },

@@ -20,6 +20,7 @@ async fn turn(
     let (tx, steering) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        origin: None,
         steering,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
@@ -30,6 +31,7 @@ async fn turn(
         mcp_servers: Vec::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt,
         harness: None,
         model: Some(
@@ -138,6 +140,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
     let nonce = format!("PARKED-STABILITY-{}", uuid::Uuid::new_v4());
     let (tx, steering) = mpsc::channel(8);
     let controls = RunControls {
+        origin: None,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
@@ -148,6 +151,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
         mcp_servers: Vec::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: format!(
             "Remember this exact token: {nonce}. Reply only that token. Do not use tools or files."
         ),
@@ -248,6 +252,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
     let (tx, steering) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        origin: None,
         steering,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
@@ -258,6 +263,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
         mcp_servers: Vec::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: if cancel {
             format!(
                 "Remember token {nonce}. First run shell command `sleep 30`, then reply only {nonce}."
@@ -385,6 +391,7 @@ async fn history(harness: &CursorHarness, count: usize) {
         .collect();
     let (tx, steering) = mpsc::channel(8);
     let controls = RunControls {
+        origin: None,
         steering,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
@@ -395,6 +402,7 @@ async fn history(harness: &CursorHarness, count: usize) {
         mcp_servers: Vec::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: format!(
             "Remember this token in conversation history: {}. Run shell command `sleep 3`, then reply only the token. Every later user message adds a token; retain them all without writing files.",
             tokens[0]

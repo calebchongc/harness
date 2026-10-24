@@ -79,32 +79,83 @@ fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<&str> {
 /// first, then unconfirmed echoes — matching transcript row order). Each tick
 /// carries the opening of the assistant reply that followed it, for the hover
 /// preview card.
+///
+/// The rail itself only needs [`rail_tick_ids`] each revision and builds the
+/// one hovered preview with [`rail_tick_preview`]; this is the whole set.
 pub fn rail_ticks(
     entries: &[SessionMessageEntry],
     echoes: &[SessionMessageEntry],
 ) -> Vec<RailTick> {
     let mut ticks: Vec<RailTick> = Vec::new();
     for (ix, entry) in entries.iter().enumerate() {
-        if entry.role != MessageRole::User {
-            continue;
+        if entry.role == MessageRole::User {
+            ticks.push(doc_tick(entries, ix));
         }
-        ticks.push(RailTick {
-            message_id: entry.id.clone(),
-            prompt: truncate_preview(&user_text(entry), PREVIEW_PROMPT_CHARS),
-            reply: first_reply_text(&entries[ix + 1..])
-                .map(|reply| truncate_preview(reply, PREVIEW_REPLY_CHARS)),
-        });
     }
     for echo in echoes {
         if echo.role == MessageRole::User && !ticks.iter().any(|t| t.message_id == echo.id) {
-            ticks.push(RailTick {
-                message_id: echo.id.clone(),
-                prompt: truncate_preview(&user_text(echo), PREVIEW_PROMPT_CHARS),
-                reply: None,
-            });
+            ticks.push(echo_tick(echo));
         }
     }
     ticks
+}
+
+/// The tick for the user entry at `ix`, with the opening of its reply.
+fn doc_tick(entries: &[SessionMessageEntry], ix: usize) -> RailTick {
+    let entry = &entries[ix];
+    RailTick {
+        message_id: entry.id.clone(),
+        prompt: truncate_preview(&user_text(entry), PREVIEW_PROMPT_CHARS),
+        reply: first_reply_text(&entries[ix + 1..])
+            .map(|reply| truncate_preview(reply, PREVIEW_REPLY_CHARS)),
+    }
+}
+
+fn echo_tick(echo: &SessionMessageEntry) -> RailTick {
+    RailTick {
+        message_id: echo.id.clone(),
+        prompt: truncate_preview(&user_text(echo), PREVIEW_PROMPT_CHARS),
+        reply: None,
+    }
+}
+
+/// The ids of [`rail_ticks`], in the same order, without building any
+/// preview. A streamed token bumps the transcript revision; recomputing every
+/// prompt's preview for it made each token cost time proportional to the
+/// whole conversation on the UI thread (#342).
+pub fn rail_tick_ids(
+    entries: &[SessionMessageEntry],
+    echoes: &[SessionMessageEntry],
+) -> Vec<String> {
+    let mut ids: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.role == MessageRole::User)
+        .map(|entry| entry.id.clone())
+        .collect();
+    for echo in echoes {
+        if echo.role == MessageRole::User && !ids.contains(&echo.id) {
+            ids.push(echo.id.clone());
+        }
+    }
+    ids
+}
+
+/// The [`rail_ticks`] entry for `message_id`, built on its own.
+pub fn rail_tick_preview(
+    entries: &[SessionMessageEntry],
+    echoes: &[SessionMessageEntry],
+    message_id: &str,
+) -> Option<RailTick> {
+    if let Some(ix) = entries
+        .iter()
+        .position(|entry| entry.role == MessageRole::User && entry.id == message_id)
+    {
+        return Some(doc_tick(entries, ix));
+    }
+    echoes
+        .iter()
+        .find(|echo| echo.role == MessageRole::User && echo.id == message_id)
+        .map(echo_tick)
 }
 
 /// The active tick for a scroll position: the last tick whose transcript row is
@@ -209,23 +260,27 @@ pub fn truncate_preview(text: &str, max_chars: usize) -> String {
 
 /// Memo of the rail's derived data so a frame (60–120Hz while streaming)
 /// neither re-extracts ticks nor rescans rows:
-/// - ticks are re-extracted only when their key — `(state entity,
+/// - tick ids are re-extracted only when their key — `(state entity,
 ///   transcript_revision)` — changes. `transcript_revision` bumps on every
 ///   transcript AND echo mutation (it is the same key the transcript's own
-///   row sync uses), and ticks read nothing else.
+///   row sync uses), and ticks read nothing else. A revision that leaves the
+///   ids as they were (a streamed token) keeps the cached ids and mapping.
 /// - the tick→row mapping is rebuilt (one id→index map, O(rows + ticks)) when
-///   the ticks change, the row vec changes identity/length, any cached pair
+///   the ids change, the row vec changes identity/length, any cached pair
 ///   no longer points at a row with its tick's id, or some tick was unmapped
 ///   (rows lagging state). Otherwise it is revalidated in O(ticks).
+/// - the hover card's preview is built for the hovered tick only, once per
+///   key.
 #[derive(Default)]
 pub struct RailTickCache {
     ticks_key: Option<(u64, u64)>,
-    ticks: Rc<Vec<RailTick>>,
+    ticks: Rc<Vec<String>>,
     /// `(rows.len(), rows.as_ptr())` the mapping was built against.
     rows_key: Option<(usize, usize)>,
     /// `(tick index, transcript row)` per tick that has a row, in tick order.
     pairs: Rc<Vec<(usize, usize)>>,
     unmapped: bool,
+    preview: Option<((u64, u64), Rc<RailTick>)>,
     #[cfg(test)]
     tick_builds: usize,
     #[cfg(test)]
@@ -233,37 +288,55 @@ pub struct RailTickCache {
 }
 
 impl RailTickCache {
-    /// The ticks for `key`, calling `extract` only when the key changed.
+    /// The tick ids for `key`, calling `extract` only when the key changed.
     pub fn ticks(
         &mut self,
         key: (u64, u64),
-        extract: impl FnOnce() -> Vec<RailTick>,
-    ) -> Rc<Vec<RailTick>> {
+        extract: impl FnOnce() -> Vec<String>,
+    ) -> Rc<Vec<String>> {
         if self.ticks_key != Some(key) {
-            self.ticks = Rc::new(extract());
-            self.ticks_key = Some(key);
-            self.rows_key = None;
-            #[cfg(test)]
-            {
-                self.tick_builds += 1;
+            let ids = extract();
+            if *self.ticks != ids {
+                self.ticks = Rc::new(ids);
+                self.rows_key = None;
+                #[cfg(test)]
+                {
+                    self.tick_builds += 1;
+                }
             }
+            self.ticks_key = Some(key);
         }
         self.ticks.clone()
     }
 
+    /// The hover preview of tick `message_id` at `key`, built at most once
+    /// per key and tick.
+    pub fn preview(
+        &mut self,
+        key: (u64, u64),
+        message_id: &str,
+        build: impl FnOnce() -> Option<RailTick>,
+    ) -> Option<Rc<RailTick>> {
+        if let Some((cached_key, tick)) = &self.preview
+            && *cached_key == key
+            && tick.message_id == message_id
+        {
+            return Some(tick.clone());
+        }
+        let tick = Rc::new(build()?);
+        self.preview = Some((key, tick.clone()));
+        Some(tick)
+    }
+
     /// `(tick index, row index)` for each cached tick whose id matches a row —
     /// the FIRST such row, exactly like a per-tick `rows.position(..)`.
-    pub fn pairs<R>(
-        &mut self,
-        rows: &[R],
-        row_id: impl Fn(&R) -> &str,
-    ) -> Rc<Vec<(usize, usize)>> {
+    pub fn pairs<R>(&mut self, rows: &[R], row_id: impl Fn(&R) -> &str) -> Rc<Vec<(usize, usize)>> {
         let rows_key = (rows.len(), rows.as_ptr() as usize);
         let valid = self.rows_key == Some(rows_key)
             && !self.unmapped
             && self.pairs.iter().all(|&(tick, row)| {
                 rows.get(row)
-                    .is_some_and(|r| row_id(r) == self.ticks[tick].message_id.as_str())
+                    .is_some_and(|r| row_id(r) == self.ticks[tick].as_str())
             });
         if !valid {
             let mut index: HashMap<&str, usize> = HashMap::with_capacity(rows.len());
@@ -274,7 +347,7 @@ impl RailTickCache {
                 .ticks
                 .iter()
                 .enumerate()
-                .filter_map(|(tick, t)| index.get(t.message_id.as_str()).map(|&row| (tick, row)))
+                .filter_map(|(tick, id)| index.get(id.as_str()).map(|&row| (tick, row)))
                 .collect();
             self.unmapped = pairs.len() != self.ticks.len();
             self.pairs = Rc::new(pairs);
@@ -562,17 +635,17 @@ impl Transcript {
         // its transcript row (user rows share the entry id) via a cached
         // id→index map. See `RailTickCache`.
         let view = cx.entity_id();
-        let (ticks, pairs) = {
+        let (ticks, pairs, key) = {
             let state_entity = self.state_entity();
             let state = state_entity.read(cx);
             let key = (state_entity.entity_id().as_u64(), state.transcript_revision);
             let rows = self.rows();
             with_rail_cache(view, |cache| {
                 let ticks = cache.ticks(key, || {
-                    rail_ticks(&state.transcript, state.pending_echoes())
+                    rail_tick_ids(&state.transcript, state.pending_echoes())
                 });
                 let pairs = cache.pairs(rows, |r| r.id.as_ref());
-                (ticks, pairs)
+                (ticks, pairs, key)
             })
         };
         // A minimap of one exchange is noise, not navigation — the original
@@ -614,6 +687,24 @@ impl Transcript {
         let capacity = rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
         let buckets = tick_buckets(pairs.len(), capacity);
         let active_bucket = active.and_then(|ix| bucket_of(&buckets, ix));
+        // The bucket's representative prompt: the ACTIVE tick when it falls
+        // inside (hover then previews what you're reading), the first prompt
+        // of the range otherwise.
+        let representative = |(start, end): (usize, usize)| {
+            active.filter(|&a| a >= start && a < end).unwrap_or(start)
+        };
+        // Only the hovered bucket shows a card, so only its preview is built.
+        let hover_preview = hover
+            .and_then(|ix| buckets.get(ix).copied())
+            .and_then(|bucket| {
+                let message_id = ticks[pairs[representative(bucket)].0].as_str();
+                let state = self.state_entity().read(cx);
+                with_rail_cache(view, |cache| {
+                    cache.preview(key, message_id, || {
+                        rail_tick_preview(&state.transcript, state.pending_echoes(), message_id)
+                    })
+                })
+            });
 
         div()
             .absolute()
@@ -627,12 +718,7 @@ impl Transcript {
             .justify_center()
             .gap(px(TICK_GAP))
             .children(buckets.into_iter().enumerate().map(|(ix, (start, end))| {
-                // The bucket's representative prompt: the ACTIVE tick when it
-                // falls inside (hover then previews what you're reading),
-                // the first prompt of the range otherwise.
-                let rep = active.filter(|&a| a >= start && a < end).unwrap_or(start);
-                let (tick_ix, row) = pairs[rep];
-                let tick = &ticks[tick_ix];
+                let (_, row) = pairs[representative((start, end))];
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
@@ -644,8 +730,9 @@ impl Transcript {
                 } else {
                     crate::theme::ink(0.16)
                 };
-                // Previews were flattened + capped once at tick extraction.
-                let card: Option<AnyElement> = is_hovered.then(|| {
+                // Previews are flattened + capped once per revision.
+                let tick = hover_preview.clone().filter(|_| is_hovered);
+                let card: Option<AnyElement> = tick.map(|tick| {
                     let theme = theme.for_popup();
                     let card = popover::popover_card(&theme)
                         .w(px(280.0))
@@ -1003,13 +1090,13 @@ mod tests {
     }
 
     /// Reference mapping: the per-tick linear scan the cache replaced.
-    fn reference_pairs(ticks: &[RailTick], rows: &[&str]) -> Vec<(usize, usize)> {
+    fn reference_pairs(ticks: &[String], rows: &[&str]) -> Vec<(usize, usize)> {
         ticks
             .iter()
             .enumerate()
-            .filter_map(|(t, tick)| {
+            .filter_map(|(t, id)| {
                 rows.iter()
-                    .position(|r| *r == tick.message_id.as_str())
+                    .position(|r| *r == id.as_str())
                     .map(|row| (t, row))
             })
             .collect()
@@ -1022,24 +1109,133 @@ mod tests {
             entry("u1", MessageRole::User, "one"),
             entry("a1", MessageRole::Assistant, "first"),
         ];
-        let t = cache.ticks((1, 7), || rail_ticks(&v1, &[]));
-        assert_eq!(t.len(), 1);
+        let t = cache.ticks((1, 7), || rail_tick_ids(&v1, &[]));
+        assert_eq!(*t, vec!["u1".to_string()]);
         assert_eq!(cache.tick_builds, 1);
         // Same revision: no re-extraction, even if the closure would differ.
         let t = cache.ticks((1, 7), || unreachable!("cached"));
         assert_eq!(t.len(), 1);
         assert_eq!(cache.tick_builds, 1);
-        // Revision bump (a streamed delta): re-extracted, new reply seen.
+        // Revision bump (a streamed delta) with the same prompts: the ids,
+        // and with them the row mapping, are kept.
         let mut v2 = v1.clone();
         v2[1] = entry("a1", MessageRole::Assistant, "first, longer");
+        let kept = cache.ticks((1, 8), || rail_tick_ids(&v2, &[]));
+        assert!(Rc::ptr_eq(&t, &kept));
+        assert_eq!(cache.tick_builds, 1);
+        // The hover preview still reads the newest reply.
+        let preview = cache
+            .preview((1, 8), "u1", || rail_tick_preview(&v2, &[], "u1"))
+            .unwrap();
+        assert_eq!(preview.reply.as_deref(), Some("first, longer"));
+        // A new prompt: re-extracted.
         v2.push(entry("u2", MessageRole::User, "two"));
-        let t = cache.ticks((1, 8), || rail_ticks(&v2, &[]));
+        let t = cache.ticks((1, 9), || rail_tick_ids(&v2, &[]));
         assert_eq!(cache.tick_builds, 2);
         assert_eq!(t.len(), 2);
-        assert_eq!(t[0].reply.as_deref(), Some("first, longer"));
         // A different state entity at the same revision is a different key.
-        cache.ticks((2, 8), || rail_ticks(&v2, &[]));
+        cache.ticks((2, 9), || vec!["other".into()]);
         assert_eq!(cache.tick_builds, 3);
+    }
+
+    #[test]
+    fn hover_previews_are_built_once_per_revision_and_tick() {
+        let mut cache = RailTickCache::default();
+        let entries = vec![
+            entry("u1", MessageRole::User, "one"),
+            entry("a1", MessageRole::Assistant, "first"),
+            entry("u2", MessageRole::User, "two"),
+        ];
+        let mut builds = 0;
+        let mut preview = |cache: &mut RailTickCache, key, id: &str| {
+            cache
+                .preview(key, id, || {
+                    builds += 1;
+                    rail_tick_preview(&entries, &[], id)
+                })
+                .map(|tick| tick.prompt.clone())
+        };
+        assert_eq!(preview(&mut cache, (1, 1), "u1").as_deref(), Some("one"));
+        assert_eq!(preview(&mut cache, (1, 1), "u1").as_deref(), Some("one"));
+        assert_eq!(preview(&mut cache, (1, 1), "u2").as_deref(), Some("two"));
+        assert_eq!(preview(&mut cache, (1, 2), "u2").as_deref(), Some("two"));
+        assert_eq!(preview(&mut cache, (1, 2), "gone"), None);
+        drop(preview);
+        assert_eq!(builds, 4);
+    }
+
+    /// Ids and on-demand previews are exactly what the full extraction gives.
+    #[test]
+    fn tick_ids_and_previews_match_full_extraction() {
+        let entries = vec![
+            entry("u1", MessageRole::User, "first question"),
+            entry("a1", MessageRole::Assistant, "first answer"),
+            entry("u2", MessageRole::User, "second   question\nwrapped"),
+            entry("u3", MessageRole::User, "third"),
+            entry("a3", MessageRole::Assistant, "third answer"),
+        ];
+        let echoes = vec![
+            entry("u3", MessageRole::User, "third"),
+            entry("e1", MessageRole::User, "pending"),
+            entry("x", MessageRole::Assistant, "not a prompt"),
+        ];
+        let full = rail_ticks(&entries, &echoes);
+        let ids = rail_tick_ids(&entries, &echoes);
+        assert_eq!(
+            ids,
+            full.iter()
+                .map(|t| t.message_id.clone())
+                .collect::<Vec<_>>()
+        );
+        for tick in &full {
+            assert_eq!(
+                rail_tick_preview(&entries, &echoes, &tick.message_id).as_ref(),
+                Some(tick)
+            );
+        }
+    }
+
+    /// The #342 shape: streaming tokens into a long conversation re-derives
+    /// no previews and keeps the row mapping, while a full extraction per
+    /// token formats every prompt each time.
+    #[test]
+    fn streaming_into_a_long_conversation_does_no_per_prompt_work() {
+        let mut entries = Vec::new();
+        for turn in 0..2000 {
+            entries.push(entry(
+                &format!("u{turn}"),
+                MessageRole::User,
+                &"Run the suite and fix whatever fails. ".repeat(20),
+            ));
+            entries.push(entry(
+                &format!("a{turn}"),
+                MessageRole::Assistant,
+                &"The parser now accepts trailing commas. ".repeat(20),
+            ));
+        }
+        let rows: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        let mut cache = RailTickCache::default();
+        let tokens = 50;
+        let started = Instant::now();
+        for revision in 0..tokens {
+            if let MessagePart::Text { text, .. } = &mut entries.last_mut().unwrap().parts[0] {
+                text.push_str(" more");
+            }
+            cache.ticks((1, revision), || rail_tick_ids(&entries, &[]));
+            cache.pairs(&rows, |r| r.as_str());
+        }
+        let cached = started.elapsed();
+        assert_eq!(cache.tick_builds, 1, "one extraction for the whole stream");
+        assert_eq!(cache.map_builds, 1, "one row mapping for the whole stream");
+        let started = Instant::now();
+        for _ in 0..tokens {
+            std::hint::black_box(rail_ticks(&entries, &[]));
+        }
+        let full = started.elapsed();
+        assert!(
+            cached * 3 < full,
+            "per-token rail work {cached:?} should be far below re-extracting every preview {full:?}"
+        );
     }
 
     #[test]
@@ -1051,7 +1247,7 @@ mod tests {
             entry("u2", MessageRole::User, "two"),
             entry("u3", MessageRole::User, "three"),
         ];
-        let ticks = cache.ticks((1, 1), || rail_ticks(&entries, &[]));
+        let ticks = cache.ticks((1, 1), || rail_tick_ids(&entries, &[]));
         let rows = vec!["u1", "a1#0", "a1#1", "u2", "u3"];
         let pairs = cache.pairs(&rows, |r| *r);
         assert_eq!(*pairs, reference_pairs(&ticks, &rows));
@@ -1076,7 +1272,7 @@ mod tests {
         assert_eq!(*pairs, reference_pairs(&ticks, &dup));
         // New ticks (revision bump) force a remap even over the same rows.
         let builds = cache.map_builds;
-        cache.ticks((1, 2), || rail_ticks(&entries[..2], &[]));
+        cache.ticks((1, 2), || rail_tick_ids(&entries[..2], &[]));
         let pairs = cache.pairs(&dup, |r| *r);
         assert_eq!(*pairs, vec![(0, 0)]);
         assert_eq!(cache.map_builds, builds + 1);

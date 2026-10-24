@@ -4,7 +4,7 @@
 
 <p align="center">Ruang kerja native untuk agen pemrograman di perangkat Anda.</p>
 
-<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.hindi.md">हिन्दी</a> · <a href="README.thai.md">ไทย</a> · Bahasa Indonesia · <a href="README.malay.md">Bahasa Melayu</a></p>
+<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.de.md">Deutsch</a> · <a href="README.es.md">Español</a> · <a href="README.hindi.md">हिन्दी</a> · <a href="README.thai.md">ไทย</a> · Bahasa Indonesia · <a href="README.malay.md">Bahasa Melayu</a></p>
 
 Harness menyatukan **CodeGraff (graff)**, Claude Code, Codex, Cursor, Devin,
 Grok, Hermes, Pi, OpenCode, dan Antigravity dalam satu aplikasi desktop.
@@ -67,8 +67,32 @@ kembali ke profil tersebut.
 
 ## Lisensi
 
-Harness tersedia dengan [GNU Affero General Public License versi 3](LICENSE)
-(`AGPL-3.0-only`), versi AGPL yang juga digunakan sebagai lisensi publik
-CodeGraff. Standard Harness Pte. Ltd. mempertahankan hak atas kontribusi
-Harness miliknya sendiri; materi lain tetap membawa hak cipta dan lisensi
+Harness tersedia dengan [GNU Affero General Public License versi 3 yang
+dimodifikasi](LICENSE) (AGPL-3.0 dengan ketentuan tambahan), disusun dengan cara
+yang sama seperti lisensi [CodeGraff](https://github.com/justrach/codegraff).
+Penggunaan lewat jaringan memicu Pasal 13. Standard Harness Pte. Ltd., Rach
+Pradhan (justrach) dan Yu Xi Lim (yxlyx) mencadangkan hak untuk menawarkan versi
+proprietari atau hosted atas kontribusi Harness asli yang mereka miliki. Lisensi
+AGPL penerima bersifat permanen kecuali penerima sendiri melanggarnya. Izin
+komersial tanpa copyleft hanya ada jika ketiganya memberikannya bersama secara
+tertulis, dan dapat dicabut. Materi lain tetap membawa hak cipta dan lisensi
 asalnya. Lihat [pemberitahuan pihak ketiga](THIRD_PARTY_NOTICES.md).
+
+**Perusahaan memerlukan lisensi komersial.** Setiap versi setelah v0.2.108
+menambahkan satu ketentuan. Organisasi Anda, dihitung bersama organisasi yang
+mengendalikannya, yang dikendalikannya, atau yang berada di bawah pengendalian
+yang sama dengannya,
+memerlukan lisensi komersial untuk penggunaan Harness apa pun (termasuk di
+mesin, cloud, CI, dan jaringannya sendiri) jika memenuhi **salah satu** dari:
+
+- telah menghimpun lebih dari **US$500 ribu** secara total dari investor atau
+  pemberi pinjaman;
+- kekayaan bersih atau valuasi terakhirnya lebih dari **US$500 ribu**;
+- pendapatan kotornya lebih dari **US$100 ribu** pada tahun fiskal terakhir
+  atau dalam periode 12 bulan mana pun.
+
+Perusahaan yang melewati salah satu batas wajib menghubungi kami dalam 5 hari
+kerja. Perorangan selalu memakai Harness di bawah AGPL, berapa pun
+penghasilannya, begitu pula organisasi yang tidak memenuhi satu pun ketentuan
+ini. Versi hingga v0.2.108 tetap memakai lisensi yang menyertainya saat rilis.
+Ragu? Anggap Anda tercakup dan hubungi [rach@standardharness.com](mailto:rach@standardharness.com).

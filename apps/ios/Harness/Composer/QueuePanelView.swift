@@ -2,8 +2,8 @@
 //
 // Everything typed while the agent is busy waits here (crates/doc/src/queue.rs)
 // until the host sends it. Rows can be reordered by dragging or with the
-// arrows, retyped in the composer, sent immediately (which stops the turn to
-// do it), or dropped.
+// arrows, retyped in the composer, given images (QueuedImageEditor), sent
+// immediately (which stops the turn to do it), or dropped.
 
 import SwiftUI
 import UniformTypeIdentifiers
@@ -16,6 +16,8 @@ struct QueuePanel: View {
     var onCancelEdit: () -> Void
     var supportsActions: Bool
     var onAction: (QueuedMessage, QueueAction) -> Void
+    /// Open the Attachments editor on a row; nil hides the action.
+    var onAttachments: ((QueuedMessage) -> Void)? = nil
 
     @State private var dragging: String?
 
@@ -83,7 +85,7 @@ struct QueuePanel: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(whiteAlpha(dragging == item.id ? 0.10 : 0.04),
+        .background(ink(dragging == item.id ? 0.10 : 0.04),
                     in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.border, lineWidth: 1))
         .contentShape(RoundedRectangle(cornerRadius: 10))
@@ -140,6 +142,10 @@ struct QueuePanel: View {
                 if let primary { onAction(item, primary) }
             }
             Menu {
+                if let onAttachments {
+                    Button("Attachments", systemImage: "photo.badge.plus") { onAttachments(item) }
+                        .disabled(gated || editingId != nil)
+                }
                 Button("Move up", systemImage: "chevron.up") { store.moveQueued(id: item.id, by: -1) }
                     .disabled(index == 0 || gated)
                 Button("Move down", systemImage: "chevron.down") { store.moveQueued(id: item.id, by: 1) }

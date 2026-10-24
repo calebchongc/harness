@@ -28,11 +28,16 @@ actions!(
         ShowAll,
         Minimize,
         Zoom,
+        CloseTab,
+        CloseTabWithoutArchiving,
         CloseWindow,
         AppearanceSystem,
         AppearanceLight,
         AppearanceDark,
         ClearBrowsingData,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
     ]
 );
 
@@ -58,12 +63,42 @@ pub fn init(cx: &mut App) {
     // (crates/zed/src/zed.rs `register_action(Minimize/Zoom)`).
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
+    cx.on_action(close_tab);
+    cx.on_action(|_: &CloseTabWithoutArchiving, cx| {
+        cx.defer(|cx| close_active_tab_with_archive(false, cx));
+    });
     cx.on_action(close_window);
     // Appearance. Each verb persists and repaints every window; see
     // `appearance::set_mode`.
     cx.on_action(|_: &AppearanceSystem, cx| appearance::set_mode(AppearanceMode::System, cx));
     cx.on_action(|_: &AppearanceLight, cx| appearance::set_mode(AppearanceMode::Light, cx));
     cx.on_action(|_: &AppearanceDark, cx| appearance::set_mode(AppearanceMode::Dark, cx));
+    // Text size, like a browser's zoom keys: steps through the sizes Settings
+    // offers, persisted the same way.
+    cx.on_action(|_: &IncreaseFontSize, cx| change_font_size(cx, |size| size.stepped(1)));
+    cx.on_action(|_: &DecreaseFontSize, cx| change_font_size(cx, |size| size.stepped(-1)));
+    cx.on_action(|_: &ResetFontSize, cx| change_font_size(cx, |_| Default::default()));
+}
+
+fn change_font_size(
+    cx: &mut App,
+    next: impl FnOnce(crate::typography::UiFontSize) -> crate::typography::UiFontSize + 'static,
+) {
+    // Harness is single-window; without a key window (tests, a window that
+    // lost focus) the first one still takes the size.
+    let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
+        return;
+    };
+    // A key binding dispatches this while its window is mid-update, so the
+    // window can't be borrowed here; apply the size once the event is done.
+    cx.defer(move |cx| {
+        handle
+            .update(cx, |_, window, cx| {
+                let size = next(crate::typography::font_size(cx));
+                crate::typography::set_font_size(size, window, cx);
+            })
+            .ok();
+    });
 }
 
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
@@ -93,14 +128,116 @@ fn prepare_quit(cx: &mut App) {
         }
     }
     if ready {
+        // Every window agreed: install staged updates now, not inside each
+        // prepare_quit — a window that installs before another window vetoes
+        // the quit would leave the running app on a replaced bundle.
+        for window in cx.windows() {
+            if let Some(window) = window.downcast::<shell::Shell>() {
+                let _ = window.update(cx, |shell, _, _| {
+                    shell.install_staged_update_on_quit();
+                });
+            }
+        }
         quit_after_save(cx);
     }
 }
 
+/// How long quitting waits for the in-process engine to settle its runs and
+/// record what it cut short. One interrupt's settle wait (5 s, every run at
+/// once) plus the flush, with margin; a hung engine still lets the app quit.
+const QUIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Set once a quit has started draining the engine: a second quit request
+/// (⌘Q again) exits at once instead of waiting a second time.
+static QUIT_DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Every app-owned quit ends here: ⌘Q, the menu, Dock or system quit,
+/// "Restart now" into an update, install-on-quit, relaunch.
+///
+/// An in-process engine is shut down first, and the app quits once that
+/// finishes (or after [`QUIT_DRAIN`]). GPUI gives `on_app_quit` handlers only
+/// a fraction of a second before the process exits, which cut the drain
+/// short whenever a run was live: its journal was left without a `Done`, the
+/// next boot took the crash path ("Run interrupted by engine restart"), and a
+/// run waiting on a question was re-sent and asked it again. A remote engine
+/// (a daemon) outlives the app and isn't drained.
 pub(crate) fn quit_after_save(cx: &mut App) {
+    use std::sync::atomic::Ordering;
     #[cfg(target_os = "macos")]
     native_quit::allow();
-    cx.quit();
+    let engine = cx
+        .try_global::<crate::ReopenState>()
+        .and_then(|reopen| reopen.state.read(cx).engine().cloned())
+        .filter(|engine| matches!(engine.mode(), crate::state::EngineMode::InProcess));
+    let Some(engine) = engine.filter(|_| !QUIT_DRAINING.swap(true, Ordering::SeqCst)) else {
+        cx.quit();
+        return;
+    };
+    // The app looks gone at once; the engine settles behind it.
+    #[cfg(target_os = "macos")]
+    cx.hide();
+    let drain = gpui_tokio::Tokio::spawn(cx, async move {
+        // Its own task: the deadline stops the wait, not the shutdown, which
+        // keeps going until the process exits.
+        let shutdown = tokio::spawn(async move { engine.shutdown().await });
+        if tokio::time::timeout(QUIT_DRAIN, shutdown).await.is_err() {
+            tracing::warn!("engine shutdown outlasted the quit drain; quitting anyway");
+        }
+    });
+    cx.spawn(async move |cx| {
+        let _ = drain.await;
+        let _ = cx.update(|cx| cx.quit());
+    })
+    .detach();
+}
+
+fn close_tab(_: &CloseTab, cx: &mut App) {
+    cx.defer(close_active_tab);
+}
+
+/// ⌘W: close the innermost thing open and never the window. Closing the
+/// window ends the app's session for every chat, so a stray ⌘W in an empty
+/// chat must not take running agents down with it (⌘⇧W closes the window).
+/// A closed session is archived when archive-on-close is on; the first ⌘W
+/// that would close one asks which the user wants (`shell/archive_choice.rs`).
+/// ⌘⌥W closes the same way without archiving or asking.
+fn close_active_tab(cx: &mut App) {
+    close_active_tab_with_archive(true, cx);
+}
+
+fn close_active_tab_with_archive(archive: bool, cx: &mut App) {
+    if let Some(window) = cx
+        .active_window()
+        .and_then(|window| window.downcast::<shell::Shell>())
+    {
+        close_tab_in_with_archive(window, archive, cx);
+    }
+}
+
+pub(crate) fn close_tab_in(window: gpui::WindowHandle<shell::Shell>, cx: &mut App) {
+    close_tab_in_with_archive(window, true, cx);
+}
+
+fn close_tab_in_with_archive(
+    window: gpui::WindowHandle<shell::Shell>,
+    archive: bool,
+    cx: &mut App,
+) {
+    window
+        .update(cx, |shell, window, cx| {
+            // The right pane's active surface (the tab the user just opened),
+            // then the focused split pane or chat tab, Ghostty-style, then
+            // the chat itself, back to a new session.
+            if shell.close_active_surface(window, cx) {
+                return;
+            }
+            if archive {
+                shell.close_chat_view_by_shortcut(window, cx);
+            } else {
+                shell.close_chat_view_with_archive(false, window, cx);
+            }
+        })
+        .ok();
 }
 
 fn close_window(_: &CloseWindow, cx: &mut App) {
@@ -112,16 +249,7 @@ fn close_active_window(cx: &mut App) {
         if let Some(window) = window.downcast::<shell::Shell>() {
             window
                 .update(cx, |shell, window, cx| {
-                    // ⌘W closes the right pane's active surface first (the tab
-                    // the user just opened); an empty or closed pane falls
-                    // through to the window close, unsaved-file gate and all.
-                    if shell.close_active_surface(window, cx) {
-                        return;
-                    }
-                    // Then the focused split chat pane, Ghostty-style.
-                    if shell.close_focused_chat_pane(window, cx) {
-                        return;
-                    }
+                    // Unsaved files hold the close until they are dealt with.
                     if shell.prepare_window_close(cx) {
                         window.remove_window();
                     }
@@ -152,14 +280,28 @@ fn app_key_bindings(macos: bool) -> Vec<KeyBinding> {
         shell::OpenSettings,
         None,
     )];
+    let primary = if macos { "cmd" } else { "ctrl" };
+    bindings.extend([
+        KeyBinding::new(&format!("{primary}-="), IncreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}-+"), IncreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}--"), DecreaseFontSize, None),
+        KeyBinding::new(&format!("{primary}-0"), ResetFontSize, None),
+    ]);
     if macos {
         bindings.extend([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-h", Hide, None),
             KeyBinding::new("alt-cmd-h", HideOthers, None),
             KeyBinding::new("cmd-m", Minimize, None),
-            KeyBinding::new("cmd-w", CloseWindow, None),
+            KeyBinding::new("cmd-w", CloseTab, None),
+            KeyBinding::new("cmd-shift-w", CloseWindow, None),
         ]);
+    } else {
+        // Ghostty's GTK key for closing a split, beside its Ctrl+Shift+O/E
+        // split keys. Without it nothing closed a pane off macOS: there is no
+        // native menu bar there to offer Close Tab. Alt+F4 still closes the
+        // window, and inside the terminal its own Ctrl+Shift+W wins.
+        bindings.push(KeyBinding::new("ctrl-shift-w", CloseTab, None));
     }
     bindings
 }
@@ -218,6 +360,10 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("Appearance: System", AppearanceSystem),
         MenuItem::action("Appearance: Light", AppearanceLight),
         MenuItem::action("Appearance: Dark", AppearanceDark),
+        MenuItem::separator(),
+        MenuItem::action("Bigger Text", IncreaseFontSize),
+        MenuItem::action("Smaller Text", DecreaseFontSize),
+        MenuItem::action("Actual Size", ResetFontSize),
     ]));
     if macos {
         // Standard Window menu; macOS appends the open-window list itself.
@@ -225,6 +371,8 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
             MenuItem::separator(),
+            MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Reopen Closed Tab", shell::ReopenClosedChatTab),
             MenuItem::action("Close Window", CloseWindow),
         ]));
     }
@@ -326,7 +474,10 @@ mod tests {
             vec![
                 AppearanceSystem.name(),
                 AppearanceLight.name(),
-                AppearanceDark.name()
+                AppearanceDark.name(),
+                IncreaseFontSize.name(),
+                DecreaseFontSize.name(),
+                ResetFontSize.name(),
             ]
         );
     }
@@ -354,7 +505,9 @@ mod tests {
             Some(combo("cmd-,"))
         );
         assert_eq!(find(&macos, Quit.name()), Some(combo("cmd-q")));
-        assert_eq!(find(&macos, CloseWindow.name()), Some(combo("cmd-w")));
+        // ⌘W closes a tab and never the window; ⌘⇧W closes the window.
+        assert_eq!(find(&macos, CloseTab.name()), Some(combo("cmd-w")));
+        assert_eq!(find(&macos, CloseWindow.name()), Some(combo("cmd-shift-w")));
         assert_eq!(find(&macos, Minimize.name()), Some(combo("cmd-m")));
 
         let other = app_key_bindings(false);
@@ -363,6 +516,34 @@ mod tests {
             Some(combo("ctrl-,"))
         );
         assert_eq!(find(&other, Quit.name()), None);
+        // Off macOS the same close-the-innermost-thing action needs a key too.
+        assert_eq!(find(&other, CloseTab.name()), Some(combo("ctrl-shift-w")));
+
+        // Text size: the browser zoom keys, Cmd on macOS and Ctrl elsewhere.
+        let all = |bindings: &[KeyBinding], name: &str| -> Vec<Keystroke> {
+            bindings
+                .iter()
+                .filter(|binding| binding.action().name() == name)
+                .flat_map(|binding| binding.keystrokes().iter().map(|ks| ks.inner().clone()))
+                .collect()
+        };
+        for (bindings, primary) in [(&macos, "cmd"), (&other, "ctrl")] {
+            assert_eq!(
+                all(bindings, IncreaseFontSize.name()),
+                vec![
+                    Keystroke::parse(&format!("{primary}-=")).unwrap(),
+                    Keystroke::parse(&format!("{primary}-+")).unwrap()
+                ]
+            );
+            assert_eq!(
+                all(bindings, DecreaseFontSize.name()),
+                vec![Keystroke::parse(&format!("{primary}--")).unwrap()]
+            );
+            assert_eq!(
+                all(bindings, ResetFontSize.name()),
+                vec![Keystroke::parse(&format!("{primary}-0")).unwrap()]
+            );
+        }
     }
 }
 

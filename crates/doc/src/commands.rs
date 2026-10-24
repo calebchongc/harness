@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use harness_proto::{RunRequest, UserInputAnswer};
+use harness_proto::{RunRequest, TurnOrigin, UserInputAnswer};
 
 use crate::constants::COMMAND_DEFAULT_TTL_MS;
 
@@ -21,6 +21,7 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    DismissInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +47,8 @@ pub enum SessionCommandPayload {
     #[serde(rename_all = "camelCase")]
     Steer {
         prompt: String,
+        #[serde(default)]
+        turn_origin: TurnOrigin,
         message_id: Option<String>,
     },
     Interrupt {},
@@ -53,6 +56,11 @@ pub enum SessionCommandPayload {
     RespondInput {
         request_id: String,
         answers: Vec<UserInputAnswer>,
+    },
+    /// Cancel this question's originating turn without supplying an answer.
+    #[serde(rename_all = "camelCase")]
+    DismissInput {
+        request_id: String,
     },
 }
 
@@ -63,6 +71,7 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::DismissInput { .. } => SessionCommandKind::DismissInput,
         }
     }
 }
@@ -193,6 +202,7 @@ mod tests {
         entry(
             id,
             SessionCommandPayload::Steer {
+                turn_origin: TurnOrigin::Human,
                 prompt: "go".into(),
                 message_id: None,
             },
@@ -254,6 +264,7 @@ mod tests {
                     entry(
                         &format!("c{i}"),
                         SessionCommandPayload::Steer {
+                            turn_origin: TurnOrigin::Human,
                             prompt: format!("unique message {i}"),
                             message_id: Some(format!("m{i}")),
                         },
@@ -347,8 +358,36 @@ mod tests {
         assert!(!can_composer_cancel(&applied, "device-a"));
     }
 
+    #[test]
+    fn steer_origin_roundtrips_and_legacy_defaults_to_human() {
+        for origin in [TurnOrigin::Human, TurnOrigin::Peer, TurnOrigin::Background] {
+            let payload = SessionCommandPayload::Steer {
+                prompt: "ordinary message without attribution".into(),
+                message_id: Some("message".into()),
+                turn_origin: origin,
+            };
+            let value = serde_json::to_value(&payload).unwrap();
+            assert_eq!(
+                serde_json::from_value::<SessionCommandPayload>(value).unwrap(),
+                payload
+            );
+        }
+        let payload: SessionCommandPayload = serde_json::from_value(serde_json::json!({
+            "kind": "steer", "prompt": "FYI", "messageId": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            payload,
+            SessionCommandPayload::Steer {
+                turn_origin: TurnOrigin::Human,
+                ..
+            }
+        ));
+    }
+
     fn run_request() -> RunRequest {
         RunRequest {
+            turn_origin: TurnOrigin::Human,
             prompt: "hello".into(),
             harness: None,
             model: None,

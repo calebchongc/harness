@@ -379,6 +379,7 @@ impl WorkspaceDoc {
             "sourceContext",
             LoroValue::from(serde_json::to_value(context)?),
         )?;
+        row.insert("sourceContextUnavailableAt", LoroValue::Null)?;
         row.insert("branch", context.branch.as_str())?;
         row.insert("checkoutId", context.checkout_id.as_str())?;
         self.doc.commit();
@@ -481,6 +482,7 @@ impl WorkspaceDoc {
             "lastCompletedTurn",
             session.last_completed_turn.as_deref(),
         )?;
+        row.insert("lastCompletedPeerOnly", session.last_completed_peer_only)?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         self.doc.commit();
@@ -689,6 +691,8 @@ pub(crate) struct RawChat {
     checkout_id: Option<String>,
     #[serde(default)]
     source_context: Option<harness_proto::ConversationSourceContext>,
+    #[serde(default)]
+    source_context_unavailable_at: Option<i64>,
     /// LENIENT: a config this build can't decode (a harness/reasoning/sandbox
     /// id from a NEWER peer — field incident: pre-v0.2.10 laptops dropped
     /// every `"opencode"` chat row wholesale, so new sessions silently never
@@ -715,6 +719,8 @@ pub(crate) struct RawChat {
     room_gen: Option<u32>,
     #[serde(default)]
     parent_chat_id: Option<String>,
+    #[serde(default)]
+    last_prompt_at: Option<i64>,
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -746,6 +752,7 @@ impl From<RawChat> for Chat {
             branch: raw.branch,
             checkout_id: raw.checkout_id,
             source_context: raw.source_context,
+            source_context_unavailable_at: raw.source_context_unavailable_at.map(dt),
             config: raw.config,
             last_message_preview: raw.last_message_preview,
             last_message_at: raw.last_message_at.map(dt),
@@ -756,6 +763,7 @@ impl From<RawChat> for Chat {
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
             parent_chat_id: raw.parent_chat_id,
+            last_prompt_at: raw.last_prompt_at.map(dt),
         }
     }
 }
@@ -765,6 +773,8 @@ impl From<RawChat> for Chat {
 pub(crate) struct RawSession {
     #[serde(default)]
     last_completed_turn: Option<String>,
+    #[serde(default)]
+    last_completed_peer_only: bool,
     chat_id: String,
     device_id: String,
     status: SessionStatus,
@@ -778,6 +788,7 @@ impl From<RawSession> for Session {
     fn from(raw: RawSession) -> Self {
         Session {
             last_completed_turn: raw.last_completed_turn,
+            last_completed_peer_only: raw.last_completed_peer_only,
             chat_id: raw.chat_id,
             device_id: raw.device_id,
             status: raw.status,
@@ -841,6 +852,7 @@ mod tests {
 
     fn chat(id: &str, device_id: &str) -> Chat {
         Chat {
+            last_prompt_at: None,
             id: id.into(),
             device_id: device_id.into(),
             title: Some("First chat".into()),
@@ -865,6 +877,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            source_context_unavailable_at: None,
         }
     }
 
@@ -884,6 +897,7 @@ mod tests {
     fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
         Session {
             last_completed_turn: None,
+            last_completed_peer_only: false,
             chat_id: chat_id.into(),
             device_id: device_id.into(),
             status,

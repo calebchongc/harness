@@ -12,6 +12,7 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — harness pulse loader, gradient spinner, boot splash.
 
+mod agent_message;
 pub mod app_menus;
 pub mod appearance;
 pub mod appshots;
@@ -20,6 +21,10 @@ pub mod badges;
 pub mod browser;
 pub mod change_requests;
 pub mod changes;
+pub(crate) mod chatgpt_plan;
+pub mod codegraff_jobs;
+pub mod codegraff_runners;
+pub mod codegraff_sandboxes;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
@@ -55,11 +60,13 @@ pub mod pickers;
 pub mod popover;
 pub mod project_actions;
 pub mod queue;
+pub mod reauth_recovery;
 pub mod rail;
 pub(crate) mod screen_access;
 pub mod settings;
 pub mod shell;
 pub mod sound;
+pub mod stall_watch;
 pub(crate) mod starters;
 pub mod state;
 pub(crate) mod surface_chrome;
@@ -68,7 +75,9 @@ pub mod terminal;
 pub mod theme;
 pub mod theme_library;
 pub mod transcript;
+mod transcript_paint_check;
 pub mod typography;
+pub mod visuals;
 mod workspace_links;
 
 use std::path::PathBuf;
@@ -172,7 +181,6 @@ pub fn run_app(config: UiConfig) {
         let data_dir = config.boot().data_dir.clone();
         let ui_settings = settings::UiSettings::load(&data_dir);
         settings::init(ui_settings.clone(), data_dir.clone(), cx);
-        perf_stats::start(data_dir.clone(), cx);
         let font_availability = typography::register_fonts(cx);
         // Typography first: theme installation reads the effective family, so
         // the first frame has the final font and palette without a flash.
@@ -201,6 +209,11 @@ pub fn run_app(config: UiConfig) {
             ui_settings.git_history_author_display,
             cx,
         );
+        motion::init(
+            ui_settings.reduce_motion,
+            ui_settings.pause_animations_in_background,
+            cx,
+        );
         composer::init(cx, ui_settings.composer_send_behavior);
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);
@@ -208,6 +221,8 @@ pub fn run_app(config: UiConfig) {
         cx.register_url_scheme("harness").detach();
 
         let state = cx.new(|_| state::AppState::new());
+        perf_stats::start(data_dir.clone(), state.clone(), cx);
+        stall_watch::start(data_dir.join("logs"), cx);
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
@@ -215,8 +230,9 @@ pub fn run_app(config: UiConfig) {
             }
         })
         .detach();
-        // Banner clicks land on the notified chat. The AppKit delegate fires
-        // mid-event, so hop through a channel rather than updating inline.
+        // Banner clicks land on the notified chat (or, for a CodeGraff job's
+        // banner, open its https page). The AppKit delegate fires mid-event,
+        // so hop through a channel rather than updating inline.
         let (click_tx, mut click_rx) = futures::channel::mpsc::unbounded::<String>();
         notify::on_click(move |chat_id| {
             let _ = click_tx.unbounded_send(chat_id);
@@ -224,11 +240,18 @@ pub fn run_app(config: UiConfig) {
         let click_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(chat_id) = click_rx.next().await {
-                let _ = cx.update(|cx| open_notified_chat(chat_id, &click_state, cx));
+                let _ = cx.update(|cx| {
+                    if chat_id.starts_with("https://") {
+                        cx.open_url(&chat_id);
+                    } else {
+                        open_notified_chat(chat_id, &click_state, cx);
+                    }
+                });
             }
         })
         .detach();
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
+        codegraff_jobs::watch(state.clone(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
         // doc snapshots before the process exits (remote engines outlive us).
@@ -251,6 +274,12 @@ pub fn run_app(config: UiConfig) {
             state: state.clone(),
             boot: config.boot(),
         });
+        // A restart into an update left a note: confirm the version once, and
+        // come back behind the app the person was using if it restarted while
+        // they were away from Harness.
+        let relaunch = shell::take_relaunch_marker(&config.boot().data_dir);
+        let relaunched_in_background = relaunch.as_ref().is_some_and(|marker| marker.background);
+        cx.set_global(shell::UpdateRelaunched(relaunch));
         open_main_window(state, config.boot(), cx);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         start_appshot_service(config.boot().data_dir, cx);
@@ -262,7 +291,9 @@ pub fn run_app(config: UiConfig) {
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
-        cx.activate(true);
+        if !relaunched_in_background {
+            cx.activate(true);
+        }
     });
 }
 
@@ -285,7 +316,7 @@ fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx
         Some(shell) => {
             let _ = shell.update(cx, |shell, window, cx| {
                 window.activate_window();
-                shell.open_chat(chat_id, cx);
+                shell.open_chat_preserving_tabs(chat_id, cx);
             });
         }
         None => state.update(cx, |state, cx| state.select_chat(Some(chat_id), cx)),

@@ -60,7 +60,7 @@ enum DocDisk {
     @discardableResult
     static func save(doc: LoroDoc, id: String) -> Bool {
         guard let data = try? doc.export(mode: .snapshot) else { return false }
-        return saveRegistry(data: data, to: url(for: id))
+        return saveRegistry(data: data, to: url(for: id), kind: .snapshots)
     }
 
     /// The workspace registry's persisted blob ({rows, cursor, gcFloor,
@@ -199,7 +199,7 @@ enum DocDisk {
             data.append(push.bytes)
         }
         data.append(snapshot)
-        return saveRegistryReturningBytes(data: data, to: chat2URL(for: id))
+        return saveRegistryReturningBytes(data: data, to: chat2URL(for: id), kind: .snapshots)
     }
 
     static func chat2SnapshotSize(id: String) -> Int {
@@ -238,13 +238,13 @@ enum DocDisk {
     }
 
     @discardableResult
-    static func saveRegistry(data: Data, to url: URL) -> Bool {
-        saveRegistryReturningBytes(data: data, to: url) != nil
+    static func saveRegistry(data: Data, to url: URL, kind: PerfFileKind = .registry) -> Bool {
+        saveRegistryReturningBytes(data: data, to: url, kind: kind) != nil
     }
 
-    static func saveRegistryReturningBytes(data: Data, to url: URL) -> Int? {
+    static func saveRegistryReturningBytes(data: Data, to url: URL, kind: PerfFileKind = .registry) -> Int? {
         do {
-            try data.write(to: url, options: .atomic)
+            try PerfFileWriter.write(data, to: url, kind: kind)
             return data.count
         } catch {
             return nil
@@ -291,7 +291,7 @@ enum DocDisk {
                         })
         }
         guard let data = try? JSONEncoder().encode(cached) else { return false }
-        return saveRegistry(data: data, to: modelsURL(deviceId: deviceId, harness: harness))
+        return saveRegistry(data: data, to: modelsURL(deviceId: deviceId, harness: harness), kind: .models)
     }
 
     static func loadModels(deviceId: String, harness: String) -> [ModelInfo]? {
@@ -305,6 +305,40 @@ enum DocDisk {
                                           choices: $0.choices.map { ModelOptionChoiceInfo(id: $0.id, label: $0.label) },
                                           defaultChoice: $0.defaultChoice)
                       })
+        }
+    }
+
+    private struct CachedHarness: Codable {
+        var id: String
+        var label: String
+        var supportsSteering: Bool?
+        var steeringMode: String?
+    }
+
+    static func harnessesURL(deviceId: String) -> URL {
+        let safe = deviceId.map { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" ? $0 : "_" }
+            .reduce(into: "") { $0.append($1) }
+        return directory.appendingPathComponent("harnesses_\(safe).json")
+    }
+
+    /// The device's last-seen agent list, so the model picker still offers
+    /// every agent (Graff included) while the device is unreachable.
+    @discardableResult
+    static func saveHarnesses(_ harnesses: [HarnessInfo], deviceId: String) -> Bool {
+        let cached = harnesses.map {
+            CachedHarness(id: $0.id, label: $0.label,
+                          supportsSteering: $0.supportsSteering, steeringMode: $0.steeringMode)
+        }
+        guard let data = try? JSONEncoder().encode(cached) else { return false }
+        return saveRegistry(data: data, to: harnessesURL(deviceId: deviceId), kind: .harnesses)
+    }
+
+    static func loadHarnesses(deviceId: String) -> [HarnessInfo]? {
+        guard let data = try? Data(contentsOf: harnessesURL(deviceId: deviceId)),
+              let cached = try? JSONDecoder().decode([CachedHarness].self, from: data) else { return nil }
+        return cached.map {
+            HarnessInfo(id: $0.id, label: $0.label,
+                        supportsSteering: $0.supportsSteering, steeringMode: $0.steeringMode)
         }
     }
 

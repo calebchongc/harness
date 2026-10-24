@@ -5,11 +5,11 @@
 //! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
 //! ([`AcpHarness::hermes`], `hermes acp`) and Antigravity
 //! ([`AcpHarness::antigravity`], Google's `agy_acp_server`, installed from its
-//! pinned release archive) — plus pi ([`AcpHarness::pi`]) via the community
-//! `pi-acp` adapter until a native driver exists — and Exo
-//! ([`AcpHarness::exo`]) through Harness's own bridge ([`exo_bridge`], `harness
-//! exo-acp`), since Exo only exposes its agent-cli socket. Claude, Codex and Cursor moved to native drivers
-//! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
+//! pinned release archive) — and Exo ([`AcpHarness::exo`]) through Harness's
+//! own bridge ([`exo_bridge`], `harness exo-acp`), since Exo only exposes its
+//! agent-cli socket. Pi, Claude, Codex and Cursor use native drivers
+//! ([`crate::PiHarness`], [`crate::ClaudeHarness`], [`crate::CodexHarness`],
+//! [`crate::CursorHarness`])
 //! after adapter-mediated ACP kept manufacturing done-status bugs the native
 //! wires don't have (turn-hold bookkeeping vs the CLI's own eager result).
 //!
@@ -31,11 +31,16 @@
 //!   always ends with `Done { status: Interrupted }`.
 
 mod antigravity_paths;
+mod clarification_resume;
+mod compaction;
 mod devin_models;
 mod elicitation;
 pub mod exo_bridge;
+pub mod graff_client;
 mod graff_models;
 pub use graff_models::{ModelMismatch, parse_model_mismatch};
+pub mod graff_login;
+pub mod graff_mcp;
 pub mod graff_worktree;
 mod normalize;
 mod prompt_images;
@@ -48,7 +53,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::time::Duration;
 
@@ -66,11 +71,12 @@ use harness_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
+pub(crate) use crate::process::owned as child;
 use crate::process::{Command, Stdio};
 use crate::scratch::ScratchDir;
-use child::Child;
-pub(crate) mod child;
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use child::Child;
+use compaction::CompactionTracker;
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
@@ -104,7 +110,7 @@ struct AcpAgentSpec {
     extra_paths: fn() -> Vec<PathBuf>,
     /// The agent's own CLI binary (`claude`, `codex`, …) — what "installed"
     /// means to the user. Distinct from `executable` where the spawned adapter
-    /// wraps the CLI (`claude-agent-acp`, `codex-acp`, `pi-acp`), and the npx
+    /// wraps the CLI (third-party ACP adapters), and the npx
     /// fallback deliberately doesn't count: npx can fetch an adapter on
     /// demand, but an absent CLI still means no logins/config to drive.
     cli_executable: &'static str,
@@ -188,27 +194,6 @@ fn default_effort_values(
     }
 }
 
-/// npm-global bin dirs for an adapter binary (`npm i -g` installs).
-fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
-    // fn pointers can't capture; probe the fixed npm-global locations and
-    // append the exe at call time via a small per-exe shim table.
-    match exe {
-        "pi-acp" => || npm_global_bins("pi-acp"),
-        _ => || Vec::new(),
-    }
-}
-
-fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = crate::executable::home_dir() {
-        dirs.push(home.join(".local").join("bin").join(exe));
-        dirs.push(home.join(".npm-global").join("bin").join(exe));
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin").join(exe));
-    dirs.push(PathBuf::from("/usr/local/bin").join(exe));
-    dirs
-}
-
 fn grok_effort() -> Vec<ReasoningLevel> {
     vec![
         ReasoningLevel::Low,
@@ -226,6 +211,8 @@ fn grok_static_models() -> Vec<Model> {
             description: Some("SpaceXAI's latest frontier model — 500k context".into()),
             reasoning_levels: grok_effort(),
             options: Vec::new(),
+            maker: None,
+            billing: None,
         },
         Model {
             id: "grok-4.7-build-fast".into(),
@@ -233,6 +220,8 @@ fn grok_static_models() -> Vec<Model> {
             description: Some("Fast variant of Grok 4.7".into()),
             reasoning_levels: grok_effort(),
             options: Vec::new(),
+            maker: None,
+            billing: None,
         },
         Model {
             id: "grok-4.6".into(),
@@ -240,6 +229,8 @@ fn grok_static_models() -> Vec<Model> {
             description: Some("xAI's coding model — 500k context".into()),
             reasoning_levels: grok_effort(),
             options: Vec::new(),
+            maker: None,
+            billing: None,
         },
         Model {
             id: "grok-4.5".into(),
@@ -247,6 +238,8 @@ fn grok_static_models() -> Vec<Model> {
             description: Some("xAI's coding model — 500k context".into()),
             reasoning_levels: grok_effort(),
             options: Vec::new(),
+            maker: None,
+            billing: None,
         },
     ]
 }
@@ -365,6 +358,8 @@ fn devin_spec() -> AcpAgentSpec {
                     description: Some("Devin's default coding model".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    maker: None,
+                    billing: None,
                 },
                 Model {
                     id: "claude-fable-5-1-high".into(),
@@ -372,6 +367,8 @@ fn devin_spec() -> AcpAgentSpec {
                     description: Some("Anthropic's frontier model through Devin".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    maker: None,
+                    billing: None,
                 },
                 Model {
                     id: "adaptive".into(),
@@ -379,6 +376,8 @@ fn devin_spec() -> AcpAgentSpec {
                     description: Some("Devin picks the model per request".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    maker: None,
+                    billing: None,
                 },
             ]
         },
@@ -441,6 +440,8 @@ fn hermes_spec() -> AcpAgentSpec {
                     description: Some("Nous Research's hybrid-reasoning flagship".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    maker: None,
+                    billing: None,
                 },
                 Model {
                     id: "hermes-4-70b".into(),
@@ -448,6 +449,8 @@ fn hermes_spec() -> AcpAgentSpec {
                     description: Some("Faster Hermes 4 — same post-training, 70B".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    maker: None,
+                    billing: None,
                 },
             ]
         },
@@ -538,6 +541,45 @@ fn exo_bridge_programs() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Harness's own MCP server (`harness mcp`: agent rooms and chat tools),
+/// speaking for the run's chat, as an ACP stdio server entry. Only graff gets
+/// it for now: graff trusts client-provided servers without a consent
+/// prompt and frames room deliveries as advisory peer mail; other ACP agents
+/// would ask the person before every room call.
+/// `session/cancel` params. With the engine's reason, `_meta` says whether the
+/// user asked (graff blames the user only then, codegraff#1611); without one
+/// the cancel stays bare, as before.
+fn cancel_params(session_id: &str, reason: Option<&str>) -> Value {
+    match reason {
+        Some(reason) => json!({
+            "sessionId": session_id,
+            "_meta": {
+                "graff/cancelSource": if crate::interrupt_reason::by_user(reason) { "user" } else { "client" },
+                "graff/cancelReason": reason,
+            },
+        }),
+        None => json!({ "sessionId": session_id }),
+    }
+}
+
+fn harness_mcp_servers(harness: HarnessId, origin: Option<&crate::RunOrigin>) -> Value {
+    let (HarnessId::Graff, Some(origin), Some(program)) =
+        (harness, origin, exo_bridge_programs().into_iter().next())
+    else {
+        return json!([]);
+    };
+    let mut env = vec![json!({ "name": "HARNESS_CHAT_ID", "value": origin.chat_id })];
+    if let Ok(port) = std::env::var("HARNESS_IPC_PORT") {
+        env.push(json!({ "name": "HARNESS_IPC_PORT", "value": port }));
+    }
+    json!([{
+        "name": "harness",
+        "command": program.to_string_lossy(),
+        "args": ["mcp"],
+        "env": env,
+    }])
+}
+
 /// Where Exo's setup docs put the `exo-cli` client (`ln -s … ~/bin/exo-cli`).
 fn exo_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -576,6 +618,8 @@ fn exo_spec() -> AcpAgentSpec {
                 description: Some("Runs the model configured in Exo (`./exo.sh --model`)".into()),
                 reasoning_levels: Vec::new(),
                 options: Vec::new(),
+                maker: None,
+                billing: None,
             }]
         },
         // One reply per agent-cli exchange: steers queue for the next turn.
@@ -587,67 +631,6 @@ fn exo_spec() -> AcpAgentSpec {
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "Check that Exo's stack is running (`./exo.sh`).",
-        effort_in_model_id: false,
-        auth_method: None,
-        skill_dirs: Vec::new,
-        hidden_commands: &[],
-    }
-}
-
-fn pi_spec() -> AcpAgentSpec {
-    AcpAgentSpec {
-        id: HarnessId::Pi,
-        display_name: "Pi",
-        executable: "pi-acp",
-        env_override: "PI_ACP_EXECUTABLE",
-        args: &[],
-        npm_package: Some("pi-acp@0.0.33"),
-        archive: None,
-        extra_paths: npm_global_paths("pi-acp"),
-        cli_executable: "pi",
-        cli_extra_paths: || npm_global_bins("pi"),
-        install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
-             and fnm/nvm/volta/pnpm/bun install dirs; harness installs the pinned \
-             pi-acp automatically when npm is available — the pi CLI itself is \
-             still required, `npm install -g --ignore-scripts \
-             @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
-        // pi routes models through its own provider config (~/.pi); the picker
-        // advertises the pass-through entry and pi keeps whatever the user set
-        // up. Unknown ids are skipped by the config-option set.
-        models: || {
-            vec![Model {
-                id: "default".into(),
-                label: "pi default".into(),
-                description: Some("Runs the model configured in pi (`pi` settings)".into()),
-                reasoning_levels: vec![
-                    ReasoningLevel::Minimal,
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                    ReasoningLevel::XHigh,
-                    ReasoningLevel::Max,
-                ],
-                options: Vec::new(),
-            }]
-        },
-        // The adapter has no `_session/steering` extension: turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
-        // pi's thinking ladder (minimal→max; its extra "off" tier has no harness
-        // equivalent and is left to the agent default).
-        reasoning_levels: &[
-            ReasoningLevel::Minimal,
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
-        prompt_transform: identity_transform,
-        effort_values: default_effort_values,
-        ladder_extras: &[],
-        prompt_complete_extension: false,
-        prompt_stall: None,
-        stall_hint: "The agent process is likely wedged.",
         effort_in_model_id: false,
         auth_method: None,
         skill_dirs: Vec::new,
@@ -914,7 +897,7 @@ fn antigravity_spec() -> AcpAgentSpec {
         extra_paths: Vec::new,
         cli_executable: "agy_acp_server",
         cli_extra_paths: Vec::new,
-        install_hint: "Install Antigravity to enable, or set ANTIGRAVITY_ACP_EXECUTABLE to its ACP server",
+        install_hint: "Antigravity's ACP server is not installed (the agy CLI does not include it): install it from Settings, or set ANTIGRAVITY_ACP_EXECUTABLE to it",
         models: || {
             use ReasoningLevel::{High, Low, Medium};
             vec![
@@ -924,6 +907,8 @@ fn antigravity_spec() -> AcpAgentSpec {
                     description: None,
                     reasoning_levels: vec![Low, Medium, High],
                     options: Vec::new(),
+                    maker: None,
+                    billing: None,
                 },
                 Model {
                     id: "gemini-3.1-pro".into(),
@@ -931,6 +916,8 @@ fn antigravity_spec() -> AcpAgentSpec {
                     description: None,
                     reasoning_levels: vec![Low, High],
                     options: Vec::new(),
+                    maker: None,
+                    billing: None,
                 },
             ]
         },
@@ -996,7 +983,7 @@ pub fn prewarm_managed_adapters() {
 }
 
 fn prewarm_managed_adapters_on(handle: &tokio::runtime::Handle) {
-    for spec in [grok_spec(), pi_spec()] {
+    for spec in [grok_spec()] {
         let Some(pkg) = spec.npm_package else {
             continue;
         };
@@ -1045,6 +1032,8 @@ enum Launch {
 pub struct AcpHarness {
     spec: AcpAgentSpec,
     graff_draft_subagents: Option<Arc<AtomicBool>>,
+    /// Settings → graff's compaction point (percent; 0 = graff's default).
+    graff_compact_at: Option<Arc<AtomicU8>>,
     executable: Option<PathBuf>,
     /// Override of the agent's on-disk sessions root (grok's
     /// `~/.grok/sessions`), where subagent transcripts are tailed from.
@@ -1073,6 +1062,7 @@ impl AcpHarness {
         Self {
             spec,
             graff_draft_subagents: None,
+            graff_compact_at: None,
             executable: None,
             sessions_root: None,
             interrupt_grace: Duration::from_secs(2),
@@ -1114,6 +1104,21 @@ impl AcpHarness {
         self
     }
 
+    pub fn with_graff_compact_at(mut self, pct: Arc<AtomicU8>) -> Self {
+        self.graff_compact_at = Some(pct);
+        self
+    }
+
+    /// The compaction point to pass graff, unless the user's own
+    /// `GRAFF_COMPACT_PCT` is set (an explicit environment setting wins).
+    fn graff_compact_at_env(&self) -> Option<u8> {
+        if self.spec.id != HarnessId::Graff || std::env::var_os("GRAFF_COMPACT_PCT").is_some() {
+            return None;
+        }
+        let pct = self.graff_compact_at.as_ref()?.load(Ordering::Relaxed);
+        (pct != 0).then_some(pct)
+    }
+
     fn draft_subagents_enabled(&self) -> bool {
         self.spec.id == HarnessId::Graff
             && (graff_draft_subagents_enabled()
@@ -1121,12 +1126,6 @@ impl AcpHarness {
                     .graff_draft_subagents
                     .as_ref()
                     .is_some_and(|flag| flag.load(Ordering::Relaxed)))
-    }
-
-    /// The pi coding agent over ACP — the community `pi-acp` adapter wrapping
-    /// pi's RPC mode.
-    pub fn pi() -> Self {
-        Self::with_spec(pi_spec()).with_model_discovery_timeout(Duration::from_secs(60))
     }
 
     /// google antigravity over its acp server (`agy_acp_server`).
@@ -1477,6 +1476,13 @@ impl AcpHarness {
             if self.draft_subagents_enabled() {
                 cmd.env("GRAFF_ACP_DRAFT_SUBAGENTS", "1");
             }
+            if let Some(pct) = self.graff_compact_at_env() {
+                cmd.env("GRAFF_COMPACT_PCT", pct.to_string());
+            }
+            // Which Harness and which computer sent each gateway request.
+            for (key, value) in graff_client::env() {
+                cmd.env(key, value);
+            }
         }
         if self.spec.id == HarnessId::Antigravity
             && let Some(parent) = executable.parent()
@@ -1740,7 +1746,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         .map(|a| a.as_slice())
         .unwrap_or_default();
 
-    let ladder: Vec<ReasoningLevel> = config_options
+    let mut ladder: Vec<ReasoningLevel> = config_options
         .iter()
         .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
         .and_then(|o| o.get("options").and_then(Value::as_array))
@@ -1751,6 +1757,10 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 .collect()
         })
         .unwrap_or_default();
+    // Agents advertise in either direction (Grok Build: highest first); the
+    // effort slider reads lowest to highest.
+    ladder.sort_unstable();
+    ladder.dedup();
     let wire_options: Vec<ModelOption> = config_options
         .iter()
         .filter_map(trait_from_config_option)
@@ -1795,6 +1805,8 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 None => ladder.clone(),
             },
             options,
+            maker: None,
+            billing: None,
         }
     };
 
@@ -2151,6 +2163,10 @@ impl Harness for AcpHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let mut launch_args = if self.id() == HarnessId::Graff {
+            // Session start is the natural moment for a graff update check;
+            // it never blocks and this session keeps the resolved binary.
+            crate::graff_bundle::maybe_check_soon();
+            crate::codedb_bundle::maybe_check_soon();
             request.model = request
                 .model
                 .take()
@@ -2168,6 +2184,9 @@ impl Harness for AcpHarness {
             .filter(|name| harness_proto::graff_worktree::valid_name(name));
         if let Some(name) = &graff_worktree {
             launch_args.extend(["-w".to_owned(), name.clone()]);
+            // "Send now" and other follow-ups rebuild the request from the
+            // chat row, already re-homed into the tree (codegraff#1693).
+            request.cwd = harness_proto::graff_worktree::launch_root(&request.cwd).to_owned();
         }
         let (scratch, mut child, stderr_tail) = self
             .spawn_agent(Some(&request.cwd), true, &launch_args)
@@ -2276,6 +2295,8 @@ fn initialize_params_with_subagents(harness: HarnessId, graff_subagents: bool) -
         // graff 0.0.302.6+ sends ask_user as a form elicitation, and answers
         // it at once for clients that don't advertise one.
         capabilities["elicitation"] = elicitation::capability();
+        // v1 gates compaction updates behind this (unstable) capability.
+        capabilities["session"] = compaction::session_capability();
         if graff_subagents {
             capabilities["subagents"] = json!({});
             capabilities["_meta"] = json!({ "graff/backgroundSubagents": true });
@@ -2660,8 +2681,9 @@ fn session_update_events(
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
-    effort: &mut EffortTracker,
+    trackers: &mut SessionTrackers,
 ) -> Vec<AgentEvent> {
+    let SessionTrackers { effort, compaction } = trackers;
     let update_session = params.get("sessionId").and_then(Value::as_str);
     let update = params.get("update").unwrap_or(&Value::Null);
     if let SubagentObserver::Graff(tracker) = subagents {
@@ -2677,6 +2699,7 @@ fn session_update_events(
                 return events;
             }
             let mut events = events;
+            events.extend(compaction.observe(update));
             if let Some(change) = effort.observe(update) {
                 events.push(change);
             }
@@ -2701,11 +2724,19 @@ fn session_update_events(
         _ => Vec::new(),
     };
     if method == "session/update" {
+        events.extend(compaction.observe(update));
         if let Some(change) = effort.observe(update) {
             events.push(change);
         }
     }
     events
+}
+
+/// Per-session state the `session/update` mapping keeps across frames.
+#[derive(Default)]
+struct SessionTrackers {
+    effort: EffortTracker,
+    compaction: CompactionTracker,
 }
 
 /// Codegraff's Jev result announces a pending choice; the config update is
@@ -2823,6 +2854,20 @@ impl EffortTracker {
 
 /// Per-turn token usage from a settled `session/prompt` response, when the
 /// adapter attaches it (tolerant of both field spellings; absent → nothing).
+/// The save a turn's session now lives in, when graff reports one that is not
+/// the connection's session id: `/resume` moves the live session onto another
+/// save while the connection keeps routing by its original id. The engine
+/// resumes from `Done.session_id`, so a restart loads the save the
+/// conversation continued in rather than the one handed out at session/new.
+fn durable_session_id(res: &Result<Value, HarnessError>, session_id: &str) -> String {
+    res.as_ref()
+        .ok()
+        .and_then(|resp| resp.get("_meta")?.get("graff/durableSessionId")?.as_str())
+        .filter(|id| !id.is_empty())
+        .unwrap_or(session_id)
+        .to_owned()
+}
+
 fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> {
     let resp = res.as_ref().ok()?;
     // Grok settles usage on the response `_meta` (inputTokens/outputTokens —
@@ -2851,7 +2896,10 @@ fn stop_outcome(
     }
     match res {
         Ok(resp) => match resp.get("stopReason").and_then(Value::as_str) {
-            Some("cancelled") => (DoneStatus::Interrupted, None),
+            Some("cancelled") => match clarification_resume::cancellation_error(resp) {
+                Some(message) => (DoneStatus::Errored, Some(message)),
+                None => (DoneStatus::Interrupted, None),
+            },
             Some("error") => (
                 DoneStatus::Errored,
                 Some("The agent failed to complete the turn.".to_owned()),
@@ -2885,6 +2933,9 @@ fn prompt_turn(
     prompt_id: Option<String>,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
     Box::pin(async move {
+        // A room delivery's tag line becomes `_meta["harness/room"]`, so the
+        // agent can tell another agent's post from the user's words.
+        let (text, room) = harness_proto::room_delivery::lift(&text);
         let prompt = prompt_images::prompt_blocks(text, &extra, &allowed, images).await;
         let mut params = json!({
             "sessionId": session_id,
@@ -2893,13 +2944,22 @@ fn prompt_turn(
         if let Some(id) = prompt_id {
             params["_meta"] = json!({ "promptId": id, "requestId": id });
         }
+        if let Some(room) = room {
+            params["_meta"]["harness/room"] = room;
+        }
         client.request("session/prompt", params).await
     })
 }
 
-/// The host's MCP servers in ACP's `session/new` shape, for an agent that
-/// advertised `agentCapabilities.mcpCapabilities.http`; none otherwise.
-fn session_mcp_servers(init: &Value, servers: &[crate::McpServer]) -> Value {
+/// `session/new`'s `mcpServers`: Harness's own stdio servers (`base`, from
+/// [`harness_mcp_servers`]) and then the run's HTTP servers (the browse
+/// relay), the latter only for an agent that advertised
+/// `agentCapabilities.mcpCapabilities.http`.
+fn session_mcp_servers(base: Value, init: &Value, servers: &[crate::McpServer]) -> Value {
+    let mut all = match base {
+        Value::Array(entries) => entries,
+        _ => Vec::new(),
+    };
     let http = init
         .pointer("/agentCapabilities/mcpCapabilities/http")
         .and_then(Value::as_bool)
@@ -2908,25 +2968,21 @@ fn session_mcp_servers(init: &Value, servers: &[crate::McpServer]) -> Value {
         if !servers.is_empty() {
             tracing::debug!(target: "harness_adapters::acp", "agent takes no HTTP MCP servers; skipping {}", servers.len());
         }
-        return json!([]);
+        return Value::Array(all);
     }
-    Value::Array(
-        servers
-            .iter()
-            .map(|server| {
-                json!({
-                    "type": "http",
-                    "name": server.name,
-                    "url": server.url,
-                    "headers": server
-                        .headers
-                        .iter()
-                        .map(|(name, value)| json!({ "name": name, "value": value }))
-                        .collect::<Vec<_>>(),
-                })
-            })
-            .collect(),
-    )
+    all.extend(servers.iter().map(|server| {
+        json!({
+            "type": "http",
+            "name": server.name,
+            "url": server.url,
+            "headers": server
+                .headers
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect::<Vec<_>>(),
+        })
+    }));
+    Value::Array(all)
 }
 
 /// Whether the agent takes ACP `image` prompt blocks.
@@ -3010,6 +3066,7 @@ fn handle_server_request_live(
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
     session_id: &str,
+    answered: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<AgentEvent> {
     if params
         .get("sessionId")
@@ -3025,7 +3082,7 @@ fn handle_server_request_live(
         return Vec::new();
     }
     if method == "elicitation/create" {
-        return ask_elicitation(client, id, params, request_input);
+        return ask_elicitation(client, id, params, request_input, answered);
     }
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
@@ -3054,9 +3111,13 @@ fn handle_server_request_live(
             .get("toolCall")
             .and_then(|t| t.get("title"))
             .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
             .unwrap_or("The agent needs your input.")
             .to_owned(),
         options: names.clone(),
+        prefill: None,
+        multiline: false,
         multi_select: false,
     };
     let client = client.clone();
@@ -3094,6 +3155,7 @@ fn ask_elicitation(
     id: Value,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    answered: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<AgentEvent> {
     let Some(form) = elicitation::form(params, new_message_id) else {
         client.respond(&id, elicitation::cancel());
@@ -3101,9 +3163,14 @@ fn ask_elicitation(
     };
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
+    let answered = std::sync::Arc::clone(answered);
     tokio::spawn(async move {
         let answers = (request_input)(form.questions()).await.unwrap_or_default();
-        client.respond(&id, form.response(&answers));
+        let response = form.response(&answers);
+        if response.get("action").and_then(Value::as_str) == Some("accept") {
+            answered.store(true, std::sync::atomic::Ordering::Release);
+        }
+        client.respond(&id, response);
     });
     Vec::new()
 }
@@ -3118,6 +3185,7 @@ async fn new_session(
     signs_in_from_settings: bool,
 ) -> Result<Value, HarnessError> {
     match request_draining(client, incoming, "session/new", params).await {
+        Err(error @ HarnessError::ReauthRequired { .. }) => Err(error),
         Err(error) if signs_in_from_settings && is_auth_required(&error) => {
             Err(HarnessError::Protocol(format!(
                 "{agent_name} isn't signed in. Use Settings → Agents → Sign in."
@@ -3215,6 +3283,8 @@ fn group_effort_variants(models: Vec<Model>) -> Vec<Model> {
                 description: None,
                 reasoning_levels: group.variants.iter().map(|(level, _)| *level).collect(),
                 options: first.options.clone(),
+                maker: None,
+                billing: None,
             })
         })
         .collect()
@@ -3443,9 +3513,12 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        origin,
         mcp_servers,
     } = controls;
+    let origin_chat = origin.as_ref().map(|o| o.chat_id.clone());
     let request_input = std::sync::Arc::new(request_input);
+    let mut clarification = clarification_resume::State::default();
 
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
@@ -3477,7 +3550,11 @@ async fn run_session(session: Session) {
 
         let session_params = json!({
             "cwd": request.cwd,
-            "mcpServers": session_mcp_servers(&init, &mcp_servers),
+            "mcpServers": session_mcp_servers(
+                harness_mcp_servers(harness, origin.as_ref()),
+                &init,
+                &mcp_servers,
+            ),
         });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
@@ -3548,17 +3625,20 @@ async fn run_session(session: Session) {
                 request_draining(&client, &mut incoming, "graff/models", json!({})).await?;
             graff_models::verify_resumed_model(&catalog, model)?;
         }
+        let mut devin_selection = None;
         if harness == HarnessId::Devin
             && let Some(model) = request.model.as_deref()
         {
-            devin_models::wait_for_model(
-                &client,
-                &mut incoming,
-                &session_id,
-                &mut session_response,
-                model,
-            )
-            .await?;
+            devin_selection = Some(
+                devin_models::wait_for_model(
+                    &client,
+                    &mut incoming,
+                    &session_id,
+                    &mut session_response,
+                    model,
+                )
+                .await?,
+            );
         }
         // ACP has had two model-selection surfaces. Newer config-option agents
         // use category=model below; Grok Build currently advertises only the
@@ -3566,13 +3646,32 @@ async fn run_session(session: Session) {
         // ACP clients follow the same split. Unlike the best-effort auxiliary options,
         // an explicit model switch is strict: prompting with a different
         // model than the picker shows is worse than surfacing the RPC error.
-        let requested_model: Option<String> = match request.model.as_deref() {
-            Some(model) if effort_in_model_id => Some(effort_variant_id(
-                &session_response,
-                model,
-                request.reasoning,
-            )),
-            model => model.map(str::to_owned),
+        let devin_configured = if harness == HarnessId::Devin
+            && let (Some(selection), Some(requested)) = (&devin_selection, request.model.as_deref())
+        {
+            devin_models::configure_model(
+                &client,
+                &mut incoming,
+                &session_id,
+                &mut session_response,
+                requested,
+                selection,
+            )
+            .await?
+        } else {
+            false
+        };
+        let requested_model: Option<String> = if devin_configured {
+            None
+        } else {
+            match request.model.as_deref() {
+                Some(model) if effort_in_model_id => Some(effort_variant_id(
+                    &session_response,
+                    model,
+                    request.reasoning,
+                )),
+                model => model.map(str::to_owned),
+            }
         };
         if harness == HarnessId::Antigravity {
             validate_config_model_selection(
@@ -3605,7 +3704,15 @@ async fn run_session(session: Session) {
         if harness == HarnessId::Graff {
             graff_models::validate_effort(&session_response, request.reasoning)?;
         }
-        let efforts = effort_values(request.reasoning, request.model.as_deref());
+        let efforts = if devin_configured
+            && devin_selection
+                .as_ref()
+                .is_some_and(|selection| selection.thought_level.is_some())
+        {
+            Vec::new()
+        } else {
+            effort_values(request.reasoning, request.model.as_deref())
+        };
         let session_commands = scan_available_commands(&session_response);
         let init_commands = if session_commands.is_empty() {
             init_commands
@@ -3621,6 +3728,14 @@ async fn run_session(session: Session) {
             &efforts,
             &request.model_options,
         ) {
+            if devin_configured
+                && config_id == "speed"
+                && devin_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.speed.is_some())
+            {
+                continue;
+            }
             let mut params = serde_json::Map::new();
             params.insert("sessionId".into(), session_id.clone().into());
             params.insert("configId".into(), config_id.clone().into());
@@ -3703,6 +3818,17 @@ async fn run_session(session: Session) {
             match res {
                 Ok(v) => v,
                 Err(e) => {
+                    if let HarnessError::ReauthRequired { provider } = &e {
+                        let _ = send(&event_tx, AgentEvent::ReauthRequired { provider: *provider }).await;
+                        let _ = send(&event_tx, AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: None,
+                            session_id: None,
+                        }).await;
+                        child.shutdown(kill_grace).await;
+                        return;
+                    }
                     // A child that dies before the handshake used to surface only
                     // the RPC-side symptom ("transport closed") — its exit status
                     // and stderr, both already in hand, were dropped, leaving
@@ -3796,8 +3922,11 @@ async fn run_session(session: Session) {
             sessions_root,
         ))
     };
-    let mut effort = EffortTracker {
-        current: initial_effort,
+    let mut trackers = SessionTrackers {
+        effort: EffortTracker {
+            current: initial_effort,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -3849,6 +3978,10 @@ async fn run_session(session: Session) {
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut done_current = false;
+    // graff produced output while no prompt of ours was outstanding: a turn
+    // it started itself (a background subagent or peer message woke the
+    // parent). Its only end is `gui_turn_end` (#276); any Done clears it.
+    let mut autonomous_turn = false;
     let mut done_after_interrupt = false;
     let mut escalation_target = None;
     let mut escalation_deadline = None;
@@ -3877,14 +4010,22 @@ async fn run_session(session: Session) {
     // `session/prompt` into a session that is visibly mid SELF-CONTINUED
     // turn — that prompt's reply is what the adapter drops (the verified
     // starve). Visibly busy = an open tool call, or stream traffic within
-    // BUSY_RECENT, with no prompt of ours outstanding. The discipline is
-    // Zed's, verified against the real adapter: `session/cancel` the
-    // unowned turn, give it CANCEL_FLUSH to die and drain, then prompt.
-    // This makes the interactive path starve-free; the settle layers below
-    // remain for the notification race a client cannot see coming.
+    // BUSY_RECENT, with no prompt of ours outstanding. The message waits
+    // (rechecked every BUSY_RECHECK) until the agent goes quiet, then goes
+    // out as the next prompt. It never cancels the unowned turn: that was
+    // Zed's discipline, but it killed the agent's own work every time a
+    // message (typed, or another chat's `send_message`) arrived mid-turn.
+    // The settle layers below remain for the notification race a client
+    // cannot see coming.
+    // Graff needs none of this: a prompt sent into its self-continued turn
+    // (a background subagent finishing wakes the parent) waits for that turn's
+    // `gui_turn_end` and then gets its own response (verified live, graff
+    // 0.0.302.18). Its background subagents also stream `graff/subagent_event`
+    // frames, which would read as busy for as long as a child runs.
+    let defer_into_busy = harness != HarnessId::Graff;
     const BUSY_RECENT: Duration = Duration::from_secs(3);
-    const CANCEL_FLUSH: Duration = Duration::from_secs(2);
-    let mut cancel_flush_deadline: Option<tokio::time::Instant> = None;
+    const BUSY_RECHECK: Duration = Duration::from_millis(500);
+    let mut busy_defer_deadline: Option<tokio::time::Instant> = None;
 
     let mut child_exit = None;
     let mut exit_drain_deadline = None;
@@ -3903,7 +4044,13 @@ async fn run_session(session: Session) {
 
             res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
                 turn = None;
-                if res.is_err() && client.is_closed() {
+                // A request failed by the reader's EOF cleanup is a crash. A
+                // reauth error is the agent's own answer, and the agent may
+                // exit right after sending it, so it still ends the turn below.
+                if res.is_err()
+                    && !matches!(&res, Err(HarnessError::ReauthRequired { .. }))
+                    && client.is_closed()
+                {
                     break 'main;
                 }
                 starve_deadline = None;
@@ -3927,6 +4074,7 @@ async fn run_session(session: Session) {
                 // a full channel never parses the response): past it the call
                 // is abandoned and the steer redelivered.
                 if let Some((text, mut fut)) = steering_call.take() {
+                    clarification.steer();
                     let outcome = match tokio::time::timeout(
                         Duration::from_millis(1000),
                         &mut fut,
@@ -3972,8 +4120,9 @@ async fn run_session(session: Session) {
                     match inc {
                         Incoming::Notification { method, params } => {
                             let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents, &mut effort);
+                                session_update_events(&method, &params, &session_id, &mut subagents, &mut trackers);
                             for ev in events {
+                                clarification.observe(&ev);
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
                                     break;
@@ -3988,6 +4137,7 @@ async fn run_session(session: Session) {
                                 &params,
                                 &request_input,
                                 &session_id,
+                                &clarification.answered,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -4003,6 +4153,29 @@ async fn run_session(session: Session) {
                 }
                 if consumer_gone {
                     break 'main;
+                }
+                if interrupt.is_cancelled() {
+                    interrupted = true;
+                }
+                if clarification.take_retry(
+                    &res, interrupted,
+                    !queued_steers.is_empty() || !steer_backlog.is_empty() || !steering.is_empty(),
+                ) {
+                    if !send(&event_tx, AgentEvent::TextDelta {
+                        text: clarification_resume::NOTICE.into(),
+                    }).await {
+                        break 'main;
+                    }
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
+                    prompt_seq += 1;
+                    current_prompt_id = prompt_complete_extension.then(|| format!("harness-p{prompt_seq}"));
+                    prompt_stall_deadline = prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    turn = Some(prompt_turn(
+                        client.clone(), session_id.clone(), clarification_resume::PROMPT.into(),
+                        Vec::new(), allowed_images.clone(), images_supported, current_prompt_id.clone(),
+                    ));
+                    continue 'main;
                 }
                 let (prev, _next) = rotate(&mut assistant_message_id);
                 if !send(
@@ -4021,11 +4194,19 @@ async fn run_session(session: Session) {
                     break 'main;
                 }
                 let (status, mut error) = stop_outcome(&res, interrupted);
-                if !interrupted && auth_method.is_some() && res.as_ref().is_err_and(is_auth_required) {
-                    error = Some(format!("{agent_name} isn't signed in. Use Settings → Agents → Sign in."));
+                if !interrupted {
+                    if let Err(HarnessError::ReauthRequired { provider }) = &res {
+                        if !send(&event_tx, AgentEvent::ReauthRequired { provider: *provider }).await {
+                            break 'main;
+                        }
+                        error = None;
+                    } else if auth_method.is_some() && res.as_ref().is_err_and(is_auth_required) {
+                        error = Some(format!("{agent_name} isn't signed in. Use Settings → Agents → Sign in."));
+                    }
                 }
-                effort.finish_turn();
+                trackers.effort.finish_turn();
                 done_current = true;
+                autonomous_turn = false;
                 if interrupted {
                     done_after_interrupt = true;
                 }
@@ -4035,7 +4216,7 @@ async fn run_session(session: Session) {
                         status,
                         result: None,
                         error,
-                        session_id: Some(session_id.clone()),
+                        session_id: Some(durable_session_id(&res, &session_id)),
                     },
                 )
                 .await
@@ -4151,11 +4332,72 @@ async fn run_session(session: Session) {
                             }));
                         }
                     }
+                    // graff ends a turn it started itself with `gui_turn_end`
+                    // (ACP v1): no `session/prompt` of ours is outstanding,
+                    // so the response arm can never settle it (#276). While
+                    // a prompt of ours IS outstanding, graff answers that
+                    // prompt after the end and its response settles the
+                    // turn, so the notification is ignored here; one with no
+                    // agent-started output since the last Done is stale.
+                    let update_kind = (method == "session/update")
+                        .then(|| {
+                            params
+                                .get("update")
+                                .and_then(|u| u.get("sessionUpdate"))
+                                .and_then(Value::as_str)
+                        })
+                        .flatten();
+                    if harness == HarnessId::Graff && update_kind == Some("gui_turn_end") {
+                        if turn.is_none() && autonomous_turn && !interrupted {
+                            let stop = params
+                                .get("update")
+                                .and_then(|u| u.get("stopReason"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("end_turn");
+                            let (status, error) =
+                                stop_outcome(&Ok(json!({ "stopReason": stop })), false);
+                            let (prev, _next) = rotate(&mut assistant_message_id);
+                            if !send(
+                                &event_tx,
+                                AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
+                            )
+                            .await
+                            {
+                                break 'main;
+                            }
+                            trackers.effort.finish_turn();
+                            open_tools.clear();
+                            done_current = true;
+                            autonomous_turn = false;
+                            if !send(
+                                &event_tx,
+                                AgentEvent::Done {
+                                    status,
+                                    result: None,
+                                    error,
+                                    session_id: Some(session_id.clone()),
+                                },
+                            )
+                            .await
+                            {
+                                break 'main;
+                            }
+                        }
+                        continue;
+                    }
+                    if harness == HarnessId::Graff
+                        && turn.is_none()
+                        && method == "session/update"
+                        && !boilerplate
+                    {
+                        autonomous_turn = true;
+                    }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
                     let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents, &mut effort);
+                        session_update_events(&method, &params, &session_id, &mut subagents, &mut trackers);
                     for ev in events {
+                        clarification.observe(&ev);
                         track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -4171,6 +4413,7 @@ async fn run_session(session: Session) {
                         &params,
                         &request_input,
                         &session_id,
+                        &clarification.answered,
                     ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -4187,8 +4430,9 @@ async fn run_session(session: Session) {
                     // failed by the reader's EOF cleanup falls through to the
                     // crash-message bookkeeping below (stderr tail intact).
                     if let Some(mut fut) = turn.take()
-                        && let Ok(res @ Ok(_)) =
+                        && let Ok(res) =
                             tokio::time::timeout(Duration::from_millis(50), &mut fut).await
+                        && (res.is_ok() || matches!(&res, Err(HarnessError::ReauthRequired { .. })))
                     {
                         let (prev, _next) = rotate(&mut assistant_message_id);
                         let _ = send(
@@ -4199,8 +4443,12 @@ async fn run_session(session: Session) {
                         if let Some(usage) = usage_from_response(&res) {
                             let _ = send(&event_tx, usage).await;
                         }
-                        let (status, error) = stop_outcome(&res, interrupted);
-                        effort.finish_turn();
+                        let (status, mut error) = stop_outcome(&res, interrupted);
+                        if !interrupted && let Err(HarnessError::ReauthRequired { provider }) = &res {
+                            let _ = send(&event_tx, AgentEvent::ReauthRequired { provider: *provider }).await;
+                            error = None;
+                        }
+                        trackers.effort.finish_turn();
                         done_current = true;
                         if interrupted {
                             done_after_interrupt = true;
@@ -4211,7 +4459,7 @@ async fn run_session(session: Session) {
                                 status,
                                 result: None,
                                 error,
-                                session_id: Some(session_id.clone()),
+                                session_id: Some(durable_session_id(&res, &session_id)),
                             },
                         )
                         .await;
@@ -4266,8 +4514,9 @@ async fn run_session(session: Session) {
                             match inc {
                                 Incoming::Notification { method, params } => {
                                     let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents, &mut effort);
+                                        session_update_events(&method, &params, &session_id, &mut subagents, &mut trackers);
                                     for ev in events {
+                                        clarification.observe(&ev);
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
                                             break;
@@ -4282,6 +4531,7 @@ async fn run_session(session: Session) {
                                         &params,
                                         &request_input,
                                 &session_id,
+                                &clarification.answered,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -4380,15 +4630,20 @@ async fn run_session(session: Session) {
                 }
             },
 
-            // Busy-session cancel flushed (see BUSY_RECENT/CANCEL_FLUSH
-            // above): the unowned self-continued turn had its cancel and a
-            // drain window; the queued steer becomes a fresh prompt on a
-            // now-idle agent.
+            // Deferred steer recheck (see BUSY_RECENT/BUSY_RECHECK above):
+            // while the self-continued turn is still busy, keep waiting;
+            // once it has gone quiet, the queued steer becomes a fresh
+            // prompt on a now-idle agent.
             _ = tokio::time::sleep_until(
-                cancel_flush_deadline.unwrap_or_else(tokio::time::Instant::now)
-            ), if cancel_flush_deadline.is_some() && !interrupted => {
-                cancel_flush_deadline = None;
+                busy_defer_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if busy_defer_deadline.is_some() && !interrupted => {
+                busy_defer_deadline = None;
                 if turn.is_none()
+                    && !queued_steers.is_empty()
+                    && (!open_tools.is_empty() || last_update_at.elapsed() < BUSY_RECENT)
+                {
+                    busy_defer_deadline = Some(tokio::time::Instant::now() + BUSY_RECHECK);
+                } else if turn.is_none()
                     && let Some(text) = queued_steers.pop_front()
                 {
                     let (prev, next) = rotate(&mut assistant_message_id);
@@ -4451,8 +4706,9 @@ async fn run_session(session: Session) {
                 {
                     break 'main;
                 }
-                effort.finish_turn();
+                trackers.effort.finish_turn();
                 done_current = true;
+                autonomous_turn = false;
                 if !send(
                     &event_tx,
                     AgentEvent::Done {
@@ -4505,33 +4761,31 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
+                    clarification.steer();
                     allowed_images.extend(msg.attachments.iter().cloned());
                     // Same transform as the initial prompt: Claude's
                     // Ultrathink prefix rides every steer too.
                     let text = prompt_transform(request.reasoning, &msg.prompt);
-                    if turn.is_none() && cancel_flush_deadline.is_some() {
-                        // A busy-session cancel is already in flight: this
-                        // steer lines up behind it and dispatches at flush.
+                    if turn.is_none() && busy_defer_deadline.is_some() {
+                        // A steer is already waiting out the busy session:
+                        // this one lines up behind it.
                         queued_steers.push_back(text);
                     } else if turn.is_none()
+                        && defer_into_busy
                         && (!open_tools.is_empty()
                             || last_update_at.elapsed() < BUSY_RECENT)
                     {
                         // Mid self-continued turn (see BUSY_RECENT above):
-                        // cancel it rather than prompt into the starve.
-                        //
+                        // wait for it to go quiet rather than prompt into
+                        // the starve or cancel the agent's work.
                         tracing::info!(
                             target: "harness_adapters::acp",
-                            "steer into a self-continuing session; cancelling \
-                             the unowned turn before prompting"
-                        );
-                        client.notify(
-                            "session/cancel",
-                            Some(json!({ "sessionId": session_id })),
+                            "steer into a self-continuing session; holding it \
+                             until the agent goes quiet"
                         );
                         queued_steers.push_back(text);
-                        cancel_flush_deadline =
-                            Some(tokio::time::Instant::now() + CANCEL_FLUSH);
+                        busy_defer_deadline =
+                            Some(tokio::time::Instant::now() + BUSY_RECHECK);
                     } else if turn.is_none() {
                         // Idle between turns: a steer is simply the next turn.
                         let (prev, next) = rotate(&mut assistant_message_id);
@@ -4591,7 +4845,8 @@ async fn run_session(session: Session) {
                 interrupt_sent = true;
                 interrupted = true;
                 if turn.is_some() {
-                    client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
+                    let reason = origin_chat.as_deref().and_then(crate::interrupt_reason::take);
+                    client.notify("session/cancel", Some(cancel_params(&session_id, reason.as_deref())));
                     // Escalate if the agent doesn't wind down (stopReason
                     // "cancelled") within the grace periods.
                     if let Some(pid) = crate::process::signal_target(&child) {
@@ -4626,7 +4881,7 @@ async fn run_session(session: Session) {
                     },
                 )
                 .await;
-                effort.finish_turn();
+                trackers.effort.finish_turn();
                 done_current = true;
                 let _ = send(
                     &event_tx,
@@ -4721,6 +4976,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_resumed_graff_session_resumes_from_the_save_it_reported() {
+        let moved: Result<Value, HarnessError> = Ok(json!({
+            "stopReason": "end_turn",
+            "_meta": {"graff/durableSessionId": "baseline"}
+        }));
+        assert_eq!(durable_session_id(&moved, "acp-1-1"), "baseline");
+        let plain: Result<Value, HarnessError> = Ok(json!({"stopReason": "end_turn"}));
+        assert_eq!(durable_session_id(&plain, "acp-1-1"), "acp-1-1");
+        let empty: Result<Value, HarnessError> =
+            Ok(json!({"_meta": {"graff/durableSessionId": ""}}));
+        assert_eq!(durable_session_id(&empty, "acp-1-1"), "acp-1-1");
+        let failed: Result<Value, HarnessError> = Err(HarnessError::Protocol("x".into()));
+        assert_eq!(durable_session_id(&failed, "acp-1-1"), "acp-1-1");
+    }
+
+    #[test]
+    fn a_cancel_says_whether_the_user_asked() {
+        let stop = cancel_params("s1", Some("stop"));
+        assert_eq!(stop["_meta"]["graff/cancelSource"], "user");
+        let replace = cancel_params("s1", Some("replace: run died around the send"));
+        assert_eq!(replace["_meta"]["graff/cancelSource"], "client");
+        assert_eq!(
+            replace["_meta"]["graff/cancelReason"],
+            "replace: run died around the send"
+        );
+        // No engine reason (title runs, tests): the bare cancel, as before.
+        assert_eq!(cancel_params("s1", None), json!({ "sessionId": "s1" }));
+    }
+
+    #[test]
     fn graff_child_keeps_the_selected_acp_workspace() {
         let mut graff = Command::new("graff");
         AcpHarness::graff().configure_adapter_environment(&mut graff, Path::new("graff"));
@@ -4751,6 +5036,35 @@ mod tests {
         let mut grok = Command::new("grok");
         AcpHarness::grok().configure_adapter_environment(&mut grok, Path::new("grok"));
         assert!(!grok.as_std_mut().get_envs().any(|(key, _)| key == "GRAFF_CODEX_WS"));
+    }
+
+    #[test]
+    fn graff_compact_at_setting_reaches_the_graff_child() {
+        let env_of = |cmd: &mut Command| {
+            cmd.as_std_mut()
+                .get_envs()
+                .find(|(key, _)| *key == "GRAFF_COMPACT_PCT")
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let pct = Arc::new(AtomicU8::new(0));
+        let harness = AcpHarness::graff().with_graff_compact_at(pct.clone());
+        // A user-set GRAFF_COMPACT_PCT wins, so the setting stays out of the way.
+        let user_set = std::env::var_os("GRAFF_COMPACT_PCT").is_some();
+
+        let mut default = Command::new("graff");
+        harness.configure_adapter_environment(&mut default, Path::new("graff"));
+        assert_eq!(env_of(&mut default), None);
+
+        pct.store(70, Ordering::Relaxed);
+        let mut set = Command::new("graff");
+        harness.configure_adapter_environment(&mut set, Path::new("graff"));
+        assert_eq!(env_of(&mut set), (!user_set).then(|| "70".to_string()));
+
+        let mut grok = Command::new("grok");
+        AcpHarness::grok()
+            .with_graff_compact_at(pct.clone())
+            .configure_adapter_environment(&mut grok, Path::new("grok"));
+        assert_eq!(env_of(&mut grok), None);
     }
 
     #[test]
@@ -4790,14 +5104,6 @@ mod tests {
                 .get_envs()
                 .any(|(key, _)| key == "GRAFF_ACP_DRAFT_SUBAGENTS")
         );
-    }
-
-    #[test]
-    fn pi_discovery_allows_cold_extension_startup() {
-        let pi = AcpHarness::pi();
-        assert_eq!(pi.model_discovery_timeout, Duration::from_secs(60));
-        assert_eq!(pi.handshake_timeout, Duration::from_secs(120));
-        assert!(pi.spec.prompt_stall.is_none());
     }
 
     #[test]
@@ -5100,20 +5406,34 @@ mod tests {
             url: "http://127.0.0.1:5/mcp".into(),
             headers: vec![("Authorization".into(), "Bearer t".into())],
         }];
+        let browse = json!({
+            "type": "http",
+            "name": "browse",
+            "url": "http://127.0.0.1:5/mcp",
+            "headers": [{ "name": "Authorization", "value": "Bearer t" }],
+        });
         let http = json!({ "agentCapabilities": { "mcpCapabilities": { "http": true } } });
         assert_eq!(
-            session_mcp_servers(&http, &servers),
-            json!([{
-                "type": "http",
-                "name": "browse",
-                "url": "http://127.0.0.1:5/mcp",
-                "headers": [{ "name": "Authorization", "value": "Bearer t" }],
-            }])
+            session_mcp_servers(json!([]), &http, &servers),
+            json!([browse.clone()])
         );
         let stdio_only = json!({ "agentCapabilities": { "mcpCapabilities": { "http": false } } });
-        assert_eq!(session_mcp_servers(&stdio_only, &servers), json!([]));
-        assert_eq!(session_mcp_servers(&json!({}), &servers), json!([]));
-        assert_eq!(session_mcp_servers(&http, &[]), json!([]));
+        assert_eq!(
+            session_mcp_servers(json!([]), &stdio_only, &servers),
+            json!([])
+        );
+        assert_eq!(session_mcp_servers(json!([]), &json!({}), &servers), json!([]));
+        assert_eq!(session_mcp_servers(json!([]), &http, &[]), json!([]));
+        // Harness's own stdio server stays first, with or without browse.
+        let harness = json!({ "name": "harness", "command": "harness", "args": ["mcp"], "env": [] });
+        assert_eq!(
+            session_mcp_servers(json!([harness.clone()]), &http, &servers),
+            json!([harness.clone(), browse])
+        );
+        assert_eq!(
+            session_mcp_servers(json!([harness.clone()]), &stdio_only, &servers),
+            json!([harness])
+        );
     }
 
     #[test]
@@ -5132,9 +5452,56 @@ mod tests {
     }
 
     #[test]
+    fn only_graff_advertises_session_compaction() {
+        for subagents in [false, true] {
+            let graff = initialize_params_with_subagents(HarnessId::Graff, subagents);
+            assert_eq!(
+                graff["clientCapabilities"]["session"],
+                json!({ "compaction": {} })
+            );
+        }
+        for other in [HarnessId::Devin, HarnessId::Grok] {
+            let params = initialize_params(other);
+            assert!(params["clientCapabilities"].get("session").is_none());
+        }
+    }
+
+    #[test]
+    fn graff_parent_compaction_opens_and_resolves_one_chip() {
+        let mut observer = SubagentObserver::Graff(GraffTracker::new("parent".into()));
+        let mut trackers = SessionTrackers::default();
+        let mut frame = |update: Value| {
+            session_update_events(
+                "session/update",
+                &json!({ "sessionId": "parent", "update": update }),
+                "parent",
+                &mut observer,
+                &mut trackers,
+            )
+        };
+        let opened = frame(json!({
+            "sessionUpdate": "compaction_update", "compactionId": "k1", "status": "in_progress"
+        }));
+        assert!(matches!(
+            &opened[..],
+            [AgentEvent::ToolCall { id, call: harness_proto::ToolCall::Unknown { name, .. } }]
+                if id == "acp-compaction-k1" && name == harness_proto::COMPACTION_TOOL_NAME
+        ));
+        let done = frame(json!({
+            "sessionUpdate": "compaction_update", "compactionId": "k1", "status": "completed",
+            "summary": [{ "type": "text", "text": "Kept the plan." }]
+        }));
+        assert!(matches!(
+            &done[..],
+            [AgentEvent::ToolResult { id, is_error: false, output: Some(text), .. }]
+                if id == "acp-compaction-k1" && text == "Kept the plan."
+        ));
+    }
+
+    #[test]
     fn graff_child_updates_route_by_announced_session_id() {
         let mut observer = SubagentObserver::Graff(GraffTracker::new("parent".into()));
-        let mut effort = EffortTracker::default();
+        let mut trackers = SessionTrackers::default();
         let announced = session_update_events(
             "session/update",
             &json!({
@@ -5143,7 +5510,7 @@ mod tests {
             }),
             "parent",
             &mut observer,
-            &mut effort,
+            &mut trackers,
         );
         assert!(matches!(&announced[0], AgentEvent::ToolCall { .. }));
         let child = session_update_events(
@@ -5154,7 +5521,7 @@ mod tests {
             }),
             "parent",
             &mut observer,
-            &mut effort,
+            &mut trackers,
         );
         assert!(matches!(&child[..], [AgentEvent::Subagent { .. }]));
         let unrelated = session_update_events(
@@ -5165,7 +5532,7 @@ mod tests {
             }),
             "parent",
             &mut observer,
-            &mut effort,
+            &mut trackers,
         );
         assert!(unrelated.is_empty());
     }
@@ -5173,7 +5540,7 @@ mod tests {
     #[test]
     fn graff_background_notifications_route_after_parent_done() {
         let mut observer = SubagentObserver::Graff(GraffTracker::new("parent".into()));
-        let mut effort = EffortTracker::default();
+        let mut trackers = SessionTrackers::default();
         let frame = |seq, event| {
             json!({
                 "parentSessionId": "parent", "subagentSessionId": "child",
@@ -5190,7 +5557,7 @@ mod tests {
             ),
             "parent",
             &mut observer,
-            &mut effort,
+            &mut trackers,
         );
         assert!(matches!(&spawn[0], AgentEvent::ToolCall { id, .. } if id == "tool-1"));
         // This is sent after the parent prompt's Done. The parked ACP
@@ -5214,7 +5581,7 @@ mod tests {
             ),
             "parent",
             &mut observer,
-            &mut effort,
+            &mut trackers,
         );
         assert!(
             matches!(&update[..], [AgentEvent::Subagent { parent_tool_use_id, event }]
@@ -5451,6 +5818,57 @@ mod tests {
             vec!["fast-mode"]
         );
         assert_eq!(models[0].options[0].default_choice, "off");
+    }
+
+    #[test]
+    fn advertised_thought_levels_order_from_lowest_to_highest() {
+        // Grok Build advertises `thought_level` highest first. A model without
+        // a catalog row (`grok-4.8` here) takes the advertised ladder, which
+        // must still read lowest to highest in the effort slider.
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "grok-4.8",
+                    "options": [
+                        { "value": "grok-4.8", "name": "Grok 4.8" },
+                        { "value": "grok-4.7", "name": "Grok 4.7" },
+                    ],
+                },
+                {
+                    "id": "reasoning_effort",
+                    "name": "Reasoning Effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "xhigh",
+                    "options": [
+                        { "value": "xhigh", "name": "Extra High" },
+                        { "value": "high", "name": "High" },
+                        { "value": "medium", "name": "Medium" },
+                        { "value": "low", "name": "Low" },
+                    ],
+                },
+            ],
+        });
+        let models = models_from_session(&response, &(grok_spec().models)());
+        let ladders = models
+            .iter()
+            .map(|m| (m.id.as_str(), m.reasoning_levels.clone()))
+            .collect::<Vec<_>>();
+        let ascending = vec![
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+        ];
+        assert_eq!(
+            ladders,
+            vec![("grok-4.8", ascending.clone()), ("grok-4.7", ascending)]
+        );
     }
 
     #[test]

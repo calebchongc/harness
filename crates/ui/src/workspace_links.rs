@@ -27,6 +27,15 @@ pub(crate) fn resolve_workspace_file_link(
         if percent_encode_path(&decoded) != encoded || decoded.ends_with('/') {
             return None;
         }
+        if decoded.starts_with('/') || decoded.as_bytes().get(1) == Some(&b':') {
+            let path =
+                crate::markdown::content_reference::workspace_path(&decoded, workspace_root)?;
+            return Some(WorkspaceFileLink {
+                path,
+                line: None,
+                column: None,
+            });
+        }
         decoded.as_str()
     } else if let Some(path) = target.strip_prefix("file://") {
         path
@@ -199,6 +208,23 @@ mod tests {
         );
         assert!(resolve_workspace_file_link("harness-file:src/%61.rs", "/work/comet").is_none());
         assert!(resolve_workspace_file_link("harness-file:src/", "/work/comet").is_none());
+    }
+
+    #[test]
+    fn citations_preserve_literal_punctuation_and_windows_host_paths() {
+        let destination =
+            crate::markdown::content_reference::file_destination("/work/a%20#L4.html");
+        let link = resolve_workspace_file_link(&destination, "/work").unwrap();
+        assert_eq!(link.path, "a%20#L4.html");
+        assert_eq!(link.line, None);
+        let destination =
+            crate::markdown::content_reference::file_destination(r"C:\work\空 格.html");
+        assert_eq!(
+            resolve_workspace_file_link(&destination, r"C:\work")
+                .unwrap()
+                .path,
+            "空 格.html"
+        );
     }
 
     #[test]

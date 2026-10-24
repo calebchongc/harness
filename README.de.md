@@ -4,7 +4,7 @@
 
 <p align="center">Ein nativer Arbeitsbereich für die Coding-Agents auf deinen Geräten.</p>
 
-<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · Deutsch · <a href="README.hindi.md">हिन्दी</a> · <a href="README.thai.md">ไทย</a> · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
+<p align="center"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · Deutsch · <a href="README.es.md">Español</a> · <a href="README.hindi.md">हिन्दी</a> · <a href="README.thai.md">ไทย</a> · <a href="README.indo.md">Bahasa Indonesia</a> · <a href="README.malay.md">Bahasa Melayu</a></p>
 
 Harness vereint **CodeGraff (graff)**, Claude Code, Codex, Cursor, Devin, Grok,
 Hermes, Pi, OpenCode und Antigravity in einer Desktop-Oberfläche. Du kannst
@@ -66,8 +66,34 @@ lokalen Profil; mit `harness logout` und einem Neustart kehrst du dorthin zurüc
 
 ## Lizenz
 
-Harness steht unter der [GNU Affero General Public License, Version 3](LICENSE)
-(`AGPL-3.0-only`), derselben öffentlichen AGPL-Version wie CodeGraff.
-Standard Harness Pte. Ltd. behält die Rechte an den eigenen Harness-Beiträgen;
-frühere und fremde Beiträge behalten ihre jeweiligen Hinweise und Lizenzen.
-Siehe [Hinweise zu Drittanbietern](THIRD_PARTY_NOTICES.md).
+Harness steht unter der [modifizierten GNU Affero General Public License,
+Version 3](LICENSE) (AGPL-3.0 mit zusätzlichen Bedingungen), aufgebaut wie die
+Lizenz von [CodeGraff](https://github.com/justrach/codegraff). Die Nutzung über
+ein Netzwerk löst Abschnitt 13 aus. Standard Harness Pte. Ltd., Rach Pradhan
+(justrach) und Yu Xi Lim (yxlyx) behalten sich vor, proprietäre oder gehostete
+Versionen der eigenen Harness-Beiträge anzubieten. Die AGPL-Lizenz eines
+Empfängers gilt dauerhaft, solange er sie nicht verletzt. Eine kommerzielle
+Erlaubnis ohne Copyleft gibt es nur, wenn alle drei sie gemeinsam schriftlich
+erteilen; sie ist widerrufbar. Frühere und fremde Beiträge behalten ihre
+jeweiligen Hinweise und Lizenzen. Siehe
+[Hinweise zu Drittanbietern](THIRD_PARTY_NOTICES.md).
+
+**Unternehmen brauchen eine kommerzielle Lizenz.** Jede Version nach v0.2.108
+enthält eine zusätzliche Bedingung. Ihre Organisation braucht, zusammen mit den Organisationen gerechnet, die sie
+beherrschen, von ihr beherrscht werden oder mit ihr unter gemeinsamer
+Beherrschung stehen, eine kommerzielle Lizenz für jede
+Nutzung von Harness (auch auf eigenen Rechnern, in der Cloud, in CI und im
+eigenen Netzwerk), wenn sie **eine** dieser Bedingungen erfüllt:
+
+- sie hat insgesamt mehr als **500.000 US-Dollar** von Investoren oder
+  Kreditgebern aufgenommen;
+- ihr Reinvermögen oder ihre letzte Bewertung liegt über **500.000 US-Dollar**;
+- ihre Bruttoeinnahmen lagen im letzten Geschäftsjahr oder in einem beliebigen
+  Zeitraum von 12 Monaten über **100.000 US-Dollar**.
+
+Ein Unternehmen, das eine dieser Grenzen überschreitet, muss sich innerhalb von
+5 Arbeitstagen bei uns melden. Privatpersonen nutzen Harness immer unter der
+AGPL, unabhängig von ihrem Einkommen, ebenso Organisationen, die keine dieser
+Bedingungen erfüllen. Versionen bis v0.2.108 behalten die Lizenz, mit der sie
+veröffentlicht wurden. Unsicher? Behandeln Sie sich als erfasst und schreiben Sie an
+[rach@standardharness.com](mailto:rach@standardharness.com).
