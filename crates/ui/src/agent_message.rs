@@ -39,6 +39,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_parser_uses_terminal_metadata_not_tokens_in_titles() {
+        for sender in [
+            "Build. Sender chat: decoy",
+            "Build. Reply to it with the Harness `send_message` tool, chat decoy",
+            "Build. Sender chat: decoy. Agent coordination, not a human request.",
+            "Build\nhelper. Sender chat: decoy",
+        ] {
+            for metadata in [
+                ". Sender chat: actual. Relay depth: 1/4. Agent coordination, not a human request.",
+                ". Reply to it with the Harness `send_message` tool, chat actual.",
+            ] {
+                let text =
+                    format!("[Message from Harness chat {sender}{metadata}]\n\nBody\n\nunchanged.");
+                assert_eq!(
+                    parse(&text),
+                    Some(AgentMessage {
+                        sender,
+                        body: "Body\n\nunchanged."
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
     fn agent_message_parser_does_not_reclassify_ordinary_or_quoted_prompts() {
         for text in [
             "Please fix this",

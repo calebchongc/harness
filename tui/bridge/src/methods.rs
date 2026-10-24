@@ -27,6 +27,12 @@ fn wrap(result: Result<Value, RpcError>) -> Reply {
 }
 
 pub async fn handle(conn: &std::sync::Arc<Conn>, method: &str, params: Value) -> Reply {
+    // Engine mode: threads are Harness chats (see engine.rs).
+    if let Some(engine) = conn.engine.clone()
+        && let Some(reply) = crate::engine_threads::handle(conn, &engine, method, &params).await
+    {
+        return reply;
+    }
     match method {
         "initialize" => ok(json!({
             // The TUI warns when the server's version differs from its own, so
@@ -141,6 +147,27 @@ pub async fn harness_ids(registry: &Arc<HarnessRegistry>) -> Vec<HarnessId> {
     ids
 }
 
+/// The thread's agent and model: the one asked for, else the first entry of
+/// the list `model/list` serves (the TUI sends none on a fresh thread).
+pub async fn pick_model(
+    conn: &std::sync::Arc<Conn>,
+    requested: Option<&str>,
+) -> (HarnessId, Option<String>) {
+    if let Some((harness, model)) = requested.and_then(split_model) {
+        return (harness, Some(model));
+    }
+    let first = crate::models::list(&conn.registry).await.into_iter().next();
+    match first
+        .as_ref()
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+        .and_then(split_model)
+    {
+        Some((harness, model)) => (harness, Some(model)),
+        None => (HarnessId::Graff, None),
+    }
+}
+
 async fn thread_start(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
     let cwd = params
         .get("cwd")
@@ -154,37 +181,10 @@ async fn thread_start(conn: &std::sync::Arc<Conn>, params: Value) -> Reply {
         .unwrap_or_else(|| "/".into());
     let requested = params.get("model").and_then(Value::as_str);
     tracing::info!(?requested, "thread/start model");
-    let (harness, model) = match requested.and_then(split_model) {
-        Some((harness, model)) => (harness, Some(model)),
-        // The TUI sends no model on a fresh thread and expects the server to
-        // pick one, so use the first entry of the same list `model/list` serves.
-        None => {
-            let first = crate::models::list(&conn.registry).await.into_iter().next();
-            match first
-                .as_ref()
-                .and_then(|m| m.get("model"))
-                .and_then(Value::as_str)
-                .and_then(split_model)
-            {
-                Some((harness, model)) => (harness, Some(model)),
-                None => (HarnessId::Graff, None),
-            }
-        }
-    };
+    let (harness, model) = pick_model(conn, requested).await;
     let id = Uuid::new_v4().to_string();
     let shown_model = model.as_ref().map(|m| qualified(harness, m));
-    let state = ThreadState {
-        history: crate::session_store::History::default(),
-        cwd: cwd.clone(),
-        harness,
-        model: model.clone(),
-        resume: None,
-        interrupt: None,
-        turn_id: None,
-        steer: None,
-        steers: Default::default(),
-        steerable: false,
-    };
+    let state = ThreadState::new(cwd.clone(), harness, model.clone());
     let thread = crate::sessions::thread_json(&id, &state, false);
     conn.threads
         .lock()

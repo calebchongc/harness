@@ -33,13 +33,6 @@ fn archived(workspace: &WorkspaceHost) -> bool {
     workspace.chat(CHAT).unwrap().unwrap().archived
 }
 
-/// A send staged before the workspace attaches is stamped from the wall clock,
-/// so an archive in the same millisecond is a tie the clock's counters decide.
-/// Tests that order an archive and a send move past it first.
-fn after_this_millisecond() {
-    std::thread::sleep(std::time::Duration::from_millis(5));
-}
-
 fn create_archived(workspace: &WorkspaceHost) {
     workspace
         .create_chat(CHAT, None, Some("restore-device"), None, None)
@@ -56,7 +49,6 @@ async fn accepted_queue_restore_survives_restart_before_workspace_arrives() {
         let workspace = workspace(store.clone());
         create_archived(&workspace);
         let host = host(store.clone());
-        after_this_millisecond();
         let id = host.queue_message(CHAT, "resume later", vec![]).unwrap();
         host.flush_all();
         assert!(store.sync_job_version(&id, RESTORE_JOB).unwrap().is_some());
@@ -148,7 +140,6 @@ async fn later_explicit_archive_supersedes_delayed_steer_restore() {
             },
         )
         .unwrap();
-    after_this_millisecond();
     workspace.set_chat_archived(CHAT, true).unwrap();
     host.set_workspace(workspace.clone());
     host.retry_prompt_restores(&mut String::new());
@@ -176,4 +167,91 @@ async fn staged_but_unaccepted_prompt_cannot_restore_a_reference_chat() {
     host.retry_prompt_restores(&mut String::new());
     assert!(archived(&workspace));
     host.shutdown_workers().await;
+}
+
+#[tokio::test]
+async fn detached_restore_observes_durable_clock_after_wall_clock_regression() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let workspace = workspace(store.clone());
+    create_archived(&workspace);
+    // The durable registry may have observed a remote future clock before
+    // startup wires it into the doc host. A wall-only clock cannot restore it.
+    workspace.archive_chat_at(CHAT, now_ms() + 60_000).unwrap();
+    workspace.flush();
+    let host = host(store.clone());
+    let id = host
+        .queue_message(CHAT, "human returns after restart", vec![])
+        .unwrap();
+    host.set_workspace(workspace.clone());
+    host.retry_prompt_restores(&mut String::new());
+    assert!(
+        !archived(&workspace),
+        "accepted human send must observe the stored archive clock"
+    );
+    assert!(store.sync_job_version(&id, RESTORE_JOB).unwrap().is_none());
+    host.shutdown_workers().await;
+}
+
+#[tokio::test]
+async fn detached_restore_cannot_outrank_a_newer_explicit_archive_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let workspace = workspace(store.clone());
+    create_archived(&workspace);
+    workspace.archive_chat_at(CHAT, now_ms() + 60_000).unwrap();
+    workspace.flush();
+    let host = host(store.clone());
+    let id = host
+        .queue_message(CHAT, "older accepted human return", vec![])
+        .unwrap();
+    // The detached host and the live workspace can reserve independent HLC
+    // counters in the same millisecond. The later archive is authoritative,
+    // even if the detached send reserved more counter increments.
+    workspace.set_chat_archived(CHAT, true).unwrap();
+    host.set_workspace(workspace.clone());
+    host.retry_prompt_restores(&mut String::new());
+    assert!(
+        archived(&workspace),
+        "newer archive intent must fence a detached restore"
+    );
+    assert!(store.sync_job_version(&id, RESTORE_JOB).unwrap().is_none());
+    host.shutdown_workers().await;
+}
+
+#[tokio::test]
+async fn corrupted_restore_clocks_cannot_unarchive_reference_chats() {
+    for (clock, archive_basis) in [
+        ("zzzz", None),
+        ("9999999999999-not-a-counter-restore-device", None),
+        ("9999999999999-000000-", None),
+        ("9999999999999-000000-restore-device", Some("zzzz")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = workspace(store.clone());
+        create_archived(&workspace);
+        let host = host(store.clone());
+        host.set_workspace(workspace.clone());
+        store.schedule_sync_job_with_cursor(
+            "corrupt-clock", RESTORE_JOB,
+            &serde_json::json!({
+                "chat_id": CHAT, "clock": clock, "archive_basis": archive_basis, "accepted": true
+            }).to_string(),
+        ).unwrap();
+        host.retry_prompt_restores(&mut String::new());
+        let stayed_archived = archived(&workspace);
+        let pending = store
+            .sync_job_version("corrupt-clock", RESTORE_JOB)
+            .unwrap();
+        host.shutdown_workers().await;
+        assert!(
+            stayed_archived,
+            "invalid durable clock must fail closed: {clock}"
+        );
+        assert!(
+            pending.is_some(),
+            "invalid data must not be acknowledged as a successful restore"
+        );
+    }
 }

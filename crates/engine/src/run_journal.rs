@@ -305,6 +305,29 @@ impl RunJournal {
         out
     }
 
+    /// Drop a chat's shutdown marker: crash recovery already handled the
+    /// chat, and a second pick-up would dispatch its turn twice.
+    pub fn clear_restart_resume(&self, chat_id: &str) {
+        let _ = std::fs::remove_file(self.restart_path(chat_id));
+    }
+
+    /// Record the version this engine booted as, returning the one the last
+    /// boot recorded when it differs: the restart was an update to `current`.
+    /// `None` on the first boot with this record, or with the same version.
+    pub fn note_boot_version(&self, current: &str) -> Option<String> {
+        let path = self.dir.join("engine-version");
+        let previous = std::fs::read_to_string(&path)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        if previous.as_deref() != Some(current)
+            && let Err(err) = std::fs::write(&path, current)
+        {
+            tracing::warn!(error = %err, "boot version record write failed");
+        }
+        previous.filter(|previous| previous != current)
+    }
+
     /// Append one event; returns its journal seq.
     pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
         let mut open = self.lock();
@@ -498,9 +521,6 @@ fn last_valid_line(path: &Path) -> Result<(Option<(u64, AgentEvent)>, bool), Jou
     }
 }
 
-/// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
-/// arbitrary journals directory — profile import copies these files between
-/// profiles without opening a `RunJournal`.
 /// What a graceful shutdown cut short in a chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartResume {
@@ -509,6 +529,10 @@ pub enum RestartResume {
     /// The turn had ended but background work the agent started was still
     /// running, and stopped with the agent: tell it so it can start again.
     Background,
+    /// The turn was waiting on the user's answer to a question. Nothing is
+    /// re-sent: the question stays answerable, and the answer continues the
+    /// run on the same harness session.
+    Question,
 }
 
 impl RestartResume {
@@ -516,6 +540,7 @@ impl RestartResume {
         match self {
             Self::Turn => "turn",
             Self::Background => "background",
+            Self::Question => "question",
         }
     }
 
@@ -523,11 +548,15 @@ impl RestartResume {
         match s {
             "turn" => Some(Self::Turn),
             "background" => Some(Self::Background),
+            "question" => Some(Self::Question),
             _ => None,
         }
     }
 }
 
+/// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
+/// arbitrary journals directory — profile import copies these files between
+/// profiles without opening a `RunJournal`.
 pub fn journal_paths(dir: &Path, chat_id: &str) -> (PathBuf, PathBuf) {
     let stem = sanitize_id(chat_id);
     (
@@ -865,5 +894,42 @@ mod tests {
         drop(open);
         assert_eq!(journal.append("live", &text("c")).unwrap(), 3);
         assert_eq!(journal.append("idle-0", &text("b")).unwrap(), 2, "reopen rescans");
+    }
+
+    #[test]
+    fn a_boot_into_a_new_version_reports_the_update_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.note_boot_version("0.2.134"), None, "first record");
+        assert_eq!(journal.note_boot_version("0.2.134"), None, "plain restart");
+        assert_eq!(
+            journal.note_boot_version("0.2.135").as_deref(),
+            Some("0.2.134"),
+            "update"
+        );
+        assert_eq!(journal.note_boot_version("0.2.135"), None, "reported once");
+    }
+
+    #[test]
+    fn restart_markers_round_trip_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.note_restart_resume("asking", RestartResume::Question);
+        journal.note_restart_resume("working", RestartResume::Turn);
+        journal.note_restart_resume("handled", RestartResume::Turn);
+        journal.clear_restart_resume("handled");
+        let kinds: Vec<_> = journal
+            .take_restart_resumes()
+            .into_iter()
+            .map(|(chat, kind, _)| (chat, kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("asking".to_owned(), RestartResume::Question),
+                ("working".to_owned(), RestartResume::Turn),
+            ]
+        );
+        assert!(journal.take_restart_resumes().is_empty(), "consumed");
     }
 }

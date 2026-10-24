@@ -17,6 +17,8 @@
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
 
 mod prompt_restore;
+#[cfg(test)]
+mod peer_dispatch_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -592,6 +594,10 @@ pub struct ChatDocHandle {
     /// explicit prompt or queue send resumes it; incidental doc/status changes
     /// must not turn Cancel into "send the next row".
     queue_paused: AtomicBool,
+    /// Bumped whenever a failed turn pauses delivery. An explicit send thaws
+    /// only if no failure landed while it dispatched: a fresh run can fail
+    /// before its dispatch returns, and that pause must outlive the thaw.
+    queue_failures: Mutex<u64>,
     /// True when the doc changed while nobody watched: the mirror rebuild is
     /// deferred to the next `watch_messages` attach instead of paid per commit.
     mirror_dirty: AtomicBool,
@@ -753,6 +759,26 @@ impl ChatDocHandle {
         rx
     }
 
+    /// An errored turn is not a turn boundary: hold every queued row until the
+    /// user explicitly sends or retries one (#466).
+    fn pause_queue_after_failure(&self) {
+        let mut failures = lock(&self.queue_failures);
+        *failures = failures.wrapping_add(1);
+        self.queue_paused.store(true, Ordering::Release);
+    }
+
+    fn queue_failures(&self) -> u64 {
+        *lock(&self.queue_failures)
+    }
+
+    /// Thaw after an explicit send, unless a turn failed since `seen`.
+    fn resume_queue_since(&self, seen: u64) {
+        let failures = lock(&self.queue_failures);
+        if *failures == seen {
+            self.queue_paused.store(false, Ordering::Release);
+        }
+    }
+
     fn publish_queue(&self) {
         if self.pending_prompts_tx.receiver_count() > 0 {
             match self.doc.read_commands() {
@@ -848,6 +874,30 @@ impl ChatDocHandle {
             self.publish_messages();
         }
         Ok(stamped)
+    }
+
+    /// Restart recovery for a run a graceful shutdown settled: append `note`
+    /// to the chat's last entry when it is this device's assistant entry the
+    /// shutdown left `aborted` (with an open question, when
+    /// `require_open_question`). Same part id as [`Self::mark_abandoned_streams`],
+    /// so the two never stack. Returns whether the entry carries the note.
+    pub fn note_restart(&self, note: &str, require_open_question: bool) -> Result<bool, DocError> {
+        let entries = self.doc.read_entries()?;
+        let Some(entry) = entries.last().filter(|e| {
+            e.role == MessageRole::Assistant
+                && e.status == Some(MessageStatus::Aborted)
+                && e.device_id == self.device_id
+                && (!require_open_question || crate::sessions::has_open_question(e))
+        }) else {
+            return Ok(false);
+        };
+        let noted =
+            self.doc
+                .append_error_part(&entry.id, &format!("{}-recovery", entry.id), note)?;
+        if noted {
+            self.publish_messages();
+        }
+        Ok(noted)
     }
 
     fn publish_messages(&self) {
@@ -1078,6 +1128,16 @@ impl DocHost {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             handle.queue_paused.store(true, Ordering::Release);
+        }
+    }
+
+    /// The sessions engine calls this before it publishes Errored, so neither
+    /// the status watcher nor a doc-change drain can read the failed turn as
+    /// a boundary. A closed chat needs nothing: a reopened queue starts frozen.
+    pub(crate) fn pause_queue_after_failure(&self, chat_id: &str) {
+        let handle = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = handle {
+            handle.pause_queue_after_failure();
         }
     }
 
@@ -1550,6 +1610,7 @@ impl DocHost {
             pending_prompts_tx,
             drain_lock: tokio::sync::Mutex::new(()),
             queue_paused: AtomicBool::new(recovered_queue_pending),
+            queue_failures: Mutex::new(0),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             last_focus: AtomicU64::new(0),
@@ -4176,15 +4237,15 @@ impl DocHost {
         let Some(item) = handle.doc.take_queued(id)? else {
             return Ok(false);
         };
-        let was_paused = handle.queue_paused.swap(false, Ordering::AcqRel);
+        handle.queue_paused.store(false, Ordering::Release);
         handle.publish_queue();
         if let Err(err) = self
             .dispatch_queued(&handle, &item, QueueSend::Interrupt)
             .await
         {
-            if was_paused {
-                handle.queue_paused.store(true, Ordering::Release);
-            }
+            // A failed explicit send leaves the queue paused even if it was
+            // flowing: restoring the row must not hand it to a drain (#466).
+            handle.queue_paused.store(true, Ordering::Release);
             // Put it back rather than swallowing what the user typed — at the
             // head, because the user just said this one was the urgent one.
             let _ = handle.doc.insert_queued(0, &item);
@@ -4236,15 +4297,13 @@ impl DocHost {
         let Some(item) = handle.doc.take_queued(id)? else {
             return Ok(false);
         };
-        let was_paused = handle.queue_paused.swap(false, Ordering::AcqRel);
+        handle.queue_paused.store(false, Ordering::Release);
         handle.publish_queue();
         // Always attempt the non-interrupting path first. If no turn exists,
         // `dispatch_queued` falls through to NextTurn; if a new turn appeared
         // after our capability check, the prompt steers that turn instead.
         if let Err(err) = self.dispatch_queued(&handle, &item, QueueSend::Steer).await {
-            if was_paused {
-                handle.queue_paused.store(true, Ordering::Release);
-            }
+            handle.queue_paused.store(true, Ordering::Release);
             let _ = handle.doc.insert_queued(0, &item);
             handle.publish_queue();
             return Err(err);
@@ -4339,6 +4398,11 @@ impl DocHost {
             if self.prompt_command_waiting(handle) {
                 return;
             }
+            // A failing turn pauses before it publishes Errored, so a drain
+            // that just read the settled status must also see the pause.
+            if handle.queue_paused.load(Ordering::Acquire) {
+                return;
+            }
             let send = QueueSend::NextTurn;
             // Take it only once we know it is going out — a row that stays in
             // the queue on a failed send is recoverable; a vanished one is not.
@@ -4379,15 +4443,16 @@ impl DocHost {
         if !sessions.turn_in_flight(&handle.chat_id) {
             return Ok(false);
         }
+        let failures = handle.queue_failures();
         handle.queue_paused.store(true, Ordering::Release);
         match sessions.interrupt_for(&handle.chat_id, "stop").await {
             Ok(true) => Ok(true),
             Ok(false) => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle.resume_queue_since(failures);
                 Ok(false)
             }
             Err(err) => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle.resume_queue_since(failures);
                 Err(err)
             }
         }
@@ -5487,6 +5552,7 @@ impl DocHost {
                 request,
                 message_id,
             } => {
+                let failures = handle.queue_failures();
                 let mut request = request.clone();
                 // Queued-attachment refs (`pending://`) resolve to this
                 // host's absolute paths before anything persists or
@@ -5554,7 +5620,7 @@ impl DocHost {
                 // the turn mid-answer. Hold it for the turn's end instead.
                 if sessions.would_cancel_active_turn(chat_id, harness, &request) {
                     self.hold_run_until_turn_end(handle, harness, &request, message_id)?;
-                    handle.queue_paused.store(false, Ordering::Release);
+                    handle.resume_queue_since(failures);
                     return Ok((
                         SessionCommandStatus::Applied,
                         Some("held until the turn ends".into()),
@@ -5602,8 +5668,9 @@ impl DocHost {
                 .await?;
                 // A fresh user-authored turn is the deliberate action that
                 // thaws a queue frozen by Cancel. Clear only after dispatch
-                // succeeds so a failed send cannot silently unfreeze it.
-                handle.queue_paused.store(false, Ordering::Release);
+                // succeeds so a failed send cannot silently unfreeze it, and
+                // not if the new run already failed.
+                handle.resume_queue_since(failures);
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::Steer {
@@ -5622,6 +5689,15 @@ impl DocHost {
                 .await
             }
             SessionCommandPayload::Interrupt {} => {
+                // Which device's Stop this was, and how old: the agent only
+                // learns "the user cancelled" (#149).
+                tracing::info!(
+                    chat = %chat_id,
+                    command = %entry.id,
+                    issued_by = %entry.issued_by,
+                    age_ms = now_ms().saturating_sub(entry.issued_at),
+                    "stop requested by command"
+                );
                 self.interrupt_and_pause_queue(sessions, handle).await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
@@ -5753,6 +5829,7 @@ impl DocHost {
         turn_origin: TurnOrigin,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        let failures = handle.queue_failures();
         // Keep upstream's queued-attachment rewrite and send-time canonical
         // history while preserving the personal cut's turn-boundary queue.
         let prompt = self.resolve_prompt_attachments(prompt);
@@ -5793,7 +5870,7 @@ impl DocHost {
             .await?
         {
             SteerOutcome::Accepted => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle.resume_queue_since(failures);
                 Ok((SessionCommandStatus::Applied, None))
             }
             SteerOutcome::NotSteerable => {
@@ -5815,7 +5892,7 @@ impl DocHost {
                 let harness = self.harness_for_request(chat_id, &request);
                 self.dispatch_with_source_context(sessions, chat_id, harness, request, message_id)
                     .await?;
-                handle.queue_paused.store(false, Ordering::Release);
+                handle.resume_queue_since(failures);
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("queued as new turn".into()),
@@ -5929,7 +6006,8 @@ impl DocHost {
     ///
     /// If that checkout drifted since the chat's last turn (another branch,
     /// or another checkout in the same folder), the dispatch is held behind a
-    /// question instead and this returns `None` (#354).
+    /// question instead and this returns `None` (#354). Peer delivery also
+    /// returns `None` when held for an already active turn.
     ///
     /// The context is recorded only once dispatch accepts the request: one
     /// rejected before it ran leaves the previous context in place. A run
@@ -5943,6 +6021,11 @@ impl DocHost {
         request: harness_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<Option<String>, EngineError> {
+        if self.refuses_peer_mail(chat_id, &request.prompt) {
+            return Err(EngineError::Other(
+                harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
+            ));
+        }
         let context = self.capture_source_context(&request.cwd).await;
         if let Some(context) = &context
             && let Some(drift) = self.drift_since_last_turn(sessions, chat_id, context).await
@@ -5952,6 +6035,30 @@ impl DocHost {
             return Ok(None);
         }
         let (request, message_id) = self.release_branch_drift(chat_id, request, message_id)?;
+        // Source capture and checkout questions can await. Recheck at the
+        // actual handoff, including cold fallbacks and orphan redelivery.
+        if self.refuses_peer_mail(chat_id, &request.prompt) {
+            return Err(EngineError::Other(
+                harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
+            ));
+        }
+        if harness_proto::peer_mail::is_peer_mail(&request.prompt)
+            && sessions.turn_in_flight(chat_id)
+        {
+            let handle = self.open(chat_id)?;
+            handle.doc.push_queued(&QueuedMessage {
+                id: message_id.unwrap_or_else(new_id),
+                text: request.prompt,
+                attachments: request.attachments,
+                hold_for_turn_end: false,
+                issued_by: self.inner.config.device_id.clone(),
+                issued_at: now_ms(),
+                edited_at: None,
+                delivery_gate: None,
+            })?;
+            handle.publish_queue();
+            return Ok(None);
+        }
         let run_id = sessions
             .dispatch(chat_id, harness, request, message_id)
             .await?;

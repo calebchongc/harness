@@ -16,6 +16,8 @@ mod opening;
 #[cfg(test)]
 mod archived_tests;
 #[cfg(test)]
+mod archived_session_tests;
+#[cfg(test)]
 mod sidebar_tests;
 #[cfg(test)]
 mod interaction_tests;
@@ -314,19 +316,32 @@ impl ChatSplit {
         {
             return None;
         }
-        let total: f32 = saved.shares.iter().sum();
+        // Finite f32 weights can still overflow when summed. Normalize in
+        // f64, then reject ratios that cannot represent visible f32 panes.
+        let total: f64 = saved.shares.iter().map(|share| f64::from(*share)).sum();
+        let shares: Vec<f32> = saved
+            .shares
+            .iter()
+            .map(|share| (f64::from(*share) / total) as f32)
+            .collect();
+        if shares.iter().any(|share| *share <= 0.0) {
+            return None;
+        }
         let mut projects = saved.projects.clone();
         projects.resize(len, None);
+        let mut seen = std::collections::HashSet::new();
         Some(Self {
             axis: if saved.vertical { SplitAxis::Vertical } else { SplitAxis::Horizontal },
             panes: saved
                 .panes
                 .iter()
                 .enumerate()
-                .map(|(ix, pane)| pane.clone().filter(|id| ix != saved.focus && live(id)))
+                .map(|(ix, pane)| {
+                    pane.clone().filter(|id| ix != saved.focus && live(id) && seen.insert(id.clone()))
+                })
                 .collect(),
             focus: saved.focus,
-            shares: saved.shares.iter().map(|s| s / total).collect(),
+            shares,
             projects,
             drafts: vec![None; len],
             vanished: vec![None; len],
@@ -397,6 +412,12 @@ pub(super) struct PeerChatView {
     _events: Subscription,
 }
 
+/// Validate a reference from an existing view, not a newly created session.
+/// Archived rows are valid; an incomplete initial list is not deletion proof.
+pub(super) fn existing_chat_selection(selected: Option<String>, state: &AppState) -> Option<String> {
+    selected.filter(|id| !state.chats_synced || state.chats.iter().any(|chat| chat.id == *id))
+}
+
 impl Shell {
     fn chat_split_active(&self) -> bool {
         matches!(self.route, Route::Chat) && self.chat_split.is_some()
@@ -429,6 +450,7 @@ impl Shell {
         let Some(target) = split.focus_pane(ix, selected.clone()) else {
             return false;
         };
+        let target = existing_chat_selection(target, self.state.read(cx));
         // Each pane keeps its own workspace and composer picks: park the
         // live ones in the pane being left and bring the target pane's back.
         split.projects[from] = self.settings.space_filter.clone();
@@ -483,23 +505,18 @@ impl Shell {
     fn drop_paths_on_pane(
         &mut self,
         ix: usize,
-        paths: Vec<std::path::PathBuf>,
+        mut paths: Vec<std::path::PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.select_chat_pane(ix, cx) {
+        paths.retain(|path| !path.as_os_str().is_empty());
+        if paths.is_empty() || !self.select_chat_pane(ix, cx) {
             return;
         }
-        // The composer swaps to the pane's draft only once the selection
-        // change reaches it, so name the destination.
-        let key = self
-            .state
-            .read(cx)
-            .selected_chat
-            .clone()
-            .unwrap_or_default();
+        // Synchronize the selected composer, including queued-message editing,
+        // before staging. Selection observers may not have run in this event.
         self.composer
-            .update(cx, |composer, cx| composer.add_paths_for(key, paths, cx));
+            .update(cx, |composer, cx| composer.add_paths(paths, cx));
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
@@ -582,22 +599,26 @@ impl Shell {
         self.close_focused_chat_view(window, cx)
     }
 
-    /// The two explicit close shortcuts share view/history handling, not their
-    /// archive policy. Include the final session-to-canvas close in both.
+    /// The two close shortcuts share view/history handling, not their archive
+    /// policy: ⌘W (`may_archive`) follows the archive-on-close setting like
+    /// the ✕ buttons, and ⌘⌥W never archives. Include the final
+    /// session-to-canvas close in both.
     pub(crate) fn close_chat_view_with_archive(
         &mut self,
-        archive: bool,
+        may_archive: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A close that went ahead some other way answers nothing.
+        self.archive_choice_prompt = false;
         let closing = self.state.read(cx).selected_chat.clone();
         let closed = self.close_focused_chat_pane_without_archiving(window, cx)
             || self.close_chat_to_new_session(cx);
         if closed
-            && archive
+            && may_archive
             && let Some(chat_id) = closing
         {
-            self.archive_closed_session_explicitly(chat_id, window, cx);
+            self.archive_closed_session(chat_id, window, cx);
         }
         closed
     }
@@ -635,6 +656,7 @@ impl Shell {
             self.chat_split = None;
             return false;
         };
+        let target = existing_chat_selection(target, self.state.read(cx));
         let project = split.projects[split.focus].clone();
         let draft = split.drafts[split.focus].take().filter(|_| target.is_none());
         if split.panes.len() == 1 {
@@ -892,6 +914,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let drop_target = self.attachment_drop_target(Some(ix), cx);
         let title: SharedString = chat_id
             .and_then(|id| {
                 self.state
@@ -1025,15 +1048,27 @@ impl Shell {
             .child(attachment_drop_veil(("chat-peer-pane-drop", ix), theme))
             .on_drop(
                 cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
-                    this.drop_paths_on_pane(ix, paths.paths().to_vec(), window, cx);
+                    if this.attachment_drop_is_current(&drop_target, cx) {
+                        this.drop_paths_on_pane(ix, paths.paths().to_vec(), window, cx);
+                    }
                 }),
             )
             // Finish the original click/selection before moving this entity
             // into the active outlet. Capturing observes consumed child events;
             // deferring lets their click handlers act on the still-mounted view.
             // Every mouse button activates, and a text selection is no veto.
-            .capture_any_mouse_up(cx.listener(move |this, _, _, cx| {
-                if cx.has_active_drag() {
+            // But a release here is not a new interaction if its press began
+            // elsewhere (for example, selecting in the active pane across us).
+            .capture_any_mouse_down(cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                this.chat_pane_press = Some((ix, event.button));
+            }))
+            .on_mouse_down_out(cx.listener(move |this, _, _, _| {
+                if this.chat_pane_press.is_some_and(|(pane, _)| pane == ix) {
+                    this.chat_pane_press = None;
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+                if this.chat_pane_press.take() != Some((ix, event.button)) || cx.has_active_drag() {
                     return;
                 }
                 let tab = this.chat_tab;
@@ -1079,7 +1114,13 @@ pub(super) fn attachment_drop_veil(
         // GPUI matches these styles against the active payload's concrete
         // TypeId. Resize markers therefore cannot reveal this overlay, even
         // after an external drag exits without another move event.
-        .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.opacity(1.0))
+        .drag_over::<gpui::ExternalPaths>(|style, paths, _, _| {
+            if paths.paths().iter().any(|path| !path.as_os_str().is_empty()) {
+                style.opacity(1.0)
+            } else {
+                style
+            }
+        })
         .child("Drop to attach")
 }
 

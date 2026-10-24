@@ -14,6 +14,7 @@ pub mod motion;
 pub mod peer_mail;
 pub mod preview;
 pub mod room_delivery;
+pub mod run_errors;
 pub mod sidebar_pins;
 pub mod view;
 pub mod visual;
