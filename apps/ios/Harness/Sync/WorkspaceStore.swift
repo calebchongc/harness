@@ -647,23 +647,15 @@ final class WorkspaceStore {
         changeRequestSnapshots.removeAll()
     }
 
-    /// The last relay failure, for surfacing in UI/diagnostics.
-    private(set) var lastRelayError: String?
-
     /// ListFolders on the target device (engine caps at 500 entries, hides
     /// dotfiles, stamps isRepo). nil path = the device's home directory.
-    func listFolders(deviceId: String, path: String?) async -> FolderListing? {
-        do {
-            return try await listFoldersDetailed(deviceId: deviceId, path: path)
-        } catch {
-            lastRelayError = describeTransportError(error)
-            return nil
-        }
-    }
-
-    func listFoldersDetailed(deviceId: String, path: String?) async throws -> FolderListing {
+    /// `dirsOnly` leaves files out on the host (engines that predate it
+    /// ignore the field and send files, which folder pickers filter anyway).
+    func listFoldersDetailed(deviceId: String, path: String?,
+                             dirsOnly: Bool = false) async throws -> FolderListing {
         var params: [String: Any] = [:]
         if let path { params["path"] = path }
+        if dirsOnly { params["dirsOnly"] = true }
         return try await relay(for: deviceId).call(method: "ListFolders", params: params)
     }
 

@@ -442,6 +442,8 @@ final class AppModel {
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
         storeLastUsed.removeAll()
+        // A new instance, so a reply still in flight lands in the old one.
+        folderListings = FolderListingCache()
         config = nil
         demo = nil
         demoPinnedSessionIds = []
@@ -967,13 +969,22 @@ final class AppModel {
         return try await workspace.setGraffCompactAt(deviceId: deviceId, pct: pct)
     }
 
-    func listFolders(deviceId: String, path: String?) async -> FolderListing? {
+    /// Folder listings the New space browser has loaded, per computer and
+    /// path, kept across presentations of the sheet (#420).
+    @ObservationIgnored private(set) var folderListings = FolderListingCache()
+
+    /// Folders only: the browser shows nothing else. Throws the host's or the
+    /// relay's own failure so the browser can say why a folder didn't open.
+    func listFolders(deviceId: String, path: String?) async throws -> FolderListing {
         if let demo {
-            try? await Task.sleep(nanoseconds: 120_000_000)  // feel like a network hop
+            // Feel like a network hop; `-slow-folders` stands in for a slow host.
+            let slow = ProcessInfo.processInfo.arguments.contains("-slow-folders")
+            try? await Task.sleep(nanoseconds: slow ? 1_500_000_000 : 120_000_000)
             let target = path ?? demo.homePath(deviceId: deviceId)
             return demo.listFolders(deviceId: deviceId, path: target)
         }
-        return await workspace?.listFolders(deviceId: deviceId, path: path)
+        guard let workspace else { throw RelayError.notConnected }
+        return try await workspace.listFoldersDetailed(deviceId: deviceId, path: path, dirsOnly: true)
     }
 
     @discardableResult

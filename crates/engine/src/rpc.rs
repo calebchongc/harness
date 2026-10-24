@@ -331,6 +331,10 @@ struct RunProjectActionParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+    /// Leave files out of the listing (folder pickers). Older engines ignore
+    /// the field and return files too, which those pickers already filter.
+    #[serde(default)]
+    dirs_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3009,7 +3013,7 @@ impl RpcService for EngineRpc {
                 let p: ListFoldersParams = parse_params(params)?;
                 let listing = self
                     .repos
-                    .list_folders(p.path)
+                    .list_folders_opts(p.path, p.dirs_only)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
