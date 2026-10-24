@@ -4143,7 +4143,7 @@ impl Shell {
     /// transcripts (nested spawns open their own tabs).
     fn on_transcript_event(
         &mut self,
-        _: Entity<Transcript>,
+        source: Entity<Transcript>,
         event: &TranscriptEvent,
         cx: &mut Context<Self>,
     ) {
@@ -4159,6 +4159,7 @@ impl Shell {
                     doc_id.clone(),
                     title.clone(),
                     *frozen,
+                    source,
                     cx,
                 );
             }
@@ -4231,30 +4232,84 @@ impl Shell {
         doc_id: String,
         title: String,
         frozen: bool,
+        source_view: Entity<Transcript>,
         cx: &mut Context<Self>,
     ) {
-        // Nested chips report their document. Resolve its registered parent
-        // rather than inferring ownership from a document ID's spelling.
+        // Document and chat IDs can collide. The emitting entity determines
+        // whether this is a root transcript or a registered nested source.
         let source = chat_id;
-        let chat_id = self
+        let (chat_id, harness) = if let Some(tab) = self
             .subagent_tabs
             .values()
-            .find(|tab| tab.doc_id == source)
-            .and_then(|tab| tab.transcript.read(cx).link_ui())
-            .and_then(|links| links.source_session)
-            .unwrap_or_else(|| source.clone());
+            .find(|tab| tab.transcript == source_view)
+        {
+            if tab.doc_id != source {
+                return;
+            }
+            let Some(owner) = tab
+                .transcript
+                .read(cx)
+                .link_ui()
+                .and_then(|links| links.source_session)
+            else {
+                return;
+            };
+            (owner, tab.harness)
+        } else {
+            let primary = source == self.active_chat && source_view == self.transcript;
+            let peer = self
+                .peer_chat_views
+                .get(&source)
+                .is_some_and(|view| view.transcript == source_view);
+            if !primary && !peer {
+                return;
+            }
+            let harness =
+                subagent_tab_harness(&self.state.read(cx).chats, std::iter::empty(), &source);
+            (source, harness)
+        };
         if chat_id.is_empty()
             || !matches!(self.route, Route::Chat)
-            || self.state.read(cx).selected_chat.as_deref().unwrap_or_default() != self.active_chat
+            || self
+                .state
+                .read(cx)
+                .selected_chat
+                .as_deref()
+                .unwrap_or_default()
+                != self.active_chat
+            || !self.chat_navigation_is_live(&chat_id, cx)
         {
             return;
         }
+        let existing = self
+            .subagent_tabs
+            .iter()
+            .find(|(_, tab)| tab.doc_id == doc_id);
+        if let Some((&id, tab)) = existing
+            && (tab
+                .transcript
+                .read(cx)
+                .link_ui()
+                .and_then(|links| links.source_session)
+                .as_deref()
+                != Some(chat_id.as_str())
+                || !self
+                    .right_tabs
+                    .get(&chat_id)
+                    .is_some_and(|tabs| tabs.contains(&RightSurface::Subagent(id))))
+        {
+            // A document is watched globally: never reuse another owner's
+            // surface or silently attach its transcript to this conversation.
+            return;
+        }
+        let existing = existing.map(|(&id, _)| id);
         if chat_id != self.active_chat {
             let pane = self.chat_split.as_ref().and_then(|split| {
                 (!split.zoomed)
                     .then(|| {
                         split.panes.iter().enumerate().find_map(|(ix, id)| {
-                            (ix != split.focus && id.as_deref() == Some(chat_id.as_str())).then_some(ix)
+                            (ix != split.focus && id.as_deref() == Some(chat_id.as_str()))
+                                .then_some(ix)
                         })
                     })
                     .flatten()
@@ -4273,23 +4328,12 @@ impl Shell {
         // The chip lives in the conversation column — the pane it opens into
         // may still be closed.
         self.set_surfaces_open(true, cx);
-        if let Some((&id, _)) = self
-            .subagent_tabs
-            .iter()
-            .find(|(_, tab)| tab.doc_id == doc_id)
-        {
+        if let Some(id) = existing {
             self.set_right_active(RightSurface::Subagent(id), cx);
             return;
         }
         self.subagent_seq += 1;
         let id = self.subagent_seq;
-        let harness = subagent_tab_harness(
-            &self.state.read(cx).chats,
-            self.subagent_tabs
-                .values()
-                .map(|tab| (tab.doc_id.as_str(), tab.harness)),
-            &source,
-        );
         // A live subagent follows its streaming end (main-transcript feel);
         // a frozen one reads top-down.
         let transcript =
@@ -16873,6 +16917,7 @@ mod exit_regressions {
                     "child-doc".into(),
                     "Child".into(),
                     true,
+                    shell.transcript.clone(),
                     cx,
                 );
                 let child = shell
@@ -17531,7 +17576,14 @@ mod right_tab_mouse_regressions {
                 shell.active_chat = "parent".into();
                 shell.state.update(cx, |state, _| state.selected_chat = Some("parent".into()));
                 for id in ["first", "second"] {
-                    shell.add_subagent_surface("parent".into(), id.into(), id.into(), false, cx);
+                    shell.add_subagent_surface(
+                        "parent".into(),
+                        id.into(),
+                        id.into(),
+                        false,
+                        shell.transcript.clone(),
+                        cx,
+                    );
                 }
                 shell
             });
@@ -17566,7 +17618,14 @@ mod right_tab_mouse_regressions {
         let (shell, cx) = setup(cx);
         shell.update(cx, |shell, cx| {
             for id in ["third", "fourth", "fifth", "sixth"] {
-                shell.add_subagent_surface("parent".into(), id.into(), id.into(), false, cx);
+                shell.add_subagent_surface(
+                    "parent".into(),
+                    id.into(),
+                    id.into(),
+                    false,
+                    shell.transcript.clone(),
+                    cx,
+                );
             }
         });
         cx.update(|window, cx| window.draw(cx).clear());
@@ -17599,7 +17658,14 @@ mod right_tab_mouse_regressions {
         let (shell, cx) = setup(cx);
         shell.update(cx, |shell, cx| {
             for id in ["third", "fourth", "fifth", "sixth", "seventh", "eighth"] {
-                shell.add_subagent_surface("parent".into(), id.into(), id.into(), false, cx);
+                shell.add_subagent_surface(
+                    "parent".into(),
+                    id.into(),
+                    id.into(),
+                    false,
+                    shell.transcript.clone(),
+                    cx,
+                );
             }
         });
         cx.update(|window, cx| window.draw(cx).clear());

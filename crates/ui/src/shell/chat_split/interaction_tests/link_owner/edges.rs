@@ -8,6 +8,7 @@ mod lifecycle;
 mod matrix;
 mod menus;
 mod race_edges;
+mod revocations;
 mod spawns;
 
 const URL: &str = "https://example.com/docs?owner=current#details";
