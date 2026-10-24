@@ -183,6 +183,10 @@ pub mod methods {
     /// (`{method, path, query?, body?}` → `{status, body}`), made with the
     /// engine's own sign-in. harness-mcp's room tools compose it.
     pub const ROOM_REQUEST: &str = "RoomRequest";
+    // browse Connected apps (engine browse_link; local only).
+    pub const BROWSE_LINK_STATUS: &str = "BrowseLinkStatus";
+    pub const BROWSE_LINK_PAIR: &str = "BrowseLinkPair";
+    pub const BROWSE_LINK_DISCONNECT: &str = "BrowseLinkDisconnect";
     pub const LIST_ORGS: &str = "ListOrgs";
     pub const CREATE_ORG: &str = "CreateOrg";
     pub const SELECT_ORG: &str = "SelectOrg";

@@ -28,6 +28,7 @@ async fn graff_acp_restores_in_the_selected_workspace() {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        mcp_servers: Vec::new(),
     };
     let request = RunRequest {
         turn_origin: Default::default(),
@@ -97,6 +98,7 @@ async fn run_graff_worktree_fixture(
         }),
         steering,
         interrupt: CancellationToken::new(),
+        mcp_servers: Vec::new(),
     };
     let request = RunRequest {
         turn_origin: Default::default(),

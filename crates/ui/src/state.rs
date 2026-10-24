@@ -40,6 +40,9 @@ use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
 };
 
+#[cfg(test)]
+mod doc_feed_tests;
+
 // Recently viewed transcripts stay renderable while a fresh watch opens. Move
 // ownership on navigation; never clone whale payloads or retain live watches.
 const TRANSCRIPT_CACHE_CAP: usize = 12;
@@ -799,6 +802,10 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
+    // A peer and a child may read the same document. Single-flight watches
+    // share work, not lifetime; each kind of consumer releases independently.
+    sub_doc_consumers: HashSet<String>,
+    peer_doc_consumers: HashSet<String>,
     /// The account's Codegraff cloud sandboxes ([`cloud_sandboxes`]).
     cloud_sandboxes: cloud_sandboxes::CloudSandboxesState,
 }
@@ -880,6 +887,8 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            sub_doc_consumers: HashSet::new(),
+            peer_doc_consumers: HashSet::new(),
             cloud_sandboxes: Default::default(),
             auto_selected: false,
             chats_synced: false,
@@ -1487,6 +1496,15 @@ impl AppState {
     /// Single-flight per key; a frozen snapshot already in place wins — the
     /// watch would race the (complete) blob with a possibly-purged live doc.
     pub fn watch_subagent_doc(&mut self, doc_id: String, cx: &mut Context<Self>) {
+        self.retain_subagent_doc(&doc_id);
+        self.watch_doc(doc_id, cx);
+    }
+
+    pub(crate) fn retain_subagent_doc(&mut self, doc_id: &str) {
+        self.sub_doc_consumers.insert(doc_id.to_owned());
+    }
+
+    fn watch_doc(&mut self, doc_id: String, cx: &mut Context<Self>) {
         if self.sub_watch_tasks.contains_key(&doc_id) {
             return;
         }
@@ -1498,37 +1516,51 @@ impl AppState {
         self.sub_watch_tasks.insert(doc_id, task);
     }
 
-    /// Tab closed: drop the watch task (cancels the engine-side watch and
-    /// unpins the doc from the engine LRU) and the rows.
+    /// Release a child without cancelling a surviving peer's shared feed.
     pub fn unwatch_subagent_doc(&mut self, doc_id: &str) {
+        self.sub_doc_consumers.remove(doc_id);
+        self.release_doc_if_unused(doc_id);
+    }
+
+    fn release_doc_if_unused(&mut self, doc_id: &str) {
+        if self.sub_doc_consumers.contains(doc_id) || self.peer_doc_consumers.contains(doc_id) {
+            return;
+        }
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(doc_id);
         self.sub_transcripts.remove(doc_id);
-        self.prepared_transcripts.remove(doc_id);
-        self.transcript_baselines.remove(doc_id);
+        // The primary feed shares these keys, but owns its own watch.
+        if self.selected_chat.as_deref() != Some(doc_id) {
+            self.prepared_transcripts.remove(doc_id);
+            self.transcript_baselines.remove(doc_id);
+        }
     }
 
     /// Live read-only feed for a chat shown in an unfocused split pane. The
     /// same doc watch subagent tabs use (`WatchDocMessages` takes any doc id).
     pub fn watch_peer_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.watch_subagent_doc(chat_id, cx);
+        self.peer_doc_consumers.insert(chat_id.clone());
+        self.watch_doc(chat_id, cx);
     }
 
     /// Drop an unfocused pane's feed. A chat that just became the selected
     /// one shares its `prepared_transcripts` / baseline keys with the primary
     /// feed, so those stay; only the peer rows and watch go.
     pub fn unwatch_peer_chat(&mut self, chat_id: &str) {
-        if self.selected_chat.as_deref() == Some(chat_id) {
-            self.sub_watch_tasks.remove(chat_id);
-            self.sub_transcripts.remove(chat_id);
-        } else {
-            self.unwatch_subagent_doc(chat_id);
-        }
+        self.peer_doc_consumers.remove(chat_id);
+        self.release_doc_if_unused(chat_id);
+    }
+
+    pub(crate) fn doc_has_chat_consumer(&self, doc_id: &str) -> bool {
+        self.peer_doc_consumers.contains(doc_id) || self.selected_chat.as_deref() == Some(doc_id)
     }
 
     /// Frozen-blob path: the finished subagent's uploaded transcript, no
     /// watch needed (and any in-flight watch is superseded).
     pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
+        if self.doc_has_chat_consumer(&doc_id) {
+            return;
+        }
         self.prepared_transcripts.remove(&doc_id);
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(&doc_id);
@@ -1545,6 +1577,9 @@ impl AppState {
         entries: Vec<SessionMessageEntry>,
         prepared: Arc<crate::transcript::PreparedTranscript>,
     ) {
+        if self.doc_has_chat_consumer(&doc_id) {
+            return;
+        }
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(&doc_id);
         self.transcript_baselines
@@ -2070,6 +2105,23 @@ impl AppState {
         self.engine = Some(handle);
     }
 
+    /// Seed a synthetic live-peer replay without pretending it is a frozen
+    /// child blob (which is forbidden from superseding a live chat feed).
+    #[cfg(test)]
+    pub(crate) fn set_peer_chat_snapshot(
+        &mut self,
+        chat_id: String,
+        entries: Vec<SessionMessageEntry>,
+    ) {
+        self.prepared_transcripts.remove(&chat_id);
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_baselines.insert(
+            chat_id.clone(),
+            Arc::new(harness_doc::TranscriptBaseline::capture(&entries)),
+        );
+        self.sub_transcripts.insert(chat_id, entries);
+    }
+
     /// Drop every account-scoped view and subscription after its runtime has
     /// stopped. The next bootstrap must never render rows from the previous
     /// account while the local profile is opening.
@@ -2363,7 +2415,15 @@ impl AppState {
     /// navigation-cache entry; keep both panes' prepared rows and baselines.
     pub(crate) fn select_split_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
         let incoming = chat_id.as_ref().and_then(|id| {
-            self.sub_transcripts.remove(id).map(|entries| {
+            // Usually promotion transfers the peer rows. A child with the
+            // same document ID still reads them, so retain its copy until
+            // that independent consumer releases the feed.
+            let entries = if self.sub_doc_consumers.contains(id) {
+                self.sub_transcripts.get(id).cloned()
+            } else {
+                self.sub_transcripts.remove(id)
+            };
+            entries.map(|entries| {
                 (
                     entries,
                     self.prepared_transcripts.get(id).cloned(),
