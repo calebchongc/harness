@@ -18,6 +18,7 @@ use harness_doc::{
 };
 use harness_proto::{
     Chat, Device, HarnessId, Model, ReasoningLevel, Session, SessionStatus, Space, SteeringMode,
+    TurnOrigin,
 };
 use harness_rpc::{RpcClient, RpcError, RpcSubscription, connect_ws, methods};
 
@@ -302,6 +303,12 @@ impl Harness {
         chat_id: &str,
         payload: &SessionCommandPayload,
     ) -> anyhow::Result<String> {
+        let mut payload = payload.clone();
+        match &mut payload {
+            SessionCommandPayload::Run { request, .. } => request.turn_origin = TurnOrigin::Peer,
+            SessionCommandPayload::Steer { turn_origin, .. } => *turn_origin = TurnOrigin::Peer,
+            _ => {}
+        }
         let command = serde_json::to_value(payload).context("serialize command")?;
         let reply = self
             .call(
@@ -352,7 +359,8 @@ impl Harness {
         let reply = self
             .call(
                 methods::QUEUE_MESSAGE,
-                json!({ "chatId": chat_id, "text": text, "holdForTurnEnd": true }),
+                json!({ "chatId": chat_id, "text": text, "holdForTurnEnd": true,
+                    "turnOrigin": TurnOrigin::Peer, "peerChatId": self.origin.chat_id }),
             )
             .await?;
         Ok(reply

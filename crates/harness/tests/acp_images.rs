@@ -38,6 +38,7 @@ async fn sent_prompt(images: bool) -> serde_json::Value {
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "What colour is this?".into(),
         harness: None,
         model: None,
@@ -144,6 +145,7 @@ async fn follow_up_prompt(authorized: bool) -> serde_json::Value {
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "hi".into(),
         harness: None,
         model: None,

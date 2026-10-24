@@ -134,6 +134,7 @@ async fn later_explicit_archive_supersedes_delayed_steer_restore() {
         .queue_command(
             CHAT,
             SessionCommandPayload::Steer {
+                turn_origin: Default::default(),
                 prompt: "new prompt".into(),
                 message_id: Some("steered-message".into()),
             },

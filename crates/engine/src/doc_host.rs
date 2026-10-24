@@ -38,7 +38,9 @@ use harness_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
-use harness_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
+use harness_proto::{
+    ConversationSourceContext, HarnessId, TurnOrigin, UserInputAnswer, UserInputQuestion,
+};
 use harness_sync::DocsStore;
 
 use crate::http_error::describe_http_error;
@@ -3291,7 +3293,14 @@ impl DocHost {
                     &origin,
                     wake["body"].as_str().unwrap_or_default(),
                 );
-                if let Err(err) = self.queue_message_with_behavior(chat_id, &text, Vec::new(), true) {
+                if let Err(err) = self.queue_message_with_origin(
+                    chat_id,
+                    &text,
+                    Vec::new(),
+                    true,
+                    TurnOrigin::Peer,
+                    None,
+                ) {
                     // Left unacked: the next nudge retries it.
                     tracing::warn!(chat = %chat_id, %err, "room wake: queue failed");
                     continue;
@@ -3579,11 +3588,20 @@ impl DocHost {
         // An archived chat takes no peer mail (#498): refuse it here, before
         // anything is staged, so it neither starts a turn nor restores the chat.
         if let SessionCommandPayload::Run {
-            request: harness_proto::RunRequest { prompt, .. },
+            request:
+                harness_proto::RunRequest {
+                    prompt,
+                    turn_origin,
+                    ..
+                },
             ..
         }
-        | SessionCommandPayload::Steer { prompt, .. } = &payload
-            && self.refuses_peer_mail(chat_id, prompt)
+        | SessionCommandPayload::Steer {
+            prompt,
+            turn_origin,
+            ..
+        } = &payload
+            && self.refuses_prompt_origin(chat_id, prompt, *turn_origin)
         {
             return Err(EngineError::Other(
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
@@ -3658,7 +3676,32 @@ impl DocHost {
         attachments: Vec<String>,
         hold_for_turn_end: bool,
     ) -> Result<String, EngineError> {
-        if self.refuses_peer_mail(chat_id, text) {
+        self.queue_message_with_origin(
+            chat_id,
+            text,
+            attachments,
+            hold_for_turn_end,
+            TurnOrigin::Human,
+            None,
+        )
+    }
+
+    /// Preserve structural origin across synchronized queue and cold-host delivery.
+    pub fn queue_message_with_origin(
+        &self,
+        chat_id: &str,
+        text: &str,
+        attachments: Vec<String>,
+        hold_for_turn_end: bool,
+        turn_origin: TurnOrigin,
+        peer_chat_id: Option<String>,
+    ) -> Result<String, EngineError> {
+        let turn_origin = if peer_chat_id.is_some() {
+            TurnOrigin::Peer
+        } else {
+            turn_origin
+        };
+        if self.refuses_prompt_origin(chat_id, text, turn_origin) {
             return Err(EngineError::Other(
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
             ));
@@ -3670,6 +3713,8 @@ impl DocHost {
         if let Err(error) = handle.doc.push_queued(&QueuedMessage {
             id: id.clone(),
             text: text.to_string(),
+            turn_origin,
+            peer_chat_id,
             attachments,
             hold_for_turn_end,
             issued_by: self.inner.config.device_id.clone(),
@@ -3691,7 +3736,21 @@ impl DocHost {
     /// (#498). Checked when mail is accepted and again when it would be
     /// delivered, so mail accepted before an archive cannot wake the chat
     /// after it. A person's prompt is never refused.
-    pub(crate) fn refuses_peer_mail(&self, chat_id: &str, text: &str) -> bool {
+    pub(crate) fn refuses_prompt_origin(
+        &self,
+        chat_id: &str,
+        text: &str,
+        origin: TurnOrigin,
+    ) -> bool {
+        self.refuses_peer_mail(chat_id, text)
+            || (origin != TurnOrigin::Human
+                && self
+                    .workspace()
+                    .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
+                    .is_some_and(|chat| chat.archived))
+    }
+
+    fn refuses_peer_mail(&self, chat_id: &str, text: &str) -> bool {
         let archived = self
             .workspace()
             .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
@@ -4309,7 +4368,15 @@ impl DocHost {
             }
             // Peer mail accepted before the chat was archived stays queued
             // (visible, removable) instead of waking it; a restore re-drains.
-            if self.refuses_peer_mail(&handle.chat_id, &head.text) {
+            if self.refuses_prompt_origin(
+                &handle.chat_id,
+                &head.text,
+                if head.peer_chat_id.is_some() {
+                    TurnOrigin::Peer
+                } else {
+                    head.turn_origin
+                },
+            ) {
                 return;
             }
             // In flight, not just Working: an agent parked on a question owns
@@ -4401,6 +4468,11 @@ impl DocHost {
         // The submitting viewport learns this id from QueueMessage and can
         // therefore wait without disturbing the active turn's runway, then
         // anchor the prompt only once this exact row reaches the transcript.
+        let turn_origin = if item.peer_chat_id.is_some() {
+            TurnOrigin::Peer
+        } else {
+            item.turn_origin
+        };
         let message_id = item.id.clone();
         let prompt = queued_message_prompt(&item.text, &item.attachments);
         // Same jail as a Run command's attachments: harnesses only ever read
@@ -4411,11 +4483,12 @@ impl DocHost {
         };
         if send == QueueSend::Steer {
             match sessions
-                .steer_with_attachments(
+                .steer_with_origin(
                     chat_id,
                     &prompt,
                     Some(message_id.clone()),
                     attachments.clone(),
+                    turn_origin,
                 )
                 .await?
             {
@@ -4447,6 +4520,7 @@ impl DocHost {
             ));
         };
         request.prompt = prompt;
+        request.turn_origin = turn_origin;
         request.resume = None; // dispatch re-derives the harness session
         request.attachments = item.attachments.clone();
         // Resolves landed `pending://` refs (text and list), then jails.
@@ -5448,11 +5522,20 @@ impl DocHost {
         // archive, or synced from a device that did not check, must not wake
         // the archived chat.
         if let SessionCommandPayload::Run {
-            request: harness_proto::RunRequest { prompt, .. },
+            request:
+                harness_proto::RunRequest {
+                    prompt,
+                    turn_origin,
+                    ..
+                },
             ..
         }
-        | SessionCommandPayload::Steer { prompt, .. } = &entry.payload
-            && self.refuses_peer_mail(chat_id, prompt)
+        | SessionCommandPayload::Steer {
+            prompt,
+            turn_origin,
+            ..
+        } = &entry.payload
+            && self.refuses_prompt_origin(chat_id, prompt, *turn_origin)
         {
             return Ok((
                 SessionCommandStatus::Rejected,
@@ -5585,13 +5668,18 @@ impl DocHost {
                 handle.resume_queue_since(failures);
                 Ok((SessionCommandStatus::Applied, None))
             }
-            SessionCommandPayload::Steer { prompt, message_id } => {
+            SessionCommandPayload::Steer {
+                prompt,
+                message_id,
+                turn_origin,
+            } => {
                 self.deliver_prompt(
                     sessions,
                     handle,
                     prompt,
                     message_id.clone(),
                     entry.issued_at,
+                    *turn_origin,
                 )
                 .await
             }
@@ -5699,6 +5787,7 @@ impl DocHost {
                     ));
                 };
                 request.prompt = respond_input_prompt(&questions, answers);
+                request.turn_origin = TurnOrigin::Human;
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
                 if let Err(err) = handle.doc.resolve_input(request_id) {
@@ -5732,13 +5821,20 @@ impl DocHost {
         prompt: &str,
         message_id: Option<String>,
         issued_at: i64,
+        turn_origin: TurnOrigin,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
         let failures = handle.queue_failures();
         // Keep upstream's queued-attachment rewrite and send-time canonical
         // history while preserving the personal cut's turn-boundary queue.
         let prompt = self.resolve_prompt_attachments(prompt);
-        if self.held_until_turn_end(sessions, chat_id, &prompt, message_id.as_deref())? {
+        if self.held_until_turn_end(
+            sessions,
+            chat_id,
+            &prompt,
+            message_id.as_deref(),
+            turn_origin,
+        )? {
             return Ok((
                 SessionCommandStatus::Applied,
                 Some("held until the turn ends".into()),
@@ -5759,7 +5855,13 @@ impl DocHost {
             .map(|uploads| uploads.owned_attachments(&prompt))
             .unwrap_or_default();
         match sessions
-            .steer_with_attachments(chat_id, &prompt, message_id.clone(), attachments.clone())
+            .steer_with_origin(
+                chat_id,
+                &prompt,
+                message_id.clone(),
+                attachments.clone(),
+                turn_origin,
+            )
             .await?
         {
             SteerOutcome::Accepted => {
@@ -5777,6 +5879,7 @@ impl DocHost {
                     ));
                 };
                 request.prompt = prompt;
+                request.turn_origin = turn_origin;
                 request.resume = None; // dispatch re-derives the harness session
                 // A reused config must not re-inline the PREVIOUS turn's
                 // images: only this prompt's own validated uploads ride.
@@ -5811,6 +5914,7 @@ impl DocHost {
         chat_id: &str,
         prompt: &str,
         message_id: Option<&str>,
+        turn_origin: TurnOrigin,
     ) -> Result<bool, EngineError> {
         // A persistent session parked BETWEEN turns DOES take the next prompt
         // through its mailbox (the warm-child fast path), so the question is
@@ -5827,6 +5931,8 @@ impl DocHost {
         handle.doc.push_queued(&QueuedMessage {
             id: message_id.map(str::to_string).unwrap_or_else(new_id),
             text: prompt.to_string(),
+            turn_origin,
+            peer_chat_id: None,
             attachments: Vec::new(),
             hold_for_turn_end: false,
             issued_by: self.inner.config.device_id.clone(),
@@ -5862,6 +5968,8 @@ impl DocHost {
         handle.doc.push_queued(&QueuedMessage {
             id: message_id.to_string(),
             text: request.prompt.clone(),
+            turn_origin: request.turn_origin,
+            peer_chat_id: None,
             attachments: request.attachments.clone(),
             hold_for_turn_end: false,
             issued_by: self.inner.config.device_id.clone(),
@@ -5908,7 +6016,7 @@ impl DocHost {
         request: harness_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<Option<String>, EngineError> {
-        if self.refuses_peer_mail(chat_id, &request.prompt) {
+        if self.refuses_prompt_origin(chat_id, &request.prompt, request.turn_origin) {
             return Err(EngineError::Other(
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
             ));
@@ -5924,18 +6032,21 @@ impl DocHost {
         let (request, message_id) = self.release_branch_drift(chat_id, request, message_id)?;
         // Source capture and checkout questions can await. Recheck at the
         // actual handoff, including cold fallbacks and orphan redelivery.
-        if self.refuses_peer_mail(chat_id, &request.prompt) {
+        if self.refuses_prompt_origin(chat_id, &request.prompt, request.turn_origin) {
             return Err(EngineError::Other(
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
             ));
         }
-        if harness_proto::peer_mail::is_peer_mail(&request.prompt)
-            && sessions.turn_in_flight(chat_id)
-        {
+        // Peer work is known by its origin; legacy envelopes still count.
+        let peer_work = request.turn_origin != TurnOrigin::Human
+            || harness_proto::peer_mail::is_peer_mail(&request.prompt);
+        if peer_work && sessions.turn_in_flight(chat_id) {
             let handle = self.open(chat_id)?;
             handle.doc.push_queued(&QueuedMessage {
                 id: message_id.unwrap_or_else(new_id),
                 text: request.prompt,
+                turn_origin: TurnOrigin::Peer,
+                peer_chat_id: None,
                 attachments: request.attachments,
                 hold_for_turn_end: false,
                 issued_by: self.inner.config.device_id.clone(),
@@ -6097,6 +6208,7 @@ impl DocHost {
         let config = chat.config;
         Some(harness_proto::RunRequest {
             prompt: prompt.to_string(),
+            turn_origin: TurnOrigin::Human,
             harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),
             reasoning: config.as_ref().and_then(|c| c.reasoning),
@@ -7005,6 +7117,7 @@ mod pending_prompt_tests {
             id: id.into(),
             payload: SessionCommandPayload::Run {
                 request: harness_proto::RunRequest {
+                    turn_origin: TurnOrigin::Human,
                     prompt: prompt.into(),
                     harness: None,
                     model: None,

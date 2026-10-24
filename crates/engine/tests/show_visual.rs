@@ -25,6 +25,7 @@ fn done() -> AgentEvent {
 
 fn request(cwd: &std::path::Path) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: "work".into(),
         harness: None,
         model: None,

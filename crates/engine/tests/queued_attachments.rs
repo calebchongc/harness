@@ -118,6 +118,7 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 fn run_payload(message_id: &str, pending_ref: &str) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
+            turn_origin: Default::default(),
             prompt: format!(
                 "look at this\n\nAttached images (local files — open them to view):\n- {pending_ref}"
             ),
@@ -308,6 +309,7 @@ async fn run_attachments_outside_uploads_never_reach_the_harness() {
 
     let payload = SessionCommandPayload::Run {
         request: RunRequest {
+            turn_origin: Default::default(),
             prompt: format!(
                 "look\n\nAttached images (local files — open them to view):\n- {outside}\n- {inside}"
             ),

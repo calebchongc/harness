@@ -87,6 +87,7 @@ async fn quiet_subagent_boundaries_do_not_spin_the_session_commit_timer() {
             "quiet-parent",
             HarnessId::Mock,
             RunRequest {
+                turn_origin: Default::default(),
                 prompt: "quiet subagent regression".into(),
                 harness: None,
                 model: None,

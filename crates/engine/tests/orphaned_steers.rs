@@ -78,6 +78,7 @@ impl Harness for ControlledHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: None,

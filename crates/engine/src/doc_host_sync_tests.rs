@@ -1388,6 +1388,7 @@ fn phone_run(id: &str) -> SessionCommandEntry {
         id: id.into(),
         payload: SessionCommandPayload::Run {
             request: harness_proto::RunRequest {
+                turn_origin: Default::default(),
                 prompt: "sent from the phone".into(),
                 harness: None,
                 model: None,

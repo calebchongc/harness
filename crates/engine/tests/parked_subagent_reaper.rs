@@ -113,6 +113,7 @@ impl Run {
                 chat,
                 HarnessId::Mock,
                 RunRequest {
+                    turn_origin: Default::default(),
                     prompt: "spawn a background subagent".into(),
                     harness: None,
                     model: None,

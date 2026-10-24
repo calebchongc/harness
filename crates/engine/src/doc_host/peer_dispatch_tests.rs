@@ -38,6 +38,7 @@ impl Harness for PendingHarness {
 fn request(prompt: &str, cwd: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        turn_origin: Default::default(),
         harness: None,
         model: None,
         reasoning: None,

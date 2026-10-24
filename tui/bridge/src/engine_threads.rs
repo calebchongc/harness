@@ -521,6 +521,7 @@ fn turn_start(conn: &Arc<Conn>, engine: &Arc<Engine>, params: &Value) -> Reply {
         }
         RunRequest {
             prompt,
+            turn_origin: harness_proto::TurnOrigin::Human,
             harness: Some(thread.harness),
             model: thread.model.clone(),
             reasoning: params
@@ -627,6 +628,7 @@ async fn turn_steer(conn: &Arc<Conn>, engine: &Engine, params: &Value) -> Reply 
     }
     let command = SessionCommandPayload::Steer {
         prompt,
+        turn_origin: harness_proto::TurnOrigin::Human,
         message_id: Some(message_id),
     };
     match engine.client.queue_command(chat_id, &command).await {

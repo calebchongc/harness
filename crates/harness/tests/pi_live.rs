@@ -82,6 +82,7 @@ async fn real_pi_mock_lifecycle() {
             }),
         };
         let request = RunRequest {
+            turn_origin: Default::default(),
             prompt: prompt.into(),
             harness: None,
             model: Some("harness-probe/mock".into()),
@@ -179,6 +180,7 @@ async fn real_pi_mock_lifecycle() {
         request_input: Box::new(|_| oneshot::channel().1),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "after loss".into(),
         harness: None,
         model: Some("harness-probe/mock".into()),
@@ -249,6 +251,7 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
         request_input: Box::new(|_| oneshot::channel().1),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "burst hold".into(),
         harness: None,
         model: Some("harness-probe/mock".into()),

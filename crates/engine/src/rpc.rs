@@ -171,6 +171,10 @@ struct QueueMessageParams {
     /// supports mid-turn steering.
     #[serde(default)]
     hold_for_turn_end: bool,
+    #[serde(default)]
+    turn_origin: harness_proto::TurnOrigin,
+    #[serde(default)]
+    peer_chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2118,11 +2122,13 @@ impl RpcService for EngineRpc {
                 let p: QueueMessageParams = parse_params(params)?;
                 let id = self
                     .doc_host
-                    .queue_message_with_behavior(
+                    .queue_message_with_origin(
                         &p.chat_id,
                         &p.text,
                         p.attachments,
                         p.hold_for_turn_end,
+                        p.turn_origin,
+                        p.peer_chat_id,
                     )
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "id": id }))
@@ -3573,6 +3579,21 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_message_decodes_structural_origin_without_attribution() {
+        let human: QueueMessageParams = serde_json::from_value(serde_json::json!({
+            "chatId": "chat", "text": "legacy"
+        }))
+        .unwrap();
+        assert_eq!(human.turn_origin, harness_proto::TurnOrigin::Human);
+        let peer: QueueMessageParams = serde_json::from_value(serde_json::json!({
+            "chatId": "chat", "text": "ordinary follow-up", "turnOrigin": "peer"
+        }))
+        .unwrap();
+        assert_eq!(peer.turn_origin, harness_proto::TurnOrigin::Peer);
+        assert!(peer.peer_chat_id.is_none());
+    }
 
     // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
     #[cfg(unix)]

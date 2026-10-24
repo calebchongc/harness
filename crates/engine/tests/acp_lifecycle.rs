@@ -54,6 +54,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
         SessionCommandPayload::Run {
             message_id: "first-user".into(),
             request: RunRequest {
+                turn_origin: Default::default(),
                 prompt: "tools".into(),
                 harness: None,
                 model: None,
@@ -95,6 +96,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
     queue(
         "followup",
         SessionCommandPayload::Steer {
+            turn_origin: Default::default(),
             prompt: "second".into(),
             message_id: Some("second-user".into()),
         },
@@ -137,6 +139,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
     queue(
         "self-continue",
         SessionCommandPayload::Steer {
+            turn_origin: Default::default(),
             prompt: "self-continue".into(),
             message_id: Some("third-user".into()),
         },

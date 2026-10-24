@@ -31,7 +31,7 @@ use harness_doc::{
 };
 use harness_proto::{
     AgentEvent, ChatConfig, DoneStatus, HarnessId, ReasoningLevel, RunRequest, Session,
-    SessionStatus, UserInputAnswer, UserInputQuestion,
+    SessionStatus, TurnOrigin, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -153,6 +153,7 @@ struct RunHandle {
 #[derive(Debug, Clone)]
 struct RoutedSteer {
     prompt: String,
+    turn_origin: TurnOrigin,
     message_id: String,
     attachments: Vec<String>,
     issued_at: i64,
@@ -293,12 +294,6 @@ struct Inner {
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
-    /// chat_id → who asked for the current (or last) turn's work: a person's
-    /// prompt or only peer mail. A prompt that opens a new turn resets it; a
-    /// steer into a running turn adds to it; a turn the agent continues on
-    /// its own keeps the last one. Read when a completion is published
-    /// (`Session::last_completed_peer_only`).
-    turn_origins: Mutex<HashMap<String, harness_proto::peer_mail::TurnOrigin>>,
     /// chat_id → background tasks its agent has open (a background shell
     /// command, monitor, agent or workflow). Read at shutdown: that work dies
     /// with the agent, so the next boot tells the agent to restart it.
@@ -378,7 +373,6 @@ impl SessionsEngine {
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
-                turn_origins: Mutex::new(HashMap::new()),
                 background_open: Mutex::new(HashMap::new()),
                 awaiting_since: Mutex::new(HashMap::new()),
                 tool_progress: Mutex::new(HashMap::new()),
@@ -434,23 +428,6 @@ impl SessionsEngine {
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
         }
-    }
-
-    /// Record who asked for the turn `prompt` feeds. A prompt reaching a
-    /// settled chat opens a new turn; one reaching a working turn joins it.
-    fn note_prompt_origin(&self, chat_id: &str, prompt: &str) {
-        let in_turn = lock(&self.inner.statuses).get(chat_id).is_some_and(|s| {
-            matches!(
-                s.status,
-                SessionStatus::Working | SessionStatus::AwaitingInput
-            )
-        });
-        let mut origins = lock(&self.inner.turn_origins);
-        let origin = origins.entry(chat_id.to_string()).or_default();
-        if !in_turn {
-            *origin = Default::default();
-        }
-        origin.note_prompt(prompt);
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -627,7 +604,12 @@ impl SessionsEngine {
             .map_err(EngineError::Other)?;
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
-        self.note_prompt_origin(chat_id, &request.prompt);
+        // Preserve legacy envelope senders while preferring structural origin.
+        if request.turn_origin == TurnOrigin::Human
+            && harness_proto::peer_mail::is_peer_mail(&request.prompt)
+        {
+            request.turn_origin = TurnOrigin::Peer;
+        }
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -663,10 +645,20 @@ impl SessionsEngine {
                 {
                     pending.push_back(RoutedSteer {
                         prompt: request.prompt.clone(),
+                        turn_origin: request.turn_origin,
                         message_id: user_id.clone(),
                         attachments: request.attachments.clone(),
                         issued_at: now_ms(),
                     });
+                    self.inner.journal.record_pending_turn_origin(
+                        chat_id, &user_id, request.turn_origin,
+                        pending.len() > 1 || self.session_status(chat_id).is_some_and(|s| matches!(
+                            s.status, SessionStatus::Working | SessionStatus::AwaitingInput
+                        )),
+                    );
+                    // Boundary consumption shares the guard: publish the User
+                    // row before its prompt-bound provenance can be retired.
+                    self.doc_handle(chat_id)?.write_user_message(&user_id, &request.prompt, now_ms())?;
                     true
                 } else {
                     false
@@ -675,8 +667,6 @@ impl SessionsEngine {
                 false
             };
             if accepted {
-                let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
                 if self.is_live(chat_id, &run_id) {
                     // Working BEFORE the lastMessageAt bump: both ride the
                     // workspace doc from this one peer, so causal order makes it
@@ -726,7 +716,9 @@ impl SessionsEngine {
             .then(|| handle.doc().read_entries())
             .and_then(Result::ok);
         let user_id = message_id.unwrap_or_else(new_id);
+        self.inner.journal.record_pending_turn_origin(chat_id, &user_id, request.turn_origin, false);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        self.inner.journal.record_confirmed_turn_origin(chat_id, &user_id, request.turn_origin);
 
         // Engine-owned resume (harness sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -875,6 +867,23 @@ impl SessionsEngine {
         message_id: Option<String>,
         attachments: Vec<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        let origin = if harness_proto::peer_mail::is_peer_mail(prompt) {
+            TurnOrigin::Peer
+        } else {
+            TurnOrigin::Human
+        };
+        self.steer_with_origin(chat_id, prompt, message_id, attachments, origin).await
+    }
+
+    /// Deliver coordination without inferring its owner from display text.
+    pub async fn steer_with_origin(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<String>,
+        attachments: Vec<String>,
+        turn_origin: TurnOrigin,
+    ) -> Result<SteerOutcome, EngineError> {
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
@@ -913,14 +922,19 @@ impl SessionsEngine {
             }
             pending.push_back(RoutedSteer {
                 prompt: prompt.to_string(),
+                turn_origin,
                 message_id: user_id.clone(),
                 attachments,
                 issued_at: now_ms(),
             });
+            self.inner.journal.record_pending_turn_origin(
+                chat_id, &user_id, turn_origin,
+                pending.len() > 1 || self.session_status(chat_id).is_some_and(|s| matches!(
+                    s.status, SessionStatus::Working | SessionStatus::AwaitingInput
+                )),
+            );
+            self.doc_handle(chat_id)?.write_user_message(&user_id, prompt, now_ms())?;
         }
-        self.note_prompt_origin(chat_id, prompt);
-        let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message(&user_id, prompt, now_ms())?;
         // A routed steer is a turn too. Fired here (not only on the confirmed
         // path) — a reclaim falls back to dispatch, which just re-snapshots.
         if let Some(request) = self.last_request(chat_id) {
@@ -1325,6 +1339,7 @@ impl SessionsEngine {
                 .or_else(|| {
                     let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                     Some(RunRequest {
+                        turn_origin: TurnOrigin::Human,
                         prompt: String::new(),
                         harness: None,
                         model: None,
@@ -1350,6 +1365,7 @@ impl SessionsEngine {
                 request.harness = sessions.inner.journal_harness(&chat_id);
             }
             request.prompt = prompt_text;
+            request.turn_origin = sessions.inner.journal.turn_origin_for_prompt(&chat_id, &user_id);
             request.resume = None; // dispatch re-injects the remembered session
             request.attachments = Vec::new();
             let harness_id = host.harness_for_request(&chat_id, &request);
@@ -1720,8 +1736,10 @@ impl Inner {
             .map(|steer| QueuedMessage {
                 id: steer.message_id,
                 text: steer.prompt,
+                turn_origin: steer.turn_origin,
                 attachments: steer.attachments,
                 issued_by: self.device_id.clone(),
+                peer_chat_id: None,
                 issued_at: steer.issued_at,
                 hold_for_turn_end: true,
                 edited_at: None,
@@ -1745,7 +1763,7 @@ impl Inner {
         chat_id: &str,
         status: SessionStatus,
         fresh_start: bool,
-        completed_turn: Option<String>,
+        completed_turn: Option<(String, TurnOrigin)>,
     ) {
         // An errored turn is not a turn boundary (#466): pause queued delivery
         // before the status watcher can read Errored as "send the next row".
@@ -1778,11 +1796,11 @@ impl Inner {
                 entry.status,
                 SessionStatus::Working | SessionStatus::AwaitingInput
             );
-            if let Some(turn) = completed_turn {
+            if let Some((turn, origin)) = completed_turn {
                 entry.last_completed_turn = Some(turn);
-                entry.last_completed_peer_only = lock(&self.turn_origins)
-                    .get(chat_id)
-                    .is_some_and(|origin| origin.peer_only());
+                // Keep the deployed wire field for old desktop/mobile/edge
+                // consumers; autonomous work is non-human completion too.
+                entry.last_completed_peer_only = origin != TurnOrigin::Human;
             }
             entry.status = status;
             entry.updated_at = now;
@@ -2657,6 +2675,8 @@ async fn drive_run(
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
+    let mut turn_origin = request.turn_origin;
+    let mut carry_human_work = false;
     let mut run_cwd = request.cwd.clone();
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
@@ -3251,9 +3271,10 @@ async fn drive_run(
                     // engine watchdog instead of a native Done. Preserve that
                     // completion notice, but never notify for an empty boundary
                     // or while an accepted steer still awaits delivery.
-                    let completed_turn = ((!folded.is_empty() || writer.is_some())
-                        && !inner.has_pending_steers(&chat_id, &run_id))
-                        .then(|| entry_id.clone());
+                    let pending_steer = inner.has_pending_steers(&chat_id, &run_id);
+                    let completed_turn = ((!folded.is_empty() || writer.is_some()) && !pending_steer)
+                        .then(|| (entry_id.clone(), turn_origin));
+                    carry_human_work = pending_steer && turn_origin == TurnOrigin::Human;
                     deltas.flush(&inner, &chat_id);
                     if !folded.is_empty() || writer.is_some() {
                         if let Err(err) = finish_segment(
@@ -3707,6 +3728,10 @@ async fn drive_run(
                     );
                     idle_since = None;
                     self_continued_turn = true;
+                    // A turn the agent continues on its own (background work
+                    // it reports on, a task wake) keeps the last prompt's
+                    // owner: "tell me when it's done" must still notify,
+                    // and peer-only work stays silent (#535).
                     // The park cleared the fold; rotate to a fresh entry and
                     // fall through — this event is the new segment's first part.
                     entry_id = new_id();
@@ -3930,13 +3955,22 @@ async fn drive_run(
             inner.set_status(&chat_id, SessionStatus::Working, true);
             // The boundary confirms delivery of the oldest accepted steer —
             // retire its at-least-once ledger entry.
-            if let Some(h) = lock(&inner.runs)
+            let incoming = lock(&inner.runs)
                 .get(&chat_id)
                 .filter(|h| h.run_id == run_id)
-            {
-                if let Some(pending) = lock(&h.routed_steers).as_mut() {
-                    pending.pop_front();
-                }
+                .and_then(|h| lock(&h.routed_steers).as_mut()?.pop_front());
+            // A boundary with no accepted steer behind it is the agent
+            // continuing on its own: it keeps the last prompt's owner.
+            let incoming_origin = incoming.as_ref().map_or(turn_origin, |s| s.turn_origin);
+            turn_origin = if carry_human_work || (turn_was_active && turn_origin == TurnOrigin::Human) {
+                TurnOrigin::Human
+            } else {
+                incoming_origin
+            };
+            if let Some(steer) = incoming {
+                inner.journal.record_confirmed_turn_origin(&chat_id, &steer.message_id, turn_origin);
+            } else {
+                inner.journal.record_turn_origin(&chat_id, turn_origin);
             }
             continue;
         }
@@ -4157,7 +4191,8 @@ async fn drive_run(
                 && !interrupted
                 && turn_was_active
                 && !pending_steer)
-                .then(|| entry_id.clone());
+                .then(|| (entry_id.clone(), turn_origin));
+            carry_human_work = pending_steer && turn_origin == TurnOrigin::Human;
             // A turn the engine interrupted on its own (Stop, send-now) ends
             // like a completed one: the agent process and its background
             // tasks stay for the next turn (#364).
@@ -4280,6 +4315,7 @@ async fn drive_run(
                     break;
                 };
                 request.prompt = steer.prompt.clone();
+                request.turn_origin = steer.turn_origin;
                 request.resume = None;
                 request.attachments = steer.attachments;
                 tracing::info!(chat = %chat, "re-dispatching steer orphaned by a dying run");
@@ -4287,7 +4323,7 @@ async fn drive_run(
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
                     break;
                 };
-                if host.refuses_peer_mail(&chat, &steer.prompt) {
+                if host.refuses_prompt_origin(&chat, &steer.prompt, steer.turn_origin) {
                     tracing::info!(chat = %chat, "discarding archived peer steer before redelivery");
                     continue;
                 }
@@ -4654,6 +4690,7 @@ mod tests {
 
     fn request() -> RunRequest {
         RunRequest {
+            turn_origin: Default::default(),
             prompt: "first".into(),
             harness: None,
             model: Some("grok-4.6".into()),
