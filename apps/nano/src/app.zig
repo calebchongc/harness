@@ -12,6 +12,62 @@ const rpc = @import("rpc.zig");
 const engine_mod = @import("engine.zig");
 const workspace = @import("workspace.zig");
 const Transcript = @import("transcript.zig").Transcript;
+const Tabs = @import("tabs.zig").Tabs;
+const agent = @import("app_agent.zig");
+
+/// The window's own state, apart from the engine's.
+pub const View = struct {
+    sidebar_open: bool = true,
+    /// The project filter: a space's id (owned), or all projects.
+    filter: ?[]u8 = null,
+    filter_menu: bool = false,
+    more_menu: bool = false,
+    search_open: bool = false,
+    search: nanoui.ui.TextBuffer = .{},
+    sessions_open: bool = true,
+    archived_open: bool = true,
+    /// Archived rows shown: 10, then 25 more at a time.
+    archived_limit: usize = 10,
+    space_menu: bool = false,
+    account_menu: bool = false,
+    /// Where the controls that open popovers were, as last laid out.
+    filter_anchor: ?nanoui.ui.Rect = null,
+    more_anchor: ?nanoui.ui.Rect = null,
+    account_anchor: ?nanoui.ui.Rect = null,
+    space_anchor: ?nanoui.ui.Rect = null,
+    chip_anchor: ?nanoui.ui.Rect = null,
+    composer_anchor: ?nanoui.ui.Rect = null,
+    /// Tool groups opened or closed by hand, by "<entry>/<first part>".
+    groups: std.StringHashMapUnmanaged(bool) = .empty,
+
+    pub fn deinit(v: *View, gpa: Allocator) void {
+        if (v.filter) |f| gpa.free(f);
+        var it = v.groups.keyIterator();
+        while (it.next()) |key| gpa.free(key.*);
+        v.groups.deinit(gpa);
+    }
+
+    pub fn setFilter(v: *View, gpa: Allocator, space: ?[]const u8) void {
+        if (v.filter) |f| gpa.free(f);
+        v.filter = if (space) |s| gpa.dupe(u8, s) catch null else null;
+        v.filter_menu = false;
+    }
+
+    /// Whether the group keyed `key` is open: as toggled, else `auto`.
+    pub fn groupOpen(v: *const View, key: []const u8, auto: bool) bool {
+        return v.groups.get(key) orelse auto;
+    }
+
+    pub fn toggleGroup(v: *View, gpa: Allocator, key: []const u8, auto: bool) void {
+        const now = !v.groupOpen(key, auto);
+        if (v.groups.getPtr(key)) |p| {
+            p.* = now;
+            return;
+        }
+        const k = gpa.dupe(u8, key) catch return;
+        v.groups.put(gpa, k, now) catch gpa.free(k);
+    }
+};
 const Allocator = std.mem.Allocator;
 
 /// A stream the app keeps open, and when to open it again once it ended.
@@ -31,6 +87,8 @@ pub const App = struct {
     spaces: workspace.Spaces,
     chats: workspace.Chats,
     sessions: workspace.Sessions,
+    devices: workspace.Devices,
+    w_devices: Watch = .{},
     w_spaces: Watch = .{},
     w_chats: Watch = .{},
     w_sessions: Watch = .{},
@@ -55,8 +113,16 @@ pub const App = struct {
     /// starts with another agent (`mock` against a test engine).
     new_harness: []u8 = &.{},
     new_model: ?[]u8 = null,
-    /// Which picker is open over the composer.
+    new_reasoning: ?[]u8 = null,
+    /// The agent `models` lists models for (owned).
+    models_for: []u8 = &.{},
+    /// The model chip's picker is open.
     picker: enum { none, harness, model } = .none,
+    /// The open chats, one per tab.
+    tabs: Tabs,
+    /// What the window shows that isn't the engine's: the sidebar, its
+    /// project filter and search, open sections and tool groups.
+    view: View = .{},
     /// The newest Harness release, asked of GitHub over HTTP/2.
     release: @import("release.zig").Check,
 
@@ -68,6 +134,8 @@ pub const App = struct {
             .spaces = .init(gpa),
             .chats = .init(gpa),
             .sessions = .init(gpa),
+            .devices = .init(gpa),
+            .tabs = .init(gpa),
             .transcript = .{ .gpa = gpa },
             .harnesses = .init(gpa),
             .models = .init(gpa),
@@ -86,46 +154,34 @@ pub const App = struct {
         a.spaces.deinit();
         a.chats.deinit();
         a.sessions.deinit();
+        a.devices.deinit();
+        a.tabs.deinit();
+        a.view.deinit(a.gpa);
         a.transcript.deinit();
         if (a.selected) |s| a.gpa.free(s);
         if (a.space) |s| a.gpa.free(s);
         if (a.device_id) |d| a.gpa.free(d);
         if (a.new_model) |m| a.gpa.free(m);
+        if (a.new_reasoning) |m| a.gpa.free(m);
+        a.gpa.free(a.models_for);
         a.gpa.free(a.new_harness);
         a.harnesses.deinit();
         a.models.deinit();
     }
 
-    /// The agent new chats start with.
-    pub fn setHarness(a: *App, id: []const u8) void {
-        const copy = a.gpa.dupe(u8, id) catch return;
-        a.gpa.free(a.new_harness);
-        a.new_harness = copy;
-        a.setModel(null);
-        a.models.replace(.{ .array = .init(a.gpa) }) catch {};
-        a.picker = .none;
-        if (a.engine.state == .connected) a.call("ListModels", .{ .harness = id }, .of(App, a, onModels));
-        a.redraw();
-    }
-
-    /// The model new chats start with; null is the agent's default.
-    pub fn setModel(a: *App, id: ?[]const u8) void {
-        if (a.new_model) |m| a.gpa.free(m);
-        a.new_model = if (id) |m| a.gpa.dupe(u8, m) catch null else null;
-        a.picker = .none;
-        a.redraw();
-    }
-
-    pub fn harnessName(a: *const App, id: []const u8) []const u8 {
-        for (a.harnesses.items) |h| if (std.mem.eql(u8, h.id, id)) return h.name;
-        return id;
-    }
-
-    pub fn modelLabel(a: *const App, id: ?[]const u8) []const u8 {
-        const want = id orelse return "Default model";
-        for (a.models.items) |m| if (std.mem.eql(u8, m.id, want)) return m.label;
-        return want;
-    }
+    pub const setHarness = agent.setHarness;
+    pub const setModel = agent.setModel;
+    pub const harnessName = agent.harnessName;
+    pub const modelLabel = agent.modelLabel;
+    pub const target = agent.target;
+    pub const levelsOf = agent.levelsOf;
+    pub const togglePicker = agent.togglePicker;
+    pub const pickModel = agent.pickModel;
+    pub const pickReasoning = agent.pickReasoning;
+    pub const ensureModels = agent.ensureModels;
+    pub const newChatSpace = agent.newChatSpace;
+    pub const setArchived = agent.setArchived;
+    pub const nowMs = agent.nowMs;
 
     /// Asks for a folder and adds it as a space on this device, as the
     /// GPUI app's "Add folder" does (`createSpace`).
@@ -141,6 +197,7 @@ pub const App = struct {
         const git_path = std.fmt.bufPrint(&git_buf, "{s}/.git", .{paths[0]}) catch "";
         const git = std.Io.Dir.cwd().access(a.io, git_path, .{}) != error.FileNotFound;
         a.call("Mutate", .{ .op = "createSpace", .spaceId = id, .deviceId = device, .path = paths[0], .gitDetected = git }, .of(App, a, onNotice));
+        a.tabs.newTab();
         a.select(null, id);
     }
 
@@ -149,7 +206,7 @@ pub const App = struct {
         a.redraw();
     }
 
-    fn redraw(a: *App) void {
+    pub fn redraw(a: *App) void {
         if (a.window) |w| w.redraw();
     }
 
@@ -159,13 +216,14 @@ pub const App = struct {
             .connected => {
                 a.call("EngineInfo", rpc.empty, .of(App, a, onEngineInfo));
                 a.call("ListHarnesses", rpc.empty, .of(App, a, onHarnesses));
-                a.call("ListModels", .{ .harness = a.new_harness }, .of(App, a, onModels));
+                a.ensureModels(a.target().harness);
                 a.call("EngineReady", rpc.empty, .of(App, a, onNotice));
                 a.watchSidebar();
                 if (a.selected != null) a.watchDoc(true);
             },
             .disconnected, .connecting => {
                 // Every stream ended with the socket; they open on reconnect.
+                a.w_devices = .{};
                 a.w_spaces = .{};
                 a.w_chats = .{};
                 a.w_sessions = .{};
@@ -175,11 +233,12 @@ pub const App = struct {
         a.redraw();
     }
 
-    fn call(a: *App, method: []const u8, params: anytype, h: rpc.Handler) void {
+    pub fn call(a: *App, method: []const u8, params: anytype, h: rpc.Handler) void {
         _ = a.engine.call(method, params, h);
     }
 
     fn watchSidebar(a: *App) void {
+        if (a.w_devices.id == null) a.w_devices = .{ .id = a.engine.call("WatchDevices", rpc.empty, .of(App, a, onDevices)) };
         if (a.w_spaces.id == null) a.w_spaces = .{ .id = a.engine.call("WatchSpaces", rpc.empty, .of(App, a, onSpaces)) };
         if (a.w_chats.id == null) a.w_chats = .{ .id = a.engine.call("WatchChats", rpc.empty, .of(App, a, onChats)) };
         if (a.w_sessions.id == null) a.w_sessions = .{ .id = a.engine.call("WatchSessions", rpc.empty, .of(App, a, onSessions)) };
@@ -189,7 +248,7 @@ pub const App = struct {
     pub fn tick(a: *App, now: f64) ?f32 {
         a.now = now;
         var next: ?f64 = null;
-        inline for (.{ "w_spaces", "w_chats", "w_sessions", "w_doc" }) |name| {
+        inline for (.{ "w_devices", "w_spaces", "w_chats", "w_sessions", "w_doc" }) |name| {
             const w = &@field(a, name);
             if (w.retry_at) |t| {
                 if (now >= t) {
@@ -207,6 +266,45 @@ pub const App = struct {
         if (a.engine.state == .connected) w.retry_at = a.now + retry_s;
     }
 
+    fn onDevices(a: *App, _: u64, r: rpc.Reply) void {
+        switch (r) {
+            .item => |v| a.devices.replace(v) catch {},
+            .done, .err => a.ended(&a.w_devices),
+            .ok => {},
+        }
+        a.redraw();
+    }
+
+    pub fn deviceName(a: *const App, id: ?[]const u8) []const u8 {
+        const want = id orelse return "Unknown device";
+        for (a.devices.items) |d| if (std.mem.eql(u8, d.id, want)) return d.name;
+        return "Unknown device";
+    }
+
+    /// Shows `chat_id` from the sidebar: in its tab, else the current one.
+    pub fn openChat(a: *App, chat_id: []const u8, space_id: ?[]const u8) void {
+        a.tabs.show(chat_id);
+        a.select(chat_id, space_id);
+    }
+
+    /// "+": a new chat in a tab of its own.
+    pub fn newTab(a: *App) void {
+        a.tabs.newTab();
+        a.select(null, null);
+    }
+
+    /// Back and forward, and the tab list's rows: show another tab.
+    pub fn showTab(a: *App, i: usize) void {
+        if (i >= a.tabs.items.items.len) return;
+        a.tabs.active = i;
+        a.select(a.tabs.current(), null);
+    }
+
+    pub fn closeTab(a: *App, i: usize) void {
+        a.tabs.close(i);
+        a.select(a.tabs.current(), null);
+    }
+
     fn onSpaces(a: *App, _: u64, r: rpc.Reply) void {
         switch (r) {
             .item => |v| a.spaces.replace(v) catch {},
@@ -221,6 +319,8 @@ pub const App = struct {
             .item => |v| {
                 a.chats.replace(v) catch {};
                 workspace.sortChats(a.chats.items);
+                // The open chat's agent is known now: list its models.
+                a.ensureModels(a.target().harness);
             },
             .done, .err => a.ended(&a.w_chats),
             .ok => {},
@@ -273,7 +373,7 @@ pub const App = struct {
         a.redraw();
     }
 
-    fn onModels(a: *App, _: u64, r: rpc.Reply) void {
+    pub fn onModels(a: *App, _: u64, r: rpc.Reply) void {
         switch (r) {
             .ok => |v| a.models.replace(v) catch {},
             else => {},
@@ -281,10 +381,10 @@ pub const App = struct {
         a.redraw();
     }
 
-    fn onNotice(a: *App, _: u64, r: rpc.Reply) void {
+    pub fn onNotice(a: *App, _: u64, r: rpc.Reply) void {
         switch (r) {
             .err => |e| {
-                if (std.mem.startsWith(u8, e, "unknown method")) return;
+                if (std.mem.startsWith(u8, e, "unknown method") or std.mem.eql(u8, e, "not connected")) return;
                 a.setNotice(e);
                 a.redraw();
             },
@@ -292,7 +392,7 @@ pub const App = struct {
         }
     }
 
-    fn setNotice(a: *App, text: []const u8) void {
+    pub fn setNotice(a: *App, text: []const u8) void {
         const n = @min(text.len, a.notice.len);
         @memcpy(a.notice[0..n], text[0..n]);
         a.notice_len = n;
@@ -323,6 +423,7 @@ pub const App = struct {
         a.call("FocusChat", .{ .chatId = chat }, .of(App, a, onNotice));
         a.call("Mutate", .{ .op = "markChatSeen", .chatId = chat }, .of(App, a, onNotice));
         a.watchDoc(true);
+        a.ensureModels(a.target().harness);
         a.redraw();
     }
 
@@ -351,11 +452,13 @@ pub const App = struct {
         const message_id = uuid(a.io, &message_buf);
         var harness: ?[]const u8 = null;
         var model: ?[]const u8 = null;
+        var reasoning: ?[]const u8 = null;
         var cwd: []const u8 = "~";
         const chat_id = if (a.selected) |id| blk: {
             if (a.findChat(id)) |c| {
                 harness = c.harness;
                 model = c.model;
+                reasoning = c.reasoning;
                 if (c.cwd) |d| cwd = d;
             }
             break :blk id;
@@ -365,11 +468,12 @@ pub const App = struct {
             if (space) |s| cwd = s.path;
             harness = a.new_harness;
             model = a.new_model;
+            reasoning = a.new_reasoning;
             a.call("Mutate", .{
                 .op = "createChat",
                 .chatId = id,
                 .spaceId = if (space) |s| s.id else null,
-                .config = .{ .harness = a.new_harness, .model = a.new_model, .modelOptions = rpc.empty, .sandbox = "workspace-write" },
+                .config = .{ .harness = a.new_harness, .model = a.new_model, .reasoning = a.new_reasoning, .modelOptions = rpc.empty, .sandbox = "workspace-write" },
             }, .of(App, a, onNotice));
             break :blk id;
         };
@@ -383,6 +487,7 @@ pub const App = struct {
                     .turnOrigin = "human",
                     .harness = harness,
                     .model = model,
+                    .reasoning = reasoning,
                     .modelOptions = rpc.empty,
                     .cwd = cwd,
                     .sandbox = "workspace-write",
@@ -390,7 +495,10 @@ pub const App = struct {
                 },
             },
         }, .of(App, a, onNotice));
-        if (a.selected == null) a.select(chat_id, null);
+        if (a.selected == null) {
+            a.tabs.setCurrent(chat_id);
+            a.select(chat_id, null);
+        }
         a.composer.clear();
         a.redraw();
     }

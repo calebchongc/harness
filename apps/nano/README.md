@@ -21,9 +21,10 @@ client codegraff uses. For now it fetches the newest release's manifest.
 - Composer: Return sends, Shift-Return starts a new line, **Stop** interrupts a
   running turn. A new chat picks its agent and model.
 
-Not there yet: answering an agent's questions, diffs, changing an existing
-chat's agent or model, the message queue, starting an engine when none is
-running, Linux and Windows.
+Not there yet: the header's project actions and the files and changes
+panels, attachments and dictation, answering an agent's questions, diffs, the
+message queue, pins, settings, starting an engine when none is running, Linux
+and Windows.
 
 ## Build and run
 
@@ -63,8 +64,22 @@ checks and screenshots:
 
 ```sh
 HARNESS_IPC_PORT=27990 zig-out/bin/harness-nano --nanoui-snapshot=/tmp/nano.png \
-  --nanoui-wait=3 --nanoui-script="click:Ask anything;type:Hello;key:enter;live:8"
+  --nanoui-wait=3 --nanoui-script="click:Do anything…;type:Hello;key:enter;live:8"
 ```
+
+To open a chat at launch (for those checks), set `HARNESS_NANO_OPEN_CHAT` to
+its id.
+
+## Matching the desktop app
+
+Sizes, spacing, colours and rules come from the GPUI source and are checked
+side by side against the real app on the same throwaway engine: the title
+bar's buttons, the tab list, the project filter, session rows (status mark,
+agent mark, project monogram, fading title, relative time), the header's
+"project @ device", the transcript column (736 points), folded tool groups
+("Ran 2 commands"), and the composer pill with its model chip. The icons are
+Harness's own (`crates/ui/assets/icons`), rendered to PNG in `src/icons`;
+the interface icons are Solar Linear by 480 Design (CC BY 4.0).
 
 ## Layout
 
@@ -76,6 +91,8 @@ HARNESS_IPC_PORT=27990 zig-out/bin/harness-nano --nanoui-snapshot=/tmp/nano.png 
 | `src/workspace.zig` | Spaces, chats, sessions, agents and models, each list replaced whole. |
 | `src/transcript.zig` | A chat's transcript: resets and deltas, checked as `apply_transcript_frame` checks them. |
 | `src/app.zig` | The state, and the calls the GPUI app makes to open a chat, create one and send. |
-| `src/view*.zig`, `src/theme.zig` | The window, in Harness's Codegraff Light and Dark colors. |
+| `src/view*.zig`, `src/theme.zig` | The window: title bar, sidebar, transcript, composer, new-chat canvas, menus and pickers, in Harness's Codegraff Light and Dark roles. |
+| `src/tabs.zig`, `src/rules.zig`, `src/tools.zig` | Tabs; relative times, project monograms and reasoning labels; how tool calls fold and what their groups say. |
+| `src/icons.zig`, `src/icons/` | Harness's icons and agent marks, tinted as drawn. |
 | `src/markdown.zig`, `markdown_html.zig`, `highlight.zig` | nanoterm's Markdown parser and code highlighting, unchanged. |
 | `src/release.zig` | The newest release, over HTTP/2. |

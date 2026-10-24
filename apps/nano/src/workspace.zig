@@ -5,6 +5,7 @@
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
+const rules = @import("rules.zig");
 
 pub const Space = struct {
     id: []const u8,
@@ -17,13 +18,33 @@ pub const Chat = struct {
     id: []const u8,
     title: ?[]const u8,
     space_id: ?[]const u8,
+    device_id: ?[]const u8 = null,
     archived: bool,
-    /// RFC 3339 in UTC: orders as text.
-    last_message_at: []const u8,
+    /// A subagent's chat: not listed in the sidebar.
+    parent_chat_id: ?[]const u8 = null,
+    /// Milliseconds since the epoch, 0 when unknown.
+    created_ms: i64 = 0,
+    last_message_ms: i64 = 0,
+    last_prompt_ms: i64 = 0,
+    last_seen_ms: i64 = 0,
     preview: ?[]const u8,
     harness: ?[]const u8,
     model: ?[]const u8,
+    reasoning: ?[]const u8 = null,
     cwd: ?[]const u8,
+
+    /// The sidebar's order: "last called" (`last_prompt_at`, then
+    /// `last_message_at`, then `created_at`).
+    pub fn calledMs(c: Chat) i64 {
+        if (c.last_prompt_ms != 0) return c.last_prompt_ms;
+        if (c.last_message_ms != 0) return c.last_message_ms;
+        return c.created_ms;
+    }
+
+    /// What a row's time counts from: the last message, else creation.
+    pub fn timeMs(c: Chat) i64 {
+        return if (c.last_message_ms != 0) c.last_message_ms else c.created_ms;
+    }
 };
 
 pub const Status = enum { idle, working, awaiting_input, errored };
@@ -31,6 +52,13 @@ pub const Status = enum { idle, working, awaiting_input, errored };
 pub const Session = struct {
     chat_id: []const u8,
     status: Status,
+    updated_ms: i64 = 0,
+};
+
+/// A computer on the account (`WatchDevices`): the header's "@ name".
+pub const Device = struct {
+    id: []const u8,
+    name: []const u8,
 };
 
 /// A list replaced whole by each item, its strings in an arena of its own.
@@ -78,6 +106,10 @@ pub const Harness = struct {
 pub const Model = struct {
     id: []const u8,
     label: []const u8,
+    /// Its levels; a chat without one picked shows "medium" when offered,
+    /// else the first.
+    reasoning_default: ?[]const u8 = null,
+    levels: []const []const u8 = &.{},
 };
 
 pub const Spaces = List(Space, parseSpace);
@@ -85,6 +117,17 @@ pub const Harnesses = List(Harness, parseHarness);
 pub const Models = List(Model, parseModel);
 pub const Chats = List(Chat, parseChat);
 pub const Sessions = List(Session, parseSession);
+pub const Devices = List(Device, parseDevice);
+
+fn ms(a: Allocator, o: json.ObjectMap, k: []const u8) i64 {
+    const s = str(a, o, k) orelse return 0;
+    return rules.parseTime(s) orelse 0;
+}
+
+fn parseDevice(a: Allocator, o: json.ObjectMap) ?Device {
+    const id = str(a, o, "id") orelse return null;
+    return .{ .id = id, .name = str(a, o, "name") orelse "Unknown device" };
+}
 
 pub fn str(a: Allocator, o: json.ObjectMap, k: []const u8) ?[]const u8 {
     const v = o.get(k) orelse return null;
@@ -109,11 +152,17 @@ fn parseChat(a: Allocator, o: json.ObjectMap) ?Chat {
         .id = str(a, o, "id") orelse return null,
         .title = str(a, o, "title"),
         .space_id = str(a, o, "spaceId"),
+        .device_id = str(a, o, "deviceId"),
         .archived = if (o.get("archived")) |v| v == .bool and v.bool else false,
-        .last_message_at = str(a, o, "lastMessageAt") orelse str(a, o, "createdAt") orelse "",
+        .parent_chat_id = str(a, o, "parentChatId"),
+        .created_ms = ms(a, o, "createdAt"),
+        .last_message_ms = ms(a, o, "lastMessageAt"),
+        .last_prompt_ms = ms(a, o, "lastPromptAt"),
+        .last_seen_ms = ms(a, o, "lastSeenAt"),
         .preview = str(a, o, "lastMessagePreview"),
         .harness = if (config) |c| str(a, c, "harness") else null,
         .model = if (config) |c| str(a, c, "model") else null,
+        .reasoning = if (config) |c| str(a, c, "reasoning") else null,
         .cwd = str(a, o, "cwd"),
     };
 }
@@ -128,13 +177,21 @@ fn parseHarness(a: Allocator, o: json.ObjectMap) ?Harness {
 
 fn parseModel(a: Allocator, o: json.ObjectMap) ?Model {
     const id = str(a, o, "id") orelse return null;
-    return .{ .id = id, .label = str(a, o, "label") orelse id };
+    var default: ?[]const u8 = null;
+    var levels: std.ArrayList([]const u8) = .empty;
+    if (o.get("reasoningLevels")) |v| if (v == .array) for (v.array.items) |l| if (l == .string) {
+        const level = a.dupe(u8, l.string) catch continue;
+        levels.append(a, level) catch continue;
+        if (default == null or std.mem.eql(u8, level, "medium")) default = level;
+    };
+    return .{ .id = id, .label = str(a, o, "label") orelse id, .reasoning_default = default, .levels = levels.items };
 }
 
 fn parseSession(a: Allocator, o: json.ObjectMap) ?Session {
     const s = if (o.get("status")) |v| (if (v == .string) v.string else "") else "";
     return .{
         .chat_id = str(a, o, "chatId") orelse return null,
+        .updated_ms = ms(a, o, "updatedAt"),
         .status = if (std.mem.eql(u8, s, "working"))
             .working
         else if (std.mem.eql(u8, s, "awaitingInput"))
@@ -150,17 +207,57 @@ fn parseSession(a: Allocator, o: json.ObjectMap) ?Session {
 pub fn sortChats(chats: []Chat) void {
     std.mem.sort(Chat, chats, {}, struct {
         fn lt(_: void, x: Chat, y: Chat) bool {
-            return std.mem.order(u8, x.last_message_at, y.last_message_at) == .gt;
+            const a = x.calledMs();
+            const b = y.calledMs();
+            if (a != b) return a > b;
+            return std.mem.order(u8, x.id, y.id) == .gt;
         }
     }.lt);
 }
 
 pub fn statusOf(sessions: []const Session, chat_id: []const u8) Status {
-    for (sessions) |s| if (std.mem.eql(u8, s.chat_id, chat_id)) return s.status;
-    return .idle;
+    return (sessionOf(sessions, chat_id) orelse return .idle).status;
+}
+
+pub fn sessionOf(sessions: []const Session, chat_id: []const u8) ?Session {
+    for (sessions) |s| if (std.mem.eql(u8, s.chat_id, chat_id)) return s;
+    return null;
+}
+
+/// What a session row's status slot shows (`spaces.rs`): a spinner while
+/// working (a live row, fresher than 45 s), a check once it finished and
+/// hasn't been opened since, else a dot coloured by its state.
+pub const Mark = enum { working, completed, awaiting_input, errored, idle };
+
+pub fn markOf(chat: Chat, session: ?Session, now_ms: i64) Mark {
+    const s = session orelse return if (unseen(chat)) .completed else .idle;
+    return switch (s.status) {
+        .working => if (s.updated_ms == 0 or now_ms - s.updated_ms < 45_000) .working else .idle,
+        .awaiting_input => .awaiting_input,
+        .errored => .errored,
+        .idle => if (unseen(chat)) .completed else .idle,
+    };
+}
+
+fn unseen(chat: Chat) bool {
+    return chat.last_message_ms != 0 and chat.last_seen_ms < chat.last_message_ms;
 }
 
 const testing = std.testing;
+
+test "the sidebar orders by last called, and marks what finished unseen" {
+    var chats = [_]Chat{
+        .{ .id = "a", .title = null, .space_id = null, .archived = false, .preview = null, .harness = null, .model = null, .cwd = null, .created_ms = 5, .last_message_ms = 50 },
+        .{ .id = "b", .title = null, .space_id = null, .archived = false, .preview = null, .harness = null, .model = null, .cwd = null, .created_ms = 9, .last_prompt_ms = 40, .last_message_ms = 60, .last_seen_ms = 60 },
+    };
+    sortChats(&chats);
+    try testing.expectEqualStrings("a", chats[0].id);
+    try testing.expectEqual(Mark.completed, markOf(chats[0], null, 100));
+    try testing.expectEqual(Mark.idle, markOf(chats[1], null, 100));
+    const working: Session = .{ .chat_id = "b", .status = .working, .updated_ms = 100 };
+    try testing.expectEqual(Mark.working, markOf(chats[1], working, 30_000));
+    try testing.expectEqual(Mark.idle, markOf(chats[1], working, 100_000));
+}
 
 test "a chats item replaces the list, reading only what it knows" {
     var chats: Chats = .init(testing.allocator);

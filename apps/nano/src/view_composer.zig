@@ -1,0 +1,117 @@
+//! The composer, as the GPUI composer draws it (crates/ui/src/composer.rs,
+//! pickers.rs): one rounded pill with attach and dictate on the left, the
+//! input ("Do anything…"), the model chip (the agent's mark, the model,
+//! the reasoning level) and a round send button that becomes Stop while a
+//! run goes with nothing typed. It expands with a line break, and always on
+//! a new chat.
+const std = @import("std");
+const nanoui = @import("nanoui");
+const ui = nanoui.ui;
+const theme = @import("theme.zig");
+const icons = @import("icons.zig");
+const kit = @import("view_kit.zig");
+const rules = @import("rules.zig");
+const transcript_view = @import("view_transcript.zig");
+const App = @import("app.zig").App;
+
+/// Docked under a chat's transcript.
+pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
+    const main_w = transcript_view.mainWidth(c, a);
+    const w = @min(transcript_view.columnWidth(main_w) + 32, main_w - 32);
+    // 16 points of padding, over the window's 24-point status strip.
+    const outer = ui.div(c).column().wFull().px(16).pb(40).itemsCenter();
+    defer outer.end();
+    const expanded = std.mem.indexOfScalar(u8, a.composer.text(), '\n') != null;
+    pill(c, a, k, w, if (expanded) .expanded else .compact, 22);
+}
+
+pub const Shape = enum { compact, expanded };
+
+pub fn pill(c: *ui.Context, a: *App, k: theme.Colors, w: f32, shape: Shape, radius: f32) void {
+    const p = ui.div(c).w(w).bg(k.composer).border(k.border).borderW(1).rounded(radius).shadowLg();
+    const box = if (shape == .compact) p.row().h(49).px(8).itemsCenter() else p.column();
+    defer box.end();
+    if (c.rects.get(c.node(box.index).id)) |r| a.view.composer_anchor = r;
+    if (shape == .compact) {
+        attachButtons(c, a, k);
+        input(c, a, k, .compact);
+        chip(c, a, k);
+        send(c, a, k);
+        return;
+    }
+    {
+        const area = ui.div(c).column().wFull().px(16).pt(16).pb(4);
+        defer area.end();
+        input(c, a, k, .expanded);
+    }
+    const actions = ui.div(c).row().wFull().h(42).px(12).pt(2).pb(8).itemsCenter();
+    defer actions.end();
+    attachButtons(c, a, k);
+    ui.spacer(c);
+    chip(c, a, k);
+    send(c, a, k);
+}
+
+fn attachButtons(c: *ui.Context, a: *App, k: theme.Colors) void {
+    if (kit.iconButton(c, k, .paperclip, .{ .size = 28, .radius = 14, .icon = 18 }))
+        a.setNotice("Attachments aren't in Harness Nano yet.");
+    _ = c.leaf(.{ .width = .{ .px = 2 } }, .none, null);
+    if (kit.iconButton(c, k, .microphone, .{ .size = 28, .radius = 14, .icon = 17 }))
+        a.setNotice("Dictation isn't in Harness Nano yet.");
+}
+
+fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
+    const box = if (shape == .compact) ui.div(c).row().grow().w(0).px(8).itemsCenter() else ui.div(c).column().wFull();
+    defer box.end();
+    const placeholder = if (a.engine.state == .connected) "Do anything…" else "Waiting for the engine…";
+    const r = ui.textField(c, &a.composer, .{
+        .placeholder = placeholder,
+        .width = .fill,
+        .bare = true,
+        .size = 14,
+        .multiline = true,
+        .max_lines = 11,
+    });
+    if (r.submitted) a.send();
+    if (a.noticeText()) |n| {
+        const line = ui.div(c).row().pt(4);
+        defer line.end();
+        ui.text(c, n, .{ .size = 11, .color = k.danger });
+    }
+}
+
+/// The model chip: what the next message runs on.
+fn chip(c: *ui.Context, a: *App, k: theme.Colors) void {
+    const t = a.target();
+    var b = ui.div(c).row().h(32).maxW(248).px(6).gap(6).itemsCenter().rounded(8).clip();
+    b = if (a.picker != .none) b.bg(k.hover) else b.hover(k.hover);
+    defer b.end();
+    if (b.clicked()) a.togglePicker();
+    if (c.rects.get(c.node(b.index).id)) |r| a.view.chip_anchor = r;
+    const mark = icons.harnessMark(t.harness);
+    icons.icon(c, mark.name, 16, mark.brand orelse k.muted, 0);
+    ui.text(c, a.modelLabel(t.model), .{ .size = 12, .weight = .medium, .color = k.text.alpha(0.9) });
+    if (t.reasoning) |level| ui.text(c, rules.reasoningLabel(level), .{ .size = 12, .weight = .medium, .color = k.muted.alpha(0.7) });
+}
+
+/// Send (or queue, while a run goes); Stop with nothing typed mid-run.
+fn send(c: *ui.Context, a: *App, k: theme.Colors) void {
+    const empty = std.mem.trim(u8, a.composer.text(), " \n\t").len == 0;
+    const running = a.selectedStatus() == .working;
+    const stop = running and empty;
+    // Dimmed only when it can't send at all; an empty box just does nothing.
+    const blocked = !stop and a.engine.state != .connected;
+    const pad = ui.div(c).row().pl(8);
+    defer pad.end();
+    var b = ui.div(c).row().size(28, 28).center().roundedFull().bg(k.text);
+    b = b.opacity(if (blocked) 0.35 else if (b.hovered()) 0.85 else 1);
+    defer b.end();
+    if (b.clicked() and !blocked and (stop or !empty)) {
+        if (stop) a.interrupt() else a.send();
+    }
+    if (stop) {
+        _ = c.leaf(.{ .width = .{ .px = 11 }, .height = .{ .px = 11 }, .radius = 3, .background = k.shell }, .none, null);
+    } else {
+        icons.icon(c, .@"arrow-up", 14, k.shell, 0);
+    }
+}

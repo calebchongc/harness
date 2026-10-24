@@ -25,6 +25,8 @@ pub fn main(init: std.process.Init) !void {
         .content = .{ .view = .init(&a, @import("view.zig").view) },
     });
     try a.start();
+    // A chat to open at launch, for checks that render the window offscreen.
+    if (init.environ_map.get("HARNESS_NANO_OPEN_CHAT")) |id| a.openChat(id, null);
     a.release.done = .{ .ctx = &a, .func = App.releaseCame };
     a.release.start();
     try app.run();

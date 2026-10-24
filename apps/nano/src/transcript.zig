@@ -14,18 +14,25 @@ pub const EntryStatus = enum { streaming, complete, aborted };
 
 pub const PartKind = enum { text, reasoning, tool, image, visual, delegation, input, @"error", other };
 
+/// A tool call's kind (`ToolCall`, crates/proto/src/agent.rs).
+pub const ToolKind = enum { exec, readFile, writeFile, editFile, applyPatch, search, glob, webFetch, webSearch, todo, mcp, unknown };
+
 pub const Part = struct {
     id: []u8,
     kind: PartKind,
-    /// Text and reasoning: their text. A tool: what it ran (`exec · cargo
-    /// test`). An error: its message.
+    /// Text and reasoning: their text. A tool: what it ran (the command,
+    /// path, pattern, URL or tool name). An error: its message.
     text: std.ArrayList(u8) = .empty,
+    tool: ToolKind = .unknown,
+    /// The file a tool read or changed, for counting distinct files.
+    path: []u8 = &.{},
     /// A tool has finished, or an input request was answered.
     resolved: bool = false,
     is_error: bool = false,
 
     fn deinit(p: *Part, gpa: Allocator) void {
         gpa.free(p.id);
+        gpa.free(p.path);
         p.text.deinit(gpa);
     }
 };
@@ -164,7 +171,7 @@ fn parsePart(gpa: Allocator, o: json.ObjectMap) !Part {
         .tool => {
             p.resolved = if (o.get("resolved")) |r| r == .bool and r.bool else false;
             p.is_error = if (o.get("isError")) |r| r == .bool and r.bool else false;
-            try toolSummary(gpa, &p.text, o.get("call"));
+            try toolCall(gpa, &p, o.get("call"));
         },
         .input => p.resolved = if (o.get("resolved")) |r| r == .bool and r.bool else false,
         .image => try p.text.appendSlice(gpa, string(o.get("name")) orelse ""),
@@ -174,23 +181,19 @@ fn parsePart(gpa: Allocator, o: json.ObjectMap) !Part {
     return p;
 }
 
-/// One line for a tool call (`ToolCall`, tagged by `kind`): what it ran.
-fn toolSummary(gpa: Allocator, out: *std.ArrayList(u8), call: ?json.Value) !void {
+/// A tool call (`ToolCall`, tagged by `kind`; fields keep their Rust
+/// names): its kind, what it ran, and the file it touched.
+fn toolCall(gpa: Allocator, p: *Part, call: ?json.Value) !void {
     const c = call orelse return;
     if (c != .object) return;
-    const kind = string(c.object.get("kind")) orelse "tool";
-    const detail = string(c.object.get("command")) orelse
-        string(c.object.get("path")) orelse
-        string(c.object.get("pattern")) orelse
-        string(c.object.get("query")) orelse
-        string(c.object.get("url")) orelse
-        string(c.object.get("tool")) orelse
-        string(c.object.get("name"));
-    try out.appendSlice(gpa, kind);
-    if (detail) |d| {
-        try out.appendSlice(gpa, " · ");
-        try out.appendSlice(gpa, d);
-    }
+    const o = c.object;
+    p.tool = std.meta.stringToEnum(ToolKind, string(o.get("kind")) orelse "") orelse .unknown;
+    const path = string(o.get("path")) orelse string(o.get("file_path"));
+    if (path) |f| p.path = try gpa.dupe(u8, f);
+    const detail = string(o.get("command")) orelse path orelse
+        string(o.get("pattern")) orelse string(o.get("query")) orelse
+        string(o.get("url")) orelse string(o.get("tool")) orelse string(o.get("name"));
+    if (detail) |d| try p.text.appendSlice(gpa, d);
 }
 
 const testing = std.testing;
@@ -254,7 +257,8 @@ test "remove, a tool's summary, and replacing an entry by id" {
         \\{"reset":[{"id":"a","role":"assistant","parts":[{"kind":"tool","id":"k","resolved":true,"isError":false,
         \\  "call":{"kind":"exec","command":"zig build test"}}]},{"id":"b","role":"user","parts":[]}]}
     );
-    try testing.expectEqualStrings("exec · zig build test", t.entries.items[0].parts.items[0].text.items);
+    try testing.expectEqualStrings("zig build test", t.entries.items[0].parts.items[0].text.items);
+    try testing.expectEqual(ToolKind.exec, t.entries.items[0].parts.items[0].tool);
     try applyText(&t,
         \\{"remove":["b"],"upsert":[{"after":null,"entry":{"id":"a","role":"assistant","status":"complete","parts":[]}}],"count":1}
     );

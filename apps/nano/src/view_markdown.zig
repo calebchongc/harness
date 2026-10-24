@@ -11,9 +11,11 @@ const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const md = @import("markdown.zig");
 const highlight = @import("highlight.zig");
+const kit = @import("view_kit.zig");
+const icons = @import("icons.zig");
 
-/// Prose: its size and line spacing.
-pub const body: ui.TextStyle = .{ .size = 14, .leading = 1.5, .wrap = true };
+/// Prose: 14 points on 22-point lines (`render.rs`), set per frame.
+var body: ui.TextStyle = .{ .size = 14, .leading = 1.5, .wrap = true };
 
 /// The colors of the Markdown being drawn (the UI thread draws one at a time).
 var k: theme.Colors = undefined;
@@ -21,7 +23,8 @@ var k: theme.Colors = undefined;
 /// Draws the Markdown `src`.
 pub fn markdown(c: *ui.Context, colors: theme.Colors, src: []const u8) void {
     k = colors;
-    const blocks = md.parse(c.alloc(), src, .{ .code = k.accent, .code_bg = k.code_inline_bg, .link = k.accent, .muted = k.muted });
+    body = kit.style(c, 14, 22, .{ .wrap = true });
+    const blocks = md.parse(c.alloc(), src, .{ .code = k.accent, .code_bg = k.accent_wash, .link = k.text, .muted = k.muted });
     const col = ui.div(c).column().wFull();
     defer col.end();
     for (blocks, 0..) |b, i| {
@@ -46,27 +49,23 @@ fn block(c: *ui.Context, b: md.Block, first: bool) void {
         .paragraph => |in| rich(c, in, body),
         .heading => |h| {
             if (!first) _ = c.leaf(.{ .height = .{ .px = if (h.level <= 2) 6 else 2 } }, .none, null);
-            var st = body;
-            st.size = switch (h.level) {
-                1 => 19,
-                2 => 16.5,
-                3 => 15,
-                else => 14,
+            const size: f32, const line: f32 = switch (h.level) {
+                1 => .{ 19, 27 },
+                2 => .{ 16, 24 },
+                3 => .{ 15, 22 },
+                else => .{ 14, 22 },
             };
-            st.leading = 1.3;
-            st.weight = if (h.level <= 2) .bold else .semibold;
-            rich(c, h.text, st);
+            rich(c, h.text, kit.style(c, size, line, .{ .wrap = true, .weight = .semibold }));
             if (h.level == 1) _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.border }, .none, null);
         },
         .item => |it| item(c, it),
         .quote => |in| {
-            const r = ui.div(c).row().wFull().gap(12);
+            const r = ui.div(c).row().wFull().bg(k.accent.alpha(0.05)).rounded(6);
             defer r.end();
-            _ = c.leaf(.{ .width = .{ .px = 3 }, .height = .fill, .radius = 1.5, .background = k.quote.alpha(0.45) }, .none, null);
+            _ = c.leaf(.{ .width = .{ .px = 2 }, .height = .fill, .background = k.accent.alpha(0.6) }, .none, null);
             var st = body;
             st.color = k.muted;
-            st.italic = true;
-            const box = ui.div(c).column().grow();
+            const box = ui.div(c).column().grow().pl(12).pr(10).py(6);
             defer box.end();
             rich(c, in, st);
         },
@@ -80,15 +79,18 @@ fn item(c: *ui.Context, it: @FieldType(md.Block, "item")) void {
     const r = ui.div(c).row().wFull().gap(8).pl(@as(f32, @floatFromInt(it.depth)) * 20);
     defer r.end();
     {
-        // The marker's column: a fixed width, so wrapped lines hang.
-        const m = ui.div(c).row().w(if (it.marker.len > 2) 26 else 16).h(c.text.lineHeight(body)).itemsCenter();
+        // The marker's column, 18 points at least, so wrapped lines hang.
+        const m = ui.div(c).row().minW(18).h(c.text.lineHeight(body)).itemsCenter();
         defer m.end();
         if (it.task) |done| {
-            ui.icon(c, if (done) "checkmark.circle.fill" else "circle", .{ .size = 13, .color = if (done) k.success else k.muted });
+            icons.icon(c, .check, 13, if (done) k.success else k.muted, 0);
         } else if (std.mem.eql(u8, it.marker, "•")) {
-            _ = c.leaf(.{ .width = .{ .px = 5 }, .height = .{ .px = 5 }, .radius = 2.5, .background = k.muted, .offset = .{ .x = 4 } }, .none, null);
+            _ = c.leaf(.{ .width = .{ .px = 5 }, .height = .{ .px = 5 }, .radius = 2.5, .background = k.accent, .offset = .{ .x = 4 } }, .none, null);
         } else {
-            ui.text(c, it.marker, .{ .size = 13, .color = k.muted });
+            var st = body;
+            st.color = k.accent;
+            st.wrap = false;
+            ui.text(c, it.marker, st);
         }
     }
     const box = ui.div(c).column().grow();
@@ -99,24 +101,27 @@ fn item(c: *ui.Context, it: @FieldType(md.Block, "item")) void {
 }
 
 fn codeBlock(c: *ui.Context, lang: []const u8, src: []const u8) void {
-    const box = ui.div(c).column().wFull().p(1).bg(k.code_bg).rounded(10).border(k.border).clip();
+    const box = ui.div(c).column().wFull().bg(k.code_bg).rounded(10).border(k.border).borderW(1).clip();
     defer box.end();
     {
-        const h = ui.div(c).row().wFull().px(12).py(6).gap(8).itemsCenter().bg(k.code_header);
+        const h = ui.div(c).row().wFull().h(28).pl(12).pr(5).gap(2).itemsCenter().bg(k.code_header);
         defer h.end();
-        ui.text(c, if (lang.len > 0) lang else "code", .{ .size = 11.5, .weight = .medium, .color = k.muted });
+        ui.text(c, if (lang.len > 0) lang else "code", .{ .size = 11, .color = k.muted });
         ui.spacer(c);
-        if (ui.button(c, "Copy", .{ .variant = .ghost, .size = 11.5, .icon = "doc.on.doc" }).clicked) c.clipboard.write(c.clipboard.ctx, src);
+        _ = kit.iconButton(c, k, .@"wrap-text", .{ .size = 22, .radius = 6, .icon = 13 });
+        if (kit.iconButton(c, k, .copy, .{ .size = 22, .radius = 5, .icon = 12 })) c.clipboard.write(c.clipboard.ctx, src);
     }
+    _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.border }, .none, null);
     const s = k.syntax;
     const pal: highlight.Palette = .{ .comment = s[0], .keyword = s[1], .string = s[2], .number = s[3], .type = s[4], .call = s[5] };
-    const lines = ui.div(c).column().wFull().px(14).py(10).gap(0);
+    const lines = ui.div(c).column().wFull().px(12).py(10).gap(0);
     defer lines.end();
+    const st = kit.style(c, 12.5, 18, .{ .mono = true, .wrap = true, .color = k.text });
     var in_block = false;
-    var it = std.mem.splitScalar(u8, src, '\n');
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, src, "\n"), '\n');
     while (it.next()) |l| {
         const spans = highlight.line(c.alloc(), l, lang, pal, &in_block);
-        ui.richText(c, if (l.len == 0) " " else l, spans, .{ .size = 12.5, .mono = true, .wrap = true, .leading = 1.35, .color = k.text });
+        ui.richText(c, if (l.len == 0) " " else l, spans, st);
     }
 }
 
@@ -129,7 +134,7 @@ fn table(c: *ui.Context, header: []const md.Inline, rows: []const []const md.Inl
 
 fn tableRow(c: *ui.Context, cells: []const md.Inline, head: bool, zebra: bool) void {
     var r = ui.div(c).row().wFull();
-    if (head) r = r.bg(k.code_header) else if (zebra) r = r.bg(k.zebra);
+    if (head) r = r.bg(k.code_header) else if (zebra) r = r.bg(k.ink(0.02));
     defer r.end();
     for (cells) |cell| {
         const d = ui.div(c).column().wFull().px(10).py(6);
@@ -138,6 +143,7 @@ fn tableRow(c: *ui.Context, cells: []const md.Inline, head: bool, zebra: bool) v
         st.size = 13;
         st.leading = 1.35;
         if (head) st.weight = .semibold;
+        st = kit.style(c, 13, 20, st);
         rich(c, cell, st);
     }
 }

@@ -6,6 +6,9 @@ test {
     _ = @import("transcript.zig");
     _ = @import("engine.zig");
     _ = @import("app.zig");
+    _ = @import("rules.zig");
+    _ = @import("tools.zig");
+    _ = @import("icons.zig");
     _ = @import("release.zig");
     _ = @import("view.zig");
     _ = @import("markdown.zig");
