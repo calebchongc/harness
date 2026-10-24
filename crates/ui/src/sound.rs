@@ -448,6 +448,23 @@ impl SessionNotificationState {
     }
 }
 
+/// Advance one chat's notification baseline and return the alert it earns.
+/// A row's first appearance seeds the baseline silently (boot/replay). A
+/// session whose chat row hasn't arrived yet (`current` is `None`: a chat made
+/// on another device, or rows still loading at startup) leaves its baseline
+/// untouched, so its completion is judged once the row lands rather than
+/// consumed while the app can't see the chat.
+pub(crate) fn observe_session_baseline(
+    baselines: &mut std::collections::HashMap<String, SessionNotificationState>,
+    chat_id: &str,
+    current: Option<SessionNotificationState>,
+    send_pending: bool,
+) -> Option<Sound> {
+    let current = current?;
+    let previous = baselines.insert(chat_id.to_owned(), current.clone())?;
+    current.sound_since(&previous, send_pending)
+}
+
 /// The engine already holds raw transport degradation for four seconds before
 /// exposing `Offline` or `Reconnecting`. Notify once when that durable state is
 /// first crossed; booting into an outage is seeded silently by the shell.
@@ -692,6 +709,80 @@ mod tests {
         let current = SessionNotificationState::new(session, archived, now);
         let previous = std::mem::replace(previous, current.clone());
         current.sound_since(&previous, send_pending)
+    }
+
+    #[test]
+    fn a_completion_without_its_chat_row_waits_for_the_row() {
+        use harness_proto::SessionStatus::{Idle, Working};
+        let now = chrono::Utc::now();
+        let known = |s: &Session, archived| Some(SessionNotificationState::new(s, archived, now));
+        let mut baselines = std::collections::HashMap::new();
+
+        // Seen working while its row was known; the completion then lands
+        // before the row does (rows still loading, or re-sent by a peer).
+        let working = session(Working, Some("t1"), false);
+        assert_eq!(
+            observe_session_baseline(&mut baselines, "chat", known(&working, false), false),
+            None
+        );
+        let finished = session(Idle, Some("t2"), false);
+        for _ in 0..3 {
+            assert_eq!(
+                observe_session_baseline(&mut baselines, "chat", None, false),
+                None,
+                "no alert for a chat the app can't show yet"
+            );
+        }
+        // The row lands: the held completion still notifies, exactly once.
+        assert_eq!(
+            observe_session_baseline(&mut baselines, "chat", known(&finished, false), false),
+            Some(Sound::Done)
+        );
+        assert_eq!(
+            observe_session_baseline(&mut baselines, "chat", known(&finished, false), false),
+            None
+        );
+
+        // A chat made on another device: its session arrives first, the row
+        // follows while the turn runs, and the finish notifies.
+        let mut baselines = std::collections::HashMap::new();
+        assert_eq!(
+            observe_session_baseline(&mut baselines, "remote", None, false),
+            None
+        );
+        let running = session(Working, None, false);
+        assert_eq!(
+            observe_session_baseline(&mut baselines, "remote", known(&running, false), false),
+            None,
+            "the row's first appearance seeds silently"
+        );
+        let done = session(Idle, Some("remote-turn"), false);
+        assert_eq!(
+            observe_session_baseline(&mut baselines, "remote", known(&done, false), false),
+            Some(Sound::Done)
+        );
+
+        // The same hold never makes an archived chat or a peer-only turn
+        // audible: the row decides, and it consumes the marker silently.
+        for (archived, peer_only) in [(true, false), (false, true)] {
+            let mut baselines = std::collections::HashMap::new();
+            observe_session_baseline(&mut baselines, "quiet", known(&working, archived), false);
+            assert_eq!(
+                observe_session_baseline(&mut baselines, "quiet", None, false),
+                None
+            );
+            let quiet = session(Idle, Some("t2"), peer_only);
+            assert_eq!(
+                observe_session_baseline(&mut baselines, "quiet", known(&quiet, archived), false),
+                None,
+                "archived={archived}, peer_only={peer_only}"
+            );
+            // Restoring the chat afterwards cannot replay the consumed marker.
+            assert_eq!(
+                observe_session_baseline(&mut baselines, "quiet", known(&quiet, false), false),
+                None
+            );
+        }
     }
 
     #[test]

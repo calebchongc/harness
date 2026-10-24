@@ -2868,7 +2868,7 @@ impl Shell {
             let now = Utc::now();
             type Ping = (
                 String,
-                crate::sound::SessionNotificationState,
+                Option<crate::sound::SessionNotificationState>,
                 bool,
                 Option<String>,
             );
@@ -2879,10 +2879,12 @@ impl Shell {
                     .iter()
                     .map(|s| {
                         let chat = state.chats.iter().find(|c| c.id == s.chat_id);
-                        // Unknown/deleted chats fail closed too. Still observe
-                        // their markers so restore cannot replay a late finish.
-                        let archived = chat.is_none_or(|c| c.archived);
-                        let status = crate::sound::SessionNotificationState::new(s, archived, now);
+                        // Archived chats and peer-only turns consume their
+                        // completion silently (#499). A session whose chat row
+                        // hasn't arrived yet waits for it (`None`).
+                        let status = chat.map(|c| {
+                            crate::sound::SessionNotificationState::new(s, c.archived, now)
+                        });
                         let send_pending = state.send_pending(&s.chat_id, now);
                         let title = chat.and_then(|c| c.title.clone());
                         (s.chat_id.clone(), status, send_pending, title)
@@ -2900,10 +2902,12 @@ impl Shell {
             // Harness; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
             for (chat_id, status, send_pending, title) in sessions {
-                let prev = self.sound_prev.insert(chat_id.clone(), status.clone());
-                if let Some(prev) = prev
-                    && let Some(sound) = status.sound_since(&prev, send_pending)
-                {
+                if let Some(sound) = crate::sound::observe_session_baseline(
+                    &mut self.sound_prev,
+                    &chat_id,
+                    status,
+                    send_pending,
+                ) {
                     crate::perf_stats::turn_finished(&chat_id, sound == crate::sound::Sound::Done);
                     let wants_sound = self.settings.session_sound_enabled(sound)
                         && (sound != crate::sound::Sound::Attention
