@@ -730,7 +730,10 @@ final class AppModel {
     func listHarnesses(deviceId: String) async -> DeviceCatalog<HarnessInfo> {
         if demo != nil {
             try? await Task.sleep(for: .seconds(ProcessInfo.processInfo.arguments.contains("-slow-catalog") ? 15 : 0.1))
-            return DeviceCatalog(items: ProcessInfo.processInfo.arguments.contains("-no-agents") ? [] : HarnessCatalog.harnesses, isLive: true)
+            let args = ProcessInfo.processInfo.arguments
+            // `-demo-graff`: the demo device also runs graff (chat mode's agent).
+            let graff = args.contains("-demo-graff") ? [HarnessInfo(id: ChatMode.harness, label: "Graff")] : []
+            return DeviceCatalog(items: args.contains("-no-agents") ? [] : HarnessCatalog.harnesses + graff, isLive: true)
         }
         if let live = await workspace?.listHarnesses(deviceId: deviceId) {
             _ = DocDisk.saveHarnesses(live, deviceId: deviceId)
@@ -770,6 +773,14 @@ final class AppModel {
             if args.contains("-models-fail-once"), harness == "codex", demoModelFailuresRemaining > 0 {
                 demoModelFailuresRemaining -= 1
                 return DeviceCatalog(items: [], isLive: false)
+            }
+            if harness == ChatMode.harness {
+                // The demo gateway lists the chat-mode tiers, unless a test
+                // asks for one that lists none (`-demo-no-auto-tiers`).
+                let tiers = args.contains("-demo-no-auto-tiers") ? [] : ChatMode.tiers.map {
+                    ModelInfo(id: $0.id, label: $0.label, description: nil, reasoningLevels: [])
+                }
+                return DeviceCatalog(items: HarnessCatalog.models(for: harness) + tiers, isLive: true)
             }
             return DeviceCatalog(items: HarnessCatalog.models(for: harness), isLive: true)
         }
@@ -911,6 +922,30 @@ final class AppModel {
         if demo != nil { return AgentAccountsSnapshot(accounts: []) }
         guard let workspace else { throw RelayError.notConnected }
         return try await workspace.agentAccounts(deviceId: deviceId, forceUsage: forceUsage)
+    }
+
+    /// Demo mode's Mac simulators (Settings → Simulators offline).
+    @ObservationIgnored private lazy var demoSimulators = DemoSimulators(
+        setUp: ProcessInfo.processInfo.arguments.contains("-simulators-set-up"))
+    #if DEBUG
+    @ObservationIgnored private lazy var localSimulatorEngine: LocalEngineSimulatorHost? =
+        LocalEngineSimulatorHost.launchPort().map(LocalEngineSimulatorHost.init(port:))
+    #endif
+
+    /// Where the Simulators screens send their calls: the computer's engine
+    /// over its relay, or demo mode's made-up Mac.
+    func simulatorHost() throws -> any SimulatorHost {
+        #if DEBUG
+        if let localSimulatorEngine { return localSimulatorEngine }
+        #endif
+        if demo != nil { return demoSimulators }
+        guard let workspace else { throw RelayError.notConnected }
+        return workspace
+    }
+
+    /// Computers that can run iOS Simulators (Macs), online ones first.
+    var simulatorMacs: [DeviceRow] {
+        SimulatorHosts.macs(devices, online: deviceOnline)
     }
 
     /// The cloud sandboxes of the Codegraff account one computer's engine is

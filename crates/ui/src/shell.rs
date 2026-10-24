@@ -14009,6 +14009,7 @@ mod tests {
             reasoning: None,
             model_options: serde_json::Map::new(),
             sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+            chat_mode: false,
         });
         let mut unconfigured = parent.clone();
         unconfigured.id = "unconfigured".into();
@@ -16411,6 +16412,7 @@ mod exit_regressions {
                             reasoning: Some(ReasoningLevel::High),
                             model_options: Default::default(),
                             sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                            chat_mode: false,
                         }),
                         last_message_preview: None,
                         last_message_at: None,
@@ -16804,6 +16806,7 @@ mod exit_regressions {
                         reasoning: Some(ReasoningLevel::High),
                         model_options: Default::default(),
                         sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                        chat_mode: false,
                     }),
                     last_message_preview: None,
                     last_message_at: None,
@@ -18268,6 +18271,25 @@ impl Shell {
     }
     pub fn fixture_readme_agents_settings(&mut self, cx: &mut Context<Self>) {
         self.open_settings(SettingsSection::Harnesses, cx);
+    }
+
+    /// browse Connected apps QA (`examples/browse-link-fixture.rs`): Settings
+    /// › Accounts with the browse card in a made-up state, or without the
+    /// card (`None`), as the page was before it.
+    pub fn fixture_browse_link(
+        &mut self,
+        status: Option<crate::settings::browse_link::BrowseLinkStatus>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(SettingsSection::Agents, cx);
+        if self.accounts_page.is_none() {
+            let state = self.state.clone();
+            self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
+        }
+        if let Some(page) = self.accounts_page.clone() {
+            page.update(cx, |page, cx| page.fixture_browse_link(status, cx));
+        }
+        cx.notify();
     }
 
     /// Close-and-archive QA (`examples/archive-choice-fixture.rs`).
