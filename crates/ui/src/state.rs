@@ -1993,6 +1993,33 @@ impl AppState {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
 
+    /// Agent turns on this device that restarting the app would cut off:
+    /// live Working or AwaitingInput rows (staleness-gated, so a crashed
+    /// host never blocks forever) plus sends still in flight. Other devices'
+    /// runs don't count; they don't stop when this app does.
+    pub fn local_busy_turns(&self, now: DateTime<Utc>) -> usize {
+        let local = self.local_device_id.as_deref();
+        let mut busy: std::collections::HashSet<&str> = self
+            .sessions
+            .iter()
+            .filter(|session| local.is_none_or(|id| session.device_id == id))
+            .filter(|session| {
+                matches!(
+                    effective_indicator(Some(session), now),
+                    Indicator::Working | Indicator::AwaitingInput
+                )
+            })
+            .map(|session| session.chat_id.as_str())
+            .collect();
+        busy.extend(
+            self.pending_sends
+                .keys()
+                .filter(|chat_id| self.send_pending(chat_id, now))
+                .map(String::as_str),
+        );
+        busy.len()
+    }
+
     /// Staleness-checked status dot for a chat row. A send in flight reads as
     /// Working (see [`Self::display_status_for`]).
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
@@ -2388,6 +2415,8 @@ impl AppState {
             self.focus_chat_sync(id, cx);
         }
         if self.selected_chat == chat_id {
+            // An explicit pick of the already-blank boot canvas is intent too.
+            self.auto_selected = true;
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
                 self.mark_chat_seen(&id, cx);
@@ -4276,6 +4305,37 @@ mod tests {
         assert!(state.apply_devices_at(vec![row], now + TimeDelta::seconds(90)));
         assert!(state.apply_devices_at(vec![], now + TimeDelta::seconds(90)));
         assert!(!state.apply_devices_at(vec![], now + TimeDelta::seconds(90)));
+    }
+
+    #[test]
+    fn local_busy_turns_counts_live_local_runs_and_sends_in_flight() {
+        let now = Utc::now();
+        let session = |chat: &str, device: &str, status: &str, age_s: i64| -> Session {
+            serde_json::from_value(serde_json::json!({
+                "chatId": chat, "deviceId": device, "status": status,
+                "startedAt": null,
+                "updatedAt": now - TimeDelta::seconds(age_s),
+            }))
+            .unwrap()
+        };
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        assert_eq!(state.local_busy_turns(now), 0);
+        state.sessions = vec![
+            session("working", "local", "working", 1),
+            session("asking", "local", "awaitingInput", 1),
+            session("idle", "local", "idle", 1),
+            session("errored", "local", "errored", 1),
+            // A crashed host's row goes stale and stops blocking.
+            session("stale", "local", "working", 600),
+            // Another device's run doesn't stop when this app restarts.
+            session("remote", "remote", "working", 1),
+        ];
+        assert_eq!(state.local_busy_turns(now), 2);
+        state.begin_pending_send("fresh", "m1", now);
+        // Already counted as working: counted once.
+        state.begin_pending_send("working", "m2", now);
+        assert_eq!(state.local_busy_turns(now), 3);
     }
 
     #[test]

@@ -56,6 +56,27 @@ struct ChatJournal {
 pub struct RunJournal {
     dir: PathBuf,
     open_files: Mutex<OpenJournals>,
+    origin_updates: Mutex<()>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TurnOriginState {
+    current: harness_proto::TurnOrigin,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<PendingTurnOrigin>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingTurnOrigin {
+    message_id: String,
+    origin: harness_proto::TurnOrigin,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedTurnOrigin {
+    State(TurnOriginState),
+    Legacy(harness_proto::TurnOrigin),
 }
 
 #[derive(Default)]
@@ -71,6 +92,7 @@ impl RunJournal {
         Ok(Self {
             dir,
             open_files: Mutex::new(OpenJournals::default()),
+            origin_updates: Mutex::new(()),
         })
     }
 
@@ -86,6 +108,134 @@ impl RunJournal {
 
     fn attempts_path(&self, chat_id: &str) -> PathBuf {
         self.dir.join(format!("{}.resume", sanitize_id(chat_id)))
+    }
+
+    fn origin_path(&self, chat_id: &str) -> PathBuf {
+        self.dir.join(format!("{}.origin", sanitize_id(chat_id)))
+    }
+
+    fn read_turn_origin(&self, chat_id: &str) -> TurnOriginState {
+        use harness_proto::TurnOrigin;
+        let current = match std::fs::read(self.origin_path(chat_id)) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(SavedTurnOrigin::State(state)) => return state,
+                Ok(SavedTurnOrigin::Legacy(origin)) => origin,
+                Err(_) => TurnOrigin::Background,
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => TurnOrigin::Human,
+            Err(_) => TurnOrigin::Background,
+        };
+        TurnOriginState {
+            current,
+            pending: Vec::new(),
+        }
+    }
+
+    fn save_turn_origin(&self, chat_id: &str, state: &TurnOriginState) {
+        let result = (|| -> Result<(), JournalError> {
+            // Never truncate the prior origin in place: a crash mid-write
+            // must leave either the previous complete value or the new one.
+            let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
+            serde_json::to_writer(&mut file, state)?;
+            file.as_file().sync_all()?;
+            file.persist(self.origin_path(chat_id))
+                .map_err(|err| err.error)?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            tracing::warn!(chat = %chat_id, error = %err, "turn-origin ledger write failed");
+        }
+    }
+
+    /// Stream ownership and accepted prompt ownership are separate until the
+    /// adapter confirms its boundary. Preserve both across that crash window.
+    pub fn record_turn_origin(&self, chat_id: &str, origin: harness_proto::TurnOrigin) {
+        let _update = self
+            .origin_updates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.read_turn_origin(chat_id);
+        state.current = origin;
+        self.save_turn_origin(chat_id, &state);
+    }
+
+    pub fn record_pending_turn_origin(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        origin: harness_proto::TurnOrigin,
+        active: bool,
+    ) {
+        use harness_proto::TurnOrigin;
+        let _update = self
+            .origin_updates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.read_turn_origin(chat_id);
+        let human_work = active
+            && state
+                .pending
+                .last()
+                .map_or(state.current == TurnOrigin::Human, |pending| {
+                    pending.origin == TurnOrigin::Human
+                });
+        // Keep each accepted prompt until its own boundary: a crash can
+        // occur before a newer prompt's User row reaches durable storage.
+        state
+            .pending
+            .retain(|pending| pending.message_id != message_id);
+        state.pending.push(PendingTurnOrigin {
+            message_id: message_id.into(),
+            origin: if human_work {
+                TurnOrigin::Human
+            } else {
+                origin
+            },
+        });
+        self.save_turn_origin(chat_id, &state);
+    }
+
+    pub fn record_confirmed_turn_origin(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        origin: harness_proto::TurnOrigin,
+    ) {
+        let _update = self
+            .origin_updates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.read_turn_origin(chat_id);
+        state.current = origin;
+        if let Some(index) = state
+            .pending
+            .iter()
+            .position(|p| p.message_id == message_id)
+        {
+            state.pending.drain(..=index);
+        }
+        self.save_turn_origin(chat_id, &state);
+    }
+
+    pub fn turn_origin(&self, chat_id: &str) -> harness_proto::TurnOrigin {
+        let state = self.read_turn_origin(chat_id);
+        state
+            .pending
+            .last()
+            .map_or(state.current, |pending| pending.origin)
+    }
+
+    pub fn turn_origin_for_prompt(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> harness_proto::TurnOrigin {
+        let state = self.read_turn_origin(chat_id);
+        state
+            .pending
+            .iter()
+            .find(|pending| pending.message_id == message_id)
+            .map_or(state.current, |pending| pending.origin)
     }
 
     /// Auto-resume revival budget (harness `resumeAttempt`/`MAX_AUTO_RESUME`):
@@ -153,6 +303,29 @@ impl RunJournal {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Drop a chat's shutdown marker: crash recovery already handled the
+    /// chat, and a second pick-up would dispatch its turn twice.
+    pub fn clear_restart_resume(&self, chat_id: &str) {
+        let _ = std::fs::remove_file(self.restart_path(chat_id));
+    }
+
+    /// Record the version this engine booted as, returning the one the last
+    /// boot recorded when it differs: the restart was an update to `current`.
+    /// `None` on the first boot with this record, or with the same version.
+    pub fn note_boot_version(&self, current: &str) -> Option<String> {
+        let path = self.dir.join("engine-version");
+        let previous = std::fs::read_to_string(&path)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        if previous.as_deref() != Some(current)
+            && let Err(err) = std::fs::write(&path, current)
+        {
+            tracing::warn!(error = %err, "boot version record write failed");
+        }
+        previous.filter(|previous| previous != current)
     }
 
     /// Append one event; returns its journal seq.
@@ -269,6 +442,7 @@ impl RunJournal {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
+        let _ = std::fs::remove_file(self.origin_path(chat_id));
         Ok(())
     }
 }
@@ -347,9 +521,6 @@ fn last_valid_line(path: &Path) -> Result<(Option<(u64, AgentEvent)>, bool), Jou
     }
 }
 
-/// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
-/// arbitrary journals directory — profile import copies these files between
-/// profiles without opening a `RunJournal`.
 /// What a graceful shutdown cut short in a chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartResume {
@@ -358,6 +529,10 @@ pub enum RestartResume {
     /// The turn had ended but background work the agent started was still
     /// running, and stopped with the agent: tell it so it can start again.
     Background,
+    /// The turn was waiting on the user's answer to a question. Nothing is
+    /// re-sent: the question stays answerable, and the answer continues the
+    /// run on the same harness session.
+    Question,
 }
 
 impl RestartResume {
@@ -365,6 +540,7 @@ impl RestartResume {
         match self {
             Self::Turn => "turn",
             Self::Background => "background",
+            Self::Question => "question",
         }
     }
 
@@ -372,11 +548,15 @@ impl RestartResume {
         match s {
             "turn" => Some(Self::Turn),
             "background" => Some(Self::Background),
+            "question" => Some(Self::Question),
             _ => None,
         }
     }
 }
 
+/// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
+/// arbitrary journals directory — profile import copies these files between
+/// profiles without opening a `RunJournal`.
 pub fn journal_paths(dir: &Path, chat_id: &str) -> (PathBuf, PathBuf) {
     let stem = sanitize_id(chat_id);
     (
@@ -444,6 +624,185 @@ mod tests {
         }
         let journal = RunJournal::open(dir.path()).unwrap();
         assert_eq!(journal.append("chat-1", &text("b")).unwrap(), 2);
+    }
+
+    #[test]
+    fn completion_origin_survives_reopen_but_not_journal_discard() {
+        use harness_proto::TurnOrigin;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat", &text("peer work")).unwrap();
+        journal.record_turn_origin("chat", TurnOrigin::Peer);
+        drop(journal);
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.turn_origin("chat"), TurnOrigin::Peer);
+        journal.discard("chat").unwrap();
+        assert_eq!(journal.turn_origin("chat"), TurnOrigin::Human);
+    }
+
+    #[test]
+    fn damaged_origin_metadata_fails_closed_without_changing_legacy_defaults() {
+        use harness_proto::TurnOrigin;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.turn_origin("legacy"), TurnOrigin::Human);
+        journal.record_turn_origin("peer", TurnOrigin::Peer);
+        // Model a truncated sidecar from an older non-atomic writer.
+        std::fs::write(dir.path().join("peer.origin"), b"\"pe").unwrap();
+        assert_eq!(journal.turn_origin("peer"), TurnOrigin::Background);
+        // An unreadable sidecar is not an absent old-version field either.
+        std::fs::create_dir(dir.path().join("unreadable.origin")).unwrap();
+        assert_eq!(journal.turn_origin("unreadable"), TurnOrigin::Background);
+    }
+
+    #[test]
+    fn pending_origin_is_prompt_bound_and_survives_background_updates() {
+        use harness_proto::TurnOrigin::{Background, Human, Peer};
+        for current in [Human, Peer, Background] {
+            for incoming in [Human, Peer, Background] {
+                for active in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let journal = RunJournal::open(dir.path()).unwrap();
+                    journal.record_turn_origin("chat", current);
+                    journal.record_pending_turn_origin("chat", "latest-user", incoming, active);
+                    let expected = if active && current == Human {
+                        Human
+                    } else {
+                        incoming
+                    };
+                    assert_eq!(
+                        journal.turn_origin_for_prompt("chat", "latest-user"),
+                        expected
+                    );
+                    assert_eq!(
+                        journal.turn_origin_for_prompt("chat", "older-user"),
+                        current,
+                        "a staged prompt cannot relabel a user row not yet written"
+                    );
+                    journal.record_turn_origin("chat", Background);
+                    drop(journal);
+                    let journal = RunJournal::open(dir.path()).unwrap();
+                    assert_eq!(
+                        journal.turn_origin_for_prompt("chat", "latest-user"),
+                        expected
+                    );
+                    journal.record_confirmed_turn_origin("chat", "older-user", Peer);
+                    assert_eq!(
+                        journal.turn_origin_for_prompt("chat", "latest-user"),
+                        expected,
+                        "an older boundary must not consume newer accepted provenance"
+                    );
+                    journal.record_confirmed_turn_origin("chat", "latest-user", expected);
+                    journal.record_turn_origin("chat", Background);
+                    assert_eq!(
+                        journal.turn_origin_for_prompt("chat", "latest-user"),
+                        Background,
+                        "confirmed human ownership cannot leak into a future background wake"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_human_work_survives_additional_peer_prompts_and_concurrent_wakes() {
+        use harness_proto::TurnOrigin::{Background, Human, Peer};
+        let dir = tempfile::tempdir().unwrap();
+        let journal = std::sync::Arc::new(RunJournal::open(dir.path()).unwrap());
+        journal.record_turn_origin("chat", Peer);
+        std::thread::scope(|scope| {
+            scope.spawn(|| journal.record_pending_turn_origin("chat", "human", Human, true));
+            scope.spawn(|| journal.record_turn_origin("chat", Background));
+        });
+        assert_eq!(journal.turn_origin_for_prompt("chat", "human"), Human);
+        journal.record_pending_turn_origin("chat", "peer-assisting-human", Peer, true);
+        assert_eq!(
+            journal.turn_origin_for_prompt("chat", "peer-assisting-human"),
+            Human
+        );
+        journal.record_confirmed_turn_origin("chat", "peer-assisting-human", Human);
+        journal.record_pending_turn_origin("chat", "later-independent-peer", Peer, false);
+        assert_eq!(
+            journal.turn_origin_for_prompt("chat", "later-independent-peer"),
+            Peer
+        );
+        journal.record_pending_turn_origin("chat", "another-independent-peer", Peer, true);
+        assert_eq!(
+            journal.turn_origin_for_prompt("chat", "another-independent-peer"),
+            Peer,
+            "a peer burst after park cannot inherit the already completed human origin"
+        );
+    }
+
+    #[test]
+    fn pending_prompt_chains_follow_live_ownership_not_completed_streams() {
+        use harness_proto::TurnOrigin::{Background, Human, Peer};
+        for current in [Human, Peer, Background] {
+            for first in [Human, Peer, Background] {
+                for second in [Human, Peer, Background] {
+                    for first_active in [false, true] {
+                        for second_active in [false, true] {
+                            let dir = tempfile::tempdir().unwrap();
+                            let journal = RunJournal::open(dir.path()).unwrap();
+                            journal.record_turn_origin("chat", current);
+                            journal.record_pending_turn_origin(
+                                "chat",
+                                "first",
+                                first,
+                                first_active,
+                            );
+                            let first_owner = if first_active && current == Human {
+                                Human
+                            } else {
+                                first
+                            };
+                            journal.record_pending_turn_origin(
+                                "chat",
+                                "second",
+                                second,
+                                second_active,
+                            );
+                            let expected = if second_active && first_owner == Human {
+                                Human
+                            } else {
+                                second
+                            };
+                            assert_eq!(
+                                journal.turn_origin_for_prompt("chat", "second"),
+                                expected,
+                                "current={current:?}, first={first:?}/{first_active}, second={second:?}/{second_active}"
+                            );
+                            assert_eq!(
+                                journal.turn_origin_for_prompt("chat", "first"),
+                                first_owner,
+                                "a crash before the second User row must retain the first prompt's origin"
+                            );
+                            // A delayed boundary for the first prompt must not
+                            // clear the second prompt's recovery provenance.
+                            journal.record_confirmed_turn_origin("chat", "first", first_owner);
+                            drop(journal);
+                            let journal = RunJournal::open(dir.path()).unwrap();
+                            assert_eq!(journal.turn_origin_for_prompt("chat", "second"), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_origin_sidecars_keep_their_wire_compatibility() {
+        use harness_proto::TurnOrigin;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        for origin in [TurnOrigin::Human, TurnOrigin::Peer, TurnOrigin::Background] {
+            std::fs::write(
+                dir.path().join("legacy.origin"),
+                serde_json::to_vec(&origin).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(journal.turn_origin_for_prompt("legacy", "user"), origin);
+        }
     }
 
     #[test]
@@ -535,5 +894,42 @@ mod tests {
         drop(open);
         assert_eq!(journal.append("live", &text("c")).unwrap(), 3);
         assert_eq!(journal.append("idle-0", &text("b")).unwrap(), 2, "reopen rescans");
+    }
+
+    #[test]
+    fn a_boot_into_a_new_version_reports_the_update_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.note_boot_version("0.2.134"), None, "first record");
+        assert_eq!(journal.note_boot_version("0.2.134"), None, "plain restart");
+        assert_eq!(
+            journal.note_boot_version("0.2.135").as_deref(),
+            Some("0.2.134"),
+            "update"
+        );
+        assert_eq!(journal.note_boot_version("0.2.135"), None, "reported once");
+    }
+
+    #[test]
+    fn restart_markers_round_trip_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.note_restart_resume("asking", RestartResume::Question);
+        journal.note_restart_resume("working", RestartResume::Turn);
+        journal.note_restart_resume("handled", RestartResume::Turn);
+        journal.clear_restart_resume("handled");
+        let kinds: Vec<_> = journal
+            .take_restart_resumes()
+            .into_iter()
+            .map(|(chat, kind, _)| (chat, kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("asking".to_owned(), RestartResume::Question),
+                ("working".to_owned(), RestartResume::Turn),
+            ]
+        );
+        assert!(journal.take_restart_resumes().is_empty(), "consumed");
     }
 }

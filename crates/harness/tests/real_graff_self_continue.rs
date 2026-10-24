@@ -40,6 +40,7 @@ async fn real_graff_messages_during_background_work_do_not_cancel_it() {
         }),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "Start ONE background subagent (do not wait for it) whose job is: run the \
                  shell command `sleep 25 && echo BG-DONE` and report its output in one line. \
                  As soon as it is started, reply exactly STARTED and end your turn. When it \

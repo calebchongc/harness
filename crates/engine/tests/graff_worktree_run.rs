@@ -156,6 +156,7 @@ fn completed_turns(core: &EngineCore) -> usize {
 fn run(message_id: &str, cwd: &str, worktree: Option<WorktreeSpec>) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
+            turn_origin: Default::default(),
             prompt: "work in your own tree".into(),
             harness: Some(HarnessId::Graff),
             model: None,

@@ -14,7 +14,7 @@ mod header_tests;
 #[cfg(test)]
 pub(super) mod navigation_tests;
 #[cfg(test)]
-mod pane_reopen_tests;
+pub(super) mod pane_reopen_tests;
 #[cfg(test)]
 mod reopen_tests;
 #[cfg(test)]
@@ -213,7 +213,9 @@ pub(super) fn restore_chat_tabs(
             split: tab
                 .layout
                 .as_ref()
-                .and_then(|layout| chat_split::ChatSplit::from_saved(layout, &live)),
+                .and_then(|layout| chat_split::ChatSplit::from_saved(layout, |id| {
+                    live(id) && tab.selected.as_deref() != Some(id)
+                })),
             selected: tab.selected.clone().filter(|id| live(id)),
             project: tab.project.clone(),
             draft: None,
@@ -310,7 +312,14 @@ impl Shell {
         window.focus(&self.composer.focus_handle(cx), cx);
     }
 
-    fn load_chat_tab_without_window(&mut self, tab: ChatTab, cx: &mut Context<Self>) {
+    fn load_chat_tab_without_window(&mut self, mut tab: ChatTab, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        tab.selected = chat_split::existing_chat_selection(tab.selected, state);
+        if let Some(split) = tab.split.as_mut() {
+            for pane in &mut split.panes {
+                *pane = chat_split::existing_chat_selection(pane.take(), state);
+            }
+        }
         self.chat_tab_id = tab.id;
         self.chat_split = tab.split;
         self.chat_split_selected = tab.selected.clone();
@@ -387,6 +396,11 @@ impl Shell {
     }
 
     fn create_chat_tab(&mut self, open: Option<String>, cx: &mut Context<Self>) {
+        if open.is_some()
+            && chat_split::existing_chat_selection(open.clone(), self.state.read(cx)).is_none()
+        {
+            return;
+        }
         if !matches!(self.route, Route::Chat) {
             self.close_settings(cx);
         }
@@ -406,12 +420,8 @@ impl Shell {
             self.chat_tabs[self.chat_tab] = parked;
         }
         // A chat moving into the new tab leaves its old pane empty.
-        if let Some(id) = open.as_deref()
-            && let Some(split) = self.chat_tabs[self.chat_tab].split.as_mut()
-        {
-            for pane in split.panes.iter_mut().filter(|p| p.as_deref() == Some(id)) {
-                *pane = None;
-            }
+        if let Some(id) = open.as_deref() {
+            self.detach_chat_from_tab_snapshots(id);
         }
         let tab = ChatTab {
             split: None,
@@ -424,6 +434,22 @@ impl Shell {
         self.chat_tab = self.chat_tabs.len() - 1;
         self.record_chat_tab_visit();
         self.load_chat_tab_without_window(tab, cx);
+    }
+
+    /// Explicit moves leave no second selected/peer reference in parked tabs.
+    pub(super) fn detach_chat_from_tab_snapshots(&mut self, chat_id: &str) {
+        for tab in &mut self.chat_tabs {
+            if tab.selected.as_deref() == Some(chat_id) {
+                tab.selected = None;
+            }
+            if let Some(split) = tab.split.as_mut() {
+                for pane in split.panes.iter_mut().chain(&mut split.vanished) {
+                    if pane.as_deref() == Some(chat_id) {
+                        *pane = None;
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn switch_chat_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -728,35 +754,17 @@ impl Shell {
             || self.chat_in_other_tab(chat_id).is_some()
     }
 
-    /// The shared archive path for explicit pane and tab closes. Keep unfinished
-    /// work and sessions still visible elsewhere; no archive runs on window exit.
+    /// The shared archive path for pane and tab closes by ⌘W or a ✕ button,
+    /// under the archive-on-close setting (⌘⌥W never enters this path). Keep
+    /// unfinished work and sessions still visible elsewhere; no archive runs
+    /// on window exit.
     pub(super) fn archive_closed_session(
         &mut self,
         chat_id: String,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> CloseArchive {
-        self.archive_closed_session_impl(chat_id, window, false, cx)
-    }
-
-    /// Cmd+W explicitly archives; Cmd+Option+W never enters this path.
-    pub(crate) fn archive_closed_session_explicitly(
-        &mut self,
-        chat_id: String,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> CloseArchive {
-        self.archive_closed_session_impl(chat_id, window, true, cx)
-    }
-
-    fn archive_closed_session_impl(
-        &mut self,
-        chat_id: String,
-        window: &Window,
-        explicit: bool,
-        cx: &mut Context<Self>,
-    ) -> CloseArchive {
-        if !explicit && !settings::archive_sessions_on_close(cx) {
+        if !settings::archive_sessions_on_close(cx) {
             return CloseArchive::Off;
         }
         if self.chat_still_open(&chat_id, cx)
@@ -907,6 +915,9 @@ impl Shell {
     /// External navigation preserves tabs; explicit replacement (`/resume`)
     /// continues using `open_chat` instead.
     pub(crate) fn open_chat_preserving_tabs(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if chat_split::existing_chat_selection(Some(chat_id.clone()), self.state.read(cx)).is_none() {
+            return;
+        }
         self.command_palette = None;
         self.route = Route::Chat;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {

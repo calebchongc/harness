@@ -17,6 +17,8 @@
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
 
 mod prompt_restore;
+#[cfg(test)]
+mod peer_dispatch_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -36,7 +38,9 @@ use harness_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
-use harness_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
+use harness_proto::{
+    ConversationSourceContext, HarnessId, TurnOrigin, UserInputAnswer, UserInputQuestion,
+};
 use harness_sync::DocsStore;
 
 use crate::http_error::describe_http_error;
@@ -590,6 +594,10 @@ pub struct ChatDocHandle {
     /// explicit prompt or queue send resumes it; incidental doc/status changes
     /// must not turn Cancel into "send the next row".
     queue_paused: AtomicBool,
+    /// Bumped whenever a failed turn pauses delivery. An explicit send thaws
+    /// only if no failure landed while it dispatched: a fresh run can fail
+    /// before its dispatch returns, and that pause must outlive the thaw.
+    queue_failures: Mutex<u64>,
     /// True when the doc changed while nobody watched: the mirror rebuild is
     /// deferred to the next `watch_messages` attach instead of paid per commit.
     mirror_dirty: AtomicBool,
@@ -751,6 +759,26 @@ impl ChatDocHandle {
         rx
     }
 
+    /// An errored turn is not a turn boundary: hold every queued row until the
+    /// user explicitly sends or retries one (#466).
+    fn pause_queue_after_failure(&self) {
+        let mut failures = lock(&self.queue_failures);
+        *failures = failures.wrapping_add(1);
+        self.queue_paused.store(true, Ordering::Release);
+    }
+
+    fn queue_failures(&self) -> u64 {
+        *lock(&self.queue_failures)
+    }
+
+    /// Thaw after an explicit send, unless a turn failed since `seen`.
+    fn resume_queue_since(&self, seen: u64) {
+        let failures = lock(&self.queue_failures);
+        if *failures == seen {
+            self.queue_paused.store(false, Ordering::Release);
+        }
+    }
+
     fn publish_queue(&self) {
         if self.pending_prompts_tx.receiver_count() > 0 {
             match self.doc.read_commands() {
@@ -846,6 +874,30 @@ impl ChatDocHandle {
             self.publish_messages();
         }
         Ok(stamped)
+    }
+
+    /// Restart recovery for a run a graceful shutdown settled: append `note`
+    /// to the chat's last entry when it is this device's assistant entry the
+    /// shutdown left `aborted` (with an open question, when
+    /// `require_open_question`). Same part id as [`Self::mark_abandoned_streams`],
+    /// so the two never stack. Returns whether the entry carries the note.
+    pub fn note_restart(&self, note: &str, require_open_question: bool) -> Result<bool, DocError> {
+        let entries = self.doc.read_entries()?;
+        let Some(entry) = entries.last().filter(|e| {
+            e.role == MessageRole::Assistant
+                && e.status == Some(MessageStatus::Aborted)
+                && e.device_id == self.device_id
+                && (!require_open_question || crate::sessions::has_open_question(e))
+        }) else {
+            return Ok(false);
+        };
+        let noted =
+            self.doc
+                .append_error_part(&entry.id, &format!("{}-recovery", entry.id), note)?;
+        if noted {
+            self.publish_messages();
+        }
+        Ok(noted)
     }
 
     fn publish_messages(&self) {
@@ -1073,6 +1125,16 @@ impl DocHost {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             handle.queue_paused.store(true, Ordering::Release);
+        }
+    }
+
+    /// The sessions engine calls this before it publishes Errored, so neither
+    /// the status watcher nor a doc-change drain can read the failed turn as
+    /// a boundary. A closed chat needs nothing: a reopened queue starts frozen.
+    pub(crate) fn pause_queue_after_failure(&self, chat_id: &str) {
+        let handle = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = handle {
+            handle.pause_queue_after_failure();
         }
     }
 
@@ -1545,6 +1607,7 @@ impl DocHost {
             pending_prompts_tx,
             drain_lock: tokio::sync::Mutex::new(()),
             queue_paused: AtomicBool::new(recovered_queue_pending),
+            queue_failures: Mutex::new(0),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             last_focus: AtomicU64::new(0),
@@ -3230,7 +3293,14 @@ impl DocHost {
                     &origin,
                     wake["body"].as_str().unwrap_or_default(),
                 );
-                if let Err(err) = self.queue_message_with_behavior(chat_id, &text, Vec::new(), true) {
+                if let Err(err) = self.queue_message_with_origin(
+                    chat_id,
+                    &text,
+                    Vec::new(),
+                    true,
+                    TurnOrigin::Peer,
+                    None,
+                ) {
                     // Left unacked: the next nudge retries it.
                     tracing::warn!(chat = %chat_id, %err, "room wake: queue failed");
                     continue;
@@ -3518,11 +3588,20 @@ impl DocHost {
         // An archived chat takes no peer mail (#498): refuse it here, before
         // anything is staged, so it neither starts a turn nor restores the chat.
         if let SessionCommandPayload::Run {
-            request: harness_proto::RunRequest { prompt, .. },
+            request:
+                harness_proto::RunRequest {
+                    prompt,
+                    turn_origin,
+                    ..
+                },
             ..
         }
-        | SessionCommandPayload::Steer { prompt, .. } = &payload
-            && self.refuses_peer_mail(chat_id, prompt)
+        | SessionCommandPayload::Steer {
+            prompt,
+            turn_origin,
+            ..
+        } = &payload
+            && self.refuses_prompt_origin(chat_id, prompt, *turn_origin)
         {
             return Err(EngineError::Other(
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
@@ -3597,7 +3676,32 @@ impl DocHost {
         attachments: Vec<String>,
         hold_for_turn_end: bool,
     ) -> Result<String, EngineError> {
-        if self.refuses_peer_mail(chat_id, text) {
+        self.queue_message_with_origin(
+            chat_id,
+            text,
+            attachments,
+            hold_for_turn_end,
+            TurnOrigin::Human,
+            None,
+        )
+    }
+
+    /// Preserve structural origin across synchronized queue and cold-host delivery.
+    pub fn queue_message_with_origin(
+        &self,
+        chat_id: &str,
+        text: &str,
+        attachments: Vec<String>,
+        hold_for_turn_end: bool,
+        turn_origin: TurnOrigin,
+        peer_chat_id: Option<String>,
+    ) -> Result<String, EngineError> {
+        let turn_origin = if peer_chat_id.is_some() {
+            TurnOrigin::Peer
+        } else {
+            turn_origin
+        };
+        if self.refuses_prompt_origin(chat_id, text, turn_origin) {
             return Err(EngineError::Other(
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
             ));
@@ -3609,6 +3713,8 @@ impl DocHost {
         if let Err(error) = handle.doc.push_queued(&QueuedMessage {
             id: id.clone(),
             text: text.to_string(),
+            turn_origin,
+            peer_chat_id,
             attachments,
             hold_for_turn_end,
             issued_by: self.inner.config.device_id.clone(),
@@ -3630,7 +3736,21 @@ impl DocHost {
     /// (#498). Checked when mail is accepted and again when it would be
     /// delivered, so mail accepted before an archive cannot wake the chat
     /// after it. A person's prompt is never refused.
-    pub(crate) fn refuses_peer_mail(&self, chat_id: &str, text: &str) -> bool {
+    pub(crate) fn refuses_prompt_origin(
+        &self,
+        chat_id: &str,
+        text: &str,
+        origin: TurnOrigin,
+    ) -> bool {
+        self.refuses_peer_mail(chat_id, text)
+            || (origin != TurnOrigin::Human
+                && self
+                    .workspace()
+                    .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
+                    .is_some_and(|chat| chat.archived))
+    }
+
+    fn refuses_peer_mail(&self, chat_id: &str, text: &str) -> bool {
         let archived = self
             .workspace()
             .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
@@ -4112,15 +4232,15 @@ impl DocHost {
         let Some(item) = handle.doc.take_queued(id)? else {
             return Ok(false);
         };
-        let was_paused = handle.queue_paused.swap(false, Ordering::AcqRel);
+        handle.queue_paused.store(false, Ordering::Release);
         handle.publish_queue();
         if let Err(err) = self
             .dispatch_queued(&handle, &item, QueueSend::Interrupt)
             .await
         {
-            if was_paused {
-                handle.queue_paused.store(true, Ordering::Release);
-            }
+            // A failed explicit send leaves the queue paused even if it was
+            // flowing: restoring the row must not hand it to a drain (#466).
+            handle.queue_paused.store(true, Ordering::Release);
             // Put it back rather than swallowing what the user typed — at the
             // head, because the user just said this one was the urgent one.
             let _ = handle.doc.insert_queued(0, &item);
@@ -4172,15 +4292,13 @@ impl DocHost {
         let Some(item) = handle.doc.take_queued(id)? else {
             return Ok(false);
         };
-        let was_paused = handle.queue_paused.swap(false, Ordering::AcqRel);
+        handle.queue_paused.store(false, Ordering::Release);
         handle.publish_queue();
         // Always attempt the non-interrupting path first. If no turn exists,
         // `dispatch_queued` falls through to NextTurn; if a new turn appeared
         // after our capability check, the prompt steers that turn instead.
         if let Err(err) = self.dispatch_queued(&handle, &item, QueueSend::Steer).await {
-            if was_paused {
-                handle.queue_paused.store(true, Ordering::Release);
-            }
+            handle.queue_paused.store(true, Ordering::Release);
             let _ = handle.doc.insert_queued(0, &item);
             handle.publish_queue();
             return Err(err);
@@ -4250,7 +4368,15 @@ impl DocHost {
             }
             // Peer mail accepted before the chat was archived stays queued
             // (visible, removable) instead of waking it; a restore re-drains.
-            if self.refuses_peer_mail(&handle.chat_id, &head.text) {
+            if self.refuses_prompt_origin(
+                &handle.chat_id,
+                &head.text,
+                if head.peer_chat_id.is_some() {
+                    TurnOrigin::Peer
+                } else {
+                    head.turn_origin
+                },
+            ) {
                 return;
             }
             // In flight, not just Working: an agent parked on a question owns
@@ -4265,6 +4391,11 @@ impl DocHost {
             // the queue follows it instead of jumping ahead (#415). Its turn
             // starting or its command resolving re-drains.
             if self.prompt_command_waiting(handle) {
+                return;
+            }
+            // A failing turn pauses before it publishes Errored, so a drain
+            // that just read the settled status must also see the pause.
+            if handle.queue_paused.load(Ordering::Acquire) {
                 return;
             }
             let send = QueueSend::NextTurn;
@@ -4307,15 +4438,16 @@ impl DocHost {
         if !sessions.turn_in_flight(&handle.chat_id) {
             return Ok(false);
         }
+        let failures = handle.queue_failures();
         handle.queue_paused.store(true, Ordering::Release);
         match sessions.interrupt_for(&handle.chat_id, "stop").await {
             Ok(true) => Ok(true),
             Ok(false) => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle.resume_queue_since(failures);
                 Ok(false)
             }
             Err(err) => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle.resume_queue_since(failures);
                 Err(err)
             }
         }
@@ -4336,6 +4468,11 @@ impl DocHost {
         // The submitting viewport learns this id from QueueMessage and can
         // therefore wait without disturbing the active turn's runway, then
         // anchor the prompt only once this exact row reaches the transcript.
+        let turn_origin = if item.peer_chat_id.is_some() {
+            TurnOrigin::Peer
+        } else {
+            item.turn_origin
+        };
         let message_id = item.id.clone();
         let prompt = queued_message_prompt(&item.text, &item.attachments);
         // Same jail as a Run command's attachments: harnesses only ever read
@@ -4346,11 +4483,12 @@ impl DocHost {
         };
         if send == QueueSend::Steer {
             match sessions
-                .steer_with_attachments(
+                .steer_with_origin(
                     chat_id,
                     &prompt,
                     Some(message_id.clone()),
                     attachments.clone(),
+                    turn_origin,
                 )
                 .await?
             {
@@ -4382,6 +4520,7 @@ impl DocHost {
             ));
         };
         request.prompt = prompt;
+        request.turn_origin = turn_origin;
         request.resume = None; // dispatch re-derives the harness session
         request.attachments = item.attachments.clone();
         // Resolves landed `pending://` refs (text and list), then jails.
@@ -5383,11 +5522,20 @@ impl DocHost {
         // archive, or synced from a device that did not check, must not wake
         // the archived chat.
         if let SessionCommandPayload::Run {
-            request: harness_proto::RunRequest { prompt, .. },
+            request:
+                harness_proto::RunRequest {
+                    prompt,
+                    turn_origin,
+                    ..
+                },
             ..
         }
-        | SessionCommandPayload::Steer { prompt, .. } = &entry.payload
-            && self.refuses_peer_mail(chat_id, prompt)
+        | SessionCommandPayload::Steer {
+            prompt,
+            turn_origin,
+            ..
+        } = &entry.payload
+            && self.refuses_prompt_origin(chat_id, prompt, *turn_origin)
         {
             return Ok((
                 SessionCommandStatus::Rejected,
@@ -5399,6 +5547,7 @@ impl DocHost {
                 request,
                 message_id,
             } => {
+                let failures = handle.queue_failures();
                 let mut request = request.clone();
                 // Queued-attachment refs (`pending://`) resolve to this
                 // host's absolute paths before anything persists or
@@ -5466,7 +5615,7 @@ impl DocHost {
                 // the turn mid-answer. Hold it for the turn's end instead.
                 if sessions.would_cancel_active_turn(chat_id, harness, &request) {
                     self.hold_run_until_turn_end(handle, harness, &request, message_id)?;
-                    handle.queue_paused.store(false, Ordering::Release);
+                    handle.resume_queue_since(failures);
                     return Ok((
                         SessionCommandStatus::Applied,
                         Some("held until the turn ends".into()),
@@ -5514,21 +5663,36 @@ impl DocHost {
                 .await?;
                 // A fresh user-authored turn is the deliberate action that
                 // thaws a queue frozen by Cancel. Clear only after dispatch
-                // succeeds so a failed send cannot silently unfreeze it.
-                handle.queue_paused.store(false, Ordering::Release);
+                // succeeds so a failed send cannot silently unfreeze it, and
+                // not if the new run already failed.
+                handle.resume_queue_since(failures);
                 Ok((SessionCommandStatus::Applied, None))
             }
-            SessionCommandPayload::Steer { prompt, message_id } => {
+            SessionCommandPayload::Steer {
+                prompt,
+                message_id,
+                turn_origin,
+            } => {
                 self.deliver_prompt(
                     sessions,
                     handle,
                     prompt,
                     message_id.clone(),
                     entry.issued_at,
+                    *turn_origin,
                 )
                 .await
             }
             SessionCommandPayload::Interrupt {} => {
+                // Which device's Stop this was, and how old: the agent only
+                // learns "the user cancelled" (#149).
+                tracing::info!(
+                    chat = %chat_id,
+                    command = %entry.id,
+                    issued_by = %entry.issued_by,
+                    age_ms = now_ms().saturating_sub(entry.issued_at),
+                    "stop requested by command"
+                );
                 self.interrupt_and_pause_queue(sessions, handle).await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
@@ -5623,6 +5787,7 @@ impl DocHost {
                     ));
                 };
                 request.prompt = respond_input_prompt(&questions, answers);
+                request.turn_origin = TurnOrigin::Human;
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
                 if let Err(err) = handle.doc.resolve_input(request_id) {
@@ -5656,12 +5821,20 @@ impl DocHost {
         prompt: &str,
         message_id: Option<String>,
         issued_at: i64,
+        turn_origin: TurnOrigin,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        let failures = handle.queue_failures();
         // Keep upstream's queued-attachment rewrite and send-time canonical
         // history while preserving the personal cut's turn-boundary queue.
         let prompt = self.resolve_prompt_attachments(prompt);
-        if self.held_until_turn_end(sessions, chat_id, &prompt, message_id.as_deref())? {
+        if self.held_until_turn_end(
+            sessions,
+            chat_id,
+            &prompt,
+            message_id.as_deref(),
+            turn_origin,
+        )? {
             return Ok((
                 SessionCommandStatus::Applied,
                 Some("held until the turn ends".into()),
@@ -5682,11 +5855,17 @@ impl DocHost {
             .map(|uploads| uploads.owned_attachments(&prompt))
             .unwrap_or_default();
         match sessions
-            .steer_with_attachments(chat_id, &prompt, message_id.clone(), attachments.clone())
+            .steer_with_origin(
+                chat_id,
+                &prompt,
+                message_id.clone(),
+                attachments.clone(),
+                turn_origin,
+            )
             .await?
         {
             SteerOutcome::Accepted => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle.resume_queue_since(failures);
                 Ok((SessionCommandStatus::Applied, None))
             }
             SteerOutcome::NotSteerable => {
@@ -5700,6 +5879,7 @@ impl DocHost {
                     ));
                 };
                 request.prompt = prompt;
+                request.turn_origin = turn_origin;
                 request.resume = None; // dispatch re-derives the harness session
                 // A reused config must not re-inline the PREVIOUS turn's
                 // images: only this prompt's own validated uploads ride.
@@ -5707,7 +5887,7 @@ impl DocHost {
                 let harness = self.harness_for_request(chat_id, &request);
                 self.dispatch_with_source_context(sessions, chat_id, harness, request, message_id)
                     .await?;
-                handle.queue_paused.store(false, Ordering::Release);
+                handle.resume_queue_since(failures);
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("queued as new turn".into()),
@@ -5734,6 +5914,7 @@ impl DocHost {
         chat_id: &str,
         prompt: &str,
         message_id: Option<&str>,
+        turn_origin: TurnOrigin,
     ) -> Result<bool, EngineError> {
         // A persistent session parked BETWEEN turns DOES take the next prompt
         // through its mailbox (the warm-child fast path), so the question is
@@ -5750,6 +5931,8 @@ impl DocHost {
         handle.doc.push_queued(&QueuedMessage {
             id: message_id.map(str::to_string).unwrap_or_else(new_id),
             text: prompt.to_string(),
+            turn_origin,
+            peer_chat_id: None,
             attachments: Vec::new(),
             hold_for_turn_end: false,
             issued_by: self.inner.config.device_id.clone(),
@@ -5785,6 +5968,8 @@ impl DocHost {
         handle.doc.push_queued(&QueuedMessage {
             id: message_id.to_string(),
             text: request.prompt.clone(),
+            turn_origin: request.turn_origin,
+            peer_chat_id: None,
             attachments: request.attachments.clone(),
             hold_for_turn_end: false,
             issued_by: self.inner.config.device_id.clone(),
@@ -5816,7 +6001,8 @@ impl DocHost {
     ///
     /// If that checkout drifted since the chat's last turn (another branch,
     /// or another checkout in the same folder), the dispatch is held behind a
-    /// question instead and this returns `None` (#354).
+    /// question instead and this returns `None` (#354). Peer delivery also
+    /// returns `None` when held for an already active turn.
     ///
     /// The context is recorded only once dispatch accepts the request: one
     /// rejected before it ran leaves the previous context in place. A run
@@ -5830,6 +6016,11 @@ impl DocHost {
         request: harness_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<Option<String>, EngineError> {
+        if self.refuses_prompt_origin(chat_id, &request.prompt, request.turn_origin) {
+            return Err(EngineError::Other(
+                harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
+            ));
+        }
         let context = self.capture_source_context(&request.cwd).await;
         if let Some(context) = &context
             && let Some(drift) = self.drift_since_last_turn(sessions, chat_id, context).await
@@ -5839,6 +6030,33 @@ impl DocHost {
             return Ok(None);
         }
         let (request, message_id) = self.release_branch_drift(chat_id, request, message_id)?;
+        // Source capture and checkout questions can await. Recheck at the
+        // actual handoff, including cold fallbacks and orphan redelivery.
+        if self.refuses_prompt_origin(chat_id, &request.prompt, request.turn_origin) {
+            return Err(EngineError::Other(
+                harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
+            ));
+        }
+        // Peer work is known by its origin; legacy envelopes still count.
+        let peer_work = request.turn_origin != TurnOrigin::Human
+            || harness_proto::peer_mail::is_peer_mail(&request.prompt);
+        if peer_work && sessions.turn_in_flight(chat_id) {
+            let handle = self.open(chat_id)?;
+            handle.doc.push_queued(&QueuedMessage {
+                id: message_id.unwrap_or_else(new_id),
+                text: request.prompt,
+                turn_origin: TurnOrigin::Peer,
+                peer_chat_id: None,
+                attachments: request.attachments,
+                hold_for_turn_end: false,
+                issued_by: self.inner.config.device_id.clone(),
+                issued_at: now_ms(),
+                edited_at: None,
+                delivery_gate: None,
+            })?;
+            handle.publish_queue();
+            return Ok(None);
+        }
         let run_id = sessions
             .dispatch(chat_id, harness, request, message_id)
             .await?;
@@ -5990,6 +6208,7 @@ impl DocHost {
         let config = chat.config;
         Some(harness_proto::RunRequest {
             prompt: prompt.to_string(),
+            turn_origin: TurnOrigin::Human,
             harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),
             reasoning: config.as_ref().and_then(|c| c.reasoning),
@@ -6898,6 +7117,7 @@ mod pending_prompt_tests {
             id: id.into(),
             payload: SessionCommandPayload::Run {
                 request: harness_proto::RunRequest {
+                    turn_origin: TurnOrigin::Human,
                     prompt: prompt.into(),
                     harness: None,
                     model: None,

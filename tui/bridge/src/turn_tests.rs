@@ -3,18 +3,7 @@ use crate::wire::ThreadState;
 use harness_proto::HarnessId;
 
 fn thread() -> ThreadState {
-    ThreadState {
-        history: Default::default(),
-        cwd: "/tmp".into(),
-        harness: HarnessId::Graff,
-        model: None,
-        resume: None,
-        interrupt: None,
-        turn_id: None,
-        steer: None,
-        steers: Default::default(),
-        steerable: false,
-    }
+    ThreadState::new("/tmp".into(), HarnessId::Graff, None)
 }
 
 fn conn_with(state: ThreadState) -> Arc<Conn> {

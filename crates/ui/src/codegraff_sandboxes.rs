@@ -22,6 +22,7 @@ pub struct CodegraffSandbox {
     pub name: Option<String>,
     /// `running` | `starting` | `paused` | `stopping` | `error` (the engine's words).
     pub state: String,
+    pub tier: Option<String>,
     pub expires_at: Option<Value>,
     /// Harness was set up in it, so it can show up as a device.
     pub harness: bool,
@@ -70,6 +71,13 @@ pub struct CodegraffSandboxes {
 /// What a create says it costs, under the size choice.
 pub const CREATE_COPY: &str =
     "Keeps running until you turn it off. Billed per second from your Codegraff credit.";
+
+/// Temporary API/tool machines are deliberately separate from persistent Harness devices.
+pub const TEMPORARY_COPY: &str = "For API and tool tasks, not a Harness device. Uses our fleet with Daytona fallback. Fleet sandboxes are deleted after 30 minutes; Daytona auto-stops after 30 idle minutes. Delete when done. Billed from your Codegraff credit.";
+
+pub fn is_temporary(sandbox: &CodegraffSandbox) -> bool {
+    sandbox.tier.as_deref() == Some("ephemeral")
+}
 
 /// An hourly price: "$0.10/h", "$0.125/h", "$1.50/h". Pure.
 pub fn format_rate(micro_usd: i64) -> String {
@@ -157,7 +165,11 @@ pub fn sandbox_title(sandbox: &CodegraffSandbox) -> String {
         .flatten()
         .map(|name| name.trim())
         .find(|name| !name.is_empty())
-        .unwrap_or("Cloud sandbox")
+        .unwrap_or(if is_temporary(sandbox) {
+            "Temporary sandbox"
+        } else {
+            "Cloud sandbox"
+        })
         .to_string()
 }
 
@@ -165,6 +177,7 @@ pub fn sandbox_title(sandbox: &CodegraffSandbox) -> String {
 /// running one that never got Harness (a create that half-failed) is set up again.
 pub fn can_start(sandbox: &CodegraffSandbox) -> bool {
     sandbox.provider == "fleet"
+        && !is_temporary(sandbox)
         && (sandbox.state == "paused" || (sandbox.state == "running" && !sandbox.harness))
 }
 
@@ -178,7 +191,7 @@ pub fn start_labels(sandbox: &CodegraffSandbox) -> (&'static str, &'static str) 
 }
 
 pub fn can_stop(sandbox: &CodegraffSandbox) -> bool {
-    sandbox.state == "running"
+    sandbox.state == "running" && !is_temporary(sandbox)
 }
 
 /// The turn-off button's label, its in-progress label, and what it does.
@@ -189,7 +202,10 @@ pub const TURN_OFF_HINT: &str = "Pauses it. Memory and files are kept; billing s
 /// running again (after a failed renewal, say). Gateways that don't know the setting say
 /// nothing, so nothing is offered.
 pub fn can_keep_running(sandbox: &CodegraffSandbox) -> bool {
-    sandbox.provider == "fleet" && sandbox.state == "running" && sandbox.keep_running == Some(false)
+    sandbox.provider == "fleet"
+        && !is_temporary(sandbox)
+        && sandbox.state == "running"
+        && sandbox.keep_running == Some(false)
 }
 
 fn keeps_running(sandbox: &CodegraffSandbox) -> bool {
@@ -210,6 +226,18 @@ fn renew_problem(sandbox: &CodegraffSandbox) -> Option<&'static str> {
 /// When a running sandbox stops on its own: "keeps running until you turn it off", "pauses in
 /// 24 min", or a failed renewal ("Out of credit — pauses in 4 min"). `None` when unknown.
 fn running_outlook(sandbox: &CodegraffSandbox, now: DateTime<Utc>) -> Option<String> {
+    if is_temporary(sandbox) {
+        return Some(if sandbox.provider == "fleet" {
+            sandbox
+                .expires_at
+                .as_ref()
+                .and_then(|at| lease_remaining(at, now))
+                .map(|lease| lease.replace("pauses", "deletes"))
+                .unwrap_or_else(|| "temporary — delete when done".into())
+        } else {
+            "auto-stops after 30 idle min; delete when done".into()
+        });
+    }
     let lease = sandbox
         .expires_at
         .as_ref()
@@ -239,7 +267,16 @@ pub fn sandbox_detail(sandbox: &CodegraffSandbox, now: DateTime<Utc>) -> String 
         let spec = machine_spec(sandbox.cpu, sandbox.memory_gib);
         let rate = sandbox.price_per_hour_micro_usd.map(format_rate);
         // With its machine and rate to say, a ready sandbox goes without "Harness ready".
-        if !sandbox.harness {
+        if is_temporary(sandbox) {
+            parts.push(
+                if sandbox.provider == "fleet" {
+                    "Temporary · Our fleet"
+                } else {
+                    "Temporary · Daytona"
+                }
+                .into(),
+            );
+        } else if !sandbox.harness {
             parts.push("Harness not set up".into());
         } else if spec.is_none() && rate.is_none() {
             parts.push("Harness ready".into());
@@ -297,8 +334,19 @@ pub fn running_summary(list: &CodegraffSandboxes, now: DateTime<Utc>) -> Option<
         .iter()
         .find(|s| renew_problem(s).is_some())
         .and_then(|s| running_outlook(s, now));
+    let temporary = live.iter().any(|s| is_temporary(s));
     let (detail, warning) = match problem {
         Some(problem) => (problem, true),
+        None if temporary && live.len() == 1 => (
+            capitalize(
+                &running_outlook(live[0], now).unwrap_or_else(|| "Temporary sandbox".into()),
+            ),
+            false,
+        ),
+        None if temporary => (
+            "Includes temporary sandboxes — manage in Settings".into(),
+            false,
+        ),
         None => match running
             .iter()
             .find(|s| !keeps_running(s))
@@ -312,7 +360,13 @@ pub fn running_summary(list: &CodegraffSandboxes, now: DateTime<Utc>) -> Option<
         label,
         detail,
         warning,
-        running_ids: running.iter().map(|s| s.id.clone()).collect(),
+        // A mixed list must not imply "Turn off" stops temporary machines too. The strip
+        // opens Settings, where each temporary sandbox has an explicit Delete action.
+        running_ids: if temporary {
+            Vec::new()
+        } else {
+            running.iter().map(|s| s.id.clone()).collect()
+        },
     })
 }
 
@@ -390,6 +444,45 @@ mod tests {
             renew_error: renew_error.map(str::to_owned),
             ..sandbox("running", true, Some(expires))
         }
+    }
+
+    #[test]
+    fn temporary_sandboxes_are_not_persistent_harness_devices() {
+        let mut temporary = sandbox("running", false, Some("2026-10-01T12:30:00Z"));
+        temporary.tier = Some("ephemeral".into());
+        temporary.keep_running = Some(false);
+        temporary.name = None;
+        assert_eq!(sandbox_title(&temporary), "Temporary sandbox");
+        assert!(!can_start(&temporary));
+        assert!(!can_stop(&temporary));
+        assert!(!can_keep_running(&temporary));
+        assert_eq!(
+            sandbox_detail(&temporary, at(12, 0)),
+            "Running · Temporary · Our fleet · deletes in 30 min"
+        );
+        let mut list = CodegraffSandboxes {
+            enabled: true,
+            sandboxes: vec![temporary.clone()],
+            sizes: vec![],
+        };
+        let summary = running_summary(&list, at(12, 0)).unwrap();
+        assert_eq!(summary.detail, "Deletes in 30 min");
+        assert!(summary.running_ids.is_empty());
+        list.sandboxes.push(kept("2026-10-01T12:30:00Z", None));
+        assert!(
+            running_summary(&list, at(12, 0))
+                .unwrap()
+                .running_ids
+                .is_empty()
+        );
+        temporary.provider = "daytona".into();
+        temporary.expires_at = None;
+        assert_eq!(
+            sandbox_detail(&temporary, at(12, 0)),
+            "Running · Temporary · Daytona · auto-stops after 30 idle min; delete when done"
+        );
+        assert!(!can_stop(&temporary));
+        assert!(!can_start(&temporary));
     }
 
     #[test]

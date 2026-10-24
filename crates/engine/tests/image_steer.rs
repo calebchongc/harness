@@ -135,6 +135,7 @@ fn run(core: &EngineCore, id: &str, prompt: &str, cwd: &str, attachments: Vec<St
             payload: SessionCommandPayload::Run {
                 message_id: id.into(),
                 request: RunRequest {
+                    turn_origin: Default::default(),
                     prompt: prompt.into(),
                     harness: Some(HarnessId::Mock),
                     model: Some("mock-1".into()),

@@ -66,6 +66,7 @@ pub(crate) mod screen_access;
 pub mod settings;
 pub mod shell;
 pub mod sound;
+pub mod stall_watch;
 pub(crate) mod starters;
 pub mod state;
 pub(crate) mod surface_chrome;
@@ -221,6 +222,7 @@ pub fn run_app(config: UiConfig) {
 
         let state = cx.new(|_| state::AppState::new());
         perf_stats::start(data_dir.clone(), state.clone(), cx);
+        stall_watch::start(data_dir.join("logs"), cx);
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
@@ -272,6 +274,12 @@ pub fn run_app(config: UiConfig) {
             state: state.clone(),
             boot: config.boot(),
         });
+        // A restart into an update left a note: confirm the version once, and
+        // come back behind the app the person was using if it restarted while
+        // they were away from Harness.
+        let relaunch = shell::take_relaunch_marker(&config.boot().data_dir);
+        let relaunched_in_background = relaunch.as_ref().is_some_and(|marker| marker.background);
+        cx.set_global(shell::UpdateRelaunched(relaunch));
         open_main_window(state, config.boot(), cx);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         start_appshot_service(config.boot().data_dir, cx);
@@ -283,7 +291,9 @@ pub fn run_app(config: UiConfig) {
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
-        cx.activate(true);
+        if !relaunched_in_background {
+            cx.activate(true);
+        }
     });
 }
 

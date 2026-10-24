@@ -171,6 +171,10 @@ struct QueueMessageParams {
     /// supports mid-turn steering.
     #[serde(default)]
     hold_for_turn_end: bool,
+    #[serde(default)]
+    turn_origin: harness_proto::TurnOrigin,
+    #[serde(default)]
+    peer_chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,6 +245,15 @@ struct CheckoutChangeRequestParams {
     cwd: String,
     #[serde(default)]
     branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeChangeRequestParams {
+    cwd: String,
+    #[serde(default)]
+    branch: Option<String>,
+    number: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,6 +335,10 @@ struct RunProjectActionParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+    /// Leave files out of the listing (folder pickers). Older engines ignore
+    /// the field and return files too, which those pickers already filter.
+    #[serde(default)]
+    dirs_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -842,6 +859,24 @@ impl EngineRpc {
         self.file_search_root(p).await
     }
 
+    /// Kept off the dispatcher's stack: `gh` runs three subprocesses here.
+    #[inline(never)]
+    fn merge_change_request(
+        &self,
+        params: serde_json::Value,
+    ) -> futures::future::BoxFuture<'_, Result<RpcReply, RpcError>> {
+        Box::pin(async move {
+            let p: MergeChangeRequestParams = parse_params(params)?;
+            let cwd = self.change_request_root(&p.cwd).await?;
+            let result = self
+                .change_requests
+                .merge(&cwd, p.branch.as_deref(), p.number)
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            RpcReply::value(&result)
+        })
+    }
+
     /// Accept only a checkout already named by a local chat or contained in a
     /// local space. Remote clients must not turn this RPC into an arbitrary path probe.
     async fn change_request_root(&self, cwd: &str) -> Result<std::path::PathBuf, RpcError> {
@@ -1348,6 +1383,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_GIT_STATUS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
+            | methods::MERGE_CHANGE_REQUEST
             | methods::GET_CHECKOUT_DIFF
             | methods::DISCARD_WORKING_TREE
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
@@ -1657,6 +1693,9 @@ impl RpcService for EngineRpc {
                 .handle(method, params)
                 .await;
         }
+        if method == methods::MERGE_CHANGE_REQUEST {
+            return self.merge_change_request(params).await;
+        }
         match method {
             methods::CODEGRAFF_SIGN_IN => {
                 let auth = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir());
@@ -1714,6 +1753,13 @@ impl RpcService for EngineRpc {
                     .filter(|size| !size.is_empty());
                 let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
                     .create_sandbox(size)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&sandbox)
+            }
+            methods::CODEGRAFF_CREATE_TEMPORARY_SANDBOX => {
+                let sandbox = crate::codegraff_auth::CodegraffAuth::shared(self.repos.data_dir())
+                    .create_temporary_sandbox()
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&sandbox)
@@ -2076,11 +2122,13 @@ impl RpcService for EngineRpc {
                 let p: QueueMessageParams = parse_params(params)?;
                 let id = self
                     .doc_host
-                    .queue_message_with_behavior(
+                    .queue_message_with_origin(
                         &p.chat_id,
                         &p.text,
                         p.attachments,
                         p.hold_for_turn_end,
+                        p.turn_origin,
+                        p.peer_chat_id,
                     )
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "id": id }))
@@ -2971,7 +3019,7 @@ impl RpcService for EngineRpc {
                 let p: ListFoldersParams = parse_params(params)?;
                 let listing = self
                     .repos
-                    .list_folders(p.path)
+                    .list_folders_opts(p.path, p.dirs_only)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
@@ -3531,6 +3579,21 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_message_decodes_structural_origin_without_attribution() {
+        let human: QueueMessageParams = serde_json::from_value(serde_json::json!({
+            "chatId": "chat", "text": "legacy"
+        }))
+        .unwrap();
+        assert_eq!(human.turn_origin, harness_proto::TurnOrigin::Human);
+        let peer: QueueMessageParams = serde_json::from_value(serde_json::json!({
+            "chatId": "chat", "text": "ordinary follow-up", "turnOrigin": "peer"
+        }))
+        .unwrap();
+        assert_eq!(peer.turn_origin, harness_proto::TurnOrigin::Peer);
+        assert!(peer.peer_chat_id.is_none());
+    }
 
     // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
     #[cfg(unix)]

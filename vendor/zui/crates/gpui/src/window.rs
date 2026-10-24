@@ -2753,6 +2753,8 @@ impl Window {
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
         // Drain unconditionally so a stale first-invalidation timestamp can't
         // leak into a later frame across enable/disable of frame tracing.
+        let _activity =
+            crate::foreground_activity::enter(crate::foreground_activity::ForegroundActivity::Draw);
         let frame_dirty = self.invalidator.take_frame_dirty();
         let draw_started_at = profiler::frame_trace_enabled().then(Instant::now);
 
@@ -5040,6 +5042,11 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let _activity = crate::foreground_activity::enter(
+            crate::foreground_activity::ForegroundActivity::Input(
+                crate::foreground_activity::input_kind(&event),
+            ),
+        );
         #[cfg(feature = "input-latency-histogram")]
         let dispatch_time = Instant::now();
         let update_count_before = self.invalidator.update_count();
@@ -5104,44 +5111,69 @@ impl Window {
             }
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
-            PlatformInput::FileDrop(file_drop) => match file_drop {
-                FileDropEvent::Entered { position, paths } => {
-                    self.mouse_position = position;
-                    if cx.active_drag.is_none() {
+            PlatformInput::FileDrop(file_drop) => {
+                let external_payload = cx.external_file_drag_window.is_some()
+                    && cx.active_drag.as_ref().is_some_and(|drag| {
+                        drag.value.is::<crate::ExternalPaths>()
+                    });
+                let external_drag = external_payload
+                    && cx.external_file_drag_window == Some(self.handle.window_id());
+                match file_drop {
+                    FileDropEvent::Entered { position, mut paths }
+                        if cx.active_drag.is_none() || external_payload =>
+                    {
+                        // A new enter owns the payload, even if an exit for
+                        // the previous external drag was never delivered.
+                        paths.0.retain(|path| !path.as_os_str().is_empty());
+                        self.mouse_position = position;
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
                             cursor_offset: position,
                             cursor_style: None,
                         });
+                        if let Some(previous) = cx.external_file_drag_window.replace(self.handle.window_id())
+                            && previous != self.handle.window_id()
+                        {
+                            // Repaint the old window without its drop veil,
+                            // even if its platform exit arrives late or not at all.
+                            let _ = cx.update_window_id(previous, |_, window, _| window.refresh());
+                        }
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: Modifiers::default(),
+                        })
                     }
-                    PlatformInput::MouseMove(MouseMoveEvent {
-                        position,
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Modifiers::default(),
-                    })
-                }
-                FileDropEvent::Pending { position } => {
-                    self.mouse_position = position;
-                    PlatformInput::MouseMove(MouseMoveEvent {
-                        position,
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Modifiers::default(),
-                    })
-                }
-                FileDropEvent::Submit { position } => {
-                    cx.activate(true);
-                    self.mouse_position = position;
-                    PlatformInput::MouseUp(MouseUpEvent {
-                        button: MouseButton::Left,
-                        position,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                    })
-                }
-                FileDropEvent::Exited => {
-                    cx.active_drag.take();
-                    PlatformInput::FileDrop(FileDropEvent::Exited)
+                    FileDropEvent::Pending { position } if external_drag => {
+                        self.mouse_position = position;
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: Modifiers::default(),
+                        })
+                    }
+                    FileDropEvent::Submit { position } if external_drag => {
+                        cx.activate(true);
+                        self.mouse_position = position;
+                        PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                        })
+                    }
+                    FileDropEvent::Exited if external_payload => {
+                        if external_drag {
+                            cx.active_drag.take();
+                            cx.external_file_drag_window = None;
+                        }
+                        self.refresh();
+                        PlatformInput::FileDrop(FileDropEvent::Exited)
+                    }
+                    // Stray/late OS events are not mouse clicks and must not
+                    // move, submit, or cancel an unrelated in-app drag.
+                    other => PlatformInput::FileDrop(other),
                 }
             },
             PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
@@ -5172,6 +5204,14 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+        // An ordinary mouse release can also drive drop listeners. It must not
+        // bypass the native file drag's window ownership checks.
+        if cx.external_file_drag_window.is_some_and(|owner| owner != self.handle.window_id())
+            && cx.active_drag.as_ref().is_some_and(|drag| drag.value.is::<crate::ExternalPaths>())
+            && (event.is::<MouseMoveEvent>() || event.is::<MouseUpEvent>())
+        {
+            return;
+        }
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
@@ -5185,6 +5225,12 @@ impl Window {
             return;
         }
 
+        let primary_release = event
+            .downcast_ref::<MouseUpEvent>()
+            .is_some_and(|event| event.button == MouseButton::Left);
+        let released_drag = primary_release
+            .then(|| cx.active_drag.as_ref().map(|drag| Arc::clone(&drag.value)))
+            .flatten();
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
@@ -5210,21 +5256,30 @@ impl Window {
 
         self.rendered_frame.mouse_listeners = mouse_listeners;
 
+        // A callback can start another drag. This release only finishes the
+        // original payload, never the replacement or its native ownership.
+        let finishes_drag = primary_release && cx.active_drag.as_ref().is_none_or(|drag| {
+            released_drag.as_ref().is_some_and(|value| Arc::ptr_eq(&drag.value, value))
+        });
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {
                 // If this was a mouse move event, redraw the window so that the
                 // active drag can follow the mouse cursor.
                 self.refresh();
-            } else if event.is::<MouseUpEvent>() {
-                // If this was a mouse up event, cancel the active drag and redraw
-                // the window.
+            } else if finishes_drag {
+                // Drags start with the primary button. An auxiliary release
+                // must not end that gesture or discard its payload.
                 cx.active_drag = None;
                 self.refresh();
             }
         }
 
-        // Auto-release pointer capture on mouse up
-        if event.is::<MouseUpEvent>() && self.captured_hitbox.is_some() {
+        // A drop listener may already have consumed the primary payload.
+        if finishes_drag {
+            cx.external_file_drag_window = None;
+        }
+        // Preserve the ordinary pointer-capture release behavior.
+        if event.is::<MouseUpEvent>() {
             self.captured_hitbox = None;
         }
     }
@@ -5544,6 +5599,9 @@ impl Window {
         action: &dyn Action,
         cx: &mut App,
     ) {
+        let _activity = crate::foreground_activity::enter(
+            crate::foreground_activity::ForegroundActivity::Action(action.name()),
+        );
         self.dispatch_action_on_node_inner(node_id, action, cx);
 
         if !cx.propagate_event

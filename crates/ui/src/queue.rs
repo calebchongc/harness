@@ -1491,8 +1491,9 @@ impl Composer {
                         composer.queue_edit_base_text_hash = Some(base_text_hash.to_string());
                         composer.queue_edit_chat_id = Some(chat_id.clone());
                         composer.queue_edit_host_device_id = Some(host_device_id.clone());
+                        let draft = composer.take_prompt_draft(cx);
                         composer.queue_edit_draft = Some((
-                            composer.input.read(cx).text().to_string(),
+                            draft,
                             composer.attachments.remove(&composer.current_key).unwrap_or_default(),
                             composer.appshots.remove(&composer.current_key).unwrap_or_default(),
                         ));

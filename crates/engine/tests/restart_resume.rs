@@ -37,6 +37,7 @@ type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 
 fn run_request(prompt: &str, cwd: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -567,129 +568,171 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
 
 #[tokio::test]
 async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("data");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+    use harness_proto::TurnOrigin::{Background, Human, Peer};
+    for (confirmed, pending, active, origin) in [
+        (Human, None, false, Human),
+        (Peer, None, false, Peer),
+        (Background, None, false, Background),
+        (Peer, Some(Human), true, Human),
+        (Human, Some(Peer), false, Peer),
+        (Human, Some(Peer), true, Human),
+        (Background, Some(Human), false, Human),
+        (Peer, Some(Background), true, Background),
+    ] {
+        for staged_but_not_written in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("data");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
 
-    // Same manufactured kill -9 state as above, but FRESH: the streaming entry
-    // crashed moments ago, inside the 12h revival window.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    {
-        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
-        let doc = SessionDoc::init(CHAT).unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "msg-user-1".into(),
-            role: MessageRole::User,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "long task".into(),
-            }],
-            created_at: now - 60_000,
-            device_id: "dev-crash".into(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-            duration_ms: None,
-        })
-        .unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "msg-assistant-1".into(),
-            role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "partial…".into(),
-            }],
-            created_at: now - 30_000,
-            device_id: "dev-crash".into(),
-            status: Some(MessageStatus::Streaming),
-            continuation_of: None,
-            duration_ms: None,
-        })
-        .unwrap();
-        store
-            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
-            .unwrap();
+            // Same manufactured kill -9 state as above, but FRESH: the streaming entry
+            // crashed moments ago, inside the 12h revival window.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            {
+                let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+                let doc = SessionDoc::init(CHAT).unwrap();
+                doc.push_message(&SessionMessageEntry {
+                    id: "msg-user-1".into(),
+                    role: MessageRole::User,
+                    parts: vec![MessagePart::Text {
+                        id: "t0".into(),
+                        text: "long task".into(),
+                    }],
+                    created_at: now - 60_000,
+                    device_id: "dev-crash".into(),
+                    status: Some(MessageStatus::Complete),
+                    continuation_of: None,
+                    duration_ms: None,
+                })
+                .unwrap();
+                doc.push_message(&SessionMessageEntry {
+                    id: "msg-assistant-1".into(),
+                    role: MessageRole::Assistant,
+                    parts: vec![MessagePart::Text {
+                        id: "t0".into(),
+                        text: "partial…".into(),
+                    }],
+                    created_at: now - 30_000,
+                    device_id: "dev-crash".into(),
+                    status: Some(MessageStatus::Streaming),
+                    continuation_of: None,
+                    duration_ms: None,
+                })
+                .unwrap();
+                store
+                    .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+                    .unwrap();
 
-        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
-        journal
-            .append(
-                CHAT,
-                &AgentEvent::SessionStarted {
-                    harness: HarnessId::Mock,
-                    model: "mock-1".into(),
-                    tools: vec![],
-                    cwd: "/tmp".into(),
-                    session_id: "hs-crash".into(),
-                    assistant_message_id: "msg-assistant-1".into(),
+                let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+                journal.record_turn_origin(CHAT, confirmed);
+                if let Some(incoming) = pending {
+                    journal.record_pending_turn_origin(CHAT, "msg-user-1", incoming, active);
+                }
+                if staged_but_not_written {
+                    journal.record_pending_turn_origin(CHAT, "not-yet-persisted", Peer, true);
+                }
+                journal
+                    .append(
+                        CHAT,
+                        &AgentEvent::SessionStarted {
+                            harness: HarnessId::Mock,
+                            model: "mock-1".into(),
+                            tools: vec![],
+                            cwd: "/tmp".into(),
+                            session_id: "hs-crash".into(),
+                            assistant_message_id: "msg-assistant-1".into(),
+                        },
+                    )
+                    .unwrap();
+                journal
+                    .append(
+                        CHAT,
+                        &AgentEvent::TextDelta {
+                            text: "partial…".into(),
+                        },
+                    )
+                    .unwrap();
+            }
+
+            let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+            let core = assemble(
+                &dir,
+                RecordingHarness {
+                    requests: requests.clone(),
+                    session_id: "hs-after-crash".into(),
+                    fail_starts: Default::default(),
                 },
+            );
+
+            // The run is PICKED BACK UP without any user action (harness: "not just
+            // eulogized"): recovery re-dispatches the crashed prompt itself.
+            wait_for(
+                || complete_assistant_count(&core) == 1,
+                "auto-resumed turn to complete",
             )
-            .unwrap();
-        journal
-            .append(
-                CHAT,
-                &AgentEvent::TextDelta {
-                    text: "partial…".into(),
+            .await;
+
+            let entries = entries_now(&core);
+            // The aborted entry SAYS why it ended — and, calmly, that the run is
+            // being picked back up.
+            let aborted = entries
+                .iter()
+                .find(|e| e.status == Some(MessageStatus::Aborted))
+                .expect("crashed entry stays, stamped aborted");
+            assert!(
+                aborted.parts.iter().any(|p| matches!(
+                    p,
+                    MessagePart::Error { message, .. }
+                        if *message == harness_doc::restart_note::resuming(None)
+                )),
+                "aborted entry carries the visible restart note"
+            );
+            // Re-dispatch reuses the original user message id — never a duplicate.
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|e| e.role == MessageRole::User)
+                    .count(),
+                1
+            );
+            // The revived run continues the journal-recovered harness conversation.
+            // (An auto-title request may precede it — titling fires at dispatch.)
+            let recorded = requests.lock().unwrap().clone();
+            let revived = recorded
+                .iter()
+                .find(|r| r.prompt == "long task")
+                .expect("auto-resumed dispatch reached the harness");
+            assert_eq!(
+                revived.resume.as_deref(),
+                Some("hs-crash"),
+                "auto-resume must reattach the crashed harness session"
+            );
+            assert_eq!(
+                revived.turn_origin, origin,
+                "revival retains notification ownership"
+            );
+            wait_for(
+                || {
+                    core.sessions
+                        .session_status(CHAT)
+                        .is_some_and(|s| s.last_completed_turn.is_some())
                 },
+                "revived completion marker",
             )
-            .unwrap();
+            .await;
+            assert_eq!(
+                core.sessions
+                    .session_status(CHAT)
+                    .unwrap()
+                    .last_completed_peer_only,
+                origin != Human
+            );
+            core.shutdown().await;
+        }
     }
-
-    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
-    let core = assemble(
-        &dir,
-        RecordingHarness {
-            requests: requests.clone(),
-            session_id: "hs-after-crash".into(),
-            fail_starts: Default::default(),
-        },
-    );
-
-    // The run is PICKED BACK UP without any user action (harness: "not just
-    // eulogized"): recovery re-dispatches the crashed prompt itself.
-    wait_for(
-        || complete_assistant_count(&core) == 1,
-        "auto-resumed turn to complete",
-    )
-    .await;
-
-    let entries = entries_now(&core);
-    // The aborted entry SAYS why it ended — and that the run is resuming.
-    let aborted = entries
-        .iter()
-        .find(|e| e.status == Some(MessageStatus::Aborted))
-        .expect("crashed entry stays, stamped aborted");
-    assert!(
-        aborted.parts.iter().any(|p| matches!(
-            p,
-            MessagePart::Error { message, .. }
-                if message.contains("engine restart") && message.contains("resuming")
-        )),
-        "aborted entry carries the visible interruption note"
-    );
-    // Re-dispatch reuses the original user message id — never a duplicate.
-    assert_eq!(
-        entries
-            .iter()
-            .filter(|e| e.role == MessageRole::User)
-            .count(),
-        1
-    );
-    // The revived run continues the journal-recovered harness conversation.
-    // (An auto-title request may precede it — titling fires at dispatch.)
-    let recorded = requests.lock().unwrap().clone();
-    let revived = recorded
-        .iter()
-        .find(|r| r.prompt == "long task")
-        .expect("auto-resumed dispatch reached the harness");
-    assert_eq!(
-        revived.resume.as_deref(),
-        Some("hs-crash"),
-        "auto-resume must reattach the crashed harness session"
-    );
-    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -844,6 +887,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     let cwd = cwd.to_string_lossy().to_string();
 
     let real_request = |prompt: &str| RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: Some("haiku".into()),
@@ -955,6 +999,7 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
         .queue_command(
             CHAT,
             SessionCommandPayload::Steer {
+                turn_origin: Default::default(),
                 prompt: "actually, also add tests".into(),
                 message_id: Some("msg-user-2".into()),
             },

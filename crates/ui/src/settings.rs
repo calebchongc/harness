@@ -450,16 +450,41 @@ pub fn transcript_compact_mode(cx: &App) -> bool {
         .unwrap_or_default()
 }
 
-/// Whether closing a session's tab or pane archives it.
+/// Whether closing a session's tab or pane with ⌘W or its ✕ archives it.
 pub fn archive_sessions_on_close(cx: &App) -> bool {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.archive_sessions_on_close)
         .unwrap_or_default()
 }
 
+/// Whether the user has picked what ⌘W does to a session; until then the
+/// first ⌘W close asks (`shell/archive_choice.rs`).
+pub fn archive_on_close_chosen(cx: &App) -> bool {
+    cx.try_global::<SettingsStore>()
+        .is_some_and(|store| store.current.archive_on_close_chosen)
+}
+
+/// The close shortcut the menu binds (`app_menus::key_bindings`: ⌘W, or
+/// Ctrl+Shift+W off macOS) and the configured close-without-archiving one,
+/// as badges ("⌘W", "⌥⌘W").
+pub fn close_shortcut_badges(cx: &App) -> (String, String) {
+    let close = if cfg!(target_os = "macos") {
+        "mod-w"
+    } else {
+        "ctrl-shift-w"
+    };
+    let close_only = with_current(cx, |current| {
+        badge_combo(current.keymap.get(ShortcutId::CloseTabWithoutArchiving))
+    });
+    (badge_combo(close), close_only)
+}
+
+/// The Settings toggle and the first-close question both land here, so
+/// either one counts as the choice.
 pub fn set_archive_sessions_on_close(enabled: bool, cx: &mut App) {
     update(SavePolicy::Immediate, cx, |settings| {
         settings.archive_sessions_on_close = enabled;
+        settings.archive_on_close_chosen = true;
     });
 }
 
@@ -736,6 +761,8 @@ pub struct UiSettings {
     pub sidebar_show_project_icon: bool,
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
+    /// The Archived accordion below the active session list.
+    pub sidebar_show_archived: bool,
     /// The last selected space — restored on boot when the row still exists;
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -762,10 +789,15 @@ pub struct UiSettings {
     /// The split chat layout at quit; launch restores it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_layout: Option<SavedChatLayout>,
-    /// Closing a session's tab or pane also archives the session (off by
-    /// default). Quitting or closing the window never does.
+    /// Closing a session's tab or pane with ⌘W or its ✕ button also archives
+    /// the session (off by default). The close-without-archiving shortcut
+    /// (⌘⌥W) never does, and neither does quitting or closing the window.
     #[serde(alias = "archiveSessionsOnTabClose")]
     pub archive_sessions_on_close: bool,
+    /// The user has chosen [`Self::archive_sessions_on_close`], in Settings or
+    /// by answering the question the first ⌘W close asks. A file that already
+    /// has the setting on counts as chosen.
+    pub archive_on_close_chosen: bool,
     /// The Settings section last viewed — reopened by the generic entry points
     /// (⌘, the account menu, the palette). Kept as a string so an unknown or
     /// malformed value falls back to the default section instead of costing
@@ -777,9 +809,6 @@ pub struct UiSettings {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chat_tabs: Vec<SavedChatTab>,
     pub chat_tab: usize,
-    /// Custom sidebar organization, isolated between account profiles on this device.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub sidebar_sections_by_profile: HashMap<String, Vec<SidebarSection>>,
     /// Device-local pins for local profiles; synced profiles use registry pins.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sidebar_pinned_session_ids_by_profile: HashMap<String, Vec<String>>,
@@ -896,6 +925,10 @@ pub struct UiSettings {
     /// a newer stable exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graff_notice_dismissed: Option<String>,
+    /// Restart into a downloaded Harness update on its own once nothing would
+    /// be interrupted. Off, a staged update waits for a click or for quit.
+    /// `HARNESS_AUTO_UPDATE=0` turns every automatic step off regardless.
+    pub restart_to_install_updates: bool,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -916,6 +949,7 @@ impl Default for UiSettings {
             sidebar_show_project_icon: true,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
+            sidebar_show_archived: true,
             last_space_id: None,
             project_folders_by_device: HashMap::new(),
             last_project_action_by_space_id: std::collections::HashMap::new(),
@@ -924,11 +958,11 @@ impl Default for UiSettings {
             last_chat_id: None,
             chat_layout: None,
             archive_sessions_on_close: false,
+            archive_on_close_chosen: false,
             settings_section: None,
             chat_tabs: Vec::new(),
             chat_tab: 0,
             sidebar_pinned_session_ids_by_profile: HashMap::new(),
-            sidebar_sections_by_profile: HashMap::new(),
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
@@ -980,6 +1014,7 @@ impl Default for UiSettings {
             reduce_motion: crate::motion::ReduceMotion::System,
             pause_animations_in_background: false,
             graff_notice_dismissed: None,
+            restart_to_install_updates: true,
             legacy_accent_color: None,
         }
     }
@@ -1025,6 +1060,7 @@ pub enum ShortcutId {
     SplitTerminalDown,
     NewSession,
     NewProject,
+    OpenProjectPicker,
     OpenModelPicker,
     NextSession,
     PrevSession,
@@ -1035,7 +1071,7 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 17 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 18 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -1047,6 +1083,7 @@ impl ShortcutId {
         ShortcutId::SplitTerminalDown,
         ShortcutId::NewSession,
         ShortcutId::NewProject,
+        ShortcutId::OpenProjectPicker,
         ShortcutId::OpenModelPicker,
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
@@ -1082,6 +1119,7 @@ impl ShortcutId {
             ShortcutId::SplitTerminalDown => "Split terminal down",
             ShortcutId::NewSession => "New chat",
             ShortcutId::NewProject => "New project",
+            ShortcutId::OpenProjectPicker => "Open project picker",
             ShortcutId::OpenModelPicker => "Open model picker",
             ShortcutId::NextSession => "Next tab or session",
             ShortcutId::PrevSession => "Previous tab or session",
@@ -1118,6 +1156,9 @@ impl ShortcutId {
             ShortcutId::NewSession if mac => "mod-t",
             ShortcutId::NewSession => "mod-shift-t",
             ShortcutId::NewProject => "mod-shift-n",
+            // Mnemonic sibling of ⌘⇧N, on the same row as the model picker's
+            // ⌘/ — free of every default, browser and terminal combo.
+            ShortcutId::OpenProjectPicker => "mod-shift-p",
             ShortcutId::OpenModelPicker => "mod-/",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
             // recorder spells ctrl (see `combo_from_keystroke`). Off macOS
@@ -1171,6 +1212,7 @@ pub struct KeymapConfig {
     pub split_terminal_down: String,
     pub new_session: String,
     pub new_project: String,
+    pub open_project_picker: String,
     pub open_model_picker: String,
     pub next_session: String,
     pub prev_session: String,
@@ -1239,6 +1281,7 @@ impl Default for KeymapConfig {
             split_terminal_down: ShortcutId::SplitTerminalDown.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
             new_project: ShortcutId::NewProject.default_combo().into(),
+            open_project_picker: ShortcutId::OpenProjectPicker.default_combo().into(),
             open_model_picker: ShortcutId::OpenModelPicker.default_combo().into(),
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
@@ -1264,6 +1307,7 @@ impl KeymapConfig {
             ShortcutId::SplitTerminalDown => &self.split_terminal_down,
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::NewProject => &self.new_project,
+            ShortcutId::OpenProjectPicker => &self.open_project_picker,
             ShortcutId::OpenModelPicker => &self.open_model_picker,
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
@@ -1291,6 +1335,7 @@ impl KeymapConfig {
             ShortcutId::SplitTerminalDown => self.split_terminal_down = combo,
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::NewProject => self.new_project = combo,
+            ShortcutId::OpenProjectPicker => self.open_project_picker = combo,
             ShortcutId::OpenModelPicker => self.open_model_picker = combo,
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
@@ -1742,6 +1787,8 @@ impl UiSettings {
             self.accent = harness_theme::AccentSelection::Preset(accent.into());
         }
         self.legacy_accent_color = None;
+        // Turning archive-on-close on was a choice; don't ask about it again.
+        self.archive_on_close_chosen |= self.archive_sessions_on_close;
         self
     }
 
@@ -1765,8 +1812,6 @@ fn min_or(value: f32, min: f32, default: f32) -> f32 {
         default
     }
 }
-
-pub use harness_proto::SidebarSection;
 
 #[cfg(test)]
 mod tests {
@@ -1880,6 +1925,35 @@ mod tests {
                 UiSettings::load(dir.path()).archive_sessions_on_close,
                 enabled
             );
+        }
+    }
+
+    #[test]
+    fn archive_on_close_choice_persists_and_counts_an_enabled_setting() {
+        assert!(!UiSettings::default().archive_on_close_chosen);
+        let dir = tempfile::tempdir().unwrap();
+        use serde_json::json;
+        for (file, chosen) in [
+            (json!({}), false),
+            (json!({ "archiveSessionsOnClose": false }), false),
+            // Already on before the question existed: never asked.
+            (json!({ "archiveSessionsOnClose": true }), true),
+            (json!({ "archiveSessionsOnTabClose": true }), true),
+            (
+                json!({ "archiveSessionsOnClose": false, "archiveOnCloseChosen": true }),
+                true,
+            ),
+        ] {
+            std::fs::write(UiSettings::path(dir.path()), file.to_string()).unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(loaded.archive_on_close_chosen, chosen, "{file}");
+            loaded.save(dir.path()).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(UiSettings::path(dir.path())).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved["archiveOnCloseChosen"], chosen, "{file}");
+            assert_eq!(UiSettings::load(dir.path()).archive_on_close_chosen, chosen);
         }
     }
 
@@ -2383,6 +2457,7 @@ mod tests {
             sidebar_show_project_label: false,
             sidebar_show_harness: false,
             sidebar_show_branch: false,
+            sidebar_show_archived: false,
             last_space_id: Some("space-1".into()),
             project_folders_by_device: HashMap::from([(
                 "local".into(),
@@ -2406,6 +2481,7 @@ mod tests {
                 projects: vec![Some("space-1".into()), None],
             }),
             archive_sessions_on_close: true,
+            archive_on_close_chosen: true,
             settings_section: Some("appearance".into()),
             chat_tabs: vec![
                 SavedChatTab {
@@ -2416,7 +2492,6 @@ mod tests {
                 SavedChatTab::default(),
             ],
             chat_tab: 1,
-            sidebar_sections_by_profile: HashMap::new(),
             sidebar_pinned_session_ids_by_profile: HashMap::from([
                 (
                     "local".to_string(),
@@ -2509,6 +2584,7 @@ mod tests {
             reduce_motion: crate::motion::ReduceMotion::On,
             pause_animations_in_background: true,
             graff_notice_dismissed: Some("0.0.9".into()),
+            restart_to_install_updates: false,
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
@@ -2524,6 +2600,19 @@ mod tests {
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
         assert!(json.contains(r#""codeFontFamily": "geist""#));
         assert!(json.contains(r#""codeFontSize": 11.0"#));
+        assert!(json.contains(r#""restartToInstallUpdates": false"#));
+    }
+
+    #[test]
+    fn restart_to_install_updates_defaults_on_and_round_trips() {
+        let legacy: UiSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.restart_to_install_updates);
+        let off: UiSettings =
+            serde_json::from_str(r#"{"restartToInstallUpdates": false}"#).unwrap();
+        assert!(!off.restart_to_install_updates);
+        let dir = tempfile::tempdir().unwrap();
+        off.save(dir.path()).unwrap();
+        assert!(!UiSettings::load(dir.path()).restart_to_install_updates);
     }
 
     #[test]
@@ -2614,10 +2703,12 @@ mod tests {
         assert!(settings.sidebar_compact);
         assert!(settings.sidebar_show_project_icon);
         assert!(settings.sidebar_show_project_label);
+        assert!(settings.sidebar_show_archived);
         let customized = UiSettings {
             sidebar_compact: false,
             sidebar_show_project_icon: false,
             sidebar_show_project_label: false,
+            sidebar_show_archived: false,
             sidebar_organization: SidebarOrganization::ByProject,
             ..settings
         };

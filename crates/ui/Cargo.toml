@@ -10,6 +10,7 @@ project-palette-fixture = []
 
 browser-fixture = []
 windows-render-fixture = []
+stall-watch-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
 
@@ -30,6 +31,10 @@ name = "windows-render-fixture"
 required-features = ["windows-render-fixture"]
 
 [[example]]
+name = "stall-watch-fixture"
+required-features = ["stall-watch-fixture"]
+
+[[example]]
 name = "appshots-fixture"
 required-features = ["appshots-fixture"]
 
@@ -39,6 +44,26 @@ required-features = ["appshots-fixture"]
 
 [[example]]
 name = "reauth-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "archive-choice-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "app-update-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "error-cards-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "restart-resume-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "tool-preview-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]

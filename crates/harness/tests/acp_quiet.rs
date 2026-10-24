@@ -41,6 +41,7 @@ fn fixture_path() -> PathBuf {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: Some("grok-4.5".into()),

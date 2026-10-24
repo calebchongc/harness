@@ -1,7 +1,7 @@
 // Home — the mobile shell. The desktop sidebar collapses into one screen: a
-// space dropdown in the nav bar (default "All") scopes the attention-sorted
-// session list below it. Tabs-as-sessions don't fit a phone; close=archive
-// becomes swipe-to-archive.
+// project pill (default "All projects") and a grouping pill sit together above
+// the attention-sorted session list and scope and arrange it. Tabs-as-sessions
+// don't fit a phone; close=archive becomes swipe-to-archive.
 
 import SwiftUI
 
@@ -26,6 +26,8 @@ struct HomeView: View {
     @State private var pendingNewSession: NewSessionTarget?
     @State private var showSettings = false
     @State private var showProfile = false
+    /// A session whose Delete is waiting on its confirmation.
+    @State private var pendingDelete: Chat?
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
     // Start with Time each launch; a saved grouping can hide recent sessions
@@ -34,7 +36,6 @@ struct HomeView: View {
     @AppStorage("homeCollapsedGroups") private var collapsedGroupsRaw = ""
     // Not persisted: a filter left on across launches reads as lost sessions.
     @State private var searchText = ""
-    @State private var statusFilter: HomeStatusFilter = .all
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private var selectedSpace: Space? {
@@ -370,11 +371,8 @@ struct HomeView: View {
             List {
                 sessionsSection
                 // The desktop's archived shelf sits under the active list,
-                // scoped by the same space filter and search. Archived sessions
-                // are never running or waiting, so a status filter hides it.
-                if statusFilter == .all {
-                    ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
-                }
+                // scoped by the same space filter and search.
+                ArchivedSection(spaceId: selectedSpace?.id, query: searchText, path: sidebarPath)
             }
             // In a split the list shrinks as the session opens below it, and the opened row was left cut in
             // half at the divider. Once the panes settle, bring the whole row into view.
@@ -389,6 +387,7 @@ struct HomeView: View {
         .searchable(text: $searchText,
                     placement: phoneArrangement == nil ? .automatic : .navigationBarDrawer(displayMode: .always),
                     prompt: "Search sessions")
+        .sessionDeleteConfirmation(pending: $pendingDelete, onDelete: delete)
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 10)
         .contentMargins(.top, 2, for: .scrollContent)
@@ -399,11 +398,11 @@ struct HomeView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(removing: .title)
         .toolbar {
-            // Let the native toolbar own this glass surface and its menu
-            // morph. A second custom glass layer retains stale masks.
-            ToolbarItem(placement: .topBarLeading) {
-                HStack(spacing: 10) {
-                    spaceDropdown
+            // The project choice moved down beside the grouping (#419): the
+            // leading side holds only the connection state, and only while
+            // there is one to show, or an empty item draws an empty bubble.
+            if showsConnectionStatus {
+                ToolbarItem(placement: .topBarLeading) {
                     // In the bar, not the list: as a list row it appeared
                     // and vanished with the connection and shoved the
                     // content down. Degraded states are GRACED (4s of
@@ -463,6 +462,7 @@ struct HomeView: View {
                         }
                     }
                 }
+                .sharedBackgroundVisibility(.hidden)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 newButton
@@ -553,19 +553,46 @@ struct HomeView: View {
         }
     }
 
-    // MARK: Space dropdown
+    /// Something to say about the connection: signed out, offline,
+    /// reconnecting, or the first catch-up.
+    private var showsConnectionStatus: Bool {
+        model.sessionExpired || model.connectivity.state != .connected || !model.connected
+    }
 
-    /// The nav-bar dropdown that scopes the session list — a NATIVE glass
-    /// menu. Rows are Buttons, not a Picker: Picker menu rows drop two-Text
-    /// subtitles, while Button rows map to UIAction subtitles, so each space
-    /// shows its owning device ("@ mac") on the small second line without the
-    /// three-line title wraps. Selection carries a checkmark in the icon slot.
-    private var spaceDropdown: some View {
-        Menu {
-            spaceMenuButton(id: "", title: "All", subtitle: nil)
-            ForEach(model.spaces) { space in
-                spaceMenuButton(id: space.id, title: space.displayName,
-                                subtitle: deviceTag(space))
+    // MARK: List controls
+
+    /// Which project's sessions the list shows and how it groups them, side by
+    /// side above the list as a matched pair of pills (#419). The project
+    /// choice used to sit alone in the nav bar as "All", the grouping alone on
+    /// this row as "Time". At large text sizes the pair stacks.
+    @ViewBuilder private func listControls(showsGrouping: Bool) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                projectMenu
+                if showsGrouping { groupPill }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                projectMenu
+                if showsGrouping { groupPill }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Scopes the session list to one project. Rows are Buttons, not a Picker:
+    /// Picker menu rows drop two-Text subtitles, while Button rows map to
+    /// UIAction subtitles, so each project shows its owning device ("@ mac")
+    /// on the small second line without the three-line title wraps. Selection
+    /// carries a checkmark in the icon slot.
+    private var projectMenu: some View {
+        let title = HomeListControls.scopeTitle(projectName: selectedSpace?.displayName)
+        return Menu {
+            Section("Show sessions from") {
+                spaceMenuButton(id: "", title: HomeListControls.allProjectsTitle, subtitle: nil)
+                ForEach(model.spaces) { space in
+                    spaceMenuButton(id: space.id, title: space.displayName,
+                                    subtitle: deviceTag(space))
+                }
             }
             Divider()
             Button {
@@ -574,38 +601,21 @@ struct HomeView: View {
                 Label("New space…", systemImage: "folder.badge.plus")
             }
         } label: {
-            HStack(spacing: 5) {
-                Text(selectedSpace?.displayName ?? "All")
-                    .font(Theme.sans(16, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Theme.textFaint)
-            }
-            // Keep long space names from swallowing the whole bar; the owning
-            // device lives on the menu rows ("@ mac"), not up here.
-            .frame(maxWidth: 200, alignment: .leading)
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 6)
-            .frame(minHeight: 32)
+            // The owning device lives on the menu rows ("@ mac"), not here.
+            HomeControlPill(symbol: "folder", title: title, active: selectedSpace != nil)
         }
-        // Put glass on the Menu control, not inside its captured label.
-        // UIKit morphs the menu's own surface and can restore its new width
-        // after selection; a label-level glass effect retained a stale mask.
-        .buttonStyle(.glass)
-        .buttonBorderShape(.capsule)
-        .fixedSize(horizontal: true, vertical: false)
+        .buttonStyle(.plain)
         .accessibilityLabel("Filter by space")
+        .accessibilityValue(title)
+        .accessibilityHint("Chooses which project's sessions the list shows")
         .accessibilityIdentifier("space-filter")
     }
 
-    /// Grouping sits on the filter row, where you look when sorting the list,
-    /// as a labeled pill: one tap opens the choices, one tap picks. (It used
-    /// to be a submenu at the foot of the space dropdown, under every space.)
+    /// Grouping as a labeled pill: one tap opens the choices, one tap picks.
+    /// (It used to be a submenu at the foot of the space dropdown, under every
+    /// space.)
     private var groupPill: some View {
         let grouping = HomeGroupBy(rawValue: groupByRaw) ?? .none
-        let grouped = grouping != .none
         return Menu {
             Picker(selection: $groupByRaw) {
                 ForEach(HomeGroupBy.allCases) { option in
@@ -616,26 +626,13 @@ struct HomeView: View {
             }
             .pickerStyle(.inline)
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: grouping.symbol)
-                    .font(.system(size: 11, weight: .medium))
-                Text(grouping.label)
-                    .font(Theme.sans(13, weight: grouped ? .semibold : .medium))
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(Theme.textFaint)
-            }
-            .foregroundStyle(grouped ? Theme.text : Theme.textMuted)
-            .padding(.horizontal, 10)
-            .frame(height: 28)
-            .background(Capsule().fill(grouped ? Theme.elementActive : Color.clear))
-            .overlay(Capsule().strokeBorder(grouped ? Color.clear : Theme.border, lineWidth: 1))
-            .contentShape(Capsule())
+            HomeControlPill(symbol: grouping.symbol, title: grouping.pillTitle, active: grouping != .none)
         }
         .buttonStyle(.plain)
         .fixedSize()
         .accessibilityLabel("Group by")
         .accessibilityValue(grouping.label)
+        .accessibilityHint("Chooses how the list is grouped")
         .accessibilityIdentifier("home-group-by")
     }
 
@@ -682,9 +679,19 @@ struct HomeView: View {
 
     @ViewBuilder private var sessionsSection: some View {
         let scoped = selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats
-        let chats = HomeFilter.apply(scoped, query: searchText, status: statusFilter,
-                                     indicator: model.indicator(for:), names: model.homeFilterNames)
+        let chats = HomeFilter.apply(scoped, query: searchText, names: model.homeFilterNames)
         let grouping = HomeGroupBy(rawValue: groupByRaw) ?? .none
+        if HomeListControls.showsRow(hasSessions: !model.overviewChats.isEmpty,
+                                     hasProjects: !model.spaces.isEmpty,
+                                     projectSelected: selectedSpace != nil) {
+            Section {
+                listControls(showsGrouping: HomeListControls.showsGrouping(sessionsInScope: scoped.count))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 2, trailing: 16))
+            }
+            .listSectionSeparator(.hidden)
+        }
         if showSplitOffer {
             Section {
                 SplitOfferBanner(mode: offeredSplit, tryIt: { answerSplitOffer(tryIt: true) },
@@ -696,22 +703,12 @@ struct HomeView: View {
             .listSectionSeparator(.hidden)
         }
         if !scoped.isEmpty {
-            Section {
-                HStack(spacing: 6) {
-                    HomeStatusChips(selection: $statusFilter, counts: statusCounts(scoped))
-                    groupPill
-                }
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 6, trailing: 16))
-            }
-            .listSectionSeparator(.hidden)
             // What's running or waiting, above the history. Hidden while
-            // searching or filtering so it never competes with a query.
+            // searching so it never competes with a query.
             let now = NowStrip.active(in: scoped, model: model)
             // Not in the phone split: the list beside the open session already shows what is running or
             // waiting, and the cards would take most of a narrow pane.
-            if statusFilter == .all, searchText.isEmpty, !now.isEmpty, phoneArrangement == nil {
+            if searchText.isEmpty, !now.isEmpty, phoneArrangement == nil {
                 Section {
                     NowStrip(chats: now) { open(.chat($0)) }
                         .listRowBackground(Color.clear)
@@ -723,7 +720,7 @@ struct HomeView: View {
         }
         if chats.isEmpty {
             // A search can still hit the archived shelf below.
-            let archivedHit = statusFilter == .all && !searchText.isEmpty
+            let archivedHit = !searchText.isEmpty
                 && !model.archivedMatches(in: selectedSpace?.id, query: searchText).isEmpty
             if !archivedHit {
                 Section {
@@ -766,17 +763,6 @@ struct HomeView: View {
         }
     }
 
-    private func statusCounts(_ chats: [Chat]) -> [HomeStatusFilter: Int] {
-        var counts: [HomeStatusFilter: Int] = [:]
-        for chat in chats {
-            let indicator = model.indicator(for: chat)
-            for filter in HomeStatusFilter.allCases where filter.matches(indicator) {
-                counts[filter, default: 0] += 1
-            }
-        }
-        return counts
-    }
-
     /// Collapsed section ids, persisted (comma-separated).
     private var collapsedGroups: Set<String> {
         Set(collapsedGroupsRaw.split(separator: ",").map(String.init))
@@ -813,7 +799,25 @@ struct HomeView: View {
                 Label("Archive", systemImage: "archivebox")
             }
             .tint(Theme.surfaceRaised)
+            // No destructive role: SwiftUI would slide the row out before the
+            // confirmation is answered.
+            Button {
+                pendingDelete = chat
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            .tint(Theme.danger)
+            .accessibilityIdentifier("session-delete")
         }
+    }
+
+    /// The confirmed Delete: gone from the list, and from the detail if it
+    /// was showing there.
+    private func delete(_ chat: Chat) {
+        withAnimation(Motion.resort) {
+            model.delete(chatId: chat.id)
+        }
+        path.removeAll { $0 == .chat(chat.id) }
     }
 }
 
@@ -955,7 +959,30 @@ struct ChatRow: View {
     }
 }
 
+/// The desktop's "Delete session?" dialog, word for word.
+enum SessionDeletion {
+    static let title = "Delete session?"
+
+    static func message(title: String) -> String {
+        "\u{201C}\(title)\u{201D} will be permanently deleted. This can\u{2019}t be undone."
+    }
+}
+
 extension View {
+    /// Ask before a row's Delete goes through; `pending` is the session asked about.
+    func sessionDeleteConfirmation(pending: Binding<Chat?>, onDelete: @escaping (Chat) -> Void) -> some View {
+        alert(SessionDeletion.title,
+              isPresented: Binding(get: { pending.wrappedValue != nil },
+                                   set: { if !$0 { pending.wrappedValue = nil } }),
+              presenting: pending.wrappedValue) { chat in
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { onDelete(chat) }
+                .accessibilityIdentifier("session-delete-confirm")
+        } message: { chat in
+            Text(SessionDeletion.message(title: chat.displayTitle))
+        }
+    }
+
     func sessionPinAction(chat: Chat, model: AppModel) -> some View {
         swipeActions(edge: .leading, allowsFullSwipe: true) {
             let pinned = model.isPinned(chatId: chat.id)

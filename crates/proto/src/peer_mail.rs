@@ -12,8 +12,8 @@
 //! - an archived chat takes no peer mail ([`delivery_allowed`]): it is out of
 //!   the active collaboration set until a person restores or reprompts it;
 //! - a turn that answered only peer mail completes without a completion
-//!   alert ([`TurnOrigin::peer_only`]); a person's prompt anywhere in the
-//!   turn makes it a human turn again.
+//!   alert (its [`crate::TurnOrigin`] is not human); a person's prompt
+//!   anywhere in the turn makes it a human turn again.
 
 const DIRECT_PREFIX: &str = "[Message from Harness chat ";
 
@@ -23,20 +23,24 @@ const DIRECT_PREFIX: &str = "[Message from Harness chat ";
 pub fn direct_message(text: &str) -> Option<(&str, &str)> {
     let envelope = text.strip_prefix(DIRECT_PREFIX)?;
     let (header, body) = envelope.split_once("]\n\n")?;
-    if header.contains(['\r', '\n']) {
-        return None;
-    }
-    let sender = if let Some((sender, rest)) = header.split_once(". Sender chat: ") {
-        if !rest.contains("Agent coordination, not a human request.") {
-            return None;
+    // A free-form sender title can contain either format's marker. The real
+    // metadata follows the title, so select the last marker across both forms.
+    let current = header.rsplit_once(". Sender chat: ");
+    let legacy = header.rsplit_once(". Reply to it with the Harness `send_message` tool, chat ");
+    let (sender, metadata) = match (current, legacy) {
+        (Some(current), Some(legacy)) if legacy.0.len() > current.0.len() => legacy,
+        (Some((sender, metadata)), _) => {
+            if !metadata.contains("Agent coordination, not a human request.") {
+                return None;
+            }
+            (sender, metadata)
         }
-        sender
-    } else {
-        let (sender, _) =
-            header.split_once(". Reply to it with the Harness `send_message` tool, chat ")?;
-        sender
+        (_, Some(legacy)) => legacy,
+        _ => return None,
     };
-    if sender.trim().is_empty() {
+    // Older producers allowed multiline chat titles in the sender label.
+    // Only the machine metadata must remain on one line.
+    if sender.trim().is_empty() || metadata.contains(['\r', '\n']) {
         return None;
     }
     Some((sender, body))
@@ -60,32 +64,6 @@ pub fn delivery_allowed(chat_archived: bool, peer_mail: bool) -> bool {
 /// command's resolution.
 pub const ARCHIVED_REFUSAL: &str = "chat is archived: archived chats take no peer messages. \
      Do not retry; ask the person to restore the chat if it is needed again";
-
-/// Who asked for the work of one turn. Accumulates over every prompt the turn
-/// accepted (its opening prompt and any steers) until the turn settles.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TurnOrigin {
-    pub human: bool,
-    pub peer: bool,
-}
-
-impl TurnOrigin {
-    pub fn note_prompt(&mut self, text: &str) {
-        if is_peer_mail(text) {
-            self.peer = true;
-        } else {
-            self.human = true;
-        }
-    }
-
-    /// Only peer mail fed this turn: its completion is coordination, not a
-    /// result a person asked to be told about. A turn with no recorded prompt
-    /// (an agent continuing on its own) is not peer-only, so it keeps the
-    /// ordinary completion alert.
-    pub fn peer_only(&self) -> bool {
-        self.peer && !self.human
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -143,26 +121,5 @@ mod tests {
         assert!(delivery_allowed(false, true));
         assert!(delivery_allowed(true, false));
         assert!(!delivery_allowed(true, true));
-    }
-
-    #[test]
-    fn a_turn_is_peer_only_until_a_person_prompts_it() {
-        let mut origin = TurnOrigin::default();
-        assert!(
-            !origin.peer_only(),
-            "a prompt-less agent turn keeps its alert"
-        );
-        origin.note_prompt(DIRECT);
-        origin.note_prompt(&room());
-        assert!(origin.peer_only());
-        origin.note_prompt("also update the changelog");
-        assert!(
-            !origin.peer_only(),
-            "human work that consults peers still notifies"
-        );
-        let mut human_first = TurnOrigin::default();
-        human_first.note_prompt("ask the other chat and report back");
-        human_first.note_prompt(DIRECT);
-        assert!(!human_first.peer_only());
     }
 }

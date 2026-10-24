@@ -35,6 +35,14 @@ const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
+/// Threads that probe a listing's directories for `.git` at once. Each probe
+/// is a `stat`, which on a network mount or a cloud-synced folder costs a
+/// round trip, so one at a time made a listing as slow as all of them together.
+const FOLDER_REPO_PROBE_WORKERS: usize = 8;
+/// How long a listing waits for its `.git` probes. The folder names are the
+/// point of the listing; a directory whose probe hasn't answered by then is
+/// listed without its git badge instead of holding up the others.
+const FOLDER_REPO_PROBE_BUDGET: Duration = Duration::from_millis(1500);
 /// Cap on returned drives (a machine with more mounts than this is a server
 /// farm, not a laptop picking a project folder).
 const DRIVE_LIST_MAX_ENTRIES: usize = 50;
@@ -210,6 +218,8 @@ impl Repos {
     /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
+        // Git hooks may need the user's shell tools.
+        harness_adapters::compose_login_shell_path(&mut cmd);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -355,15 +365,33 @@ impl Repos {
     /// Canonical identity shared by every chat operating in this exact worktree:
     /// `sha256(deviceId ‖ NUL ‖ canonical git dir)`.
     pub async fn checkout_identity(&self, path: &Path) -> Result<CheckoutIdentity, EngineError> {
-        let root = self
-            .git(&["rev-parse", "--show-toplevel"], Some(path))
-            .await?;
-        let git_dir = self
+        // One `rev-parse` for both answers: this runs before every
+        // workspace-file request (the Cmd+K palette's Recent Files included).
+        let out = self
             .git(
-                &["rev-parse", "--path-format=absolute", "--git-dir"],
+                &[
+                    "rev-parse",
+                    "--show-toplevel",
+                    "--path-format=absolute",
+                    "--git-dir",
+                ],
                 Some(path),
             )
             .await?;
+        let mut lines = out.lines();
+        let (root, git_dir) = match (lines.next(), lines.next(), lines.next()) {
+            (Some(root), Some(git_dir), None) => (root.to_owned(), git_dir.to_owned()),
+            // Fallback for a path with a `\n` in its name.
+            _ => (
+                self.git(&["rev-parse", "--show-toplevel"], Some(path))
+                    .await?,
+                self.git(
+                    &["rev-parse", "--path-format=absolute", "--git-dir"],
+                    Some(path),
+                )
+                .await?,
+            ),
+        };
         let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
         let canonical_git_dir =
             std::fs::canonicalize(&git_dir).unwrap_or_else(|_| PathBuf::from(&git_dir));
@@ -1056,19 +1084,36 @@ impl Repos {
         Some(path.to_string_lossy().into_owned())
     }
 
+    /// Every checkout of the repository at `repo_path`, main one first.
+    /// NUL-terminated so a `\n` in a worktree's path can't forge another entry.
+    async fn worktree_paths(&self, repo_path: &Path) -> Result<Vec<PathBuf>, EngineError> {
+        let out = match self
+            .git(&["worktree", "list", "--porcelain", "-z"], Some(repo_path))
+            .await
+        {
+            Ok(out) => out,
+            // Git before 2.36 has no `-z`.
+            Err(_) => self
+                .git(&["worktree", "list", "--porcelain"], Some(repo_path))
+                .await?
+                .replace('\n', "\0"),
+        };
+        Ok(out
+            .split('\0')
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .collect())
+    }
+
     /// Whether `candidate` is the repository root or one of its linked
-    /// worktrees. Filesystem resolution happens on a disposable thread because
-    /// user-selected paths may be dead mounts.
+    /// worktrees (detached ones included). Filesystem resolution happens on a
+    /// disposable thread because user-selected paths may be dead mounts.
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
-        let worktrees: Vec<_> = self
-            .refs(&repo_path)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| row.worktree_path.map(PathBuf::from))
-            .collect();
+        // One `git worktree list` rather than `refs()`, which runs several
+        // git commands to read one column.
+        let worktrees = self.worktree_paths(&repo_path).await.unwrap_or_default();
         disposable_worker("checkout-auth", move || {
             let candidate = std::fs::canonicalize(candidate).ok()?;
             std::iter::once(repo_path)
@@ -1304,7 +1349,18 @@ impl Repos {
     /// (dead mount, permission-gated folder) fails this listing without blocking
     /// anything else; the abandoned task unwinds on its own thread.
     pub async fn list_folders(&self, path: Option<String>) -> Result<FolderListing, EngineError> {
-        self.list_folders_with(path, FOLDER_LIST_TIMEOUT, false)
+        self.list_folders_opts(path, false).await
+    }
+
+    /// [`Self::list_folders`], optionally leaving files out (`dirs_only`): a
+    /// folder picker shows directories only, so files are skipped during the
+    /// walk instead of being collected, sorted and sent to be filtered out.
+    pub async fn list_folders_opts(
+        &self,
+        path: Option<String>,
+        dirs_only: bool,
+    ) -> Result<FolderListing, EngineError> {
+        self.list_folders_inner(path, dirs_only, FOLDER_LIST_TIMEOUT, false)
             .await
     }
 
@@ -1374,6 +1430,17 @@ impl Repos {
         timeout: Duration,
         hang_for_test: bool,
     ) -> Result<FolderListing, EngineError> {
+        self.list_folders_inner(path, false, timeout, hang_for_test)
+            .await
+    }
+
+    async fn list_folders_inner(
+        &self,
+        path: Option<String>,
+        dirs_only: bool,
+        timeout: Duration,
+        hang_for_test: bool,
+    ) -> Result<FolderListing, EngineError> {
         let target = match path.filter(|p| !p.trim().is_empty()) {
             Some(p) => absolutize(Path::new(&p)),
             None => home_dir(),
@@ -1387,7 +1454,7 @@ impl Repos {
                     // exit reclaims it) — the caller must hit its timeout.
                     std::thread::sleep(Duration::from_secs(3600));
                 }
-                let _ = tx.send(list_folders_blocking(&target));
+                let _ = tx.send(list_folders_blocking(&target, dirs_only));
             });
         if let Err(err) = spawned {
             return Err(EngineError::Other(format!("folder listing failed: {err}")));
@@ -1441,9 +1508,50 @@ async fn disposable_worker<T: Send + 'static>(
     rx.await.ok()
 }
 
-/// The blocking walk: ONE readdir of the target; `is_repo` is a cheap `.git`
-/// existence probe per directory entry.
-fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
+/// The blocking walk: ONE readdir of the target, then a `.git` existence probe
+/// for each directory that made the cut.
+fn list_folders_blocking(target: &Path, dirs_only: bool) -> Result<FolderListing, EngineError> {
+    let started = std::time::Instant::now();
+    let listing = list_folders_in(
+        target,
+        FolderWalk {
+            dirs_only,
+            max_entries: FOLDER_LIST_MAX_ENTRIES,
+            probe_workers: FOLDER_REPO_PROBE_WORKERS,
+            probe_budget: FOLDER_REPO_PROBE_BUDGET,
+        },
+        std::sync::Arc::new(|dir: &Path| dir.join(".git").exists()),
+    );
+    if let Ok(listing) = &listing {
+        // Host-side cost, separate from the relay round trip the phone sees.
+        tracing::debug!(
+            entries = listing.entries.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "folder listing"
+        );
+    }
+    listing
+}
+
+/// Limits for one [`list_folders_in`] walk.
+#[derive(Debug, Clone, Copy)]
+struct FolderWalk {
+    dirs_only: bool,
+    max_entries: usize,
+    probe_workers: usize,
+    probe_budget: Duration,
+}
+
+type RepoProbe = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+/// Enumerate, sort and cap the names first; probe for `.git` only in the
+/// directories that are returned. Probing every entry before the cap made a
+/// big folder pay for rows it then dropped, and one slow `stat` delayed all.
+fn list_folders_in(
+    target: &Path,
+    walk: FolderWalk,
+    is_repo: RepoProbe,
+) -> Result<FolderListing, EngineError> {
     let read = std::fs::read_dir(target).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
             EngineError::Other("Harness doesn't have access to this folder on the device.".into())
@@ -1452,31 +1560,114 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
     })?;
     let mut entries: Vec<FolderEntry> = Vec::new();
     for entry in read.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
+        let name = entry.file_name();
+        if name.as_encoded_bytes().first() == Some(&b'.') {
             continue;
         }
+        // `file_type` comes from the readdir record on macOS and Linux, so
+        // this costs no extra `stat`.
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let is_repo = is_dir && entry.path().join(".git").exists();
+        if walk.dirs_only && !is_dir {
+            continue;
+        }
         entries.push(FolderEntry {
-            name,
+            name: name.to_string_lossy().to_string(),
             is_dir,
-            is_repo,
+            is_repo: false,
         });
     }
     // Directories first, each group name-sorted (case-insensitive).
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    let truncated = entries.len() > FOLDER_LIST_MAX_ENTRIES;
-    entries.truncate(FOLDER_LIST_MAX_ENTRIES);
+    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
+    let truncated = entries.len() > walk.max_entries;
+    entries.truncate(walk.max_entries);
+
+    let dirs: Vec<usize> = (0..entries.len()).filter(|&i| entries[i].is_dir).collect();
+    let paths: Vec<PathBuf> = dirs
+        .iter()
+        .map(|&i| target.join(&entries[i].name))
+        .collect();
+    let flags = probe_repos(paths, walk.probe_workers, walk.probe_budget, is_repo);
+    for (&i, flag) in dirs.iter().zip(flags) {
+        entries[i].is_repo = flag;
+    }
     Ok(FolderListing {
         path: target.to_string_lossy().to_string(),
         entries,
         truncated,
     })
+}
+
+/// Run `probe` over `paths` on up to `workers` detached threads and wait at
+/// most `budget` for them. A path whose probe hasn't answered in time reads
+/// `false`; its thread is abandoned (a `stat` wedged in the kernel can't be
+/// cancelled) and stops taking new paths.
+fn probe_repos(
+    paths: Vec<PathBuf>,
+    workers: usize,
+    budget: Duration,
+    probe: RepoProbe,
+) -> Vec<bool> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    let total = paths.len();
+    let mut flags = vec![false; total];
+    if total == 0 {
+        return flags;
+    }
+    let deadline = std::time::Instant::now() + budget;
+    let paths = Arc::new(paths);
+    let next = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, bool)>();
+    let mut spawned = 0;
+    for _ in 0..workers.clamp(1, total) {
+        let (paths, next, stop, probe, tx) = (
+            paths.clone(),
+            next.clone(),
+            stop.clone(),
+            probe.clone(),
+            tx.clone(),
+        );
+        let worker = std::thread::Builder::new()
+            .name("folder-repo-probe".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = paths.get(i) else { break };
+                    if tx.send((i, probe(path))).is_err() {
+                        break;
+                    }
+                }
+            });
+        if worker.is_ok() {
+            spawned += 1;
+        }
+    }
+    drop(tx);
+    if spawned == 0 {
+        // No threads to be had: probe inline rather than lose every badge.
+        for (i, path) in paths.iter().enumerate() {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            flags[i] = probe(path);
+        }
+        return flags;
+    }
+    let mut answered = 0;
+    while answered < total {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((i, flag)) => {
+                flags[i] = flag;
+                answered += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    flags
 }
 
 /// The blocking drive walk. Best-effort everywhere: the list is navigation
@@ -2582,6 +2773,130 @@ tmpfs /run tmpfs rw 0 0
         );
     }
 
+    async fn fixture_git(cwd: &Path, args: &[&str]) {
+        let output = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .output()
+            .await
+            .expect("git spawns");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_checkout_accepts_every_linked_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        let branch = tmp.path().join("branch");
+        let detached = tmp.path().join("detached");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).expect("repo dir");
+        std::fs::create_dir_all(&elsewhere).expect("unrelated dir");
+        fixture_git(&root, &["init", "-q", "-b", "main"]).await;
+        fixture_git(&root, &["commit", "-q", "--allow-empty", "-m", "initial"]).await;
+        fixture_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                &branch.to_string_lossy(),
+            ],
+        )
+        .await;
+        fixture_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &detached.to_string_lossy(),
+            ],
+        )
+        .await;
+        let data = tmp.path().join("data");
+        let repos = Repos::with_worktrees_root(&data, "device", data.join("worktrees"));
+
+        for checkout in [&root, &branch, &detached] {
+            assert_eq!(
+                repos.workspace_checkout(&root, checkout).await,
+                std::fs::canonicalize(checkout).ok(),
+                "{}",
+                checkout.display()
+            );
+        }
+        // A newline in a worktree's path must not smuggle in another entry.
+        #[cfg(unix)]
+        {
+            let forged = tmp
+                .path()
+                .join(format!("forged\nworktree {}", elsewhere.display()));
+            fixture_git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    &forged.to_string_lossy(),
+                ],
+            )
+            .await;
+        }
+        assert!(repos.workspace_checkout(&root, &elsewhere).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn checkout_identity_resolves_root_and_git_dir_in_one_call() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(root.join("nested")).expect("repo dir");
+        fixture_git(&root, &["init", "-q", "-b", "main"]).await;
+        fixture_git(&root, &["commit", "-q", "--allow-empty", "-m", "initial"]).await;
+        fixture_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &linked.to_string_lossy(),
+            ],
+        )
+        .await;
+        let data = tmp.path().join("data");
+        let repos = Repos::with_worktrees_root(&data, "device", data.join("worktrees"));
+
+        let main = repos
+            .checkout_identity(&root.join("nested"))
+            .await
+            .expect("main identity");
+        assert_eq!(main.root, std::fs::canonicalize(&root).unwrap());
+        assert_eq!(
+            main.git_dir,
+            std::fs::canonicalize(root.join(".git")).unwrap()
+        );
+        let worktree = repos
+            .checkout_identity(&linked)
+            .await
+            .expect("linked identity");
+        assert_eq!(worktree.root, std::fs::canonicalize(&linked).unwrap());
+        assert!(worktree.git_dir.starts_with(main.git_dir.join("worktrees")));
+        assert_ne!(main.id, worktree.id);
+    }
+
     #[tokio::test]
     async fn concurrent_searches_of_one_checkout_do_not_cancel_each_other() {
         let data = tempfile::tempdir().unwrap();
@@ -2597,5 +2912,159 @@ tmpfs /run tmpfs rw 0 0
 
         assert_eq!(alpha.unwrap()[0].path, "alpha.rs");
         assert_eq!(beta.unwrap()[0].path, "beta.rs");
+    }
+
+    // ── ListFolders walk (#420) ─────────────────────────────────────────────
+
+    fn folder_walk(dirs_only: bool, max_entries: usize, workers: usize) -> FolderWalk {
+        FolderWalk {
+            dirs_only,
+            max_entries,
+            probe_workers: workers,
+            probe_budget: Duration::from_secs(30),
+        }
+    }
+
+    /// A `.git` probe that records which directories it was asked about.
+    fn counting_probe(
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        delay: Duration,
+    ) -> RepoProbe {
+        std::sync::Arc::new(move |dir: &Path| {
+            std::thread::sleep(delay);
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            seen.lock().unwrap().push(name.clone());
+            name.ends_with("-repo")
+        })
+    }
+
+    #[test]
+    fn folder_walk_probes_only_the_directories_it_returns() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            std::fs::create_dir(root.path().join(format!("dir-{i:02}"))).unwrap();
+            std::fs::write(root.path().join(format!("file-{i:02}.txt")), "").unwrap();
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listing = list_folders_in(
+            root.path(),
+            folder_walk(false, 20, 4),
+            counting_probe(seen.clone(), Duration::ZERO),
+        )
+        .unwrap();
+        assert!(listing.truncated);
+        assert_eq!(listing.entries.len(), 20);
+        // The 10 directories cut by the cap, and every file, are never probed.
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        let expected: Vec<String> = (0..20).map(|i| format!("dir-{i:02}")).collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn folder_walk_dirs_only_skips_files_before_the_cap() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            std::fs::write(root.path().join(format!("a-file-{i:02}.txt")), "").unwrap();
+        }
+        std::fs::create_dir(root.path().join("zeta-repo")).unwrap();
+        std::fs::create_dir(root.path().join("Alpha")).unwrap();
+        std::fs::create_dir(root.path().join(".hidden")).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listing = list_folders_in(
+            root.path(),
+            folder_walk(true, 10, 4),
+            counting_probe(seen, Duration::ZERO),
+        )
+        .unwrap();
+        let rows: Vec<(&str, bool, bool)> = listing
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.is_dir, e.is_repo))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("Alpha", true, false), ("zeta-repo", true, true)]
+        );
+        // 50 files would have filled a cap of 10; skipped, they don't count.
+        assert!(!listing.truncated);
+    }
+
+    /// Shape of the fix: with a slow `stat` (a network mount), probing in
+    /// parallel is several times faster than probing one directory at a time.
+    #[test]
+    fn folder_walk_parallel_probes_beat_sequential_on_slow_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..48 {
+            std::fs::create_dir(root.path().join(format!("dir-{i:02}"))).unwrap();
+        }
+        let time = |workers: usize| {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let started = std::time::Instant::now();
+            let listing = list_folders_in(
+                root.path(),
+                folder_walk(true, 500, workers),
+                counting_probe(seen.clone(), Duration::from_millis(10)),
+            )
+            .unwrap();
+            assert_eq!(listing.entries.len(), 48);
+            assert_eq!(seen.lock().unwrap().len(), 48);
+            started.elapsed()
+        };
+        let sequential = time(1);
+        let parallel = time(FOLDER_REPO_PROBE_WORKERS);
+        assert!(
+            parallel * 3 < sequential,
+            "parallel {parallel:?} vs sequential {sequential:?}"
+        );
+    }
+
+    /// A probe wedged on one directory costs the listing its budget, not the
+    /// whole listing: names come back, that directory just lacks its badge.
+    #[test]
+    fn folder_walk_wedged_probe_returns_names_within_budget() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("ok-repo")).unwrap();
+        std::fs::create_dir(root.path().join("wedged-repo")).unwrap();
+        let probe: RepoProbe = std::sync::Arc::new(|dir: &Path| {
+            if dir.ends_with("wedged-repo") {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            true
+        });
+        let started = std::time::Instant::now();
+        let listing = list_folders_in(
+            root.path(),
+            FolderWalk {
+                probe_budget: Duration::from_millis(200),
+                ..folder_walk(true, 500, 2)
+            },
+            probe,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let rows: Vec<(&str, bool)> = listing
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.is_repo))
+            .collect();
+        assert_eq!(rows, vec![("ok-repo", true), ("wedged-repo", false)]);
+    }
+
+    #[tokio::test]
+    async fn list_folders_opts_dirs_only_matches_default_minus_files() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("beta/.git")).unwrap();
+        std::fs::create_dir(root.path().join("alpha")).unwrap();
+        std::fs::write(root.path().join("aaa.txt"), "x").unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let path = Some(root.path().to_string_lossy().to_string());
+        let all = repos.list_folders(path.clone()).await.unwrap();
+        let dirs = repos.list_folders_opts(path, true).await.unwrap();
+        let expected: Vec<FolderEntry> = all.entries.into_iter().filter(|e| e.is_dir).collect();
+        assert_eq!(dirs.entries, expected);
+        assert!(dirs.entries.iter().any(|e| e.name == "beta" && e.is_repo));
     }
 }

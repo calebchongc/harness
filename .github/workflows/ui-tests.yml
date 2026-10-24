@@ -79,8 +79,18 @@ jobs:
         background: true
         run: |
           # Only Ubuntu packages are needed; unrelated runner repositories can be out of sync.
-          sudo apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
-          sudo apt-get install -y -qq \
+          # A mirror that stops answering used to hang this step until the job
+          # timed out; give each attempt a deadline and retry.
+          apt() {
+            for attempt in 1 2 3; do
+              sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0
+              echo "apt-get $1: attempt $attempt failed" >&2
+              sleep 10
+            done
+            return 1
+          }
+          apt update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
+          apt install -y -qq \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
@@ -260,8 +270,18 @@ jobs:
         background: true
         run: |
           # Only Ubuntu packages are needed; unrelated runner repositories can be out of sync.
-          sudo apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
-          sudo apt-get install -y -qq \
+          # A mirror that stops answering used to hang this step until the job
+          # timed out; give each attempt a deadline and retry.
+          apt() {
+            for attempt in 1 2 3; do
+              sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0
+              echo "apt-get $1: attempt $attempt failed" >&2
+              sleep 10
+            done
+            return 1
+          }
+          apt update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
+          apt install -y -qq \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev \
             libfreetype-dev libasound2-dev libvulkan-dev pkg-config cmake \

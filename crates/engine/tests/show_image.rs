@@ -37,6 +37,7 @@ fn done(status: DoneStatus) -> AgentEvent {
 
 fn run_request(cwd: &std::path::Path) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: "work".into(),
         harness: None,
         model: None,

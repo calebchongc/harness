@@ -387,7 +387,7 @@ struct FolderEntry: Codable, Hashable {
     var isRepo: Bool
 }
 
-struct FolderListing: Codable {
+struct FolderListing: Codable, Equatable {
     var path: String
     var entries: [FolderEntry]
     var truncated: Bool
