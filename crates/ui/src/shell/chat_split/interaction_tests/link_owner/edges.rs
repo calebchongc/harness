@@ -2,6 +2,7 @@ use super::*;
 use crate::markdown::render::LinkUi;
 
 mod cached;
+mod closure;
 mod destinations;
 mod guards;
 mod lifecycle;

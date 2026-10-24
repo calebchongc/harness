@@ -2749,6 +2749,7 @@ impl Shell {
         }
         self.prune_file_explorers(cx);
         self.prune_browser_surfaces(cx);
+        self.prune_subagent_surfaces(cx);
         self.chat_split_on_state_changed(cx);
         self.maybe_auto_download_update(cx);
         if let Some(chat_id) = state.update(cx, |state, _| state.take_linked_chat()) {
@@ -4338,13 +4339,42 @@ impl Shell {
         // a frozen one reads top-down.
         let transcript =
             cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), !frozen, cx));
-        let links = Self::session_links(Some(chat_id.clone()), cx);
+        // Menus retain their handler after a tab closes. Bind it to this
+        // registration, not just a root chat that may still be on screen.
+        let shell = cx.weak_entity();
+        let source_id = transcript.entity_id();
+        let owner = chat_id.clone();
+        let links = crate::markdown::render::LinkUi {
+            source_session: Some(chat_id.clone()),
+            handler: std::rc::Rc::new(move |activation, window, cx| {
+                use crate::markdown::render::LinkOutcome;
+                shell
+                    .update(cx, |shell, cx| {
+                        if activation.source_session.as_deref() != Some(owner.as_str())
+                            || !shell
+                                .subagent_tabs
+                                .get(&id)
+                                .is_some_and(|tab| tab.transcript.entity_id() == source_id)
+                            || !shell
+                                .right_tabs
+                                .get(&owner)
+                                .is_some_and(|tabs| tabs.contains(&RightSurface::Subagent(id)))
+                        {
+                            return LinkOutcome::Rejected;
+                        }
+                        shell.activate_session_link(activation, window, cx)
+                    })
+                    .unwrap_or(LinkOutcome::Rejected)
+            }),
+        };
         let views = Self::view_opener(cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links);
             transcript.set_view_opener(views);
         });
         let events = cx.subscribe(&transcript, Self::on_transcript_event);
+        self.state
+            .update(cx, |state, _| state.retain_subagent_doc(&doc_id));
         let fetch = if frozen {
             self.spawn_subagent_snapshot_fetch(&chat_id, &doc_id, cx)
         } else {
@@ -4380,6 +4410,14 @@ impl Shell {
         doc_id: &str,
         cx: &mut Context<Self>,
     ) -> Option<Task<()>> {
+        // A legacy child ID can also identify a real chat. A frozen blob
+        // must not replace that chat's live shared rows or cancel its watch.
+        if self.state.read(cx).doc_has_chat_consumer(doc_id) {
+            self.state.update(cx, |state, cx| {
+                state.watch_subagent_doc(doc_id.to_owned(), cx)
+            });
+            return None;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.state
                 .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
@@ -4483,6 +4521,52 @@ impl Shell {
         }
     }
 
+    fn release_subagent_surface(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.subagent_tabs.remove(&id) else {
+            return;
+        };
+        self.state
+            .update(cx, |state, _| state.unwatch_subagent_doc(&tab.doc_id));
+        let surface = RightSurface::Subagent(id);
+        let owners: Vec<_> = self
+            .right_tabs
+            .iter_mut()
+            .filter_map(|(owner, tabs)| {
+                let present = tabs.contains(&surface);
+                tabs.retain(|tab| *tab != surface);
+                present.then(|| owner.clone())
+            })
+            .collect();
+        for owner in owners {
+            self.panels.update(&owner, |panel| {
+                if panel.right_active == surface {
+                    panel.right_active = RightSurface::Picker;
+                }
+            });
+            self.collapse_surfaces_if_empty(&owner, cx);
+        }
+        // Dropping the registration also cancels any pending snapshot fetch.
+        cx.notify();
+    }
+
+    fn prune_subagent_surfaces(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if !state.chats_synced {
+            return;
+        }
+        let stale: Vec<_> = self
+            .subagent_tabs
+            .iter()
+            .filter_map(|(&id, tab)| {
+                let owner = tab.transcript.read(cx).link_ui()?.source_session?;
+                (!state.chats.iter().any(|chat| chat.id == owner)).then_some(id)
+            })
+            .collect();
+        for id in stale {
+            self.release_subagent_surface(id, cx);
+        }
+    }
+
     /// A surface tab's ✕. The active fallback happens naturally through
     /// [`Self::resolved_right_active`] on the next frame.
     fn close_right_surface(
@@ -4495,6 +4579,10 @@ impl Shell {
             if self.release_browser_surface(id, cx) {
                 window.focus(&self.composer.focus_handle(cx), cx);
             }
+            return;
+        }
+        if let RightSurface::Subagent(id) = surface {
+            self.release_subagent_surface(id, cx);
             return;
         }
         let key = self.panel_key(cx);
@@ -4529,14 +4617,7 @@ impl Shell {
                 let panel = self.right_terminal_panel(cx);
                 panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
             }
-            RightSurface::Subagent(id) => {
-                // Unwatch drops the watch task — that cancels the engine-side
-                // watch and unpins the subagent doc from the engine LRU.
-                if let Some(tab) = self.subagent_tabs.remove(&id) {
-                    self.state
-                        .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
-                }
-            }
+            RightSurface::Subagent(_) => unreachable!("subagent surfaces are released above"),
             RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
