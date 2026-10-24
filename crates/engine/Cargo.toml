@@ -34,6 +34,7 @@ gethostname.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 sha2.workspace = true
 reqwest.workspace = true
+tokio-tungstenite.workspace = true
 ignore.workspace = true
 nucleo-matcher.workspace = true
 # browse Connected apps (browse_link): P-256 ECDSA request signing.
