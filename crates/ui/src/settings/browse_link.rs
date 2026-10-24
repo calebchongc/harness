@@ -115,6 +115,16 @@ impl BrowseLinkCard {
         }));
     }
 
+    /// Fixture only: show `status` and stop asking the engine.
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_status(&mut self, status: BrowseLinkStatus, cx: &mut Context<Self>) {
+        self.task = None;
+        self.busy = false;
+        self.error = None;
+        self.status = Some(status);
+        cx.notify();
+    }
+
     fn connect(&mut self, cx: &mut Context<Self>) {
         let Some(call) = self.call(cx, methods::BROWSE_LINK_PAIR) else {
             return;

@@ -383,6 +383,9 @@ pub struct AccountsPage {
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     browse: Entity<crate::settings::browse_link::BrowseLinkCard>,
+    /// Fixture only: the page as it was before the browse card.
+    #[cfg(feature = "appshots-fixture")]
+    hide_browse: bool,
     _observe: Subscription,
     _code_events: Subscription,
 }
@@ -431,6 +434,8 @@ impl AccountsPage {
             action_task: None,
             poll_task: None,
             browse,
+            #[cfg(feature = "appshots-fixture")]
+            hide_browse: false,
             _observe: observe,
             _code_events: code_events,
         };
@@ -1573,6 +1578,21 @@ impl AccountsPage {
             })
             .ok();
         }));
+        cx.notify();
+    }
+
+    /// browse Connected apps QA: the card in a made-up state, or hidden.
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_browse_link(
+        &mut self,
+        status: Option<crate::settings::browse_link::BrowseLinkStatus>,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide_browse = status.is_none();
+        if let Some(status) = status {
+            self.browse
+                .update(cx, |card, cx| card.fixture_status(status, cx));
+        }
         cx.notify();
     }
 
@@ -3172,6 +3192,8 @@ impl Render for AccountsPage {
         // browse runs on this Mac and pairs with this device's engine only:
         // the card would misstate another device's pairing.
         let show_browse = cfg!(target_os = "macos") && !self.target_is_remote(cx);
+        #[cfg(feature = "appshots-fixture")]
+        let show_browse = show_browse && !self.hide_browse;
         div()
             .id("accounts-page-host")
             .relative()
