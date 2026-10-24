@@ -8,4 +8,7 @@ test {
     _ = @import("app.zig");
     _ = @import("release.zig");
     _ = @import("view.zig");
+    _ = @import("markdown.zig");
+    _ = @import("markdown_html.zig");
+    _ = @import("highlight.zig");
 }

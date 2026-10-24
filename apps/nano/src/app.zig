@@ -46,9 +46,17 @@ pub const App = struct {
     /// The view's clock, as of its last frame.
     now: f64 = 0,
     dark: ?bool = null,
-    /// The agent a new chat runs, until the composer has a picker
-    /// (`HARNESS_NANO_HARNESS`, e.g. `mock` against a test engine).
-    new_chat_harness: []const u8 = "graff",
+    /// This engine's device: a space added here is this device's folder.
+    device_id: ?[]u8 = null,
+    /// The agents to pick from, and the models the picked one offers.
+    harnesses: workspace.Harnesses,
+    models: workspace.Models,
+    /// The agent and model a new chat runs (owned); `HARNESS_NANO_HARNESS`
+    /// starts with another agent (`mock` against a test engine).
+    new_harness: []u8 = &.{},
+    new_model: ?[]u8 = null,
+    /// Which picker is open over the composer.
+    picker: enum { none, harness, model } = .none,
     /// The newest Harness release, asked of GitHub over HTTP/2.
     release: @import("release.zig").Check,
 
@@ -61,6 +69,8 @@ pub const App = struct {
             .chats = .init(gpa),
             .sessions = .init(gpa),
             .transcript = .{ .gpa = gpa },
+            .harnesses = .init(gpa),
+            .models = .init(gpa),
             .release = .{ .gpa = gpa, .io = io },
         };
     }
@@ -79,6 +89,59 @@ pub const App = struct {
         a.transcript.deinit();
         if (a.selected) |s| a.gpa.free(s);
         if (a.space) |s| a.gpa.free(s);
+        if (a.device_id) |d| a.gpa.free(d);
+        if (a.new_model) |m| a.gpa.free(m);
+        a.gpa.free(a.new_harness);
+        a.harnesses.deinit();
+        a.models.deinit();
+    }
+
+    /// The agent new chats start with.
+    pub fn setHarness(a: *App, id: []const u8) void {
+        const copy = a.gpa.dupe(u8, id) catch return;
+        a.gpa.free(a.new_harness);
+        a.new_harness = copy;
+        a.setModel(null);
+        a.models.replace(.{ .array = .init(a.gpa) }) catch {};
+        a.picker = .none;
+        if (a.engine.state == .connected) a.call("ListModels", .{ .harness = id }, .of(App, a, onModels));
+        a.redraw();
+    }
+
+    /// The model new chats start with; null is the agent's default.
+    pub fn setModel(a: *App, id: ?[]const u8) void {
+        if (a.new_model) |m| a.gpa.free(m);
+        a.new_model = if (id) |m| a.gpa.dupe(u8, m) catch null else null;
+        a.picker = .none;
+        a.redraw();
+    }
+
+    pub fn harnessName(a: *const App, id: []const u8) []const u8 {
+        for (a.harnesses.items) |h| if (std.mem.eql(u8, h.id, id)) return h.name;
+        return id;
+    }
+
+    pub fn modelLabel(a: *const App, id: ?[]const u8) []const u8 {
+        const want = id orelse return "Default model";
+        for (a.models.items) |m| if (std.mem.eql(u8, m.id, want)) return m.label;
+        return want;
+    }
+
+    /// Asks for a folder and adds it as a space on this device, as the
+    /// GPUI app's "Add folder" does (`createSpace`).
+    pub fn addFolder(a: *App) void {
+        const device = a.device_id orelse return a.setNotice("The engine hasn't said which device it is yet.");
+        const picked = nanoui.dialog.open(a.gpa, .{ .title = "Add a folder", .button = "Add", .files = false, .directories = true }) catch return;
+        const paths = picked orelse return;
+        defer nanoui.dialog.freePaths(a.gpa, paths);
+        if (paths.len == 0) return;
+        var buf: [36]u8 = undefined;
+        const id = uuid(a.io, &buf);
+        var git_buf: [4096]u8 = undefined;
+        const git_path = std.fmt.bufPrint(&git_buf, "{s}/.git", .{paths[0]}) catch "";
+        const git = std.Io.Dir.cwd().access(a.io, git_path, .{}) != error.FileNotFound;
+        a.call("Mutate", .{ .op = "createSpace", .spaceId = id, .deviceId = device, .path = paths[0], .gitDetected = git }, .of(App, a, onNotice));
+        a.select(null, id);
     }
 
     pub fn releaseCame(ctx: *anyopaque) void {
@@ -94,7 +157,9 @@ pub const App = struct {
         const a: *App = @ptrCast(@alignCast(ctx.?));
         switch (s) {
             .connected => {
-                a.call("EngineInfo", rpc.empty, .of(App, a, onNotice));
+                a.call("EngineInfo", rpc.empty, .of(App, a, onEngineInfo));
+                a.call("ListHarnesses", rpc.empty, .of(App, a, onHarnesses));
+                a.call("ListModels", .{ .harness = a.new_harness }, .of(App, a, onModels));
                 a.call("EngineReady", rpc.empty, .of(App, a, onNotice));
                 a.watchSidebar();
                 if (a.selected != null) a.watchDoc(true);
@@ -187,6 +252,35 @@ pub const App = struct {
         a.redraw();
     }
 
+    fn onEngineInfo(a: *App, _: u64, r: rpc.Reply) void {
+        const v = switch (r) {
+            .ok => |v| v,
+            else => return,
+        };
+        if (v != .object) return;
+        const id = v.object.get("deviceId") orelse return;
+        if (id != .string) return;
+        if (a.device_id) |d| a.gpa.free(d);
+        a.device_id = a.gpa.dupe(u8, id.string) catch null;
+    }
+
+    fn onHarnesses(a: *App, _: u64, r: rpc.Reply) void {
+        switch (r) {
+            .ok => |v| a.harnesses.replace(v) catch {},
+            .err => |e| a.setNotice(e),
+            else => {},
+        }
+        a.redraw();
+    }
+
+    fn onModels(a: *App, _: u64, r: rpc.Reply) void {
+        switch (r) {
+            .ok => |v| a.models.replace(v) catch {},
+            else => {},
+        }
+        a.redraw();
+    }
+
     fn onNotice(a: *App, _: u64, r: rpc.Reply) void {
         switch (r) {
             .err => |e| {
@@ -269,12 +363,13 @@ pub const App = struct {
             const id = uuid(a.io, &chat_buf);
             const space = a.findSpace(a.space) orelse if (a.spaces.items.len > 0) a.spaces.items[0] else null;
             if (space) |s| cwd = s.path;
-            harness = a.new_chat_harness;
+            harness = a.new_harness;
+            model = a.new_model;
             a.call("Mutate", .{
                 .op = "createChat",
                 .chatId = id,
                 .spaceId = if (space) |s| s.id else null,
-                .config = .{ .harness = a.new_chat_harness, .modelOptions = rpc.empty, .sandbox = "workspace-write" },
+                .config = .{ .harness = a.new_harness, .model = a.new_model, .modelOptions = rpc.empty, .sandbox = "workspace-write" },
             }, .of(App, a, onNotice));
             break :blk id;
         };

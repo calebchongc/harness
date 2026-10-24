@@ -7,6 +7,7 @@ const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const workspace = @import("workspace.zig");
 const transcript_view = @import("view_transcript.zig");
+const picker = @import("view_picker.zig");
 const App = @import("app.zig").App;
 
 const sidebar_w = 264;
@@ -31,8 +32,9 @@ pub fn view(a: *App, c: *ui.Context) void {
     composer(c, a, k);
 }
 
-/// ⌘N starts a new chat; ⌘↩ sends.
+/// ⌘N starts a new chat; ⌘↩ sends; Escape closes a picker.
 fn keys(c: *ui.Context, a: *App) void {
+    if (c.shortcut(.{ .key = ui.Shortcut.escape })) a.picker = .none;
     if (c.shortcut(.{ .key = 'n', .cmd = true })) a.select(null, null);
     if (c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true })) a.send();
 }
@@ -56,6 +58,15 @@ fn sidebar(c: *ui.Context, a: *App, k: theme.Colors) void {
         if (row.clicked()) a.select(null, null);
         ui.icon(c, "square.and.pencil", .{ .size = 13, .frame = 16, .color = k.muted });
         ui.text(c, "New chat", .{ .color = k.text });
+    }
+    {
+        const pad = ui.div(c).column().wFull().px(8).pb(6);
+        defer pad.end();
+        const row = ui.div(c).row().wFull().px(10).py(7).gap(8).itemsCenter().rounded(7).hover(k.hover);
+        defer row.end();
+        if (row.clicked()) a.addFolder();
+        ui.icon(c, "folder.badge.plus", .{ .size = 13, .frame = 16, .color = k.muted });
+        ui.text(c, "Add folder", .{ .color = k.text });
     }
     ui.scroll(c, .{ .grow = 1, .width = .fill, .padding = .xy(8, 0), .gap = 2 });
     defer ui.end(c);
@@ -166,6 +177,7 @@ fn header(c: *ui.Context, a: *App, k: theme.Colors) void {
 fn composer(c: *ui.Context, a: *App, k: theme.Colors) void {
     const outer = ui.div(c).column().wFull().px(20).pb(16).gap(6);
     defer outer.end();
+    if (a.selected == null) picker.list(c, a, k) else a.picker = .none;
     const frame = ui.div(c).column().wFull().bg(k.card).border(k.border).borderW(1).rounded(12).px(12).pt(10).pb(8).gap(8);
     defer frame.end();
     const r = ui.textField(c, &a.composer, .{
@@ -178,6 +190,7 @@ fn composer(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (r.submitted) a.send();
     const row = ui.div(c).row().wFull().gap(8).itemsCenter();
     defer row.end();
+    if (a.selected == null) picker.buttons(c, a, k);
     if (a.noticeText()) |n| ui.text(c, n, .{ .size = 11, .color = k.danger }) else ui.text(c, "Return to send · Shift-Return for a new line", .{ .size = 11, .color = k.faint });
     ui.spacer(c);
     const working = a.selectedStatus() == .working;

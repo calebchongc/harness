@@ -22,6 +22,14 @@ pub const Colors = struct {
     hover: Color,
     /// The selected chat in the sidebar.
     selected: Color,
+    /// Markdown: code panels and their headers, inline code, a quote's
+    /// bar, a table's every other row, and code's colors.
+    code_bg: Color,
+    code_header: Color,
+    code_inline_bg: Color,
+    quote: Color,
+    zebra: Color,
+    syntax: [6]Color,
 };
 
 const white: Color = .{ .r = 1, .g = 1, .b = 1 };
@@ -47,6 +55,12 @@ pub fn colors(dark: bool) Colors {
             .border = bg.mix(white, 0.10),
             .hover = white.alpha(0.05),
             .selected = bg.mix(accent, 0.22),
+            .code_bg = bg.mix(black, 0.28),
+            .code_header = .hex(0x1f1c16),
+            .code_inline_bg = .hex(0x2a261e),
+            .quote = .hex(0xbd80e4),
+            .zebra = bg.mix(white, 0.07),
+            .syntax = .{ .hex(0x5c564b), .hex(0xe8a33d), .hex(0x7fa86b), .hex(0xd9a441), .hex(0xedeae2), .hex(0xe8a33d) },
         };
     }
     const bg = Color.hex(0xfaf8f3);
@@ -67,6 +81,12 @@ pub fn colors(dark: bool) Colors {
         .border = bg.mix(black, 0.10),
         .hover = black.alpha(0.04),
         .selected = bg.mix(accent, 0.12),
+        .code_bg = .hex(0xf0ece3),
+        .code_header = .hex(0xe7e1d5),
+        .code_inline_bg = .hex(0xe7e1d5),
+        .quote = .hex(0x7a4ea3),
+        .zebra = bg.mix(black, 0.05),
+        .syntax = .{ .hex(0xa8a090), .hex(0xc77d20), .hex(0x5c7e47), .hex(0x9a6e1b), .hex(0x1a1813), .hex(0xc77d20) },
     };
 }
 

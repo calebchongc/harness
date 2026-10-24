@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
     defer app.destroy();
     var a: App = .init(init.gpa, init.io, Engine.portFrom(init.environ_map));
     defer a.deinit();
-    if (init.environ_map.get("HARNESS_NANO_HARNESS")) |h| a.new_chat_harness = h;
+    a.new_harness = try init.gpa.dupe(u8, init.environ_map.get("HARNESS_NANO_HARNESS") orelse "graff");
     a.window = try app.newWindow(.{
         .title = "Harness",
         .width = 1200,

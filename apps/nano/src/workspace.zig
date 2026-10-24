@@ -65,7 +65,24 @@ pub fn List(comptime T: type, comptime parse: fn (Allocator, json.ObjectMap) ?T)
     };
 }
 
+/// An agent the engine can run (`HarnessDescriptor`, crates/engine/src/registry.rs).
+pub const Harness = struct {
+    id: []const u8,
+    name: []const u8,
+    /// Offered for new chats: enabled, or (from an engine that doesn't say)
+    /// installed and one of graff, Codex, Claude Code.
+    offered: bool,
+};
+
+/// A model an agent offers (`Model`, crates/proto/src/agent.rs).
+pub const Model = struct {
+    id: []const u8,
+    label: []const u8,
+};
+
 pub const Spaces = List(Space, parseSpace);
+pub const Harnesses = List(Harness, parseHarness);
+pub const Models = List(Model, parseModel);
 pub const Chats = List(Chat, parseChat);
 pub const Sessions = List(Session, parseSession);
 
@@ -99,6 +116,19 @@ fn parseChat(a: Allocator, o: json.ObjectMap) ?Chat {
         .model = if (config) |c| str(a, c, "model") else null,
         .cwd = str(a, o, "cwd"),
     };
+}
+
+fn parseHarness(a: Allocator, o: json.ObjectMap) ?Harness {
+    const id = str(a, o, "id") orelse return null;
+    const installed = if (o.get("installed")) |v| v == .bool and v.bool else false;
+    const offered = if (o.get("enabled")) |v| v == .bool and v.bool else installed and
+        (std.mem.eql(u8, id, "graff") or std.mem.eql(u8, id, "codex") or std.mem.eql(u8, id, "claude-code"));
+    return .{ .id = id, .name = str(a, o, "name") orelse id, .offered = offered };
+}
+
+fn parseModel(a: Allocator, o: json.ObjectMap) ?Model {
+    const id = str(a, o, "id") orelse return null;
+    return .{ .id = id, .label = str(a, o, "label") orelse id };
 }
 
 fn parseSession(a: Allocator, o: json.ObjectMap) ?Session {
@@ -162,6 +192,20 @@ test "a space without a name takes its folder's" {
     defer parsed.deinit();
     try spaces.replace(parsed.value);
     try testing.expectEqualStrings("harness", spaces.items[0].name);
+}
+
+test "harnesses offered: enabled, else installed and one of the three" {
+    var hs: Harnesses = .init(testing.allocator);
+    defer hs.deinit();
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator,
+        \\[{"id":"mock","name":"Mock","installed":true,"enabled":false},{"id":"graff","name":"graff","installed":true},
+        \\ {"id":"pi","name":"Pi","installed":true}]
+    , .{});
+    defer parsed.deinit();
+    try hs.replace(parsed.value);
+    try testing.expect(!hs.items[0].offered);
+    try testing.expect(hs.items[1].offered);
+    try testing.expect(!hs.items[2].offered);
 }
 
 test "sessions map statuses" {

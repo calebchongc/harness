@@ -51,7 +51,7 @@ fn assistant(c: *ui.Context, k: theme.Colors, e: *const tr.Entry) void {
     for (e.parts.items) |*p| {
         ui.key(c, c.print("part-{s}-{s}", .{ e.id, p.id }));
         switch (p.kind) {
-            .text => ui.text(c, p.text.items, .{ .wrap = true, .color = k.text, .leading = 1.4 }),
+            .text => @import("view_markdown.zig").markdown(c, k, p.text.items),
             .reasoning => {
                 const t = p.text.items;
                 const shown = t[0..@min(t.len, reasoning_cap)];
