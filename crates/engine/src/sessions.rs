@@ -322,6 +322,9 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// browse Connected apps: gives runs a `browse` MCP server while browse
+    /// is paired and running (wired at engine assembly; absent in bare tests).
+    browse_link: OnceLock<Arc<crate::browse_link::BrowseLink>>,
     /// The version this boot updated Harness to, when the last boot recorded
     /// an older one (`RunJournal::note_boot_version`). Names the update in
     /// the note on a run the restart cut short.
@@ -382,6 +385,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                browse_link: OnceLock::new(),
                 boot_update: OnceLock::new(),
             }),
         }
@@ -422,6 +426,11 @@ impl SessionsEngine {
     /// Wire the turn-start listener (called once at engine assembly).
     pub fn set_turn_listener(&self, listener: TurnListener) {
         let _ = self.inner.turn_listener.set(listener);
+    }
+
+    /// Wire browse Connected apps (called once at engine assembly).
+    pub fn set_browse_link(&self, link: Arc<crate::browse_link::BrowseLink>) {
+        let _ = self.inner.browse_link.set(link);
     }
 
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
@@ -782,6 +791,12 @@ impl SessionsEngine {
             })
         };
         let interrupt_token = CancellationToken::new();
+        // browse, while paired and running: this run's own pages, closed
+        // when it ends (`remove_run`).
+        let mcp_servers = match self.inner.browse_link.get() {
+            Some(link) => link.mcp_server_for_run(&run_id).await.into_iter().collect(),
+            None => Vec::new(),
+        };
         let controls = RunControls {
             origin: Some(harness_adapters::RunOrigin {
                 chat_id: chat_id.to_string(),
@@ -789,6 +804,7 @@ impl SessionsEngine {
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            mcp_servers,
         };
 
         lock(&self.inner.runs).insert(
@@ -2123,6 +2139,10 @@ impl Inner {
         let mut runs = lock(&self.runs);
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
             runs.remove(chat_id);
+        }
+        drop(runs);
+        if let Some(link) = self.browse_link.get() {
+            link.end_run(run_id);
         }
     }
 }

@@ -17,6 +17,7 @@ use harness_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod browse_link;
 pub mod change_requests;
 pub mod chat2_host;
 pub mod codegraff_auth;
@@ -341,6 +342,7 @@ impl EngineCore {
         sessions.set_turn_listener(Arc::new(move |chat_id, cwd| {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
+        sessions.set_browse_link(browse_link::BrowseLink::shared(data_dir));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
             sessions,

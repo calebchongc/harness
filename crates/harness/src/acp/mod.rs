@@ -2951,6 +2951,40 @@ fn prompt_turn(
     })
 }
 
+/// `session/new`'s `mcpServers`: Harness's own stdio servers (`base`, from
+/// [`harness_mcp_servers`]) and then the run's HTTP servers (the browse
+/// relay), the latter only for an agent that advertised
+/// `agentCapabilities.mcpCapabilities.http`.
+fn session_mcp_servers(base: Value, init: &Value, servers: &[crate::McpServer]) -> Value {
+    let mut all = match base {
+        Value::Array(entries) => entries,
+        _ => Vec::new(),
+    };
+    let http = init
+        .pointer("/agentCapabilities/mcpCapabilities/http")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !http {
+        if !servers.is_empty() {
+            tracing::debug!(target: "harness_adapters::acp", "agent takes no HTTP MCP servers; skipping {}", servers.len());
+        }
+        return Value::Array(all);
+    }
+    all.extend(servers.iter().map(|server| {
+        json!({
+            "type": "http",
+            "name": server.name,
+            "url": server.url,
+            "headers": server
+                .headers
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect::<Vec<_>>(),
+        })
+    }));
+    Value::Array(all)
+}
+
 /// Whether the agent takes ACP `image` prompt blocks.
 fn accepts_images(init: &Value) -> bool {
     init.pointer("/agentCapabilities/promptCapabilities/image")
@@ -3480,6 +3514,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         origin,
+        mcp_servers,
     } = controls;
     let origin_chat = origin.as_ref().map(|o| o.chat_id.clone());
     let request_input = std::sync::Arc::new(request_input);
@@ -3515,7 +3550,11 @@ async fn run_session(session: Session) {
 
         let session_params = json!({
             "cwd": request.cwd,
-            "mcpServers": harness_mcp_servers(harness, origin.as_ref()),
+            "mcpServers": session_mcp_servers(
+                harness_mcp_servers(harness, origin.as_ref()),
+                &init,
+                &mcp_servers,
+            ),
         });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
@@ -5358,6 +5397,53 @@ mod tests {
         assert!(stable["clientCapabilities"].get("subagents").is_none());
         assert!(stable["clientCapabilities"].get("_meta").is_none());
         assert!(grok["clientCapabilities"].get("subagents").is_none());
+    }
+
+    #[test]
+    fn host_mcp_servers_reach_only_agents_that_take_http_ones() {
+        let servers = vec![crate::McpServer {
+            name: "browse".into(),
+            url: "http://127.0.0.1:5/mcp".into(),
+            headers: vec![("Authorization".into(), "Bearer t".into())],
+        }];
+        let browse = json!({
+            "type": "http",
+            "name": "browse",
+            "url": "http://127.0.0.1:5/mcp",
+            "headers": [{ "name": "Authorization", "value": "Bearer t" }],
+        });
+        let http = json!({ "agentCapabilities": { "mcpCapabilities": { "http": true } } });
+        assert_eq!(
+            session_mcp_servers(json!([]), &http, &servers),
+            json!([browse.clone()])
+        );
+        let stdio_only = json!({ "agentCapabilities": { "mcpCapabilities": { "http": false } } });
+        assert_eq!(
+            session_mcp_servers(json!([]), &stdio_only, &servers),
+            json!([])
+        );
+        assert_eq!(
+            session_mcp_servers(json!([]), &json!({}), &servers),
+            json!([])
+        );
+        assert_eq!(session_mcp_servers(json!([]), &http, &[]), json!([]));
+        // Harness's own stdio server stays first, with or without browse.
+        let harness =
+            json!({ "name": "harness", "command": "harness", "args": ["mcp"], "env": [] });
+        assert_eq!(
+            session_mcp_servers(json!([harness.clone()]), &http, &servers),
+            json!([harness.clone(), browse])
+        );
+        assert_eq!(
+            session_mcp_servers(json!([harness.clone()]), &stdio_only, &servers),
+            json!([harness])
+        );
+        // The run's token never reaches a log line.
+        let logged = format!("{:?}", servers[0]);
+        assert!(
+            logged.contains("Authorization") && !logged.contains("Bearer t"),
+            "{logged}"
+        );
     }
 
     #[test]
