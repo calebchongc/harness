@@ -4233,9 +4233,16 @@ impl Shell {
         frozen: bool,
         cx: &mut Context<Self>,
     ) {
-        // Nested chips report their document, but surfaces and web links belong
-        // to the root conversation, not whichever pane currently has focus.
-        let chat_id = chat_id.split("--sub--").next().unwrap_or_default().to_owned();
+        // Nested chips report their document. Resolve its registered parent
+        // rather than inferring ownership from a document ID's spelling.
+        let source = chat_id;
+        let chat_id = self
+            .subagent_tabs
+            .values()
+            .find(|tab| tab.doc_id == source)
+            .and_then(|tab| tab.transcript.read(cx).link_ui())
+            .and_then(|links| links.source_session)
+            .unwrap_or_else(|| source.clone());
         if chat_id.is_empty()
             || !matches!(self.route, Route::Chat)
             || self.state.read(cx).selected_chat.as_deref().unwrap_or_default() != self.active_chat
@@ -4281,7 +4288,7 @@ impl Shell {
             self.subagent_tabs
                 .values()
                 .map(|tab| (tab.doc_id.as_str(), tab.harness)),
-            &chat_id,
+            &source,
         );
         // A live subagent follows its streaming end (main-transcript feel);
         // a frozen one reads top-down.
