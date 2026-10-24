@@ -115,6 +115,7 @@ async fn failed_acceptance_receipt_recovers_from_distinct_command_id_after_resta
             .queue_command(
                 CHAT,
                 SessionCommandPayload::Steer {
+                    turn_origin: Default::default(),
                     prompt: "accepted command with staged receipt".into(),
                     message_id: Some(message_id.into()),
                 },

@@ -4321,7 +4321,7 @@ async fn drive_run(
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
                     break;
                 };
-                if host.refuses_peer_mail(&chat, &steer.prompt) {
+                if host.refuses_prompt_origin(&chat, &steer.prompt, steer.turn_origin) {
                     tracing::info!(chat = %chat, "discarding archived peer steer before redelivery");
                     continue;
                 }

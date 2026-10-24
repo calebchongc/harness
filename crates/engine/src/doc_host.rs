@@ -3746,7 +3746,12 @@ impl DocHost {
     /// (#498). Checked when mail is accepted and again when it would be
     /// delivered, so mail accepted before an archive cannot wake the chat
     /// after it. A person's prompt is never refused.
-    fn refuses_prompt_origin(&self, chat_id: &str, text: &str, origin: TurnOrigin) -> bool {
+    pub(crate) fn refuses_prompt_origin(
+        &self,
+        chat_id: &str,
+        text: &str,
+        origin: TurnOrigin,
+    ) -> bool {
         self.refuses_peer_mail(chat_id, text)
             || (origin != TurnOrigin::Human
                 && self
@@ -3755,7 +3760,7 @@ impl DocHost {
                     .is_some_and(|chat| chat.archived))
     }
 
-    pub(crate) fn refuses_peer_mail(&self, chat_id: &str, text: &str) -> bool {
+    fn refuses_peer_mail(&self, chat_id: &str, text: &str) -> bool {
         let archived = self
             .workspace()
             .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
@@ -6021,7 +6026,7 @@ impl DocHost {
         request: harness_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<Option<String>, EngineError> {
-        if self.refuses_peer_mail(chat_id, &request.prompt) {
+        if self.refuses_prompt_origin(chat_id, &request.prompt, request.turn_origin) {
             return Err(EngineError::Other(
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
             ));
@@ -6037,18 +6042,21 @@ impl DocHost {
         let (request, message_id) = self.release_branch_drift(chat_id, request, message_id)?;
         // Source capture and checkout questions can await. Recheck at the
         // actual handoff, including cold fallbacks and orphan redelivery.
-        if self.refuses_peer_mail(chat_id, &request.prompt) {
+        if self.refuses_prompt_origin(chat_id, &request.prompt, request.turn_origin) {
             return Err(EngineError::Other(
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
             ));
         }
-        if harness_proto::peer_mail::is_peer_mail(&request.prompt)
-            && sessions.turn_in_flight(chat_id)
-        {
+        // Peer work is known by its origin; legacy envelopes still count.
+        let peer_work = request.turn_origin != TurnOrigin::Human
+            || harness_proto::peer_mail::is_peer_mail(&request.prompt);
+        if peer_work && sessions.turn_in_flight(chat_id) {
             let handle = self.open(chat_id)?;
             handle.doc.push_queued(&QueuedMessage {
                 id: message_id.unwrap_or_else(new_id),
                 text: request.prompt,
+                turn_origin: TurnOrigin::Peer,
+                peer_chat_id: None,
                 attachments: request.attachments,
                 hold_for_turn_end: false,
                 issued_by: self.inner.config.device_id.clone(),
