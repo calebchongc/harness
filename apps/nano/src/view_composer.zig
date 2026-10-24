@@ -18,11 +18,26 @@ const App = @import("app.zig").App;
 pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
     const main_w = transcript_view.mainWidth(c, a);
     const w = @min(transcript_view.columnWidth(main_w) + 32, main_w - 32);
-    // 16 points of padding, over the window's 24-point status strip.
-    const outer = ui.div(c).column().wFull().px(16).pb(40).itemsCenter();
+    const queue_view = @import("view_queue.zig");
+    const queued = a.queue.items.len > 0;
+    // 16 points of padding, over the window's 24-point status strip; the
+    // pill covers the queue tray's foot, so it moves up as much.
+    const outer = ui.div(c).column().wFull().px(16).pb(if (queued) 40 - queue_view.tuck else 40).itemsCenter();
     defer outer.end();
-    if (a.wizard != null) return @import("view_question.zig").panel(c, a, k, w);
+    // Keyed: the tray coming and going must not change the input's id
+    // (which would take its focus).
+    ui.key(c, "queue-tray");
+    _ = queue_view.tray(c, a, k, w);
+    ui.key(c, "composer");
+    const lift: f32 = if (queued) -queue_view.tuck else 0;
+    if (a.wizard != null) {
+        const q = ui.div(c).column().offset(0, lift);
+        defer q.end();
+        return @import("view_question.zig").panel(c, a, k, w);
+    }
     const expanded = std.mem.indexOfScalar(u8, a.composer.text(), '\n') != null;
+    const p = ui.div(c).column().offset(0, lift);
+    defer p.end();
     pill(c, a, k, w, if (expanded) .expanded else .compact, 22);
 }
 
@@ -64,7 +79,12 @@ fn attachButtons(c: *ui.Context, a: *App, k: theme.Colors) void {
 fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
     const box = if (shape == .compact) ui.div(c).row().grow().w(0).px(8).itemsCenter() else ui.div(c).column().wFull();
     defer box.end();
-    const placeholder = if (a.engine.state == .connected) "Do anything…" else "Waiting for the engine…";
+    const placeholder = if (a.engine.state != .connected)
+        "Waiting for the engine…"
+    else if (a.queue_edit != null)
+        "Edit queued message…"
+    else
+        "Do anything…";
     const r = ui.textField(c, &a.composer, .{
         .placeholder = placeholder,
         .width = .fill,
@@ -74,6 +94,11 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
         .max_lines = 11,
     });
     if (r.submitted) a.send();
+    // ⌘↩ with nothing typed sends the newest queued message now.
+    if (c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true }) and std.mem.trim(u8, a.composer.text(), " \n\t").len == 0) {
+        if (a.queue.items.len > 0) a.queueSendNow(a.queue.items[a.queue.items.len - 1].id);
+    }
+    if (a.queue_edit != null and c.shortcut(.{ .key = ui.Shortcut.escape })) a.queueFinishEdit(.cancel);
     if (a.noticeText()) |n| {
         const line = ui.div(c).row().pt(4);
         defer line.end();

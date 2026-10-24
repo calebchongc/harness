@@ -15,6 +15,8 @@ const Transcript = @import("transcript.zig").Transcript;
 const Tabs = @import("tabs.zig").Tabs;
 const agent = @import("app_agent.zig");
 const question = @import("app_question.zig");
+const queue_mod = @import("app_queue.zig");
+pub const uuid = @import("ids.zig").uuid;
 
 /// The window's own state, apart from the engine's.
 pub const View = struct {
@@ -124,6 +126,16 @@ pub const App = struct {
     wizard: ?@import("wizard.zig").Wizard = null,
     draft_stash: std.ArrayList(u8) = .empty,
     answered: ?[]u8 = null,
+    /// The open chat's queue, what the engine can do with it, and a row
+    /// being edited in the composer (or asked for).
+    queue: @import("queue.zig").Rows,
+    w_queue: Watch = .{},
+    caps: queue_mod.Caps = .{},
+    queue_edit: ?queue_mod.Edit = null,
+    queue_begin: ?[]u8 = null,
+    /// This window's editor id for queue edit leases.
+    instance: [36]u8 = undefined,
+    instance_set: bool = false,
     /// The open chats, one per tab.
     tabs: Tabs,
     /// What the window shows that isn't the engine's: the sidebar, its
@@ -141,6 +153,7 @@ pub const App = struct {
             .chats = .init(gpa),
             .sessions = .init(gpa),
             .devices = .init(gpa),
+            .queue = .init(gpa),
             .tabs = .init(gpa),
             .transcript = .{ .gpa = gpa },
             .harnesses = .init(gpa),
@@ -164,6 +177,7 @@ pub const App = struct {
         a.tabs.deinit();
         a.view.deinit(a.gpa);
         question.deinit(a);
+        queue_mod.deinit(a);
         a.transcript.deinit();
         if (a.selected) |s| a.gpa.free(s);
         if (a.space) |s| a.gpa.free(s);
@@ -194,6 +208,21 @@ pub const App = struct {
     pub const wizardAdvance = question.advance;
     pub const wizardBack = question.back;
     pub const wizardDismiss = question.dismiss;
+    pub const queueRemove = queue_mod.remove;
+    pub const queueSendNow = queue_mod.sendNow;
+    pub const queueBeginEdit = queue_mod.beginEdit;
+    pub const queueFinishEdit = queue_mod.finishEdit;
+    pub const queues = queue_mod.queues;
+
+    /// This window's editor id, minted once.
+    pub fn instanceId(a: *App, buf: *[36]u8) []const u8 {
+        if (!a.instance_set) {
+            _ = uuid(a.io, &a.instance);
+            a.instance_set = true;
+        }
+        buf.* = a.instance;
+        return buf;
+    }
 
     /// Asks for a folder and adds it as a space on this device, as the
     /// GPUI app's "Add folder" does (`createSpace`).
@@ -231,7 +260,10 @@ pub const App = struct {
                 a.ensureModels(a.target().harness);
                 a.call("EngineReady", rpc.empty, .of(App, a, onNotice));
                 a.watchSidebar();
-                if (a.selected != null) a.watchDoc(true);
+                if (a.selected != null) {
+                    a.watchDoc(true);
+                    queue_mod.watch(a);
+                }
             },
             .disconnected, .connecting => {
                 // Every stream ended with the socket; they open on reconnect.
@@ -240,6 +272,7 @@ pub const App = struct {
                 a.w_chats = .{};
                 a.w_sessions = .{};
                 a.w_doc = .{};
+                a.w_queue = .{};
             },
         }
         a.redraw();
@@ -261,6 +294,11 @@ pub const App = struct {
         a.now = now;
         question.syncWizard(a);
         var next: ?f64 = question.tick(a, now);
+        if (queue_mod.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
+        if (a.w_queue.retry_at) |t| if (now >= t) {
+            a.w_queue = .{};
+            queue_mod.watch(a);
+        };
         inline for (.{ "w_devices", "w_spaces", "w_chats", "w_sessions", "w_doc" }) |name| {
             const w = &@field(a, name);
             if (w.retry_at) |t| {
@@ -371,6 +409,9 @@ pub const App = struct {
             else => return,
         };
         if (v != .object) return;
+        if (v.object.get("capabilities")) |caps| if (caps == .array) {
+            a.caps = queue_mod.readCaps(caps.array.items);
+        };
         const id = v.object.get("deviceId") orelse return;
         if (id != .string) return;
         if (a.device_id) |d| a.gpa.free(d);
@@ -426,6 +467,7 @@ pub const App = struct {
         a.w_doc = .{};
         a.transcript.clear();
         a.notice_len = 0;
+        queue_mod.stop(a);
         if (a.selected) |s| a.gpa.free(s);
         a.selected = if (chat_id) |c| a.gpa.dupe(u8, c) catch null else null;
         if (space_id) |s| {
@@ -436,6 +478,7 @@ pub const App = struct {
         a.call("FocusChat", .{ .chatId = chat }, .of(App, a, onNotice));
         a.call("Mutate", .{ .op = "markChatSeen", .chatId = chat }, .of(App, a, onNotice));
         a.watchDoc(true);
+        queue_mod.watch(a);
         a.ensureModels(a.target().harness);
         a.redraw();
     }
@@ -458,8 +501,14 @@ pub const App = struct {
 
     /// Sends what the composer holds: to the open chat, or to a new one.
     pub fn send(a: *App) void {
+        if (a.queue_edit != null) return queue_mod.finishEdit(a, .commit);
         const prompt = std.mem.trim(u8, a.composer.text(), " \n\t");
         if (prompt.len == 0 or a.engine.state != .connected) return;
+        if (a.queues()) {
+            queue_mod.queueMessage(a, prompt);
+            a.composer.clear();
+            return a.redraw();
+        }
         var chat_buf: [36]u8 = undefined;
         var message_buf: [36]u8 = undefined;
         const message_id = uuid(a.io, &message_buf);
@@ -522,31 +571,3 @@ pub const App = struct {
         a.call("QueueCommand", .{ .chatId = chat, .command = .{ .kind = "interrupt" } }, .of(App, a, onNotice));
     }
 };
-
-/// A version 4 UUID, as the GPUI app mints chat and message ids.
-pub fn uuid(io: std.Io, out: *[36]u8) []const u8 {
-    var b: [16]u8 = undefined;
-    io.random(&b);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    const hex = "0123456789abcdef";
-    var o: usize = 0;
-    for (b, 0..) |x, i| {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            out[o] = '-';
-            o += 1;
-        }
-        out[o] = hex[x >> 4];
-        out[o + 1] = hex[x & 15];
-        o += 2;
-    }
-    return out;
-}
-
-test "uuids are version 4" {
-    var buf: [36]u8 = undefined;
-    const u = uuid(std.testing.io, &buf);
-    try std.testing.expectEqual(@as(u8, '4'), u[14]);
-    try std.testing.expect(std.mem.indexOfScalar(u8, "89ab", u[19]) != null);
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, u, "-"));
-}

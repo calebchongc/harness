@@ -54,7 +54,7 @@ fn keys(c: *ui.Context, a: *App) void {
     if (c.shortcut(.{ .key = 'w', .cmd = true })) a.closeTab(a.tabs.active);
     if (c.shortcut(.{ .key = '[', .cmd = true }) and a.tabs.canStep(-1)) a.showTab(a.tabs.active - 1);
     if (c.shortcut(.{ .key = ']', .cmd = true }) and a.tabs.canStep(1)) a.showTab(a.tabs.active + 1);
-    if (c.shortcut(.{ .key = S.escape })) {
+    if (c.shortcut(.{ .key = S.escape }) and a.queue_edit == null) {
         a.picker = .none;
         a.view.filter_menu = false;
         a.view.more_menu = false;
