@@ -1,5 +1,6 @@
 package harness.codegraff.android.ui.session
 
+import harness.codegraff.android.model.ChatMode
 import harness.codegraff.android.model.modelSelection
 import harness.codegraff.android.ui.components.rememberDeviceCatalog
 import harness.codegraff.android.model.Connection
@@ -54,6 +55,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
@@ -274,7 +276,10 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
         initial = { model.cachedModels(chat.deviceId, harness) },
         fetch = { model.listModels(chat.deviceId, harness) },
     )
-    val selection = modelSelection(harness, chat.config?.model, chat.config?.reasoning, modelLoad.catalog, harnessLoad.catalog)
+    // A chat offers the three auto tiers and nothing else.
+    val isChat = chat.config?.chatMode == true
+    val models = if (isChat) modelLoad.catalog.copy(items = ChatMode.models(modelLoad.catalog.items)) else modelLoad.catalog
+    val selection = modelSelection(harness, chat.config?.model, chat.config?.reasoning, models, harnessLoad.catalog)
     val currentModel = selection.model
     val currentReasoning = selection.reasoning
 
@@ -394,6 +399,13 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
                 contentAlignment = Alignment.CenterStart,
             ) { Text(if (dead) "Copy edit and stop editing" else "Stop editing", style = sans(12f), color = Theme.palette.textMuted) }
         }
+        // Chat mode: the API-cost note for Auto (smart), on its own line so the chip row never squeezes it.
+        if (isChat) ChatMode.note(currentModel.id)?.let { note ->
+            Text(
+                note, style = sans(11f), color = Theme.palette.textMuted,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).testTag("chat-mode-note"),
+            )
+        }
         // Pre-send honesty: one quiet caption, never a warning box. The send still works; it just queues.
         if (model.chatDeliveryDegraded(chat)) {
             val connectivity by model.connectivity.collectAsState()
@@ -404,7 +416,7 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
         }
         if (selection.unavailable) {
             Text(
-                "The selected agent or model is not available on this device. Select another model.",
+                if (isChat) ChatMode.UNAVAILABLE_NOTE else "The selected agent or model is not available on this device. Select another model.",
                 style = sans(12f), color = Theme.palette.warning,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
             )
@@ -451,7 +463,7 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
     if (showModelPicker) {
         ModelPickerSheet(
             harness = harness, modelId = currentModel.id, reasoning = chat.config?.reasoning,
-            lockedHarness = true, harnesses = harnessLoad.catalog.items, catalogs = mapOf(harness to modelLoad.catalog.items),
+            lockedHarness = true, harnesses = harnessLoad.catalog.items, catalogs = mapOf(harness to models.items),
             loading = modelLoad.loading || harnessLoad.loading,
             confirmedHarnesses = harnessLoad.catalog.isLive,
             confirmedCatalogs = if (modelLoad.catalog.isLive) setOf(harness) else emptySet(),

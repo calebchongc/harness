@@ -11,6 +11,7 @@ import harness.codegraff.android.perf.PerfSpan
 import harness.codegraff.android.model.ChangeRequestSummary
 import harness.codegraff.android.model.Chat
 import harness.codegraff.android.model.ChatConfig
+import harness.codegraff.android.model.ChatMode
 import harness.codegraff.android.model.ChatIndicator
 import harness.codegraff.android.model.DeviceRow
 import harness.codegraff.android.model.HomeFilterNames
@@ -805,7 +806,9 @@ class AppModel(
     }
 
     fun cachedModels(deviceId: String, harness: String): DeviceCatalog<ModelInfo> = if (live == null) {
-        DeviceCatalog(HarnessCatalog.models(harness), isLive = true)
+        // The demo gateway lists the chat-mode tiers for graff.
+        val tiers = if (harness == ChatMode.HARNESS) ChatMode.tiers.map { ModelInfo(it.id, it.label, null, emptyList()) } else emptyList()
+        DeviceCatalog(HarnessCatalog.models(harness) + tiers, isLive = true)
     } else modelCache.cached(deviceId to harness)
 
     /** The models offered by this agent on this execution device, never a different host's defaults. */
