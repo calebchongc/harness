@@ -4168,6 +4168,36 @@ impl Shell {
         frozen: bool,
         cx: &mut Context<Self>,
     ) {
+        // Nested chips report their document, but surfaces and web links belong
+        // to the root conversation, not whichever pane currently has focus.
+        let chat_id = chat_id.split("--sub--").next().unwrap_or_default().to_owned();
+        if chat_id.is_empty()
+            || !matches!(self.route, Route::Chat)
+            || self.state.read(cx).selected_chat.as_deref().unwrap_or_default() != self.active_chat
+        {
+            return;
+        }
+        if chat_id != self.active_chat {
+            let pane = self.chat_split.as_ref().and_then(|split| {
+                (!split.zoomed)
+                    .then(|| {
+                        split.panes.iter().enumerate().find_map(|(ix, id)| {
+                            (ix != split.focus && id.as_deref() == Some(chat_id.as_str())).then_some(ix)
+                        })
+                    })
+                    .flatten()
+            });
+            let Some(pane) = pane.filter(|_| self.peer_chat_views.contains_key(&chat_id)) else {
+                return;
+            };
+            if !self.select_chat_pane(pane, cx) {
+                return;
+            }
+            self.on_state_changed(&self.state.clone(), cx);
+            if self.active_chat != chat_id {
+                return;
+            }
+        }
         // The chip lives in the conversation column — the pane it opens into
         // may still be closed.
         self.set_surfaces_open(true, cx);
@@ -4185,7 +4215,7 @@ impl Shell {
         // a frozen one reads top-down.
         let transcript =
             cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), !frozen, cx));
-        let links = Self::session_links(Some(self.active_chat.clone()), cx);
+        let links = Self::session_links(Some(chat_id.clone()), cx);
         let views = Self::view_opener(cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links);
@@ -17007,6 +17037,7 @@ mod right_tab_mouse_regressions {
                     cx,
                 );
                 shell.active_chat = "parent".into();
+                shell.state.update(cx, |state, _| state.selected_chat = Some("parent".into()));
                 for id in ["first", "second"] {
                     shell.add_subagent_surface("parent".into(), id.into(), id.into(), false, cx);
                 }

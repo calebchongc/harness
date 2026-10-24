@@ -4,6 +4,9 @@ use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, Point, ScrollDelta, Scroll
 use harness_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use harness_proto::ToolCall;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod link_owner;
+
 /// Keep the real Shell and peer-pane capture handlers, transcript, markdown and
 /// tool controls, without booting an engine or rendering unrelated chrome.
 struct InteractionPanes(Entity<Shell>);
@@ -12,8 +15,11 @@ impl Render for InteractionPanes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.0.update(cx, |shell, cx| {
             let theme = Theme::of(cx).clone();
-            let focus = shell.chat_split.as_ref().unwrap().focus;
-            div().size_full().flex().children((0..2).map(|ix| {
+            let (focus, count) = shell
+                .chat_split
+                .as_ref()
+                .map_or((0, 1), |split| (split.focus, split.panes.len()));
+            div().size_full().flex().children((0..count).map(|ix| {
                 let pane = if ix == focus {
                     // Match the peer's geometry when its entity is promoted.
                     div()

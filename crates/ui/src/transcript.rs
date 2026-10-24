@@ -3957,6 +3957,11 @@ impl Transcript {
             self.rail_enabled = false;
             self.bottom_clearance = 0.0;
         }
+        if let Some(link) = self.workspace_link.as_mut() {
+            // Peers have a fixed owner; the primary follows its current chat.
+            // A promoted peer must not keep its old owner after navigation.
+            link.source_session = peer.clone();
+        }
         self.doc_override = peer;
         self.last_source = None;
     }
