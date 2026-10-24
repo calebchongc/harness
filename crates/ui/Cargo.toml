@@ -83,6 +83,10 @@ name = "markdown-math-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "composer-completion-fade-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "visuals-fixture"
 required-features = ["appshots-fixture"]
 
