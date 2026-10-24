@@ -3,6 +3,7 @@
 // marks the chat seen (the synced LWW marker behind the green dot everywhere).
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SessionView: View {
     @Environment(AppModel.self) private var model
@@ -10,12 +11,22 @@ struct SessionView: View {
     @Environment(\.pageSession) private var pageSession
     /// Open another session beside this one, or close this pane: set only on a Max-class iPhone (SplitScreen).
     @Environment(\.splitScreen) private var splitScreen
+    /// Open a new session below this one, in the phone's stacked split (⌘D on the desktop).
+    @Environment(\.stackedSplit) private var stackedSplit
+    /// Close this pane of the stacked split, while two are shown.
+    @Environment(\.stackedClose) private var stackedClose
     let chatId: String
 
     /// Reserve the back button and native bar margins. Anchor the rest to the
     /// trailing edge so the title can use the space before the controls.
     private static let headerChromeInset: CGFloat = 100
     private static let topFadeHeight: CGFloat = 28
+
+    /// Room the stacked split's trailing buttons take from the title: the titled Split button, or the ×.
+    private var stackedButtonsWidth: CGFloat {
+        if stackedSplit != nil { return 92 }
+        return stackedClose == nil ? 0 : 44
+    }
 
     /// The view's own width, the only reliable basis for capping the principal
     /// toolbar item (its container proposes an unbounded width).
@@ -24,6 +35,7 @@ struct SessionView: View {
 
     /// Follow intent belongs to the session, independent of composer focus.
     @State private var scroll = ScrollState()
+    @State private var attachmentDraft = AttachmentDraft()
     @State private var hostLink: HostLink?
     @State private var renamingSession = false
     @State private var renameChatId: String?
@@ -190,12 +202,40 @@ struct SessionView: View {
                 // moved into the composer's picker chips.
                 ToolbarItem(placement: .topBarTrailing) {
                     headerTitle(chat)
-                        // Claim the remaining bar width: the title expands
-                        // before the fixed-size navigation and status marks.
-                        .frame(width: max(140, viewWidth - Self.headerChromeInset), alignment: .leading)
+                        // Claim the remaining bar width, less the stacked split's
+                        // trailing buttons: the title expands before the
+                        // fixed-size navigation and status marks. The title and
+                        // pager carry their own swipe (headerControls).
+                        .frame(width: max(140, viewWidth - Self.headerChromeInset - stackedButtonsWidth),
+                               alignment: .leading)
                 }
                 // Bare text on the bar, not a glass capsule.
                 .sharedBackgroundVisibility(.hidden)
+            }
+            if let stackedSplit {
+                ToolbarItem(placement: .topBarTrailing) {
+                    // Titled: the icon alone read as a plain box. A Label in the bar drops its title, so the
+                    // icon and the word are laid out here.
+                    Button(action: stackedSplit) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "rectangle.split.1x2")
+                            Text("Split")
+                                .font(Theme.sans(15, weight: .medium))
+                        }
+                        .padding(.horizontal, 4)
+                        .fixedSize()
+                    }
+                    .accessibilityLabel("Open another session below this one")
+                    .accessibilityIdentifier("stacked-split-open")
+                }
+            }
+            if let stackedClose {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: stackedClose) {
+                        Label("Close this pane", systemImage: "xmark")
+                    }
+                    .accessibilityIdentifier("stacked-pane-close")
+                }
             }
         }
         .alert("Rename session", isPresented: $renamingSession) {
@@ -282,7 +322,7 @@ struct SessionView: View {
                 if verticalSizeClass != .compact || status == .working || status == .errored
                     || model.sendState(for: chat) != nil || model.connectivity.state != .connected {
                     statusStrip(chat: chat, status: status, store: store)
-                        .allowsHitTesting(model.sendState(for: chat) == .failed)
+                        .allowsHitTesting(model.sendState(for: chat).map { $0 == .failed || $0 == .waiting } ?? false)
                 }
                 Group {
                     if let request = store.openInputRequest {
@@ -290,7 +330,8 @@ struct SessionView: View {
                             store.respondInput(requestId: requestId, answers: answers)
                         }
                     } else {
-                        ComposerView(store: store, chat: chat, runLive: status == .working)
+                        ComposerView(store: store, chat: chat, runLive: status == .working,
+                                     attachmentDraft: attachmentDraft)
                             .id(chat.id)
                     }
                 }
@@ -312,6 +353,37 @@ struct SessionView: View {
             }
         }
         .background(Theme.bg.ignoresSafeArea())
+        .overlay(alignment: .top) {
+            #if DEBUG
+            if model.demo != nil, ProcessInfo.processInfo.arguments.contains("-image-drop-fixture") {
+                ImageDropFixture()
+            }
+            #endif
+        }
+        .onDrop(of: [UTType.image], isTargeted: Binding(
+            get: { attachmentDraft.targeted },
+            set: { attachmentDraft.targeted = $0 }
+        )) { providers in
+            guard store.openInputRequest == nil else { return false }
+            return attachmentDraft.receive(providers)
+        }
+        .overlay {
+            if attachmentDraft.targeted, attachmentDraft.canImport, store.openInputRequest == nil {
+                RoundedRectangle(cornerRadius: 20)
+                    .strokeBorder(Theme.text.opacity(0.6), style: StrokeStyle(lineWidth: 2, dash: [8, 5]))
+                    .padding(8)
+                    .overlay(alignment: .bottom) {
+                        Text("Drop images to attach")
+                            .font(Theme.sans(14, weight: .medium))
+                            .foregroundStyle(Theme.text)
+                            .padding(12)
+                            .background(Theme.bg, in: Capsule())
+                            .padding(.bottom, 90)
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
         .overlay {
             GeometryReader { geometry in
                 // The bar stays opaque so the header never collides with rows
@@ -331,6 +403,9 @@ struct SessionView: View {
             .allowsHitTesting(false)
             .accessibilityHidden(true)
         }
+        .onChange(of: chatId) { _, _ in
+            attachmentDraft = AttachmentDraft()
+        }
         .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
     }
 
@@ -346,8 +421,9 @@ struct SessionView: View {
     /// shows "Run failed"; the strip always reserves its height so the
     /// composer never shifts. An unadopted send's truth takes precedence:
     /// "Sending…" (healthy, within the 2-minute grace), "Queued — will send
-    /// automatically" (degraded path — no fake progress), or the explicit
-    /// "Not delivered — tap to retry" (transcript.rs retry_send).
+    /// automatically" (degraded path — no fake progress), "Waiting for Mac to
+    /// start it" (past the grace, still pending in the doc), or "Not
+    /// delivered — tap to retry" once no command for it can run.
     private func statusStrip(chat: Chat, status: SessionStatus?, store: SessionStore) -> some View {
         // Ticks once a second only while something on the strip is timed: the Working elapsed counter, a
         // pending send's grace, or the reconnect countdown. An idle open chat repaints nothing.
@@ -363,6 +439,25 @@ struct SessionView: View {
                         Text("Not delivered — tap to retry")
                             .font(Theme.sans(11))
                             .foregroundStyle(Theme.danger)
+                    }
+                    .buttonStyle(.plain)
+                case .waiting?:
+                    // Still pending in the doc: the host can start it at any
+                    // time (#413). Tapping re-checks delivery; it never sends
+                    // a second copy of a command that can still run.
+                    Button {
+                        store.retryDelivery()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(Theme.warning)
+                                .frame(width: 5, height: 5)
+                            Text(waitingLabel(chat: chat, store: store))
+                                .font(Theme.sans(11))
+                                .foregroundStyle(Theme.textMuted)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                        }
                     }
                     .buttonStyle(.plain)
                 case .queued?:
@@ -396,7 +491,7 @@ struct SessionView: View {
                         Text(reconnectingLabel)
                             .font(Theme.sans(11)).foregroundStyle(Theme.textFaint).monospacedDigit()
                     case .connected:
-                        normalStatus(chat: chat, status: status)
+                        normalStatus(chat: chat, status: status, store: store)
                     }
                 }
             }
@@ -406,6 +501,18 @@ struct SessionView: View {
         }
     }
 
+    /// "Waiting for Mac to start it · sent 9m 57s ago". The age counts from the original
+    /// submission, which a retry keeps; only the delivery grace restarts.
+    private func waitingLabel(chat: Chat, store: SessionStore) -> String {
+        let host = model.deviceName(store.hostDeviceId ?? chat.deviceId)
+        let sent = store.pendingSends.map(\.at).min() ?? nowMs()
+        let age = Motion.formatElapsed((nowMs() - sent) / 1000)
+        let what = store.transferProgress != nil
+            ? "Attachments still on their way to \(host)"
+            : "Waiting for \(host) to start it"
+        return "\(what) · sent \(age) ago"
+    }
+
     private var reconnectingLabel: String {
         guard let retryAt = model.connectivity.retryAt else { return "Reconnecting…" }
         let secs = Int(retryAt.timeIntervalSinceNow.rounded(.up))
@@ -413,7 +520,7 @@ struct SessionView: View {
     }
 
     @ViewBuilder
-    private func normalStatus(chat: Chat, status: SessionStatus?) -> some View {
+    private func normalStatus(chat: Chat, status: SessionStatus?, store: SessionStore) -> some View {
         Group {
                 switch status {
                 case .working:
@@ -427,6 +534,15 @@ struct SessionView: View {
                         .font(Theme.sans(11))
                         .foregroundStyle(Theme.textFaint)
                         .monospacedDigit()
+                    // The timer counts the run; a prompt that sat waiting
+                    // for its host says how long, after it (#413).
+                    if let waited = turnWaitSecs(entries: store.entries, turnStartedAt: turnStartedAt(chat: chat)) {
+                        Text("· waited \(Motion.formatElapsed(waited)) to start")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textFaint)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                    }
                 case .errored:
                     Text("Run failed")
                         .font(Theme.sans(11))
@@ -435,6 +551,11 @@ struct SessionView: View {
                     EmptyView()
                 }
         }
+    }
+
+    /// The host's start of this turn only, without the timer's fallbacks.
+    private func turnStartedAt(chat: Chat) -> Int64? {
+        (model.demo?.sessions[chat.id] ?? model.workspace?.sessions[chat.id])?.startedAt
     }
 
     private func sessionStartedAt(chat: Chat) -> Int64 {

@@ -444,26 +444,249 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
     }
 }
 
-/// A parent's control of its subagents, as drivers name them (codex collab
-/// tools, graff background agents): "Wait for agent 1[: <title>]" reads
-/// "Waiting on <title>" (or "agent 1" until the spawn is known), not the
-/// generic "Tool · Wait for agent 1".
-fn agent_control(name: &str) -> Option<(&'static str, String)> {
-    let target = |rest: &str| {
-        rest.split_once(": ")
-            .map_or(rest, |(_, title)| title)
-            .to_owned()
-    };
-    if let Some(rest) = name.strip_prefix("Wait for ") {
-        return Some(("Waiting on", target(rest)));
+// ---------------------------------------------------------------------------
+// Collapsed command previews: long filepaths (pure)
+// ---------------------------------------------------------------------------
+
+/// A path in a collapsed command preview is shortened only past this many
+/// characters: `/bin/zsh` or `"\tools\pwsh.exe"` already read fine.
+pub const PREVIEW_PATH_MAX_CHARS: usize = 32;
+
+/// Directories a collapsed preview may shorten a path against: the chat's
+/// folder (paths inside it read relative) and the home directory (`~`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PreviewPathAnchors<'a> {
+    pub workspace: Option<&'a str>,
+    pub home: Option<&'a str>,
+}
+
+/// The collapsed `Run` preview of `command`. Every recognised filepath longer
+/// than [`PREVIEW_PATH_MAX_CHARS`] is shortened: relative when it is inside
+/// the workspace, `~` when it is under home, then `…/parent/file` (or
+/// `…/file`) while it is still long. Everything else is kept byte for byte:
+/// the executable's name, the subcommand, flags, quotes, operators and order.
+///
+/// Display only: execution, the expanded invocation and copied text keep the
+/// original command.
+///
+/// A token counts as a path only when it is certainly one: an absolute path
+/// (`/…`, `~/…`, `C:\…`, `C:/…`, `\\server\…`, `\\?\…`, `\dir\…`) forming a
+/// whole word, a whole quoted word or a `--flag=` value, with no glob,
+/// variable, operator or URL characters. Quoted `-c` scripts aren't parsed.
+pub fn compact_command_paths(command: &str, anchors: PreviewPathAnchors<'_>) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut last = 0;
+    for range in path_candidates(command) {
+        if let Some(short) = compact_path(&command[range.clone()], anchors) {
+            out.push_str(&command[last..range.start]);
+            out.push_str(&short);
+            last = range.end;
+        }
     }
-    if let Some(rest) = name.strip_prefix("Message agent") {
-        return Some(("Message", target(&format!("agent{rest}"))));
+    out.push_str(&command[last..]);
+    out
+}
+
+/// Whether `command` holds a path [`compact_command_paths`] may shorten under
+/// some anchors. Such a command keeps its expanded invocation even when it
+/// fits the header, so the full path stays one click away.
+pub fn command_has_long_path(command: &str) -> bool {
+    path_candidates(command)
+        .into_iter()
+        .any(|range| command[range].chars().count() > PREVIEW_PATH_MAX_CHARS)
+}
+
+/// Byte ranges of the recognised paths among `command`'s words: a bare word,
+/// the inside of a wholly quoted word, or the value of `-flag=value`.
+fn path_candidates(command: &str) -> Vec<std::ops::Range<usize>> {
+    command_words(command)
+        .into_iter()
+        .filter_map(|word| {
+            let text = &command[word.clone()];
+            let value = if text.starts_with('-') {
+                word.start + text.find('=')? + 1..word.end
+            } else {
+                word
+            };
+            unquoted(command, value)
+        })
+        .filter(|range| path_separator(&command[range.clone()]).is_some())
+        .collect()
+}
+
+/// Split `command` into shell-like words: whitespace outside quotes ends a
+/// word; `\ ` outside quotes and `\"` inside double quotes are escapes.
+fn command_words(command: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = command.as_bytes();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut quote: Option<u8> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match quote {
+                Some(q) if b == q => quote = None,
+                Some(b'"') if b == b'\\' && bytes.get(i + 1) == Some(&b'"') => i += 1,
+                Some(_) => {}
+                None if b.is_ascii_whitespace() => break,
+                None if b == b'"' || b == b'\'' => quote = Some(b),
+                None if b == b'\\' && bytes.get(i + 1) == Some(&b' ') => i += 1,
+                None => {}
+            }
+            i += 1;
+        }
+        words.push(start..i.min(bytes.len()));
+    }
+    words
+}
+
+/// The path text of a word: inside its quotes when it is wholly quoted, the
+/// word itself when it has no quotes, and nothing for mixed quoting.
+fn unquoted(command: &str, range: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    let text = &command[range.clone()];
+    match text.chars().next() {
+        Some(q @ ('"' | '\'')) => {
+            let inner = text.strip_prefix(q)?.strip_suffix(q)?;
+            (!inner.contains(q)).then(|| range.start + 1..range.end - 1)
+        }
+        _ => (!text.contains(['"', '\''])).then_some(range),
+    }
+}
+
+/// The separator of a confidently recognised absolute filepath, or `None`
+/// for anything else (relative words, URLs, globs, regexes, scripts).
+fn path_separator(path: &str) -> Option<char> {
+    let b = path.as_bytes();
+    let (sep, body) = if path.starts_with('/') || path.starts_with("~/") {
+        ('/', path)
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        ('\\', rest)
+    } else if path.starts_with(r"\\") {
+        ('\\', path)
+    } else if b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && matches!(b[2], b'\\' | b'/')
+    {
+        (b[2] as char, path)
+    } else if b.first() == Some(&b'\\')
+        && b.get(1)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_'))
+    {
+        ('\\', path)
+    } else {
+        return None;
+    };
+    let suspicious = body.contains("://")
+        || body.contains(" -")
+        || body.contains([
+            '*', '?', '$', '`', '{', '}', '[', ']', '|', '<', '>', ';', '&', '^', '"', '\'', '\n',
+            '\t', '\r',
+        ]);
+    // In a slash path a backslash is only ever an escaped space; anything
+    // else (`/\d+/`) is a pattern, not a path.
+    let stray_escape = sep == '/'
+        && body
+            .match_indices('\\')
+            .any(|(i, _)| !body[i + 1..].starts_with(' '));
+    (!suspicious && !stray_escape).then_some(sep)
+}
+
+/// `path` without `dir` and its separator when `path` lies strictly inside
+/// `dir`. Windows paths compare case-insensitively with either separator.
+fn strip_dir<'p>(path: &'p str, dir: &str, sep: char, windows: bool) -> Option<&'p str> {
+    let dir = dir.trim_end_matches(['/', '\\']);
+    if dir.is_empty() || path.len() <= dir.len() + 1 {
+        return None;
+    }
+    let is_sep = |c: u8| c == b'/' || c == b'\\';
+    let same = path.as_bytes()[..dir.len()]
+        .iter()
+        .zip(dir.as_bytes())
+        .all(|(a, b)| {
+            a == b || (windows && (a.eq_ignore_ascii_case(b) || (is_sep(*a) && is_sep(*b))))
+        });
+    let next = path.as_bytes()[dir.len()];
+    (same && (next == sep as u8 || (windows && is_sep(next)))).then(|| &path[dir.len() + 1..])
+}
+
+/// One recognised path, shortened; `None` when it is short, unrecognised, or
+/// nothing shorter exists.
+fn compact_path(path: &str, anchors: PreviewPathAnchors<'_>) -> Option<String> {
+    let sep = path_separator(path)?;
+    if path.chars().count() <= PREVIEW_PATH_MAX_CHARS {
+        return None;
+    }
+    let (body, trailing) = match path.strip_suffix(sep) {
+        Some(body) if !body.is_empty() => (body, true),
+        _ => (path, false),
+    };
+    let windows = sep == '\\' || body.as_bytes().get(1) == Some(&b':');
+    let home = format!("~{sep}");
+    let (lead, rest) = if let Some(rest) = anchors
+        .workspace
+        .and_then(|dir| strip_dir(body, dir, sep, windows))
+    {
+        ("", rest)
+    } else if let Some(rest) = body.strip_prefix("~/") {
+        (home.as_str(), rest)
+    } else if let Some(rest) = anchors
+        .home
+        .and_then(|dir| strip_dir(body, dir, sep, windows))
+    {
+        (home.as_str(), rest)
+    } else {
+        ("", body)
+    };
+    let mut short = format!("{lead}{rest}");
+    if short.chars().count() > PREVIEW_PATH_MAX_CHARS {
+        let segments: Vec<&str> = rest.split(sep).filter(|s| !s.is_empty()).collect();
+        for keep in [2, 1] {
+            if segments.len() <= keep {
+                continue;
+            }
+            let tail = segments[segments.len() - keep..].join(&sep.to_string());
+            let elided = format!("{lead}…{sep}{tail}");
+            if elided.chars().count() <= PREVIEW_PATH_MAX_CHARS || keep == 1 {
+                if elided.chars().count() < short.chars().count() {
+                    short = elided;
+                }
+                break;
+            }
+        }
+    }
+    if trailing {
+        short.push(sep);
+    }
+    (short != path).then_some(short)
+}
+
+/// A parent's control of its subagents, as drivers name them (codex collab
+/// tools, graff background agents): waits always read "Waiting on subagent".
+/// Worker IDs and task titles remain in the call for routing and linked tabs,
+/// rather than exposing implementation details in the wait chip.
+fn agent_control(name: &str) -> Option<(&'static str, String)> {
+    if name.starts_with("Wait for ") {
+        return Some(("Waiting on", "subagent".into()));
+    }
+    for (prefix, label) in [
+        ("Message agent", "Message"),
+        ("Resume agent", "Resume"),
+        ("Close agent", "Close"),
+    ] {
+        if name == prefix || name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with(' ')) {
+            return Some((label, "subagent".into()));
+        }
     }
     match name {
-        "Send agent message" => Some(("Message", "agent".into())),
-        "Resume agent" => Some(("Resume", "agent".into())),
-        "Close agent" => Some(("Close", "agent".into())),
+        "agent_output" => Some(("Waiting on", "subagent".into())),
+        "Send agent message" | "agent_message" => Some(("Message", "subagent".into())),
+        "subagent_resume" => Some(("Resume", "subagent".into())),
         "Load tools" => Some(("Load", "tools".into())),
         _ => None,
     }
@@ -734,5 +957,252 @@ mod sort_tests {
         sort_active(&mut rows);
         let ids: Vec<&str> = rows.iter().map(|(_, c)| c.id.as_str()).collect();
         assert_eq!(ids, ["fresh", "old-host", "busy"]);
+    }
+}
+
+#[cfg(test)]
+mod preview_path_tests {
+    use super::*;
+
+    const NONE: PreviewPathAnchors<'static> = PreviewPathAnchors {
+        workspace: None,
+        home: None,
+    };
+    const MAC: PreviewPathAnchors<'static> = PreviewPathAnchors {
+        workspace: Some("/Users/example/projects/demo"),
+        home: Some("/Users/example"),
+    };
+    const WINDOWS: PreviewPathAnchors<'static> = PreviewPathAnchors {
+        workspace: Some(r"C:\work\demo-app"),
+        home: Some(r"C:\Users\ExampleUser"),
+    };
+
+    fn compact(command: &str, anchors: PreviewPathAnchors<'_>) -> String {
+        compact_command_paths(command, anchors)
+    }
+
+    #[test]
+    fn issue_examples_keep_the_executable_and_command() {
+        // The collapsed `Run` preview used to show these byte for byte, so the
+        // long executable path crowded the command off the row.
+        assert_eq!(
+            compact(
+                r#""C:\Users\ExampleUser\.cache\agent-runtime\dependencies\native\powershell\pwsh.exe" -Command "git status""#,
+                NONE,
+            ),
+            r#""…\powershell\pwsh.exe" -Command "git status""#
+        );
+        assert_eq!(
+            compact(
+                "/Users/example/tools/runtime/bundled/shells/zsh -lc 'git status'",
+                NONE
+            ),
+            "…/shells/zsh -lc 'git status'"
+        );
+        assert_eq!(
+            compact(
+                r#"cat "/Users/example/projects/demo/application/src/settings.rs""#,
+                NONE
+            ),
+            r#"cat "…/src/settings.rs""#
+        );
+    }
+
+    #[test]
+    fn short_commands_and_paths_are_unchanged() {
+        for command in [
+            r#""\folder\pwsh.exe" -Command "git status""#,
+            "/bin/zsh -lc 'git status'",
+            "git status",
+            "ls -la /tmp",
+            "cargo test -p harness-proto --lib view",
+            "",
+        ] {
+            assert_eq!(compact(command, MAC), command);
+            assert!(!command_has_long_path(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn paths_inside_the_workspace_read_relative() {
+        assert_eq!(
+            compact(
+                "cargo test --manifest-path /Users/example/projects/demo/crates/ui/Cargo.toml -p demo-ui",
+                MAC,
+            ),
+            "cargo test --manifest-path crates/ui/Cargo.toml -p demo-ui"
+        );
+        assert_eq!(
+            compact(
+                "cargo build --manifest-path=/Users/example/projects/demo/crates/ui/Cargo.toml",
+                MAC,
+            ),
+            "cargo build --manifest-path=crates/ui/Cargo.toml"
+        );
+        // Still long once relative: elided like any other path.
+        assert_eq!(
+            compact(
+                "rustfmt /Users/example/projects/demo/crates/server/src/handlers/sessions/history.rs",
+                MAC,
+            ),
+            "rustfmt …/sessions/history.rs"
+        );
+        // A sibling folder that merely shares the prefix isn't inside it.
+        assert_eq!(
+            compact("cat /Users/example/projects/demo-old/src/main.rs", MAC),
+            "cat ~/projects/demo-old/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn paths_under_home_use_a_tilde() {
+        assert_eq!(
+            compact("/Users/example/.local/share/toolchains/bin/rg -n TODO", MAC),
+            "~/.local/share/toolchains/bin/rg -n TODO"
+        );
+        assert_eq!(
+            compact(
+                r#""/Users/example/Library/Application Support/Tool Runtime/bin/node" --version"#,
+                MAC,
+            ),
+            r#""~/…/bin/node" --version"#
+        );
+        assert_eq!(
+            compact(
+                "~/Library/Caches/example-tool/runtime/bin/tool --help",
+                NONE
+            ),
+            "~/…/bin/tool --help"
+        );
+    }
+
+    #[test]
+    fn quoted_and_escaped_paths_with_spaces() {
+        assert_eq!(
+            compact(
+                r#"open "/Users/example/My Projects/demo app/build output/report.txt""#,
+                NONE,
+            ),
+            r#"open "…/build output/report.txt""#
+        );
+        assert_eq!(
+            compact(
+                "open '/Users/example/My Projects/demo app/build output/report.txt'",
+                NONE
+            ),
+            "open '…/build output/report.txt'"
+        );
+        assert_eq!(
+            compact(
+                r"ls /Users/example/My\ Projects/demo/very/deep/folder",
+                NONE
+            ),
+            "ls …/deep/folder"
+        );
+    }
+
+    #[test]
+    fn every_long_path_in_a_command_is_shortened() {
+        assert_eq!(
+            compact(
+                "cp /Users/example/projects/demo/target/release/app /Users/example/Applications/Staging/app && echo done",
+                MAC,
+            ),
+            "cp target/release/app ~/Applications/Staging/app && echo done"
+        );
+    }
+
+    #[test]
+    fn windows_paths() {
+        // UNC share, with a short `/quiet` switch left alone.
+        assert_eq!(
+            compact(
+                r#""\\fileserver\team share\builds\nightly\2026\windows\setup.exe" /quiet"#,
+                NONE,
+            ),
+            r#""…\windows\setup.exe" /quiet"#
+        );
+        // Extended-length prefix.
+        assert_eq!(
+            compact(
+                r"\\?\C:\Users\ExampleUser\AppData\Local\Programs\tool\tool.exe --version",
+                NONE,
+            ),
+            r"…\tool\tool.exe --version"
+        );
+        // Home matches case-insensitively.
+        assert_eq!(
+            compact(
+                r"c:\users\exampleuser\AppData\Local\Programs\Tool\tool.exe --version",
+                WINDOWS,
+            ),
+            r"~\…\Tool\tool.exe --version"
+        );
+        // Forward slashes inside a backslash workspace.
+        assert_eq!(
+            compact(
+                "npx eslint C:/work/demo-app/src/components/panel.tsx",
+                WINDOWS
+            ),
+            "npx eslint src/components/panel.tsx"
+        );
+        // Paths with parentheses are still paths.
+        assert_eq!(
+            compact(
+                r#""C:\Program Files (x86)\Example Vendor\Example Tool\bin\tool.exe" sync"#,
+                NONE,
+            ),
+            r#""…\bin\tool.exe" sync"#
+        );
+    }
+
+    #[test]
+    fn unicode_long_names_and_trailing_separators() {
+        assert_eq!(
+            compact(
+                "cat \"/Users/example/プロジェクト/デモ/設定/ファイル.txt\"",
+                NONE
+            ),
+            "cat \"…/設定/ファイル.txt\""
+        );
+        assert_eq!(
+            compact(
+                "tail /Users/example/projects/an-extremely-long-generated-file-name-that-never-ends.log",
+                NONE,
+            ),
+            "tail …/an-extremely-long-generated-file-name-that-never-ends.log"
+        );
+        assert_eq!(
+            compact("ls /Users/example/projects/demo/application/", NONE),
+            "ls …/demo/application/"
+        );
+    }
+
+    #[test]
+    fn non_paths_are_left_alone() {
+        for command in [
+            "curl -L https://example.com/a/very/long/path/that/keeps/going/index.html",
+            "rg -g '/Users/example/projects/demo/**/*.rs' needle",
+            "sed -n '/^start of a long pattern here$/,/^end$/p' notes.txt",
+            "bash -lc 'cd /Users/example/projects/demo/application && cargo build'",
+            "echo $HOME/projects/demo/application/src/settings.rs",
+            r"rg '/\d+/very/long/regular/expression/pattern/here/'",
+            r#"tool --out="/Users/example/projects/demo/application/"suffix"#,
+        ] {
+            assert_eq!(compact(command, MAC), command);
+        }
+    }
+
+    #[test]
+    fn long_path_detection_matches_what_can_shorten() {
+        assert!(command_has_long_path(
+            "cat /Users/example/projects/demo/application/src/settings.rs"
+        ));
+        assert!(command_has_long_path(
+            r#""C:\Users\ExampleUser\.cache\agent-runtime\dependencies\native\powershell\pwsh.exe" -Command "git status""#
+        ));
+        assert!(!command_has_long_path(
+            "curl -L https://example.com/a/very/long/path/that/keeps/going/index.html"
+        ));
     }
 }

@@ -647,13 +647,14 @@ fn group(id: ShortcutId) -> &'static str {
         | ShortcutId::ToggleTerminal
         | ShortcutId::SplitTerminal
         | ShortcutId::SplitTerminalDown => "Panels",
-        ShortcutId::NewProject => "Projects",
+        ShortcutId::NewProject | ShortcutId::OpenProjectPicker => "Projects",
         ShortcutId::OpenModelPicker
         | ShortcutId::NewSession
         | ShortcutId::NextSession
         | ShortcutId::PrevSession
         | ShortcutId::ArchiveSession
-        | ShortcutId::CloseTabWithoutArchiving => "Sessions",
+        | ShortcutId::CloseTabWithoutArchiving
+        | ShortcutId::ReopenClosedTab => "Sessions",
         ShortcutId::JumpSession(_) => "Jump to session",
     }
 }
@@ -677,6 +678,9 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::SplitTerminalDown => "Split the focused terminal downward.",
         ShortcutId::NewSession => "Open a new chat tab, preserving the current chat and split layout.",
         ShortcutId::NewProject => "Open the new project dialog.",
+        ShortcutId::OpenProjectPicker => {
+            "Open the project picker to switch the project new sessions run in."
+        }
         ShortcutId::OpenModelPicker => "Open the model picker for the current session.",
         ShortcutId::NextSession => {
             "Switch to the next tab when two or more are open; otherwise select the next session in the sidebar."
@@ -687,6 +691,9 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::ArchiveSession => "Move the current session to the archived shelf.",
         ShortcutId::CloseTabWithoutArchiving => {
             "Close the focused pane or tab without archiving, regardless of the archive-on-close setting."
+        }
+        ShortcutId::ReopenClosedTab => {
+            "Reopen the most recently closed chat tab where it was; press again for earlier ones."
         }
         // One line per slot would repeat itself nine times; the ordinal is
         // already in the row's label.

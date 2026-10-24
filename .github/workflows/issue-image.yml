@@ -1,0 +1,35 @@
+name: Issue image
+
+# Every issue includes an image of what's wrong or what should change
+# (AGENTS.md, "Issue format"). An issue without one is labelled `needs-image`
+# with one comment; with TYPESAFE_API_KEY set, the first image is also checked
+# against the issue and for private details. See scripts/check-issue-image.py.
+on:
+  issues:
+    types: [opened, edited, reopened]
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: issue-image-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/check-issue-image.py
+          sparse-checkout-cone-mode: false
+      - name: Pillow
+        run: python3 -m pip install --quiet --disable-pip-version-check pillow==11.3.0
+      - name: Check the issue's image
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: python3 scripts/check-issue-image.py

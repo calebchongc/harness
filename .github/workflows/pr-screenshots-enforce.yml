@@ -1,0 +1,37 @@
+name: PR screenshots enforce
+
+# Closes a new pull request whose description has no before and after
+# screenshots, and reopens it once it has them (AGENTS.md, "Every pull request
+# shows before and after"). The `PR screenshots` workflow is the required
+# status check; this one acts on the pull request.
+#
+# pull_request_target runs with write access, so it only ever checks out and
+# runs the base branch's script, never code from the pull request. The
+# description is read from the event file.
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-screenshots-enforce-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/check-pr-screenshots.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Close or reopen
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-pr-screenshots.py --enforce

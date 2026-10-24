@@ -37,7 +37,6 @@ pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
 pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
 mod appearance;
 mod sidebar_pins;
-mod sidebar_sections;
 pub use appearance::{APPEARANCE_STATE_ID, SyncedAppearance};
 
 /// Snapshot row id in the local `DocsStore` for the persisted registry state.
@@ -1066,12 +1065,23 @@ impl RegistryDoc {
                 kind: KIND_CHATS.to_string(),
                 id: chat_id.to_string(),
                 op: OpKind::Update,
-                set: Some(fields([("archived", json!(true))])),
+                set: Some(fields([
+                    ("archived", json!(true)),
+                    ("archiveCloseAt", json!(requested_at_ms)),
+                ])),
                 hlc: clock,
                 clocks: None,
             }]);
         }
         Ok(true)
+    }
+
+    /// Archive revision observed by a detached sender before reserving its clock.
+    pub fn chat_archive_clock(&self, chat_id: &str) -> Option<String> {
+        self.overlay_row(KIND_CHATS, chat_id)?
+            .clocks
+            .get("archived")
+            .cloned()
     }
 
     /// Reserve send ordering before attempting a restore, including while the
@@ -1091,9 +1101,42 @@ impl RegistryDoc {
     /// Apply the original send intent, never a fresh write at retry time.
     /// `false` means metadata has not arrived; no partial chat is fabricated.
     pub fn restore_chat_on_send(&mut self, chat_id: &str, clock: &str) -> Result<bool, DocError> {
+        self.restore_chat_on_send_from(chat_id, clock, None)
+    }
+
+    /// Detached senders reserve clocks from a durable snapshot, not the live
+    /// clock source. New explicit archive intents fence that independent clock;
+    /// older remote intents and timestamped close ties still obey send ordering.
+    pub fn restore_chat_on_send_from(
+        &mut self,
+        chat_id: &str,
+        clock: &str,
+        archive_basis: Option<&str>,
+    ) -> Result<bool, DocError> {
         let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
             return Ok(false);
         };
+        let archive_clock = row.clocks.get("archived").map(String::as_str);
+        let physical_ms = |hlc: &str| hlc.split('-').next().and_then(|ms| ms.parse::<i64>().ok());
+        let older_intent = archive_clock
+            .and_then(physical_ms)
+            .zip(physical_ms(clock))
+            .is_some_and(|(archived_at, sent_at)| archived_at < sent_at);
+        // A marker is valid only at this archive revision: a later explicit
+        // archive must not inherit an earlier automatic close's tie policy.
+        let automatic_close = archive_clock.is_some_and(|clock| {
+            row.clocks.get("archiveCloseAt").map(String::as_str) == Some(clock)
+        }) && row
+            .fields
+            .get("archiveCloseAt")
+            .and_then(Value::as_i64)
+            .is_some();
+        if archive_basis.is_some_and(|basis| archive_clock != Some(basis))
+            && !older_intent
+            && !automatic_close
+        {
+            return Ok(true); // New explicit archive supersedes this detached receipt.
+        }
         self.clock.observe(clock);
         if hlc_newer(clock, row.clocks.get("archived").map(String::as_str)) {
             self.enqueue_ops(vec![RowOp {
@@ -1310,6 +1353,10 @@ impl RegistryDoc {
             ("deviceId", json!(session.device_id)),
             ("status", serde_json::to_value(session.status)?),
             ("lastCompletedTurn", json!(session.last_completed_turn)),
+            (
+                "lastCompletedPeerOnly",
+                json!(session.last_completed_peer_only),
+            ),
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
         ]);
@@ -1331,7 +1378,6 @@ impl RegistryDoc {
 
     pub fn sidebar_preferences(&self) -> Option<SidebarPreferences> {
         self.sidebar_pins_initialized().then(|| SidebarPreferences {
-            sections: self.sidebar_sections(),
             pinned_session_ids: self
                 .ordered_sidebar_pins()
                 .into_iter()
@@ -1485,6 +1531,10 @@ impl RegistryDoc {
                     ("deviceId", json!(session.device_id)),
                     ("status", serde_json::to_value(session.status)?),
                     ("lastCompletedTurn", json!(session.last_completed_turn)),
+                    (
+                        "lastCompletedPeerOnly",
+                        json!(session.last_completed_peer_only),
+                    ),
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                 ]),

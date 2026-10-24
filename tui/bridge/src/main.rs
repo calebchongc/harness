@@ -6,9 +6,14 @@
 //! from the terminal.
 
 mod config;
+mod engine;
+mod engine_threads;
 mod mcp;
 mod methods;
+mod mirror;
 mod models;
+mod session_store;
+mod sessions;
 mod tools;
 mod turn;
 mod wire;
@@ -53,14 +58,16 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| DEFAULT_LISTEN.to_string());
     let registry = Arc::new(default_registry());
     models::prewarm(registry.clone());
+    let engine = engine::connect().await;
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(%listen, "harness-tui-bridge listening");
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let registry = registry.clone();
+        let engine = engine.clone();
         tokio::spawn(async move {
-            if let Err(err) = wire::serve(stream, registry).await {
+            if let Err(err) = wire::serve(stream, registry, engine).await {
                 tracing::warn!(%peer, %err, "connection ended");
             }
         });

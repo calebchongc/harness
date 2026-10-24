@@ -487,6 +487,17 @@ impl TerminalPanel {
 
     /// Whether the drawer is currently shown (the shell's hide-before-navigate
     /// checks this to avoid redundant updates).
+    /// Shells still running in any chat's tabs, shown or not. Restarting the
+    /// app ends them, so an automatic restart waits for none (the headless
+    /// updater's open-terminal gate).
+    pub fn live_tab_count(&self) -> usize {
+        self.chats
+            .values()
+            .flat_map(|chat| &chat.tabs)
+            .filter(|tab| tab.exited.is_none())
+            .count()
+    }
+
     pub fn is_open(&self) -> bool {
         self.open
     }

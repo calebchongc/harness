@@ -133,7 +133,8 @@ fn sidebar_single_tab_header_survives_split_and_tab_closure(cx: &mut TestAppCont
     let second = cx.debug_bounds("chat-pane-card-1").unwrap();
     assert!(header.bottom() <= first.top());
     assert_eq!(first.top(), second.top());
-    assert_eq!(first.size.width, px(99.0));
+    // Two tracks inside the tab list's inset: (220 - 20 - 16 - 6) / 2.
+    assert_eq!(first.size.width, px(89.0));
     assert_eq!(first.size.width, second.size.width);
     // Cmd+W removes the extra Cmd+D pane; the header must not disappear.
     cx.update(|window, cx| {

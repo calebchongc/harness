@@ -80,3 +80,61 @@ fn restore_retry_is_idempotent_and_does_not_undo_later_local_or_remote_archives(
     doc.restore_chat_on_send("chat", &clock).unwrap();
     assert!(doc.chat("chat").unwrap().unwrap().archived);
 }
+
+#[test]
+fn detached_restore_beats_an_older_remote_archive_delivered_after_staging() {
+    let mut live = RegistryDoc::new("sender");
+    live.apply_state(1, true, 0, vec![row(true, encode_hlc(1_000, 0, "remote"))]);
+    let mut detached = RegistryDoc::from_bytes(&live.to_bytes().unwrap(), "sender").unwrap();
+    let basis = detached.chat_archive_clock("chat").unwrap();
+    let clock = detached.chat_prompt_clock("chat");
+    // Arrival is later, but the intent predates this human send.
+    assert!(live.apply_rows(2, vec![row(true, encode_hlc(2_000, 0, "remote"))]));
+    live.restore_chat_on_send_from("chat", &clock, Some(&basis))
+        .unwrap();
+    assert!(
+        !live.chat("chat").unwrap().unwrap().archived,
+        "a late older archive is not a newer user intent"
+    );
+}
+
+#[test]
+fn detached_restore_wins_an_ambiguous_same_millisecond_automatic_close() {
+    let mut live = RegistryDoc::new("sender");
+    live.apply_state(1, true, 0, vec![row(true, encode_hlc(1_000, 0, "remote"))]);
+    let mut detached = RegistryDoc::from_bytes(&live.to_bytes().unwrap(), "sender").unwrap();
+    let basis = detached.chat_archive_clock("chat").unwrap();
+    let clock = detached.chat_prompt_clock("chat");
+    let sent_at = clock.split('-').next().unwrap().parse::<i64>().unwrap();
+    live.archive_chat_at("chat", sent_at).unwrap();
+    // The paired close-intent marker must survive persistence too.
+    let mut live = RegistryDoc::from_bytes(&live.to_bytes().unwrap(), "sender").unwrap();
+    live.restore_chat_on_send_from("chat", &clock, Some(&basis))
+        .unwrap();
+    assert!(
+        !live.chat("chat").unwrap().unwrap().archived,
+        "detached sends need the same automatic-close tie policy as live sends"
+    );
+}
+
+#[test]
+fn detached_restore_still_respects_a_newer_explicit_archive_with_independent_counter() {
+    let mut live = RegistryDoc::new("sender");
+    live.apply_state(1, true, 0, vec![row(true, encode_hlc(1_000, 0, "remote"))]);
+    live.archive_chat_at("chat", RegistryDoc::now_ms() + 60_000)
+        .unwrap();
+    let mut detached = RegistryDoc::from_bytes(&live.to_bytes().unwrap(), "sender").unwrap();
+    let basis = detached.chat_archive_clock("chat").unwrap();
+    let clock = detached.chat_prompt_clock("chat");
+    live.set_chat_archived("chat", true).unwrap();
+    assert!(
+        live.chat_archive_clock("chat").unwrap() < clock,
+        "the detached prompt reserved an independent larger HLC counter"
+    );
+    live.restore_chat_on_send_from("chat", &clock, Some(&basis))
+        .unwrap();
+    assert!(
+        live.chat("chat").unwrap().unwrap().archived,
+        "a later explicit archive remains authoritative"
+    );
+}

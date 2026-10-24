@@ -32,20 +32,6 @@ pub fn validate_sidebar_pin_update(
 pub struct SidebarPreferences {
     #[serde(default)]
     pub pinned_session_ids: Vec<String>,
-    #[serde(default)]
-    pub sections: Vec<SidebarSection>,
-}
-
-/// A user-named sidebar section. Archived sessions retain membership so restoring
-/// them restores their section; deleting the section never deletes sessions.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SidebarSection {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub session_ids: Vec<String>,
-    #[serde(default)]
-    pub collapsed: bool,
 }
 
 /// Watch payload for pins. `initialized` records known cached state, including
@@ -61,8 +47,6 @@ pub struct SidebarPreferencesState {
     pub initialized: bool,
     #[serde(default)]
     pub pinned_session_ids: Vec<String>,
-    #[serde(default)]
-    pub sections: Vec<SidebarSection>,
 }
 
 impl SidebarPreferencesState {
@@ -307,6 +291,12 @@ pub struct Session {
     /// Interrupts, failures and liveness expiry never advance this marker.
     #[serde(default)]
     pub last_completed_turn: Option<String>,
+    /// `last_completed_turn` answered peer mail only (another chat's message
+    /// or a room delivery, no person's prompt): clients consume the marker
+    /// without a completion alert. Published with the marker; older hosts
+    /// omit it, which reads as an ordinary completion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_completed_peer_only: bool,
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
@@ -818,6 +808,15 @@ pub struct ChangeRequestSummary {
     pub head_ref: String,
 }
 
+/// Result of merging a checkout's change request on its host. `merged: false`
+/// carries the provider's own reason (checks pending, review required, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRequestMergeResult {
+    pub merged: bool,
+    pub message: String,
+}
+
 /// Latest successful change request resolution for one checkout and branch.
 ///
 /// `change_request: None` is an authoritative successful lookup with no match;
@@ -1232,6 +1231,26 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn sidebar_preferences_ignore_legacy_section_data() {
+        let legacy = serde_json::json!({
+            "pinnedSessionIds": ["pin"],
+            "sections": [{ "id": "old", "name": "Old", "session_ids": ["session"] }]
+        });
+        let preferences: SidebarPreferences = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(preferences.pinned_session_ids, ["pin"]);
+        assert_eq!(
+            serde_json::to_value(preferences).unwrap(),
+            serde_json::json!({ "pinnedSessionIds": ["pin"] })
+        );
+        let mut state = legacy;
+        state["initialized"] = serde_json::json!(true);
+        state["synced"] = serde_json::json!(false);
+        let state: SidebarPreferencesState = serde_json::from_value(state).unwrap();
+        assert_eq!(state.pinned_session_ids, ["pin"]);
+        assert!(serde_json::to_value(state).unwrap().get("sections").is_none());
+    }
 
     #[test]
     fn checkout_change_request_status_round_trips_all_states_as_camel_case() {

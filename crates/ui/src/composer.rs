@@ -591,6 +591,16 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
+/// A prompt from another device that hasn't started yet goes first: a
+/// follow-up typed meanwhile is queued behind it rather than sent as its own
+/// run (#415). Nothing is running, so there is no Stop.
+pub fn send_mode_behind_pending(mode: SendButtonMode, pending_prompt: bool) -> SendButtonMode {
+    match mode {
+        SendButtonMode::Send if pending_prompt => SendButtonMode::Queue,
+        mode => mode,
+    }
+}
+
 /// Queue rows are represented by the queue panel until the host promotes them
 /// into the transcript. They must never publish (or refresh) a local echo.
 fn should_publish_optimistic_echo(queue: bool) -> bool {
@@ -1814,6 +1824,12 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
     }
 
     cx.bind_keys(palette_input_bindings());
+    // Sidebar search uses palette text editing but has no horizontal menu
+    // navigation. Bind bare caret motion only inside its parent context.
+    cx.bind_keys([
+        KeyBinding::new("left", Left, Some("SidebarSearch")),
+        KeyBinding::new("right", Right, Some("SidebarSearch")),
+    ]);
     cx.bind_keys(generic_bindings);
     cx.bind_keys(message_bindings);
 }
@@ -2081,6 +2097,12 @@ impl ComposerInput {
         self
     }
 
+    /// Include a standalone field in natural keyboard focus traversal.
+    pub fn with_tab_stop(mut self, tab_stop: bool) -> Self {
+        self.focus_handle = self.focus_handle.clone().tab_stop(tab_stop);
+        self
+    }
+
     /// Reset the caret blink phase (solid again) — called on every edit and
     /// caret move, matching textarea behavior.
     fn reset_blink(&mut self) {
@@ -2339,13 +2361,26 @@ impl ComposerInput {
         self.content_height
     }
 
+    /// Height that can scroll and fade. A wrapped placeholder still sizes the
+    /// box, but it isn't a draft: it never scrolls or fades (#447).
+    fn scrollable_height(&self) -> f32 {
+        if self.display_is_placeholder {
+            0.0
+        } else {
+            self.content_height
+        }
+    }
+
     pub fn set_placeholder(
         &mut self,
         placeholder: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        self.placeholder = placeholder.into();
-        cx.notify();
+        let placeholder = placeholder.into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -3578,7 +3613,7 @@ impl ComposerInput {
         let next = (self.scroll_top + delta).clamp(
             0.0,
             input_max_scroll(
-                self.content_height,
+                self.scrollable_height(),
                 self.settled_viewport_height
                     .unwrap_or(f32::from(bounds.size.height)),
             ),
@@ -3612,7 +3647,7 @@ impl ComposerInput {
         let next = input_scroll_offset(
             self.scroll_top,
             delta_y,
-            self.content_height,
+            self.scrollable_height(),
             viewport_height,
         );
         if next == self.scroll_top {
@@ -3620,7 +3655,7 @@ impl ComposerInput {
             // taller than the viewport), swallow the wheel event even at the
             // scroll boundary so it never chains into the outer transcript
             // list (the native equivalent of `overscroll-behavior: contain`).
-            if delta_y != 0.0 && input_max_scroll(self.content_height, viewport_height) > 0.0 {
+            if delta_y != 0.0 && input_max_scroll(self.scrollable_height(), viewport_height) > 0.0 {
                 cx.stop_propagation();
             }
             return;
@@ -3997,7 +4032,7 @@ impl ComposerInput {
     fn paint_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
         let visible = f32::from(bounds.size.height);
         let top_overflow = input_overflow_edges(
-            self.content_height,
+            self.scrollable_height(),
             self.settled_viewport_height.unwrap_or(visible),
             visible,
             self.scroll_top,
@@ -4049,7 +4084,7 @@ impl ComposerInput {
         self.scroll_top = self.scroll_top.clamp(
             0.0,
             input_max_scroll(
-                self.content_height,
+                self.scrollable_height(),
                 self.settled_viewport_height.unwrap_or(element_height),
             ),
         );
@@ -4821,7 +4856,7 @@ impl Render for ComposerInput {
                         .last_bounds
                         .map_or(0.0, |bounds| f32::from(bounds.size.height));
                     input_overflow_edges(
-                        input.content_height,
+                        input.scrollable_height(),
                         input
                             .settled_viewport_height
                             .unwrap_or(TEXTAREA_MAX - TEXTAREA_PAD_V),
@@ -5080,8 +5115,9 @@ fn invocation_token(text: &str, cursor: usize, prefix: char) -> Option<MentionTo
     })
 }
 
-/// Pasted prose is eligible only at completion boundaries, never inside
-/// Markdown code/links. Catalog matching below decides whether it is a reference.
+/// Pasted file/skill references are eligible only at completion boundaries,
+/// never inside Markdown code/links. Slash commands require explicit completion
+/// acceptance, not a catalog match in pasted prose.
 fn pasted_reference_tokens(text: &str, pasted: Range<usize>) -> Vec<(char, MentionToken)> {
     if text.len() > 256 * 1024 || text.get(pasted.clone()).is_none() {
         return Vec::new();
@@ -5089,7 +5125,7 @@ fn pasted_reference_tokens(text: &str, pasted: Range<usize>) -> Vec<(char, Menti
     let mut tokens = Vec::new();
     let mut attempts = 0;
     for (relative, prefix) in text[pasted.clone()].char_indices() {
-        if !matches!(prefix, '@' | '$' | '/') {
+        if !matches!(prefix, '@' | '$') {
             continue;
         }
         let start = pasted.start + relative;
@@ -5255,6 +5291,9 @@ fn workspace_command_for_text(
     text: &str,
     rows: &[InvocationCandidate],
 ) -> Option<WorkspaceCommand> {
+    // Match native-command whitespace rules: non-ASCII indentation and code
+    // must stay literal, even when the workspace-command cache is warm.
+    harness_proto::invocation::leading_command(text)?;
     let end = text.trim_end().len();
     let token = slash_token(text, end)?;
     if !text[..token.range.start].trim().is_empty() {
@@ -5471,10 +5510,13 @@ fn slash_error_message(err: &RpcError, skill: bool) -> SharedString {
 struct PromptHistoryNav {
     back: usize,
     draft: String,
+    /// Stable while browsing: live transcript appends/replays must not move
+    /// the cursor or invalidate an index. A new browse sees the latest rows.
+    prompts: Vec<String>,
 }
 
-/// The session's sent prompts, oldest first: user rows' text without
-/// attachment references, skipping attachment-only sends and repeats.
+/// The session's human prompts, oldest first: user rows' text without
+/// attachment references, skipping agent deliveries, attachment-only sends and repeats.
 fn session_prompts(transcript: &[SessionMessageEntry]) -> Vec<String> {
     let mut prompts: Vec<String> = Vec::new();
     for entry in transcript
@@ -5490,7 +5532,19 @@ fn session_prompts(transcript: &[SessionMessageEntry]) -> Vec<String> {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
+        // Deliveries from another chat's `send_message` or from an agent room
+        // ride the user role too, but nobody typed them here: recalling one
+        // would resend coordination as this person's request (#516). Text is
+        // the only record older transcripts keep, so match the same strict
+        // leading envelopes the transcript renders as deliveries; a prompt
+        // that merely quotes one stays recallable.
+        if harness_proto::room_delivery::strip(&raw).len() != raw.len() {
+            continue;
+        }
         let text = attachments::parse_user_message_images(&raw).text;
+        if crate::agent_message::parse(&text).is_some() {
+            continue;
+        }
         if !text.trim().is_empty() && prompts.last() != Some(&text) {
             prompts.push(text);
         }
@@ -5559,6 +5613,8 @@ pub struct Composer {
     /// Live dictation through the device's Codex voice, while one runs.
     dictation: Option<ComposerDictation>,
     wizard: Option<Wizard>,
+    /// Unfinished question pages, separate from ordinary prompt drafts.
+    wizard_drafts: HashMap<(String, String), Wizard>,
     wizard_focus: FocusHandle,
     wizard_expanded: bool,
     wizard_scroll: gpui::ScrollHandle,
@@ -5566,6 +5622,9 @@ pub struct Composer {
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
+    /// Failed submissions can complete after navigation. Restore only when
+    /// this chat/request is pending again, never into another chat's editor.
+    wizard_retries: HashMap<(String, String), (Wizard, String)>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     /// The queued message being edited in the composer (see
@@ -5829,11 +5888,13 @@ impl Composer {
             failure: None,
             dictation: None,
             wizard: None,
+            wizard_drafts: HashMap::new(),
             wizard_focus: cx.focus_handle(),
             wizard_expanded: false,
             wizard_scroll: gpui::ScrollHandle::new(),
             available_height: None,
             answered_requests: HashSet::new(),
+            wizard_retries: HashMap::new(),
             failure_key: None,
             action_task: None,
             advance_task: None,
@@ -5939,6 +6000,16 @@ impl Composer {
         self.wizard.is_some() && self.editing_queued.is_none()
     }
 
+    /// Explicit navigation should reveal the selected session's pending ask,
+    /// even when the selection itself did not change. Never steal a queue edit.
+    pub(crate) fn reveal_pending_question(&mut self, cx: &mut Context<Self>) {
+        self.on_state_changed(cx);
+        if self.wizard_active() {
+            self.wizard_expanded = true;
+            cx.notify();
+        }
+    }
+
     pub(crate) fn prepare_queue_edit_input(&mut self, cx: &mut Context<Self>) {
         // Pause auto-submit while the composer belongs to the queued row.
         // The wizard's picks and its displaced free-text draft stay intact.
@@ -6009,6 +6080,18 @@ impl Composer {
             self.drafts.insert(String::new(), input.text);
         }
         cx.notify();
+    }
+
+    /// Typed-but-unsent text, staged files or captures in any chat's
+    /// composer. All of it lives in memory only, so an automatic app restart
+    /// waits until there is none. (A question being answered keeps its
+    /// session AwaitingInput, which blocks the restart on its own.)
+    pub(crate) fn has_unsent_input(&self, cx: &App) -> bool {
+        !self.input.read(cx).text().trim().is_empty()
+            || self.queue_edit_draft.is_some()
+            || self.drafts.values().any(|text| !text.trim().is_empty())
+            || self.attachments.values().any(|stage| !stage.is_empty())
+            || self.appshots.values().any(|shots| !shots.is_empty())
     }
 
     /// Staged attachments for the chat the composer is showing.
@@ -6114,16 +6197,22 @@ impl Composer {
     }
 
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
+        self.add_staged_for(self.current_key.clone(), staged, cx);
+    }
+
+    fn add_staged_for(
+        &mut self,
+        key: String,
+        staged: Vec<StagedAttachment>,
+        cx: &mut Context<Self>,
+    ) {
         if self.queue_edit_finishing {
             return;
         }
         if staged.is_empty() {
             return;
         }
-        self.attachments
-            .entry(self.current_key.clone())
-            .or_default()
-            .extend(staged);
+        self.attachments.entry(key).or_default().extend(staged);
         self.focus_pending = true;
         cx.notify();
     }
@@ -6134,18 +6223,43 @@ impl Composer {
     /// PDF did nothing at all (user report). Read failures, folders and
     /// oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if !paths.iter().any(|path| !path.as_os_str().is_empty()) {
+            return;
+        }
+        // A pane drop can change selection before our observer runs. Swap
+        // attachment keys, drafts and queued-message editing only on navigation;
+        // staging in the same session must not reprocess its queue/wizard state.
+        if self.state.read(cx).selected_chat.as_deref().unwrap_or_default() != self.current_key {
+            self.on_state_changed(cx);
+        }
+        self.add_paths_for(self.current_key.clone(), paths, cx);
+    }
+
+    /// [`Self::add_paths`] for chat `key` (`""` = the canvas). A drop on an
+    /// unfocused pane selects its chat first, and the composer only switches
+    /// to that chat once the selection change reaches it.
+    pub(crate) fn add_paths_for(
+        &mut self,
+        key: String,
+        mut paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        paths.retain(|path| !path.as_os_str().is_empty());
+        if paths.is_empty() {
+            return;
+        }
         let mut staged = Vec::new();
         for path in &paths {
             match attachments::stage_any_file(path) {
                 Ok(att) => staged.push(att),
                 Err(message) => {
                     self.failure = Some(message.into());
-                    self.failure_key = Some(self.current_key.clone());
+                    self.failure_key = Some(key.clone());
                     cx.notify();
                 }
             }
         }
-        self.add_staged(staged, cx);
+        self.add_staged_for(key, staged, cx);
     }
 
     /// Add a file-tree or file-tab drop through the existing file-mention
@@ -6221,6 +6335,7 @@ impl Composer {
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
         self.appshots.remove(chat_id);
+        self.wizard_retries.retain(|(chat, _), _| chat != chat_id);
         self.state.update(cx, |state, _| {
             state.purge_review_comments(chat_id);
         });
@@ -6890,7 +7005,11 @@ impl Composer {
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
-        if self.wizard_active() {
+        let input = self.input.read(cx);
+        let recalling = input.history_entry.as_deref() == Some(input.text());
+        // Recalling a command or mention is navigation, not fresh typing.
+        // Popups would take the next Up/Down away from prompt history.
+        if self.wizard_active() || recalling {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
@@ -7343,7 +7462,7 @@ impl Composer {
     /// The new-session canvas heading. The destination chips alone read as
     /// settings, so a fresh canvas (first launch, ⌘D) never said where the
     /// session would run; this names the project up front. Clicking it opens
-    /// the project picker, which also offers "New project…".
+    /// the project picker, which also offers "New project".
     fn render_new_thread_heading(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let project = self
             .state
@@ -7821,7 +7940,7 @@ impl Composer {
         }
     }
 
-    fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         {
             let state = self.state.read(cx);
             let now = chrono::Utc::now();
@@ -7893,14 +8012,14 @@ impl Composer {
             self.launching_new_chat = false;
             // A question temporarily borrows the editor. Its answer must never
             // replace the ordinary chat draft saved when the panel opened.
-            if self.wizard.is_none() {
-                let mut old_text = self.input.read(cx).text().to_string();
-                // Leaving mid-recall keeps the real draft, not the recalled prompt.
-                if let Some(nav) = self.prompt_history.take()
-                    && self.input.read(cx).history_entry.as_deref() == Some(old_text.as_str())
-                {
-                    old_text = nav.draft;
-                }
+            if let Some(mut wizard) = self.wizard.take() {
+                wizard.set_typed(self.input.read(cx).text().to_string());
+                self.wizard_drafts.insert(
+                    (self.current_key.clone(), wizard.request_id.clone()),
+                    wizard,
+                );
+            } else {
+                let old_text = self.take_prompt_draft(cx);
                 if old_text.is_empty() {
                     self.drafts.remove(&self.current_key);
                 } else {
@@ -7913,7 +8032,7 @@ impl Composer {
             // failures render only under their own chat (see `failure_key`),
             // so switching away and back must not erase the one visible
             // trace of a failed send.
-            self.wizard = None;
+            self.advance_task = None;
             self.wizard_expanded = false;
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
@@ -7956,7 +8075,7 @@ impl Composer {
             cx.notify();
             return;
         }
-        // Question panel lifecycle (wizard state cached per request id).
+        // Question drafts belong to both a chat and a particular request.
         match pending {
             Some((request_id, questions)) if !self.answered_requests.contains(&request_id) => {
                 let same = self
@@ -7965,29 +8084,56 @@ impl Composer {
                     .is_some_and(|w| w.request_id == request_id);
                 if !same {
                     if self.wizard.is_none() {
-                        self.drafts.insert(
-                            self.current_key.clone(),
-                            self.input.read(cx).text().to_string(),
-                        );
+                        let draft = self.take_prompt_draft(cx);
+                        self.drafts.insert(self.current_key.clone(), draft);
                     }
                     self.reset_mention(None, cx);
-                    let prefill = questions
-                        .first()
-                        .and_then(|q| q.prefill.clone())
-                        .unwrap_or_default();
-                    self.wizard = Some(Wizard::new(request_id, questions));
-                    self.input
-                        .update(cx, |input, cx| input.set_text(prefill, cx));
-                    self.wizard_expanded = false;
+                    self.wizard_drafts.retain(|(chat, request), _| {
+                        chat != &self.current_key || request == &request_id
+                    });
+                    let key = (self.current_key.clone(), request_id.clone());
+                    // A failed submission's snapshot wins over an unsent
+                    // navigation draft: it holds what the user last sent.
+                    let (wizard, text) = match self.wizard_retries.remove(&key) {
+                        Some(retry) => {
+                            self.wizard_drafts.remove(&key);
+                            retry
+                        }
+                        None => {
+                            let wizard = self
+                                .wizard_drafts
+                                .remove(&key)
+                                .unwrap_or_else(|| Wizard::new(request_id, questions));
+                            let text = wizard.typed.get(wizard.page).cloned().unwrap_or_default();
+                            (wizard, text)
+                        }
+                    };
+                    self.wizard = Some(wizard);
+                    self.input.update(cx, |input, cx| input.set_text(text, cx));
+                    // The active session's question opens immediately, even
+                    // when a narrow pane needs the anchored popover. Only a
+                    // deliberate dismissal keeps this request collapsed.
+                    self.wizard_expanded = true;
                     self.wizard_scroll.set_offset(point(px(0.0), px(0.0)));
                     self.advance_task = None;
-                    // The shared input becomes the panel's free-text override.
+                    // Restore the hint for this page's selections, too.
+                    let has_pick = self.wizard.as_ref().is_some_and(|w| w.page_has_pick());
                     self.input.update(cx, |input, cx| {
-                        input.set_placeholder("Type your own answer, or pick an option above", cx)
+                        input.set_placeholder(
+                            if has_pick {
+                                "Type your own answer, or leave this blank to use the selected option"
+                            } else {
+                                "Type your own answer, or pick an option above"
+                            },
+                            cx,
+                        )
                     });
                 }
             }
             _ => {
+                if !self.state.read(cx).transcript.is_empty() {
+                    self.wizard_drafts.retain(|(chat, _), _| chat != &self.current_key);
+                }
                 if let Some(wizard) = self.wizard.as_ref() {
                     // LATCH (original composer.tsx `inputLatch`): a transient
                     // fold/sync blip — or a steer appended behind the
@@ -8019,8 +8165,15 @@ impl Composer {
             }
         }
         let input_context = message_input_context(self.wizard.is_some());
-        self.input
-            .update(cx, |input, cx| input.set_key_context(input_context, cx));
+        let question_open = self.wizard.is_some();
+        self.input.update(cx, |input, cx| {
+            input.set_key_context(input_context, cx);
+            // Every way out of a question (answer, resolution elsewhere,
+            // navigation) hands the ordinary hint back (#447).
+            if !question_open {
+                input.set_placeholder("Do anything…", cx);
+            }
+        });
         self.on_input_edited(cx);
         cx.notify();
     }
@@ -8087,7 +8240,17 @@ impl Composer {
             self.staged().len() + self.staged_appshots().len(),
             self.staged_comments(cx).len(),
         );
-        send_button_mode(self.run_live(cx), has_text)
+        let pending_prompt = has_text
+            && self
+                .state
+                .read(cx)
+                .remote_pending_prompts()
+                .next()
+                .is_some();
+        send_mode_behind_pending(
+            send_button_mode(self.run_live(cx), has_text),
+            pending_prompt,
+        )
     }
 
     fn execute_workspace_command(
@@ -8107,6 +8270,17 @@ impl Composer {
         cx.notify();
     }
 
+    /// End recall when another editor borrows the composer, preserving the
+    /// displaced draft unless the user actually edited the recalled prompt.
+    pub(crate) fn take_prompt_draft(&mut self, cx: &App) -> String {
+        let input = self.input.read(cx);
+        let text = input.text().to_string();
+        match self.prompt_history.take() {
+            Some(nav) if input.history_entry.as_deref() == Some(text.as_str()) => nav.draft,
+            _ => text,
+        }
+    }
+
     /// Up (`-1`) / Down (`1`) through this session's earlier prompts. The
     /// transcript is the history, so it survives reopening the session and
     /// never mixes sessions. Past the newest prompt the unsent draft returns.
@@ -8115,29 +8289,33 @@ impl Composer {
             return;
         }
         // `set_text` (a send, a draft swap) ends recall inside the input.
-        if self.input.read(cx).history_entry.is_none() {
+        let input = self.input.read(cx);
+        if input.history_entry.as_deref() != Some(input.text()) {
             self.prompt_history = None;
         }
-        let prompts = session_prompts(&self.state.read(cx).transcript);
         let next = match (&self.prompt_history, delta < 0) {
-            (None, true) if !prompts.is_empty() => {
+            (None, true) => {
+                let prompts = session_prompts(&self.state.read(cx).transcript);
+                if prompts.is_empty() {
+                    return;
+                }
                 self.prompt_history = Some(PromptHistoryNav {
                     back: 0,
-                    draft: self.input.read(cx).text().to_string(),
+                    draft: input.text().to_string(),
+                    prompts,
                 });
                 Some(0)
             }
-            (Some(nav), true) if nav.back + 1 < prompts.len() => Some(nav.back + 1),
+            (Some(nav), true) if nav.back + 1 < nav.prompts.len() => Some(nav.back + 1),
             (Some(nav), false) if nav.back > 0 => Some(nav.back - 1),
             (Some(_), false) => None,
             _ => return,
         };
         let (text, recalled) = match next {
             Some(back) => {
-                if let Some(nav) = self.prompt_history.as_mut() {
-                    nav.back = back;
-                }
-                (prompts[prompts.len() - 1 - back].clone(), true)
+                let nav = self.prompt_history.as_mut().unwrap();
+                nav.back = back;
+                (nav.prompts[nav.prompts.len() - 1 - back].clone(), true)
             }
             None => (
                 self.prompt_history
@@ -8480,6 +8658,9 @@ impl Composer {
         };
         self.launching_new_chat = is_new;
         if is_new {
+            self.pickers.update(cx, |pickers, _| {
+                pickers.begin_chat_creation(chat_id.clone(), resolved.clone());
+            });
             cx.emit(ComposerEvent::NewThreadTransitionStarted);
         }
         // A queued message is not in the transcript yet — the queue panel is
@@ -9216,14 +9397,48 @@ impl Composer {
         cx.notify();
     }
 
+    fn restore_failed_answer(
+        &mut self,
+        chat_id: String,
+        wizard: Wizard,
+        text: String,
+        staged: Vec<StagedAttachment>,
+        cx: &mut Context<Self>,
+    ) {
+        self.answered_requests.remove(&wizard.request_id);
+        self.attachments
+            .entry(chat_id.clone())
+            .or_default()
+            .extend(staged);
+        self.wizard_retries
+            .insert((chat_id.clone(), wizard.request_id.clone()), (wizard, text));
+        // A Composer notify only redraws; it does not run the AppState
+        // observer that mounts a wizard. Reconcile explicitly, even offline.
+        if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
+            self.on_state_changed(cx);
+        }
+        cx.notify();
+    }
+
     /// Submit RespondInput and retire the panel.
     fn wizard_finish(&mut self, answers: Vec<UserInputAnswer>, cx: &mut Context<Self>) {
         if self.question_cancellation_pending(cx) {
             return;
         }
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected — your answer is still here".into());
+            self.failure_key = Some(chat_id);
+            self.wizard_expanded = true;
+            cx.notify();
+            return;
+        };
         let Some(wizard) = self.wizard.take() else {
             return;
         };
+        let answer_text = self.input.read(cx).text().to_string();
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
         let draft = self
@@ -9237,12 +9452,6 @@ impl Composer {
             input.set_placeholder("Do anything…", cx);
             input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
         });
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
-            return;
-        };
         let request_id = wizard.request_id.clone();
         // Files staged while the question was up belong to the answer, not
         // to the next message: upload them to the chat's host like a send.
@@ -9250,15 +9459,15 @@ impl Composer {
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
-        let staged_key = self.current_key.clone();
         let host_device_id = self
             .state
             .read(cx)
             .selected_chat_row()
             .map(|chat| chat.device_id.clone());
         let failure_chat = chat_id.clone();
-        // `action_task`, NOT `send_task` — see `interrupt`.
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        // Delivery and recovery must survive navigation and another chat's
+        // composer action; replacing action_task used to cancel this work.
+        cx.spawn(async move |this, cx| {
             let mut paths = Vec::with_capacity(staged.len());
             for attachment in &staged {
                 let upload_id = uuid::Uuid::new_v4().to_string();
@@ -9276,17 +9485,13 @@ impl Composer {
                     Err(err) => {
                         tracing::warn!(name = %attachment.name, error = %err, "answer attachment upload failed");
                         this.update(cx, |composer, cx| {
-                            composer
-                                .attachments
-                                .entry(staged_key)
-                                .or_default()
-                                .extend(staged.iter().cloned());
                             composer.failure = Some(
                                 "Couldn't upload the attachment — the device may be offline.".into(),
                             );
-                            composer.failure_key = Some(failure_chat);
-                            composer.answered_requests.remove(&request_id);
-                            cx.notify();
+                            composer.failure_key = Some(failure_chat.clone());
+                            composer.restore_failed_answer(
+                                failure_chat, wizard, answer_text, staged, cx,
+                            );
                         })
                         .ok();
                         return;
@@ -9297,18 +9502,22 @@ impl Composer {
                 request_id: request_id.clone(),
                 answers: answers_with_attachments(answers, &paths),
             };
-            let Ok(command) = serde_json::to_value(&command) else {
-                return;
-            };
             let params = serde_json::json!({ "chatId": chat_id, "command": command });
-            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            let result = attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                methods::QUEUE_COMMAND,
+                params,
+                Duration::from_secs(30),
+            )
+            .await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
                     composer.failure = Some(format!("Answer failed: {err}").into());
-                    composer.failure_key = Some(failure_chat);
-                    // The answer never left this device — put the panel back.
-                    composer.answered_requests.remove(&request_id);
-                    cx.notify();
+                    composer.failure_key = Some(failure_chat.clone());
+                    composer.restore_failed_answer(
+                        failure_chat, wizard, answer_text, staged, cx,
+                    );
                 })
                 .ok();
                 return;
@@ -9321,16 +9530,27 @@ impl Composer {
             // un-hide the panel instead of leaving the question unanswerable.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
-                let transcript = composer.state.read(cx).transcript.clone();
-                let still_pending = pending_input_request(&transcript)
-                    .is_some_and(|(pending_id, _)| pending_id == request_id);
-                if still_pending && composer.answered_requests.remove(&request_id) {
-                    cx.notify();
+                let state = composer.state.read(cx);
+                let selected = state.selected_chat.as_deref() == Some(chat_id.as_str());
+                let still_pending = !selected
+                    || pending_input_request(&state.transcript)
+                        .is_some_and(|(pending_id, _)| pending_id == request_id);
+                if still_pending && composer.answered_requests.contains(&request_id) {
+                    composer.restore_failed_answer(chat_id, wizard, answer_text, staged, cx);
                 }
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
+    }
+
+    fn question_needs_popover(&self, window: &Window) -> bool {
+        self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH) < QUESTION_INLINE_MIN_WIDTH
+            || self
+                .available_height
+                .unwrap_or(f32::from(window.viewport_size().height))
+                < QUESTION_INLINE_MIN_HEIGHT
     }
 
     fn on_wizard_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -9359,7 +9579,7 @@ impl Composer {
                 cx.stop_propagation();
             }
         } else if key == "escape" {
-            if self.wizard_expanded {
+            if self.wizard_expanded && self.question_needs_popover(window) {
                 self.wizard_expanded = false;
                 window.focus(&self.wizard_focus, cx);
                 cx.notify();
@@ -9999,9 +10219,7 @@ impl Render for Composer {
             // compact launcher opens it in a popover anchored to this pane:
             // wide enough to read, without dimming or blocking other panes.
             let pane_width = self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH);
-            let narrow =
-                pane_width < QUESTION_INLINE_MIN_WIDTH || available < QUESTION_INLINE_MIN_HEIGHT;
-            if narrow {
+            if self.question_needs_popover(window) {
                 if !self.wizard_expanded && self.input.focus_handle(cx).is_focused(window) {
                     window.focus(&self.wizard_focus, cx);
                 }
@@ -10113,7 +10331,9 @@ impl Render for Composer {
                     .priority(3),
                 );
             }
-            self.wizard_expanded = false;
+            // Inline questions are visible too. Preserve that visibility if
+            // resizing later moves the same question into a popover.
+            self.wizard_expanded = true;
             let cap = (available * QUESTION_INLINE_SHARE)
                 .max(QUESTION_INLINE_FLOOR)
                 .min(available - Theme::SPACE_LG)
@@ -10124,7 +10344,11 @@ impl Render for Composer {
                 div().min_h_0().flex().flex_col().child(wizard),
             ));
         }
-        self.wizard_expanded = false;
+        // A queue edit only borrows the composer; hiding the wizard must not
+        // discard its expanded/collapsed state before the edit finishes.
+        if self.wizard.is_none() {
+            self.wizard_expanded = false;
+        }
 
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
@@ -11046,6 +11270,14 @@ fn dictation_unavailable_message(
 }
 
 #[cfg(test)]
+#[path = "composer/prompt_history_tests.rs"]
+mod prompt_history_tests;
+
+#[cfg(test)]
+#[path = "composer/question_recovery_tests.rs"]
+mod question_recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -11507,6 +11739,126 @@ mod tests {
             handle
                 .read_with(cx, |composer, _| assert!(!composer.wizard_expanded))
                 .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn agent_question_opens_on_session_activation(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let mut visual = gpui::VisualTestContext::from_window(handle.into(), cx);
+        visual.simulate_resize(size(px(1000.0), px(600.0)));
+        let state = handle
+            .read_with(cx, |composer, _| composer.state.clone())
+            .unwrap();
+        let transcript = vec![SessionMessageEntry {
+            id: "assistant".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Input {
+                id: "input".into(),
+                request_id: "pending-question".into(),
+                questions: vec![
+                    question("branch", &["Yes", "No"], true),
+                    question("confirm", &["Yes", "No"], true),
+                ],
+                resolved: false,
+            }],
+            created_at: 0,
+            device_id: "device".into(),
+            status: Some(harness_doc::MessageStatus::Streaming),
+            continuation_of: None,
+            duration_ms: None,
+        }];
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.set_available_width(200.0, cx)
+            })
+            .unwrap();
+
+        // Both a warm snapshot and a question arriving after watch replay
+        // must open without a second click on the collapsed launcher.
+        for delayed in [false, true] {
+            state.update(cx, |state, cx| {
+                state.select_chat(Some("other".into()), cx);
+                state.transcript.clear();
+                cx.notify();
+            });
+            visual.run_until_parked();
+            state.update(cx, |state, cx| {
+                state.select_chat(Some("question-chat".into()), cx);
+                if !delayed {
+                    state.transcript = transcript.clone();
+                }
+                cx.notify();
+            });
+            visual.run_until_parked();
+            if delayed {
+                assert!(visual.debug_bounds("question-popover").is_none());
+                state.update(cx, |state, cx| {
+                    state.transcript = transcript.clone();
+                    cx.notify();
+                });
+            }
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert!(visual.debug_bounds("question-popover").is_some());
+            assert!(visual.debug_bounds("wizard-submit").is_some());
+
+            // Switching between inline and popover layouts must not silently
+            // dismiss the active question, whether width or height changes.
+            for (width, height, popover) in [
+                (260.0, 600.0, false),
+                (200.0, 600.0, true),
+                (260.0, 600.0, false),
+                (260.0, 140.0, true),
+                (200.0, 600.0, true),
+            ] {
+                handle
+                    .update(cx, |composer, _, cx| {
+                        composer.set_available_width(width, cx);
+                        composer.set_available_height(height, cx);
+                    })
+                    .unwrap();
+                visual.update(|window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear();
+                });
+                assert_eq!(
+                    visual.debug_bounds("question-popover").is_some(),
+                    popover,
+                    "{width}x{height}"
+                );
+                assert!(visual.debug_bounds("wizard-submit").is_some());
+                if !popover {
+                    // Escape still goes back a page inline; it must not
+                    // consume the key as though a popover were showing.
+                    handle
+                        .update(cx, |composer, window, cx| {
+                            composer.wizard.as_mut().unwrap().page = 1;
+                            window.focus(&composer.wizard_focus, cx);
+                        })
+                        .unwrap();
+                    cx.simulate_keystrokes(handle.into(), "escape");
+                    handle
+                        .read_with(cx, |composer, _| {
+                            assert_eq!(composer.wizard.as_ref().unwrap().page, 0);
+                        })
+                        .unwrap();
+                }
+            }
+
+            // Explicit collapse remains respected across unrelated updates,
+            // but leaving and returning to the session opens it again.
+            let close = visual.debug_bounds("question-close").unwrap();
+            visual.simulate_click(close.center(), Default::default());
+            state.update(cx, |_, cx| cx.notify());
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert!(visual.debug_bounds("question-popover").is_none());
+            assert!(visual.debug_bounds("question-expand").is_some());
         }
     }
 
@@ -12339,6 +12691,10 @@ mod tests {
         );
         for literal in [
             "    /model",
+            "\t/model",
+            "\u{a0}/model",
+            "\u{2003}/model",
+            "\n\u{a0}/model",
             "`/model`",
             "```\n/model\n```",
             "please /model",
@@ -12556,6 +12912,111 @@ mod tests {
         assert_eq!(key(cx, false), "my draft");
     }
 
+    fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.into(),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    /// #516: messages delivered by another chat or a room are not prompts this
+    /// person typed, in either envelope format, while a prompt that quotes an
+    /// envelope stays recallable and human prompts keep their order.
+    #[test]
+    fn prompt_recall_skips_agent_and_room_deliveries() {
+        let current = "[Message from Harness chat Cleanup (abc12345). Sender chat: abc12345. Relay depth: 1/4. Agent coordination, not a human request. Do not send acknowledgements or progress updates.]\n\nKeep tests running.";
+        let legacy = "[Message from Harness chat Cleanup (abc12345). Reply to it with the Harness `send_message` tool, chat abc12345.]\n\nKeep tests running.";
+        let quoted = "Why did I get this? [Message from Harness chat Cleanup (abc12345). Sender chat: abc12345. Agent coordination, not a human request.]\n\nKeep tests running.";
+        let room = harness_proto::room_delivery::format(
+            &harness_proto::room_delivery::RoomOrigin {
+                room_id: "room".into(),
+                room_name: "Room".into(),
+                seq: 3,
+                from_member: "Reviewer".into(),
+                member_kind: "agent".into(),
+                from_user: false,
+                framed: false,
+                external: false,
+                from_display: None,
+                from_github: None,
+                from_fingerprint: None,
+            },
+            "Please look again.",
+        );
+        let transcript = vec![
+            user_entry("u1", "first prompt"),
+            user_entry("m1", current),
+            user_entry("u2", "second prompt"),
+            user_entry("m2", legacy),
+            user_entry("r1", &room),
+            user_entry("u3", quoted),
+            user_entry("m3", current),
+        ];
+        assert_eq!(
+            session_prompts(&transcript),
+            vec![
+                "first prompt".to_string(),
+                "second prompt".to_string(),
+                quoted.to_string()
+            ]
+        );
+        assert!(
+            session_prompts(&[user_entry("m1", current), user_entry("m2", legacy)]).is_empty(),
+            "a chat that only received agent messages has nothing to recall"
+        );
+    }
+
+    #[gpui::test]
+    fn up_in_a_chat_with_only_agent_messages_keeps_the_draft(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.transcript = vec![user_entry(
+                "m1",
+                "[Message from Harness chat Cleanup (abc12345). Sender chat: abc12345. Relay depth: 1/4. Agent coordination, not a human request.]\n\nKeep tests running.",
+            )];
+        });
+        let window = cx.add_window(|_, cx| Composer::new(state.clone(), cx));
+        window
+            .update(cx, |composer, window, cx| {
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("my draft", cx);
+                    input.move_to(0, cx);
+                    input.up(&Up, window, cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |composer, cx| {
+                assert_eq!(composer.input.read(cx).text(), "my draft");
+                assert!(composer.prompt_history.is_none());
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn projectless_composer_allows_send_and_enter_submission(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
@@ -12581,6 +13042,102 @@ mod tests {
                 composer.send_blocked(cx),
                 "Pending edits must still block submission"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn first_send_keeps_canvas_config_while_chat_row_is_missing(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut defaults = crate::settings::composer::ComposerDefaults::default();
+        defaults.remember_model(
+            HarnessId::ClaudeCode,
+            "other-model".into(),
+            "Other model".into(),
+        );
+        defaults
+            .model_options_mut(HarnessId::Codex, "canvas-model")
+            .insert("serviceTier".into(), "fast".into());
+        defaults.save(directory.path()).unwrap();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.data_dir = Some(directory.path().to_path_buf());
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                harness_rpc::RpcClient::new(out, inbound),
+            ));
+            state
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let captured = composer.update(cx, |composer, cx| {
+            composer.pickers.update(cx, |pickers, cx| {
+                pickers.adopt_canvas_draft(
+                    Some(crate::pickers::CanvasDraft {
+                        harness: Some(HarnessId::Codex),
+                        model: Some("canvas-model".into()),
+                        reasoning: Some(harness_proto::ReasoningLevel::High),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+            let captured = composer.pickers.read(cx).resolved(cx);
+            composer.send("First prompt".into(), false, cx);
+            captured
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(state.selected_chat.is_some());
+            assert!(state.selected_chat_row().is_none());
+        });
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.pickers.read(cx).resolved(cx), captured)
+        });
+        let mut create = None;
+        while let Ok(frame) = requests.try_recv() {
+            let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            if frame.method.as_deref() == Some(methods::MUTATE)
+                && frame.params["op"] == "createChat"
+            {
+                create = Some(frame);
+            }
+        }
+        let create = create.expect("first send creates the chat with captured picks");
+        assert_eq!(
+            create.params["config"],
+            serde_json::to_value(captured.chat_config().unwrap()).unwrap()
+        );
+        replies
+            .try_send(
+                serde_json::to_string(&harness_rpc::ServerFrame {
+                    id: create.id,
+                    ok: Some(serde_json::json!({})),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        let mut run = None;
+        while let Ok(frame) = requests.try_recv() {
+            let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            if frame.method.as_deref() == Some(methods::QUEUE_COMMAND) {
+                run = Some(frame.params["command"]["request"].clone());
+            }
+        }
+        let run = run.expect("first send queues the captured run independently of row sync");
+        assert_eq!(run["harness"], "codex");
+        assert_eq!(run["model"], "canvas-model");
+        assert_eq!(run["reasoning"], "high");
+        assert_eq!(run["modelOptions"]["serviceTier"], "fast");
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.pickers.read(cx).resolved(cx), captured)
         });
     }
 
@@ -12829,6 +13386,70 @@ mod tests {
     }
 
     #[gpui::test]
+    fn wrapped_placeholder_never_scrolls_or_fades(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.input.update(cx, |input, cx| {
+                    let hint =
+                        "Type your own answer, or leave this blank to use the selected option";
+                    let line = f32::from(input.line_height);
+                    input.set_text("", cx);
+                    input.set_placeholder(hint, cx);
+                    input.layout_text(px(140.0), &window.text_style(), window, cx);
+                    assert!(
+                        input.content_height > line,
+                        "the hint must wrap for this test"
+                    );
+                    input.settled_viewport_height = Some(line);
+                    input.scroll_top = line;
+                    input.clamp_scroll(line);
+                    assert_eq!(input.scroll_top, 0.0);
+                    assert_eq!(
+                        input_overflow_edges(input.scrollable_height(), line, line, 0.0),
+                        (false, false),
+                        "an empty composer is not a scrolled draft"
+                    );
+
+                    // A draft of the same length still scrolls and fades.
+                    input.set_text(hint, cx);
+                    input.layout_text(px(140.0), &window.text_style(), window, cx);
+                    assert_eq!(
+                        input_overflow_edges(input.scrollable_height(), line, line, 0.0),
+                        (false, true)
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn leaving_a_question_restores_the_ordinary_hint(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.selected_chat = Some("question-chat".into());
+                });
+                composer.on_state_changed(cx);
+                composer.wizard = Some(Wizard::new(
+                    "answer".into(),
+                    vec![question("answer", &[], false)],
+                ));
+                composer.input.update(cx, |input, cx| {
+                    input.set_placeholder("Type your own answer, or pick an option above", cx)
+                });
+                composer.state.update(cx, |state, _| {
+                    state.selected_chat = Some("ordinary-chat".into());
+                });
+                composer.on_state_changed(cx);
+                assert!(composer.wizard.is_none());
+                assert_eq!(composer.input.read(cx).placeholder.as_ref(), "Do anything…");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn soft_wrap_carets_preserve_pointer_keyboard_and_ime_affinity(cx: &mut gpui::TestAppContext) {
         let (_dir, handle) = composer_focus_window(cx);
         handle.update(cx, |composer, window, cx| {
@@ -13023,6 +13644,256 @@ mod tests {
         assert_eq!(shown[0], shown[2]);
     }
 
+    #[gpui::test]
+    fn explicit_command_completion_preserves_supported_and_legacy_behavior(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        for supported in [false, true] {
+            handle.update(cx, |composer, window, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.selected_device = Some("peer".into());
+                    state.devices = vec![serde_json::from_value(serde_json::json!({
+                        "id": "peer", "name": "Peer", "platform": "linux",
+                        "capabilities": if supported { vec![capabilities::COMPOSER_REFERENCES_V1] } else { vec![] }
+                    })).unwrap()];
+                });
+                let draft = "Mention /res later";
+                composer.input.update(cx, |input, cx| input.set_text(draft, cx));
+                composer.update_slash(draft, "Mention /res".len(), cx);
+                let invocation = harness_proto::invocation::Invocation::Command { name: "resume".into() };
+                composer.slash_cache.insert(composer.slash.context.clone(), vec![InvocationCandidate {
+                    workspace_command: None,
+                    name: "resume".into(),
+                    description: String::new(),
+                    input_hint: None,
+                    invocation: invocation.clone(),
+                }]);
+                composer.refilter_slash(cx);
+                composer.accept_slash(cx);
+                let expected = if supported { invocation.link() } else { "/resume".into() };
+                assert_eq!(composer.input.read(cx).text(), format!("Mention {expected} later"));
+                assert_eq!(composer.input.read(cx).projection.mentions.len(), usize::from(supported));
+                composer.input.update(cx, |input, cx| {
+                    input.undo(&Undo, window, cx);
+                    assert_eq!(input.text(), draft);
+                });
+            }).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn pasted_literal_slash_mentions_reach_send_and_queue_edit_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        for supported in [false, true] {
+            for editing_queue in [false, true] {
+                for raw in LITERAL_SLASH_PASTES
+                    .iter()
+                    .copied()
+                    .filter(|raw| harness_proto::invocation::leading_command(raw).is_none())
+                {
+                    let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+                    let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+                    let state = cx.new(|_| AppState::new());
+                    state.update(cx, |state, _| {
+                        state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                            harness_rpc::RpcClient::new(out, inbound),
+                        ));
+                        state.selected_chat = Some("literal-draft".into());
+                        state.selected_device = Some("peer".into());
+                        state.devices = vec![serde_json::from_value(serde_json::json!({
+                            "id": "peer", "name": "Peer", "platform": "linux",
+                            "capabilities": if supported { vec![capabilities::COMPOSER_REFERENCES_V1] } else { vec![] }
+                        })).unwrap()];
+                    });
+                    let composer = cx.new(|cx| Composer::new(state, cx));
+                    composer.update(cx, |composer, cx| {
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_text(raw, cx));
+                        let revision = composer.input.read(cx).edit_revision;
+                        composer.resolve_pasted_references(0..raw.len(), revision, cx);
+                        assert_eq!(composer.input.read(cx).text(), raw);
+                        assert!(composer.input.read(cx).projection.mentions.is_empty());
+                        // Even a warm workspace-command cache must not turn a
+                        // literal mention into navigation when submitting.
+                        composer.slash_cache.insert(
+                            composer.slash.context.clone(),
+                            with_workspace_commands(vec![], true),
+                        );
+                        if editing_queue {
+                            composer.editing_queued = Some("queued-row".into());
+                            composer.queue_edit_lease_id = Some("lease".into());
+                            composer.queue_edit_chat_id = Some("literal-draft".into());
+                            composer.queue_edit_host_device_id = Some("peer".into());
+                        }
+                        composer.on_submit(cx);
+                    });
+                    cx.run_until_parked();
+                    let mut submitted = Vec::new();
+                    while let Ok(frame) = requests.try_recv() {
+                        let frame: harness_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                        match frame.method.as_deref() {
+                            Some(methods::FINISH_QUEUED_MESSAGE_EDIT) => {
+                                submitted.push(frame.params["text"].as_str().unwrap().to_owned())
+                            }
+                            Some(methods::QUEUE_COMMAND) => submitted.push(
+                                frame.params["command"]["request"]["prompt"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned(),
+                            ),
+                            method => panic!("literal paste must not need discovery: {method:?}"),
+                        }
+                    }
+                    assert_eq!(
+                        submitted,
+                        vec![raw],
+                        "supported={supported}, editing_queue={editing_queue}, raw={raw:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    const LITERAL_SLASH_PASTES: &[&str] = &[
+        "/resume",
+        "/harness:resume",
+        "/compact arguments",
+        "Would /resume work?",
+        "Will\r\n/resume\r\nor /compact work?",
+        "Please compare /resume and /harness:resume",
+        "Mention /resume",
+        "(/resume), [/compact]; {/harness:resume}.",
+        "café 🦀 /resume 日本語",
+        "    /resume",
+        "\t/resume",
+        "\u{a0}/resume",
+        "`/resume` and ``/compact``",
+        "```text\n/resume\n/compact\n```",
+        "~~~text\n/resume\n~~~",
+        "[/resume](https://example.com/resume)",
+        "![a /resume example](example.png)",
+        "<!-- /resume -->",
+        r"\/resume and /usr/bin/resume",
+        "https://example.com/resume?q=/compact#resume",
+        "//resume /resume/path /resume?arg=yes",
+    ];
+
+    #[test]
+    fn pasted_slash_mentions_stay_literal_across_boundaries_and_work_limits() {
+        for text in LITERAL_SLASH_PASTES {
+            assert!(
+                pasted_reference_tokens(text, 0..text.len()).is_empty(),
+                "{text:?}"
+            );
+            // A paste may replace any UTF-8-aligned part of an existing draft.
+            let boundaries: Vec<_> = text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(text.len()))
+                .collect();
+            for &start in &boundaries {
+                for &end in boundaries.iter().filter(|&&end| end >= start) {
+                    assert!(
+                        pasted_reference_tokens(text, start..end).is_empty(),
+                        "{text:?}: {start}..{end}"
+                    );
+                }
+            }
+        }
+        let text = "/resume ".repeat(64) + "$review @README.md";
+        let tokens = pasted_reference_tokens(&text, 0..text.len());
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|(prefix, token)| (*prefix, token.query.as_str()))
+                .collect::<Vec<_>>(),
+            vec![('$', "review"), ('@', "README.md")],
+            "slash mentions must not consume the reference-discovery budget"
+        );
+        let text = "🦀 /resume $review";
+        for range in [1..text.len(), 0..1, text.len()..text.len() + 1] {
+            assert!(pasted_reference_tokens(text, range).is_empty());
+        }
+        let text = "x".repeat(256 * 1024) + " /resume $review";
+        assert!(pasted_reference_tokens(&text, 0..text.len()).is_empty());
+    }
+
+    #[gpui::test]
+    fn pasted_slash_clipboard_replacement_and_undo_never_create_chips(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_composer_input(cx, |input, window, cx| {
+            let prefix = "Préface 🦀 ";
+            let suffix = " 日本語 after";
+            let original = format!("{prefix}replace{suffix}");
+            for pasted in LITERAL_SLASH_PASTES {
+                input.set_text(&original, cx);
+                input.selected_range = prefix.len()..prefix.len() + "replace".len();
+                cx.write_to_clipboard(ClipboardItem::new_string((*pasted).into()));
+                input.paste(&Paste, window, cx);
+                let expected = format!("{prefix}{pasted}{suffix}");
+                assert_eq!(input.text(), expected, "{pasted:?}");
+                assert!(input.projection.mentions.is_empty(), "{pasted:?}");
+                assert_eq!(input.cursor_offset(), prefix.len() + pasted.len());
+                input.undo(&Undo, window, cx);
+                assert_eq!(input.text(), original);
+                input.redo(&Redo, window, cx);
+                assert_eq!(input.text(), expected);
+                assert!(input.projection.mentions.is_empty());
+                input.select_all(&SelectAll, window, cx);
+                input.copy(&Copy, window, cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), expected);
+                input.set_text("", cx);
+                input.paste(&Paste, window, cx);
+                assert_eq!(input.text(), expected);
+                assert!(input.projection.mentions.is_empty());
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn selected_command_clipboard_metadata_is_preserved_but_stale_metadata_is_ignored(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_composer_input(cx, |input, window, cx| {
+            let invocation = harness_proto::invocation::Invocation::Command {
+                name: "resume".into(),
+            };
+            let raw = format!("Please {} later", invocation.link());
+            input.set_text(&raw, cx);
+            input.select_all(&SelectAll, window, cx);
+            input.copy(&Copy, window, cx);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "Please /resume later"
+            );
+            input.set_text("", cx);
+            input.paste(&Paste, window, cx);
+            assert_eq!(input.text(), raw);
+            assert_eq!(
+                input.projection.mentions.len(),
+                1,
+                "an explicitly selected command survives internal copy/paste"
+            );
+            input.set_text("", cx);
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                "Would /resume work?".into(),
+                serde_json::json!({"harnessComposerV1": raw, "text": "Please /resume later"}),
+            ));
+            input.paste(&Paste, window, cx);
+            assert_eq!(input.text(), "Would /resume work?");
+            assert!(input.projection.mentions.is_empty());
+        });
+    }
+
     #[test]
     fn pasted_references_only_recognize_complete_prose_tokens() {
         let text = "Use @README.md, ($framer) and /review. café@example.com $12.50 /usr/bin x/review `@code.rs` \\@escaped.rs [@label](url) https://host/@remote";
@@ -13032,7 +13903,7 @@ mod tests {
                 .iter()
                 .map(|(prefix, token)| (*prefix, token.query.as_str()))
                 .collect::<Vec<_>>(),
-            vec![('@', "README.md"), ('$', "framer"), ('/', "review")]
+            vec![('@', "README.md"), ('$', "framer")]
         );
         for text in [
             "```\n@README.md\n```",
@@ -13040,6 +13911,9 @@ mod tests {
             "<user@example.com>",
             "$HOME/bin",
             "[x](https://host/@file)",
+            "Would /resume work?",
+            "Will\n/resume\nor /compact work?",
+            "/resume",
         ] {
             assert!(
                 pasted_reference_tokens(text, 0..text.len()).is_empty(),
@@ -13095,7 +13969,7 @@ mod tests {
                 ));
             });
             let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-            let raw = "$review /compact @README.md";
+            let raw = "$review: would /resume\nor /compact work? @README.md";
             composer.update(cx, |composer, cx| {
                 assert!(composer.file_search_params("", cx).is_none());
                 composer
@@ -13115,7 +13989,10 @@ mod tests {
                 assert!(frame.params.get("cwd").is_none());
                 let value = match frame.method.as_deref() {
                     Some(methods::LIST_COMMANDS) => {
-                        serde_json::json!([{"name":"compact", "description":"Compact"}])
+                        serde_json::json!([
+                            {"name":"compact", "description":"Compact"},
+                            {"name":"resume", "description":"Resume"}
+                        ])
                     }
                     Some(methods::LIST_SKILLS) => {
                         serde_json::json!([{"name":"review", "path":"/skills/SKILL.md", "description":"Review", "enabled":true}])
@@ -13145,8 +14022,8 @@ mod tests {
                 if change_target {
                     assert_eq!(text, raw);
                 } else {
-                    assert_eq!(harness_proto::invocation::invocation_links(text).len(), 2);
-                    assert!(text.ends_with(" @README.md"));
+                    assert_eq!(harness_proto::invocation::invocation_links(text).len(), 1);
+                    assert!(text.ends_with(": would /resume\nor /compact work? @README.md"));
                 }
             });
         }
@@ -15580,6 +16457,19 @@ mod tests {
         assert_eq!(send_button_mode(false, false), SendButtonMode::Send);
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Queue);
+        // Behind another device's prompt that hasn't started: queue, never Stop.
+        assert_eq!(
+            send_mode_behind_pending(send_button_mode(false, true), true),
+            SendButtonMode::Queue
+        );
+        assert_eq!(
+            send_mode_behind_pending(send_button_mode(false, true), false),
+            SendButtonMode::Send
+        );
+        assert_eq!(
+            send_mode_behind_pending(send_button_mode(true, false), true),
+            SendButtonMode::Stop
+        );
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
     }
 
@@ -15826,11 +16716,227 @@ mod tests {
         });
     }
 
+    fn switch_question_draft_chat(
+        composer: &mut Composer,
+        chat_id: &str,
+        pending: Option<(&str, Vec<UserInputQuestion>)>,
+        cx: &mut Context<Composer>,
+    ) {
+        composer.state.update(cx, |state, _| {
+            state.selected_chat = Some(chat_id.into());
+            state.transcript = pending
+                .map(|(request_id, questions)| SessionMessageEntry {
+                    id: format!("message-{request_id}"),
+                    role: MessageRole::Assistant,
+                    parts: vec![MessagePart::Input {
+                        id: format!("input-{request_id}"),
+                        request_id: request_id.into(),
+                        questions,
+                        resolved: false,
+                    }],
+                    created_at: 0,
+                    device_id: "host".into(),
+                    status: Some(harness_doc::MessageStatus::Streaming),
+                    continuation_of: None,
+                    duration_ms: None,
+                })
+                .into_iter()
+                .collect();
+        });
+        composer.on_state_changed(cx);
+    }
+
+    #[gpui::test]
+    fn question_draft_survives_tab_switch_until_submitted(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        // Submitting retires the question only with an engine to answer to.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, _requests) = tokio::sync::mpsc::channel(64);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                        harness_rpc::RpcClient::new(out, inbound),
+                    ));
+                })
+            })
+            .unwrap();
+        let questions = vec![question("custom", &["Yes", "No"], false)];
+        let answer = "  My unfinished answer\n还有一些细节…  ";
+        handle
+            .update(cx, |composer, window, cx| {
+                switch_question_draft_chat(composer, "question", None, cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Prompt draft", cx));
+                switch_question_draft_chat(
+                    composer,
+                    "question",
+                    Some(("ask", questions.clone())),
+                    cx,
+                );
+                assert!(
+                    composer.input.read(cx).is_empty(),
+                    "do not borrow the prompt draft as an answer"
+                );
+                composer.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, answer, window, cx);
+                });
+            })
+            .unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                switch_question_draft_chat(composer, "ordinary", None, cx);
+                assert!(composer.wizard.is_none());
+                assert!(composer.input.read(cx).is_empty());
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Other prompt", cx));
+            })
+            .unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                switch_question_draft_chat(
+                    composer,
+                    "question",
+                    Some(("ask", questions.clone())),
+                    cx,
+                );
+                assert_eq!(composer.input.read(cx).text(), answer);
+                composer.on_submit(cx);
+                assert!(composer.wizard.is_none());
+                assert!(composer.answered_requests.contains("ask"));
+                assert_eq!(composer.input.read(cx).text(), "Prompt draft");
+            })
+            .unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                switch_question_draft_chat(composer, "ordinary", None, cx);
+                assert_eq!(composer.input.read(cx).text(), "Other prompt");
+                switch_question_draft_chat(composer, "question", Some(("ask", questions)), cx);
+                assert!(
+                    composer.wizard.is_none(),
+                    "submitted answers must not reappear"
+                );
+                assert_eq!(composer.input.read(cx).text(), "Prompt draft");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn question_drafts_survive_navigation_and_page_changes(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let questions = vec![
+            question("first", &["one", "two"], true),
+            question("second", &[], false),
+        ];
+        let first = "  First answer\nwith unfinished details  ";
+        let second = "Second answer, still typing…";
+        handle
+            .update(cx, |composer, window, cx| {
+                switch_question_draft_chat(composer, "a", None, cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Ordinary draft A", cx));
+                switch_question_draft_chat(composer, "a", Some(("request", questions.clone())), cx);
+                composer.wizard_select(1, cx);
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("", cx);
+                    input.replace_text_in_range(None, first, window, cx);
+                });
+                // The button path must capture text too, not just Enter.
+                composer.wizard_advance(cx);
+                composer.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, second, window, cx);
+                });
+                switch_question_draft_chat(composer, "b", None, cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Ordinary draft B", cx));
+                // Even identical request IDs in different chats must stay isolated.
+                switch_question_draft_chat(composer, "b", Some(("request", questions.clone())), cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Answer B", cx));
+                switch_question_draft_chat(composer, "a", Some(("request", questions.clone())), cx);
+                let wizard = composer.wizard.as_ref().unwrap();
+                assert_eq!(wizard.page, 1, "return to the unfinished question page");
+                assert_eq!(wizard.answers()[0].labels, vec![first.trim()]);
+                assert_eq!(composer.input.read(cx).text(), second);
+                composer.wizard_back(cx);
+                assert_eq!(
+                    composer.input.read(cx).text(),
+                    first,
+                    "restore exact unsubmitted text"
+                );
+                assert!(composer.wizard.as_ref().unwrap().is_picked(1));
+                composer.wizard_advance(cx);
+                assert_eq!(composer.input.read(cx).text(), second);
+                switch_question_draft_chat(composer, "b", Some(("request", questions.clone())), cx);
+                assert_eq!(composer.wizard.as_ref().unwrap().page, 0);
+                assert_eq!(composer.input.read(cx).text(), "Answer B");
+                switch_question_draft_chat(composer, "a", Some(("request", questions.clone())), cx);
+                // An empty sync frame must not discard the active answer.
+                switch_question_draft_chat(composer, "a", None, cx);
+                assert!(composer.wizard.is_some());
+                assert_eq!(composer.input.read(cx).text(), second);
+                composer.state.update(cx, |state, _| {
+                    state.transcript = vec![SessionMessageEntry {
+                        id: "resolved-message".into(),
+                        role: MessageRole::Assistant,
+                        parts: vec![MessagePart::Input {
+                            id: "resolved-input".into(),
+                            request_id: "request".into(),
+                            questions: questions.clone(),
+                            resolved: true,
+                        }],
+                        created_at: 0,
+                        device_id: "host".into(),
+                        status: Some(harness_doc::MessageStatus::Complete),
+                        continuation_of: None,
+                        duration_ms: None,
+                    }];
+                });
+                composer.on_state_changed(cx);
+                assert!(composer.wizard.is_none());
+                assert_eq!(composer.input.read(cx).text(), "Ordinary draft A");
+                // A newer request must not inherit an older answer or page.
+                switch_question_draft_chat(
+                    composer,
+                    "a",
+                    Some(("new-request", questions.clone())),
+                    cx,
+                );
+                assert_eq!(composer.wizard.as_ref().unwrap().page, 0);
+                assert!(composer.input.read(cx).is_empty());
+                switch_question_draft_chat(composer, "b", Some(("request", questions)), cx);
+                assert_eq!(composer.input.read(cx).text(), "Answer B");
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn wizard_restores_displaced_draft_after_submit_navigation_and_timeout(
         cx: &mut gpui::TestAppContext,
     ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, _requests) = tokio::sync::mpsc::channel(16);
+        let (_replies, inbound) = tokio::sync::mpsc::channel(16);
         let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                harness_rpc::RpcClient::new(out, inbound),
+            ));
+        });
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let transcript = |id: &str, resolved: bool| {
             let mut q = question("editor", &[], false);

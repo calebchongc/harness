@@ -794,7 +794,7 @@ impl IncrementalParser {
         }
         // The delta may complete a line begun earlier — rescan from that line's
         // start when checking for definitions.
-        let scan_from = self.source.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let scan_from = self.source.rfind(['\n', '\r']).map(|i| i + 1).unwrap_or(0);
         self.source.push_str(delta);
         if !self.full_only && has_link_defs(&self.source[scan_from..]) {
             self.full_only = true;
@@ -820,7 +820,7 @@ impl IncrementalParser {
             n => self.tree.blocks[n - 2].range.start,
         };
         let boundary = self.source[..boundary]
-            .rfind('\n')
+            .rfind(['\n', '\r'])
             .map(|i| i + 1)
             .unwrap_or(0);
 
@@ -874,7 +874,7 @@ impl IncrementalParser {
 /// Conservative detector for link-reference-definition lines
 /// (`[label]: destination`, up to 3 leading spaces).
 fn has_link_defs(text: &str) -> bool {
-    text.lines().any(|line| {
+    text.split(['\n', '\r']).any(|line| {
         let trimmed = line.trim_start();
         line.len() - trimmed.len() <= 3 && trimmed.starts_with('[') && trimmed.contains("]:")
     })
