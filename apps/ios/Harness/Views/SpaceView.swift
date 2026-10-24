@@ -2,6 +2,7 @@
 // the space's sessions as a vertical list (creation order, like tab order),
 // swipe-to-archive (= tab close), and "+" to start a session in this space.
 
+import os
 import SwiftUI
 
 struct SpaceView: View {
@@ -134,11 +135,14 @@ struct SpaceView: View {
 
 // MARK: - New space: remote folder browser
 
+private let folderLog = Logger(subsystem: "harness.codegraff.ios", category: "folders")
+
 /// The desktop add-space palette translated to a sheet: device tabs, mono
 /// breadcrumb with an up button, the device's folders (git repos badged),
 /// "Use this folder" pinned at the bottom. Listing comes from the device over
 /// the relay (ListFolders); dotfiles are pre-filtered and long listings are
-/// truncated at 500 by the engine.
+/// truncated at 500 by the engine. Folders already visited come from
+/// `FolderBrowserState`'s cache instead of another round trip (#420).
 struct NewSpaceSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
@@ -227,6 +231,8 @@ struct NewSpaceSheet: View {
             let host = selectedDeviceId
             if deviceId == nil { deviceId = host }
             navigationTask?.cancel()
+            // Folders loaded in an earlier presentation show straight away.
+            browser.cache = model.folderListings
             browser.selectDevice(host)
             guard let request = browser.begin(path: nil) else { return }
             await load(request)
@@ -287,6 +293,8 @@ struct NewSpaceSheet: View {
             }
             .buttonStyle(.plain)
             .disabled(listing?.parent == nil || creating)
+            .accessibilityLabel("Up")
+            .accessibilityIdentifier("folder-up")
 
             Text(listing?.path ?? " ")
                 .font(Theme.mono(12))
@@ -294,11 +302,13 @@ struct NewSpaceSheet: View {
                 .lineLimit(1)
                 .truncationMode(.head)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("folder-path")
 
             if loading {
                 ProgressView()
                     .controlSize(.mini)
                     .tint(Theme.textMuted)
+                    .accessibilityIdentifier("folder-loading")
             }
         }
     }
@@ -344,6 +354,9 @@ struct NewSpaceSheet: View {
             .padding(.bottom, 12)
         }
         .opacity(loading && listing == nil ? 0.4 : 1)
+        .refreshable {
+            await refresh()
+        }
     }
 
     private func folderRow(_ entry: FolderEntry) -> some View {
@@ -379,6 +392,7 @@ struct NewSpaceSheet: View {
         }
         .buttonStyle(SheetRowButtonStyle())
         .disabled(creating)
+        .accessibilityIdentifier("folder-row-\(entry.name)")
     }
 
     private var useFolderButton: some View {
@@ -410,11 +424,25 @@ struct NewSpaceSheet: View {
 
     // MARK: Data
 
+    /// Never waits on the host: a cached folder shows at once (and refreshes
+    /// in the background when it's older), and the latest tap always wins.
     private func navigate(path: String, isRepo: Bool) {
-        guard !creating, browser.deviceId == selectedDeviceId,
-              let request = browser.begin(path: path, isRepo: isRepo) else { return }
+        guard !creating, browser.deviceId == selectedDeviceId else { return }
         navigationTask?.cancel()
+        navigationTask = nil
+        guard let request = browser.begin(path: path, isRepo: isRepo) else { return }
         navigationTask = Task { await load(request) }
+    }
+
+    /// Pull to refresh: ask the host for the folder on screen even when its
+    /// listing is fresh.
+    private func refresh() async {
+        guard !creating, let current = browser.selection(for: selectedDeviceId) else { return }
+        navigationTask?.cancel()
+        navigationTask = nil
+        guard let request = browser.begin(path: current.listing.path, isRepo: current.isRepo,
+                                          refresh: true) else { return }
+        await load(request)
     }
 
     private func load(_ request: FolderBrowserState.Request) async {
@@ -423,11 +451,24 @@ struct NewSpaceSheet: View {
                            cancelled: true, failureMessage: "")
             return
         }
-        let result = await model.listFolders(deviceId: request.deviceId, path: request.path)
+        let started = ContinuousClock.now
+        var listing: FolderListing?
+        var failure = ""
+        do {
+            listing = try await model.listFolders(deviceId: request.deviceId, path: request.path)
+        } catch {
+            // Say why, even when an older listing stays on screen.
+            failure = "Couldn't open that folder on \(model.deviceName(request.deviceId)): "
+                + describeUserFacingError(error)
+        }
+        // End to end (relay included); the host logs its own walk time.
+        let ms = Int((ContinuousClock.now - started) / .milliseconds(1))
+        let mode = request.revalidating ? "refresh" : "cold"
+        let outcome = listing == nil ? "failed" : "ok"
+        folderLog.info("ListFolders \(mode, privacy: .public) \(outcome, privacy: .public) in \(ms) ms")
         withAnimation(Motion.fadeQuick) {
-            _ = browser.finish(request, listing: result, currentDeviceId: selectedDeviceId,
-                           cancelled: Task.isCancelled,
-                           failureMessage: "Couldn't open that folder on \(model.deviceName(request.deviceId)). Make sure it's online.")
+            _ = browser.finish(request, listing: listing, currentDeviceId: selectedDeviceId,
+                               cancelled: Task.isCancelled, failureMessage: failure)
         }
     }
 
