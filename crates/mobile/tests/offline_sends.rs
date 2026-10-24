@@ -127,7 +127,7 @@ fn sends_made_offline_wait_in_the_outbox_across_a_restart() {
     assert_eq!(request.model_options["serviceTier"], "fast");
     assert!(matches!(
         &commands[1].payload,
-        SessionCommandPayload::Steer { prompt, message_id: Some(id) } if prompt == "Also the tests" && id == &steer_id
+        SessionCommandPayload::Steer { prompt, message_id: Some(id), .. } if prompt == "Also the tests" && id == &steer_id
     ));
     assert!(matches!(
         &commands[2].payload,

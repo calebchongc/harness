@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "Reply with exactly: Devin model discovery verified. Do not use tools.".into(),
         harness: None,
         model: Some(model.clone()),

@@ -319,6 +319,7 @@ impl Shell {
         let message_id = uuid::Uuid::new_v4().to_string();
         let command = harness_doc::SessionCommandPayload::Run {
             request: harness_proto::RunRequest {
+                turn_origin: Default::default(),
                 prompt: RESUME_PROMPT.to_string(),
                 harness: Some(config.harness),
                 model: config.model.clone(),

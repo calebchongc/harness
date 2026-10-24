@@ -138,6 +138,8 @@ fn main() -> anyhow::Result<()> {
         harness_doc::QueuedMessage {
             id: "queued-review".into(),
             text: body,
+            turn_origin: Default::default(),
+            peer_chat_id: None,
             attachments: paths.clone(),
             hold_for_turn_end: true,
             issued_by: device.clone(),
@@ -148,6 +150,8 @@ fn main() -> anyhow::Result<()> {
         harness_doc::QueuedMessage {
             id: "queued-text".into(),
             text: "Then check the spacing and keyboard navigation.".into(),
+            turn_origin: Default::default(),
+            peer_chat_id: None,
             attachments: vec![],
             hold_for_turn_end: true,
             issued_by: device.clone(),

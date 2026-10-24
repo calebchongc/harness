@@ -236,6 +236,7 @@ fn send(core: &EngineCore, harness: HarnessId, prompt: &str, message_id: &str) {
             CHAT,
             SessionCommandPayload::Run {
                 request: RunRequest {
+                    turn_origin: Default::default(),
                     prompt: prompt.into(),
                     harness: Some(harness),
                     model: Some(MODEL.into()),

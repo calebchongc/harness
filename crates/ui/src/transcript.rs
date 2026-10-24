@@ -5548,9 +5548,24 @@ impl Transcript {
                 fold.disclosure_at = None;
             }
         }
+        // Rows of the reused prefix are the previous build's, unchanged. With
+        // no baseline change their tool groups keep the reveal they have:
+        // recomputing it gives the same starts, and doing so for every group
+        // on every streamed token made each token cost time proportional to
+        // the whole conversation on the UI thread (#342).
+        let keeps_reveal = |row: &Row, reveals: &HashMap<SharedString, ToolGroupReveal>| {
+            !baseline_changed
+                && matches!(row.kind, RowKind::ToolGroup { .. })
+                && reveals.contains_key(&row.id)
+        };
+        let kept_reveals = new_rows[..reused]
+            .iter()
+            .filter(|row| keeps_reveal(row, &self.tool_group_reveals))
+            .count();
         let previous_tools: HashMap<SharedString, HashMap<String, Option<Instant>>> = new_rows
             [..reused]
             .iter()
+            .filter(|row| !keeps_reveal(row, &self.tool_group_reveals))
             .chain(old_rows.iter())
             .filter(|row| !fully_historical.contains(&row.entry_id))
             .filter_map(|row| match &row.kind {
@@ -5575,10 +5590,14 @@ impl Transcript {
             .collect();
         let now = Instant::now();
         let mut live_tool_groups = HashSet::new();
-        for row in &new_rows {
+        for (ix, row) in new_rows.iter().enumerate() {
             let RowKind::ToolGroup { tools, .. } = &row.kind else {
                 continue;
             };
+            if kept_reveals > 0 && ix < reused && keeps_reveal(row, &self.tool_group_reveals) {
+                live_tool_groups.insert(row.id.clone());
+                continue;
+            }
             // Agent/spawn groups are standalone cards, not task trees —
             // except under compact mode, where they collapse like the rest.
             if !self.compact_mode && !tool_group_collapses(tools) {

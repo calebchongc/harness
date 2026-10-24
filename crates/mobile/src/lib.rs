@@ -398,6 +398,7 @@ impl MobileCore {
             &chat_id,
             harness_doc::SessionCommandPayload::Steer {
                 prompt,
+                turn_origin: harness_proto::TurnOrigin::Human,
                 message_id: Some(message_id.clone()),
             },
         );

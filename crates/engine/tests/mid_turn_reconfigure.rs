@@ -111,6 +111,7 @@ fn run(core: &EngineCore, id: &str, prompt: &str, model: Option<&str>, cwd: &str
             payload: SessionCommandPayload::Run {
                 message_id: id.into(),
                 request: RunRequest {
+                    turn_origin: Default::default(),
                     prompt: prompt.into(),
                     harness: Some(HarnessId::Mock),
                     model: model.map(str::to_string),

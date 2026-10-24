@@ -1089,6 +1089,7 @@ impl Tools {
                     .or_else(|| space.map(|s| s.path.clone()))
                     .unwrap_or_else(|| "~".into());
                 let request = RunRequest {
+                    turn_origin: harness_proto::TurnOrigin::Peer,
                     prompt: text,
                     harness: Some(harness),
                     model: config.as_ref().and_then(|c| c.model.clone()),
@@ -1122,6 +1123,7 @@ impl Tools {
                     .queue_command(
                         &chat.id,
                         &SessionCommandPayload::Steer {
+                            turn_origin: harness_proto::TurnOrigin::Peer,
                             prompt: text,
                             message_id: Some(uuid::Uuid::new_v4().to_string()),
                         },
@@ -1474,6 +1476,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_send_mode_is_peer_even_without_sender_metadata() {
+        for sender in [None, Some("chat-beta-2")] {
+            for mode in ["auto", "run", "steer", "queue"] {
+                let world = Arc::new(World::default());
+                let tools = tools(
+                    world.clone(),
+                    Origin {
+                        chat_id: sender.map(str::to_owned),
+                        device_id: None,
+                    },
+                );
+                tools
+                    .call(
+                        "send_message",
+                        json!({
+                            "chat": "alpha", "text": "ordinary follow-up", "mode": mode
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let writes = world.writes.lock().unwrap();
+                let (method, params) = writes.last().unwrap();
+                let (origin, text) = if method == methods::QUEUE_MESSAGE {
+                    assert_eq!(params["holdForTurnEnd"], true);
+                    assert_eq!(params["peerChatId"].as_str(), sender);
+                    (&params["turnOrigin"], &params["text"])
+                } else if params["command"]["kind"] == "run" {
+                    (
+                        &params["command"]["request"]["turnOrigin"],
+                        &params["command"]["request"]["prompt"],
+                    )
+                } else {
+                    (
+                        &params["command"]["turnOrigin"],
+                        &params["command"]["prompt"],
+                    )
+                };
+                assert_eq!(origin, "peer");
+                assert!(text.as_str().unwrap().ends_with("ordinary follow-up"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn send_attributes_and_refuses_self() {
         let world = Arc::new(World::default());
         let tools = tools(
@@ -1673,6 +1719,7 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+        assert_eq!(writes[2].1["command"]["request"]["turnOrigin"], "peer");
     }
 
     #[tokio::test]

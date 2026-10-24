@@ -50,6 +50,7 @@ async fn main() {
             .into()
     });
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt,
         harness: None,
         model: None,

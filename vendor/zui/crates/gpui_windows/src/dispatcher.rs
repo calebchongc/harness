@@ -93,7 +93,11 @@ impl WindowsDispatcher {
         let location = runnable.metadata().location;
         let spawned = runnable.metadata().spawned;
         gpui::profiler::update_running_task(spawned, location);
+        let activity = gpui::foreground_activity::enter(
+            gpui::foreground_activity::ForegroundActivity::Task(location),
+        );
         runnable.run();
+        drop(activity);
         gpui::profiler::save_task_timing();
     }
 }

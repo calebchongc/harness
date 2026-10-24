@@ -88,6 +88,7 @@ async fn agent_started_turns_end_on_gui_turn_end() {
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "Fix it".into(),
         harness: None,
         model: None,

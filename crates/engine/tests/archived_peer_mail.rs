@@ -171,6 +171,7 @@ async fn setup() -> (
 fn run(prompt: &str) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
+            turn_origin: Default::default(),
             prompt: prompt.into(),
             harness: None,
             model: None,
@@ -223,6 +224,7 @@ async fn archived_chat_refuses_peer_mail_and_a_person_still_restores_it() {
     let steer = core.doc_host.queue_command(
         CHAT,
         SessionCommandPayload::Steer {
+            turn_origin: Default::default(),
             prompt: peer("status?"),
             message_id: None,
         },

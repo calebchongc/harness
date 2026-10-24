@@ -97,6 +97,52 @@ pub(super) fn per_token_cost(
     tail_bytes: usize,
     deltas: usize,
 ) -> TokenCost {
+    per_token_cost_with_history(cx, 0, steps, tail_bytes, deltas).1
+}
+
+/// A settled earlier turn: the prompt, then a reply with a thought, two tool
+/// calls and a few paragraphs of text.
+fn settled_turn(turn: usize) -> [SessionMessageEntry; 2] {
+    let prompt = SessionMessageEntry {
+        role: MessageRole::User,
+        status: None,
+        ..assistant(
+            &format!("p{turn}"),
+            MessageStatus::Complete,
+            vec![MessagePart::Text {
+                id: format!("p{turn}-text"),
+                text: "Run the suite and fix whatever fails.".into(),
+            }],
+        )
+    };
+    let reply = assistant(
+        &format!("a{turn}"),
+        MessageStatus::Complete,
+        vec![
+            MessagePart::Reasoning {
+                id: format!("a{turn}-r"),
+                text: "Considering the next change to the parser and its tests. ".repeat(8),
+            },
+            exec(format!("a{turn}-t0")),
+            exec(format!("a{turn}-t1")),
+            MessagePart::Text {
+                id: format!("a{turn}-text"),
+                text: "The parser now accepts trailing commas.\n\n".repeat(6),
+            },
+        ],
+    );
+    [prompt, reply]
+}
+
+/// [`per_token_cost`] behind `history` settled turns; also returns what the
+/// opening reset cost on the UI thread (apply + first draw).
+pub(super) fn per_token_cost_with_history(
+    cx: &mut gpui::TestAppContext,
+    history: usize,
+    steps: usize,
+    tail_bytes: usize,
+    deltas: usize,
+) -> (Duration, TokenCost) {
     let dir = tempfile::tempdir().unwrap();
     let state = cx.update(|cx| {
         gpui_base::init(cx);
@@ -143,8 +189,10 @@ pub(super) fn per_token_cost(
             }],
         )
     };
-    let entries = [prompt, live_turn(steps, tail_bytes)];
-    deliver(
+    let mut entries: Vec<SessionMessageEntry> = (0..history).flat_map(settled_turn).collect();
+    entries.extend([prompt, live_turn(steps, tail_bytes)]);
+    let count = entries.len();
+    let (_, reset_apply, reset_draw) = deliver(
         harness_doc::TranscriptUpdate {
             frame: harness_doc::TranscriptFrame::reset(&entries),
             context_usage: None,
@@ -168,7 +216,7 @@ pub(super) fn per_token_cost(
                         len,
                     }],
                     remove: Vec::new(),
-                    count: 2,
+                    count,
                 },
                 context_usage: None,
                 replay_baseline: None,
@@ -180,11 +228,14 @@ pub(super) fn per_token_cost(
         total[2] += draw;
     }
     let mean = |d: Duration| d.as_secs_f64() * 1e6 / deltas as f64;
-    TokenCost {
-        prepare_us: mean(total[0]),
-        apply_us: mean(total[1]),
-        draw_us: mean(total[2]),
-    }
+    (
+        reset_apply + reset_draw,
+        TokenCost {
+            prepare_us: mean(total[0]),
+            apply_us: mean(total[1]),
+            draw_us: mean(total[2]),
+        },
+    )
 }
 
 /// Prints the per-token cost as the live turn grows. Run with
@@ -199,12 +250,26 @@ fn report_per_token_cost_by_live_turn_size(cx: &mut gpui::TestAppContext) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
+    if let Some(history) = std::env::var("STALL_HISTORY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        let (reset, cost) = per_token_cost_with_history(cx, history, 5, 0, deltas);
+        eprintln!("{history:>5} settled turns + live turn of 5 steps: opening {reset:?}; {cost:?}");
+        return;
+    }
     let sizes = only.map_or(vec![25, 100, 400, 1600], |steps| vec![steps]);
     for steps in sizes {
         let cost = per_token_cost(cx, steps, 0, deltas);
         eprintln!("live turn of {steps:>5} steps: {cost:?}");
     }
     if only.is_none() {
+        for history in [100, 400, 1600, 3200] {
+            let (reset, cost) = per_token_cost_with_history(cx, history, 5, 0, deltas);
+            eprintln!(
+                "{history:>5} settled turns + live turn of 5 steps: opening {reset:?}; {cost:?}"
+            );
+        }
         for kb in [16, 64, 256, 1024] {
             let cost = per_token_cost(cx, 20, kb * 1024, deltas);
             eprintln!("20 steps, live thought of {kb:>5} KB: {cost:?}");

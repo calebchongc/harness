@@ -21,6 +21,7 @@ pub mod colors;
 mod element;
 mod elements;
 mod executor;
+pub mod foreground_activity;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;

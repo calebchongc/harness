@@ -28,6 +28,7 @@ const SPAWN: &str = "toolu_wf";
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        turn_origin: Default::default(),
         prompt: prompt.into(),
         harness: None,
         model: None,

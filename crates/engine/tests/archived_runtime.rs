@@ -12,7 +12,7 @@ use harness_doc::{MessagePart, MessageRole, MessageStatus, SessionCommandPayload
 use harness_engine::{EngineCore, HarnessRegistry};
 use harness_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode,
+    SessionStatus, SteeringMode, TurnOrigin,
 };
 use tokio::sync::mpsc;
 
@@ -128,6 +128,7 @@ fn payload(cwd: &str, message_id: &str) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         message_id: message_id.into(),
         request: RunRequest {
+            turn_origin: Default::default(),
             prompt: "human task".into(),
             harness: Some(HarnessId::Mock),
             model: None,
@@ -352,6 +353,114 @@ async fn archive_retires_pending_peer_steers_but_recovers_accepted_human_prompts
         "peer work must not redeliver"
     );
     assert!(core.workspace.chat(CHAT).unwrap().unwrap().archived);
+    core.shutdown().await;
+}
+
+/// Peer work is known by its origin, not only by the envelope text (#553):
+/// an MCP send arrives as plain text tagged `TurnOrigin::Peer`, and archive
+/// retirement must drop it like enveloped peer mail.
+#[tokio::test]
+async fn archive_retires_pending_peer_steers_known_only_by_their_origin() {
+    let (dir, core, harness) = setup().await;
+    let feed = harness.feeds.lock().unwrap()[0].clone();
+    for (id, origin) in [
+        ("plain-peer-pending", TurnOrigin::Peer),
+        ("human-pending", TurnOrigin::Human),
+    ] {
+        let SessionCommandPayload::Run { mut request, .. } =
+            payload(&dir.path().to_string_lossy(), id)
+        else {
+            unreachable!()
+        };
+        request.prompt = id.into();
+        request.turn_origin = origin;
+        core.sessions
+            .dispatch(CHAT, HarnessId::Mock, request, Some(id.into()))
+            .await
+            .unwrap();
+    }
+    core.workspace.set_chat_archived(CHAT, true).unwrap();
+    feed.send(AgentEvent::TextDelta {
+        text: "original human result".into(),
+    })
+    .unwrap();
+    feed.send(done()).unwrap();
+    wait_for(|| harness.requests.lock().unwrap().len() == 2).await;
+    let recovered = harness.requests.lock().unwrap()[1].clone();
+    assert_eq!(recovered.prompt, "human-pending");
+    assert_eq!(recovered.turn_origin, TurnOrigin::Human);
+    harness.feeds.lock().unwrap()[1].send(done()).unwrap();
+    wait_for(|| harness.retired.load(Ordering::SeqCst) == 2).await;
+    assert_eq!(
+        harness.requests.lock().unwrap().len(),
+        2,
+        "plain-text peer work must not redeliver into an archived chat"
+    );
+
+    // New peer work tagged only by origin is refused at the door, too.
+    let mut refused = payload(&dir.path().to_string_lossy(), "late-peer");
+    if let SessionCommandPayload::Run { request, .. } = &mut refused {
+        request.prompt = "ordinary follow-up".into();
+        request.turn_origin = TurnOrigin::Peer;
+    }
+    let err = core.doc_host.queue_command(CHAT, refused).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(harness_proto::peer_mail::ARCHIVED_REFUSAL)
+    );
+    assert!(
+        core.doc_host
+            .queue_message_with_origin(
+                CHAT,
+                "ordinary follow-up",
+                Vec::new(),
+                true,
+                TurnOrigin::Peer,
+                None
+            )
+            .is_err()
+    );
+    assert!(core.workspace.chat(CHAT).unwrap().unwrap().archived);
+    core.shutdown().await;
+}
+
+/// #499: retiring an archived chat's parked runtime is not a completion, and
+/// output that races the archive cannot publish one either.
+#[tokio::test]
+async fn archived_runtime_retirement_publishes_no_completion() {
+    let (_dir, core, harness) = setup().await;
+    let feed = harness.feeds.lock().unwrap()[0].clone();
+    feed.send(AgentEvent::TextDelta {
+        text: "finished human task".into(),
+    })
+    .unwrap();
+    feed.send(done()).unwrap();
+    wait_for(|| {
+        core.sessions
+            .session_status(CHAT)
+            .is_some_and(|s| s.status == SessionStatus::Idle && s.last_completed_turn.is_some())
+    })
+    .await;
+    let completed = core.sessions.session_status(CHAT).unwrap();
+    assert!(!completed.last_completed_peer_only);
+
+    // Past the resume gate, so a frame would otherwise unpark the runtime
+    // as a self-continued turn.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    core.workspace.set_chat_archived(CHAT, true).unwrap();
+    // A self-continued frame already in flight when the archive lands.
+    let _ = feed.send(AgentEvent::TextDelta {
+        text: "background result after archive".into(),
+    });
+    wait_for(|| harness.retired.load(Ordering::SeqCst) == 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after = core.sessions.session_status(CHAT).unwrap();
+    assert_eq!(after.status, SessionStatus::Idle);
+    assert_eq!(
+        after.last_completed_turn, completed.last_completed_turn,
+        "an archived chat's retirement publishes no new completion"
+    );
+    assert!(!text(&core, "background result after archive"));
     core.shutdown().await;
 }
 

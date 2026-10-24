@@ -6,7 +6,7 @@ use harness_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, QueuedMessage, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus,
 };
-use harness_proto::{RunRequest, SandboxLevel, UserInputAnswer};
+use harness_proto::{RunRequest, SandboxLevel, TurnOrigin, UserInputAnswer};
 use serde_json::{Map, Value, json};
 
 use crate::records::{ChatRecord, UserInputAnswerRecord};
@@ -43,6 +43,7 @@ pub(crate) fn run_request(
     let config = chat.and_then(|chat| chat.config.as_ref());
     RunRequest {
         prompt,
+        turn_origin: TurnOrigin::Human,
         harness: parse(config.map(|c| c.harness.as_str())),
         model: config.and_then(|c| c.model.clone()),
         reasoning: parse(config.and_then(|c| c.reasoning.as_deref())),

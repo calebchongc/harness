@@ -30,6 +30,7 @@ async fn graff_acp_restores_in_the_selected_workspace() {
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "Hello".into(),
         harness: None,
         model: None,
@@ -98,6 +99,7 @@ async fn run_graff_worktree_fixture(
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "Hello".into(),
         harness: None,
         model: None,

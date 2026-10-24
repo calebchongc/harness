@@ -76,6 +76,7 @@ for line in sys.stdin:
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {
+        turn_origin: Default::default(),
         prompt: "Inspect".into(),
         harness: None,
         model: None,

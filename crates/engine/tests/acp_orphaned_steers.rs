@@ -57,6 +57,7 @@ impl Rig {
 
     fn request(&self, prompt: &str) -> RunRequest {
         RunRequest {
+            turn_origin: Default::default(),
             prompt: prompt.into(),
             harness: None,
             model: None,
