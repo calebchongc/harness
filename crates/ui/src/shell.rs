@@ -90,6 +90,13 @@ mod titlebar_tests;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
+/// Text highlighting and row presentation are independent: sidebar search
+/// keeps sidebar view preferences, while the command palette uses card rows.
+enum ChatRowSearch<'a> {
+    Palette(&'a str),
+    Sidebar(&'a str),
+}
+
 actions!(
     shell,
     [
@@ -7526,10 +7533,15 @@ impl Shell {
         // nine chips appear together instead of leaving a hole on whichever
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
-        search_query: Option<&str>,
+        search: Option<ChatRowSearch<'_>>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let (search_query, palette) = match search {
+            Some(ChatRowSearch::Palette(query)) => (Some(query), true),
+            Some(ChatRowSearch::Sidebar(query)) => (Some(query), false),
+            None => (None, false),
+        };
         // Activity, not position (t3code Sidebar): status is a small colored
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
@@ -7546,9 +7558,9 @@ impl Shell {
         };
         // This renderer is shared with palette results; PR badges belong there,
         // not in session rows in the sidebar (including drag previews).
-        let change_request = change_request.filter(|_| search_query.is_some());
-        let compact = search_query.is_none() && self.settings.sidebar_compact;
-        let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
+        let change_request = change_request.filter(|_| palette);
+        let compact = !palette && self.settings.sidebar_compact;
+        let show_label = palette || self.settings.sidebar_show_project_label;
         let remote = self
             .state
             .read(cx)
@@ -7558,10 +7570,10 @@ impl Shell {
             .is_some_and(|chat| {
                 self.state.read(cx).local_device_id.as_deref() != Some(chat.device_id.as_str())
             });
-        let project_icon = (search_query.is_none() && self.settings.sidebar_show_project_icon)
+        let project_icon = (!palette && self.settings.sidebar_show_project_icon)
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
-        let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
+        let archived_muted = archived && !palette && !selected && !corner_hovered;
         let project_icon = project_icon.map(|icon| {
             div()
                 .flex_none()
@@ -7822,7 +7834,7 @@ impl Shell {
         let mut corner = Some(corner);
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
-        let subline = if search_query.is_some() {
+        let subline = if palette {
             theme.text_muted
         } else {
             theme.text_muted.opacity(0.5)
@@ -7842,7 +7854,7 @@ impl Shell {
         // below its near-opaque selected fill, and blending toward it visibly
         // dimmed the active row under the pointer (user report).
         let hover_bg = if selected { selected_wash } else { hover };
-        let rest_text = if selected || search_query.is_some() {
+        let rest_text = if selected || palette {
             text
         } else if archived {
             text.opacity(0.55)
@@ -7865,7 +7877,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .rounded(px(if search_query.is_some() {
+            .rounded(px(if palette {
                 popover::PALETTE_ITEM_RADIUS
             } else {
                 8.0
