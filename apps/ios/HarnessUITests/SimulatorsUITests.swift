@@ -113,7 +113,7 @@ final class SimulatorsUITests: XCTestCase {
         keep("live-simulator-home")
         // The Settings app icon on a fresh simulator's first home page (third row, last column).
         screen.coordinate(withNormalizedOffset: CGVector(dx: 0.84, dy: 0.49)).tap()
-        sleep(3)
+        sleep(6)
         keep("live-simulator-tapped")
         app.buttons["simulator-home"].tap()
         sleep(2)
