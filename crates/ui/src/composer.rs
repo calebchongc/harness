@@ -3177,7 +3177,11 @@ impl ComposerInput {
     fn mention_tab(&mut self, _: &MentionTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.mention_has_selection {
             cx.emit(ComposerInputEvent::MentionAccept);
-        } else if !self.indent_list(false, window, cx) {
+        } else if !self.indent_list(false, window, cx)
+            && self.key_context != MESSAGE_COMPOSER_CONTEXT
+        {
+            // Standalone fields may traverse controls. An ordinary Tab while
+            // composing must not send the caret to unrelated sidebar buttons.
             cx.propagate();
         }
     }

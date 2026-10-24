@@ -3,6 +3,14 @@
 use super::*;
 use harness_proto::Chat;
 
+fn search_icon(theme: &Theme, size: f32) -> gpui::Svg {
+    // SVG painting requires a local foreground; parent text color is not
+    // inherited by Svg::paint. Match the adjacent sidebar control icons.
+    icon(icons::MAGNIFER)
+        .size(px(size))
+        .text_color(theme.text_muted)
+}
+
 pub(super) struct SidebarSearch {
     input: Entity<ComposerInput>,
     focus: FocusHandle,
@@ -39,6 +47,7 @@ fn matching_chats<'a>(
                 .unwrap_or("New session")
                 .to_lowercase()
                 .contains(&query)
+                || chat.id.to_lowercase().contains(&query)
         })
         .collect();
     matches.sort_by(|left, right| spaces::compare_sidebar_chats(sort, left, right));
@@ -69,7 +78,7 @@ impl Shell {
             .border_color(theme.border.opacity(0.0))
             .focus_visible(|el| el.border_color(theme.border_strong))
             .cursor_pointer()
-            .text_color(if open { theme.accent } else { theme.text_muted })
+            .text_color(theme.text_muted)
             .bg(if open {
                 theme.glass_hover()
             } else {
@@ -89,7 +98,7 @@ impl Shell {
                     window.prevent_default();
                 }
             })
-            .child(icon(icons::MAGNIFER).size(px(16.0)))
+            .child(search_icon(theme, 16.0).debug_selector(|| "sidebar-search-trigger-icon".into()))
             .into_any_element()
     }
 
@@ -131,7 +140,7 @@ impl Shell {
             self.close_spaces_menu(cx);
             self.close_sidebar_view_menu(cx);
             let input = cx.new(|cx| {
-                ComposerInput::with_context("Search session names…", "PaletteSearch", cx)
+                ComposerInput::with_context("Search names or session IDs…", "PaletteSearch", cx)
                     .with_single_line()
                     .with_accessibility_role(gpui::Role::SearchInput)
                     .with_tab_stop(true)
@@ -332,6 +341,7 @@ impl Shell {
             }))
             .child(
                 div()
+                    .debug_selector(|| "sidebar-search-field".into())
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -342,9 +352,8 @@ impl Shell {
                     .border_color(theme.border)
                     .bg(theme.surface)
                     .child(
-                        icon(icons::MAGNIFER)
-                            .size(px(14.0))
-                            .text_color(theme.text_muted),
+                        search_icon(theme, 14.0)
+                            .debug_selector(|| "sidebar-search-field-icon".into()),
                     )
                     .child(
                         div()
@@ -387,7 +396,11 @@ impl Shell {
                                         }
                                     },
                                 ))
-                                .child(icon(icons::CLOSE).size(px(12.0))),
+                                .child(
+                                    icon(icons::CLOSE)
+                                        .size(px(12.0))
+                                        .text_color(theme.text_muted),
+                                ),
                         )
                     }),
             )
@@ -403,10 +416,12 @@ impl Shell {
                     })
                     .track_focus(&archive_focus)
                     .h(px(28.0))
+                    .px(px(Theme::SPACE_SM))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
                     .text_size(crate::typography::ui_rems(11.0))
+                    .line_height(px(16.0))
                     .text_color(theme.text_muted)
                     .cursor_pointer()
                     .on_click(cx.listener(|this, event, _, cx| {
@@ -426,7 +441,9 @@ impl Shell {
                     }))
                     .child(
                         div()
-                            .size(px(12.0))
+                            .debug_selector(|| "sidebar-search-checkbox".into())
+                            .size(px(14.0))
+                            .flex_none()
                             .rounded(px(3.0))
                             .border_1()
                             .border_color(if include_archived {
@@ -441,7 +458,11 @@ impl Shell {
                                 el.child(icon(icons::CHECK).size(px(10.0)).text_color(theme.accent))
                             }),
                     )
-                    .child("Include archived sessions"),
+                    .child(
+                        div()
+                            .debug_selector(|| "sidebar-search-archive-label".into())
+                            .child("Include archived sessions"),
+                    ),
             );
         Some(controls.into_any_element())
     }
@@ -499,6 +520,7 @@ impl Shell {
         self.reconcile_sidebar_search(&ids);
         let search = self.sidebar_search.as_ref()?;
         let active = search.active;
+        let selected_chat = self.state.read(cx).selected_chat.clone();
         let rows = data
             .into_iter()
             .enumerate()
@@ -515,12 +537,16 @@ impl Shell {
                         .then(|| chat.config.as_ref().map(|c| c.harness))
                         .flatten(),
                     status,
-                    index == active,
+                    if query.is_empty() {
+                        selected_chat.as_deref() == Some(chat.id.as_str())
+                    } else {
+                        index == active
+                    },
                     chat.archived,
                     false,
                     None,
                     None,
-                    Some(&query),
+                    Some(ChatRowSearch::Sidebar(&query)),
                     theme,
                     cx,
                 );
@@ -567,7 +593,7 @@ impl Shell {
                         .child(
                             div()
                                 .text_color(theme.text_muted)
-                                .child("Try another name or project."),
+                                .child("Try another name, session ID, or project."),
                         ),
                 )
             });
