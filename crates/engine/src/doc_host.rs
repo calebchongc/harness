@@ -1076,10 +1076,7 @@ impl DocHost {
     /// see — so watch session status instead and re-drain every warm chat.
     /// `drain_queue` is a cheap no-op for empty queues and busy agents, which
     /// is why this can afford to be indiscriminate.
-    fn spawn_queue_flush_watcher(
-        &self,
-        mut statuses: watch::Receiver<Vec<harness_proto::Session>>,
-    ) {
+    fn spawn_queue_flush_watcher(&self, mut statuses: watch::Receiver<Vec<harness_proto::Session>>) {
         let host = self.clone();
         self.spawn_worker(async move {
             while statuses.changed().await.is_ok() {
@@ -3254,12 +3251,7 @@ impl DocHost {
     /// was offline drains when it reconnects. Returns how many were queued.
     pub async fn drain_room_wakes(&self) -> Result<usize, String> {
         let reply = self
-            .room_request(
-                "GET",
-                "rooms/wakes",
-                &[("limit".into(), "100".into())],
-                None,
-            )
+            .room_request("GET", "rooms/wakes", &[("limit".into(), "100".into())], None)
             .await?;
         if reply["status"].as_u64() != Some(200) {
             return Err(format!("rooms/wakes answered {}", reply["status"]));
@@ -3275,9 +3267,7 @@ impl DocHost {
             if wake["toDevice"].as_str() != Some(self.device_id()) {
                 continue;
             }
-            let Some(id) = wake["id"].as_u64() else {
-                continue;
-            };
+            let Some(id) = wake["id"].as_u64() else { continue };
             let chat_id = wake["toRef"].as_str().unwrap_or_default();
             let row = (!chat_id.is_empty())
                 .then(|| workspace.and_then(|w| w.chat(chat_id).ok().flatten()))
@@ -6415,10 +6405,7 @@ mod transfer_progress_tests {
         for token in 0..50 {
             text.push_str(&format!("token{token} "));
             writer
-                .sync(&[harness_doc::MessagePart::Text {
-                    id: "t".into(),
-                    text: text.clone(),
-                }])
+                .sync(&[harness_doc::MessagePart::Text { id: "t".into(), text: text.clone() }])
                 .unwrap();
             handle.doc.doc().commit();
             handle.publish_messages_if_watched();
@@ -6463,10 +6450,7 @@ mod transfer_progress_tests {
         // Unwatched changes drop the cache; reattaching rebuilds correctly.
         drop(rx);
         writer
-            .sync(&[harness_doc::MessagePart::Text {
-                id: "t".into(),
-                text: format!("{text} done"),
-            }])
+            .sync(&[harness_doc::MessagePart::Text { id: "t".into(), text: format!("{text} done") }])
             .unwrap();
         handle.doc.doc().commit();
         handle.publish_messages_if_watched();

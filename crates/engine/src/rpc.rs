@@ -645,11 +645,7 @@ enum MutateParams {
     /// The desktop's appearance mode and light/dark theme ids, published to
     /// the registry so phones can match the desktop.
     #[serde(rename_all = "camelCase")]
-    SetAppearance {
-        mode: String,
-        light: String,
-        dark: String,
-    },
+    SetAppearance { mode: String, light: String, dark: String },
     /// Full-config replace on the chat row (harness `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -1144,11 +1140,7 @@ impl EngineRpc {
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatArchived {
-                chat_id,
-                archived,
-                archive_requested_at,
-            } => {
+            MutateParams::SetChatArchived { chat_id, archived, archive_requested_at } => {
                 match archive_requested_at.filter(|_| archived) {
                     Some(at) => self.workspace.archive_chat_at(&chat_id, at),
                     None => self.workspace.set_chat_archived(&chat_id, archived),
@@ -3223,9 +3215,7 @@ impl RpcService for EngineRpc {
                     .cwd
                     .as_deref()
                     .and_then(harness_proto::graff_worktree::GraffWorktree::from_path)
-                    .ok_or_else(|| {
-                        RpcError::Failed("This chat isn't in a Graff worktree".into())
-                    })?;
+                    .ok_or_else(|| RpcError::Failed("This chat isn't in a Graff worktree".into()))?;
                 let result = harness_adapters::run_graff_worktree_action(
                     std::path::Path::new(&tree.root),
                     &tree.name,

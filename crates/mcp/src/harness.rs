@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
 use harness_doc::{
     SessionCommandPayload, SessionMessageEntry, TranscriptFrame, apply_transcript_frame,
 };
@@ -18,9 +21,6 @@ use harness_proto::{
     TurnOrigin,
 };
 use harness_rpc::{RpcClient, RpcError, RpcSubscription, connect_ws, methods};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use tokio::sync::Mutex;
 
 /// First-item wait for a watch snapshot. Localhost; the engine answers
 /// watch attaches in milliseconds unless it is still assembling stores.
@@ -661,11 +661,7 @@ mod tests {
         struct Service(tokio::sync::watch::Sender<()>);
         #[async_trait::async_trait]
         impl harness_rpc::RpcService for Service {
-            async fn handle(
-                &self,
-                method: &str,
-                _: Value,
-            ) -> Result<harness_rpc::RpcReply, RpcError> {
+            async fn handle(&self, method: &str, _: Value) -> Result<harness_rpc::RpcReply, RpcError> {
                 let first = if method == methods::WATCH_DOC_MESSAGES {
                     json!({"reset": []})
                 } else {

@@ -9,20 +9,20 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use harness_doc::SessionCommandPayload;
 use harness_proto::{
     Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
     Space, UserInputAnswer,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::turn_replies::{REPLIES_TRUNCATED_NOTE, turn_replies};
 
 mod peer_messages;
 mod rooms;
-use crate::harness::{Harness, HarnessInfo, TurnOutcome, session_for, short};
+use crate::harness::{HarnessInfo, TurnOutcome, Harness, session_for, short};
 
 /// Default and ceiling for the blocking waits.
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
@@ -1266,8 +1266,8 @@ mod tests {
     use crate::harness::Origin;
     use async_trait::async_trait;
     use futures::StreamExt;
-    use harness_rpc::{RpcError, RpcReply, RpcService, memory_client, methods};
     use std::sync::Mutex;
+    use harness_rpc::{RpcError, RpcReply, RpcService, memory_client, methods};
 
     /// A fixed little workspace: one device, one project, one chat with a
     /// two-message transcript. Writes are recorded for assertions.
@@ -1389,11 +1389,7 @@ mod tests {
                                 "stripped": 0
                             })
                         }
-                        _ => {
-                            return Ok(RpcReply::Value(
-                                json!({ "status": 404, "body": { "error": "not_found" } }),
-                            ));
-                        }
+                        _ => return Ok(RpcReply::Value(json!({ "status": 404, "body": { "error": "not_found" } }))),
                     };
                     RpcReply::Value(json!({ "status": 200, "body": body }))
                 }
@@ -1407,16 +1403,10 @@ mod tests {
         let world = Arc::new(World::default());
         let tools = tools(
             world.clone(),
-            Origin {
-                chat_id: Some("chat-beta-2".into()),
-                device_id: Some("dev-local".into()),
-            },
+            Origin { chat_id: Some("chat-beta-2".into()), device_id: Some("dev-local".into()) },
         );
         let posted = tools
-            .call(
-                "post_room",
-                json!({ "room": "build", "text": "@alpha tests are green" }),
-            )
+            .call("post_room", json!({ "room": "build", "text": "@alpha tests are green" }))
             .await
             .unwrap();
         assert_eq!(posted["seq"], 3);

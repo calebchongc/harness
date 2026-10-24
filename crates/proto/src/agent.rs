@@ -219,11 +219,9 @@ impl ToolView {
     /// `None` unless `id` has graff's snapshot-name shape, so an id can never
     /// carry a path separator or anything else into a file lookup.
     pub fn new(kind: ToolViewKind, id: &str) -> Option<Self> {
-        (id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then(|| {
-            Self {
-                kind,
-                id: id.to_owned(),
-            }
+        (id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then(|| Self {
+            kind,
+            id: id.to_owned(),
         })
     }
 
