@@ -10,6 +10,8 @@ const rules = @import("rules.zig");
 pub const Space = struct {
     id: []const u8,
     path: []const u8,
+    /// The computer the folder is on.
+    device_id: ?[]const u8 = null,
     /// `name`, else the last part of `path`, as the GPUI app shows it.
     name: []const u8,
 };
@@ -142,6 +144,7 @@ fn parseSpace(a: Allocator, o: json.ObjectMap) ?Space {
     return .{
         .id = str(a, o, "id") orelse return null,
         .path = path,
+        .device_id = str(a, o, "deviceId"),
         .name = str(a, o, "name") orelse std.fs.path.basename(path),
     };
 }

@@ -20,6 +20,7 @@ pub fn view(a: *App, c: *ui.Context) void {
     const dark = a.dark orelse nanoui.isDark();
     c.theme = theme.ui(dark);
     const k = theme.colors(dark);
+    a.ansi = k.ansi;
     if (a.tick(c.time)) |wait| c.frameIn(wait);
     c.title_bar_height = sidebar.titlebar_h;
     keys(c, a);
@@ -41,6 +42,7 @@ pub fn view(a: *App, c: *ui.Context) void {
             } else {
                 @import("view_transcript.zig").transcript(c, a, k);
                 @import("view_composer.zig").docked(c, a, k);
+                @import("view_actions.zig").dock(c, a, k);
             }
         }
         if (a.selected != null and a.panels.host_open) {
@@ -55,6 +57,7 @@ pub fn view(a: *App, c: *ui.Context) void {
     titlebar(c, a, k);
     trailing(c, a, k);
     @import("view_diffs.zig").overlays(c, a, k);
+    @import("view_actions.zig").overlays(c, a, k);
     @import("view_menus.zig").menus(c, a, k);
     @import("view_picker.zig").popover(c, a, k);
 }
@@ -96,9 +99,15 @@ fn titlebar(c: *ui.Context, a: *App, k: theme.Colors) void {
 /// surface pane's toggles (`shell/tabs.rs`); a new chat has none.
 fn trailing(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (a.selected == null) return;
-    const w: f32 = 28 * 2 + 4;
+    const va = @import("view_actions.zig");
+    const actions_w = va.controlWidth(c, a);
+    const w: f32 = 28 * 2 + 4 + (if (actions_w > 0) actions_w + 8 else 0);
     const bar = ui.div(c).fixed().offset(c.size.w - 6 - w, 4 + (34 - 28) / 2).row().gap(4).itemsCenter().layer(3);
     defer bar.end();
+    if (actions_w > 0) {
+        va.control(c, a, k);
+        _ = c.leaf(.{ .width = .{ .px = 4 } }, .none, null);
+    }
     if (kit.iconButton(c, k, .@"file-tree", .{ .size = 28, .on = a.panels.files_open })) @import("app_files.zig").toggle(a);
     if (kit.iconButton(c, k, .@"sidebar-minimalistic", .{ .size = 28 })) @import("app_panels.zig").toggleHost(a);
 }

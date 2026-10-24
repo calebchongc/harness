@@ -147,6 +147,7 @@ pub fn chatChanged(a: *App) void {
     if (p.chat) |c| p.gpa.free(c);
     p.chat = if (a.selected) |s| p.gpa.dupe(u8, s) catch null else null;
     if (a.selected == null) return;
+    @import("app_actions.zig").refresh(a);
     if (p.host_open) openDiffs(a);
     if (p.files_open) openFiles(a);
 }
@@ -156,6 +157,7 @@ pub fn chatChanged(a: *App) void {
 pub fn chatsArrived(a: *App) void {
     const p = &a.panels;
     if (a.selected == null) return;
+    @import("app_actions.zig").refresh(a);
     if (p.host_open and p.diff == null and !p.diff_loading) openDiffs(a);
     if (p.files_open and p.w_git == null) openFiles(a);
 }

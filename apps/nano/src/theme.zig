@@ -42,6 +42,8 @@ pub const Colors = struct {
     code_header: Color,
     /// white (dark) or black (light): a project badge's tone.
     tone: Color,
+    /// The 16 colours a terminal's escape codes name.
+    ansi: [16]Color,
     /// A primary button's fill and text.
     solid: Color,
     on_solid: Color,
@@ -94,6 +96,7 @@ pub fn colors(dark: bool) Colors {
             .code_bg = white.alpha(0.035),
             .code_header = white.alpha(0.02),
             .tone = white,
+            .ansi = hexes(.{ 0x16140f, 0xd2674f, 0x7fa86b, 0xd9a441, 0x8a9bb0, 0xbd80e4, 0x7fa86b, 0xedeae2, 0x5c564b, 0xd2674f, 0x7fa86b, 0xe8a33d, 0x8a9bb0, 0xbd80e4, 0x9a9384, 0xfaf8f3 }),
             .solid = .hex(0xebebef),
             .on_solid = black,
             .diff_add = .hex(0x7fa86b),
@@ -128,12 +131,19 @@ pub fn colors(dark: bool) Colors {
         .code_bg = black.alpha(0.035),
         .code_header = black.alpha(0.02),
         .tone = black,
+        .ansi = hexes(.{ 0x1a1813, 0xb14228, 0x5c7e47, 0x9a6e1b, 0x3b6fb0, 0x7a4ea3, 0x2f8f9d, 0x6b6557, 0xa8a090, 0xb14228, 0x5c7e47, 0xc77d20, 0x3b6fb0, 0x7a4ea3, 0x2f8f9d, 0x1a1813 }),
         .solid = .hex(0x232328),
         .on_solid = white,
         .diff_add = .hex(0x5c7e47),
         .diff_del = .hex(0xb14228),
         .syntax = .{ .hex(0xa8a090), .hex(0xc77d20), .hex(0x5c7e47), .hex(0x9a6e1b), .hex(0x1a1813), .hex(0xc77d20) },
     };
+}
+
+fn hexes(comptime v: [16]u24) [16]Color {
+    var out: [16]Color = undefined;
+    for (v, 0..) |h, i| out[i] = .hex(h);
+    return out;
 }
 
 pub fn ui(dark: bool) nanoui.ui.Theme {

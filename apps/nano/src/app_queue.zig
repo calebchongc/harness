@@ -71,8 +71,10 @@ pub fn stop(a: *App) void {
     }
 }
 
+/// Frees what the queue holds; no calls (the engine may be gone first).
 pub fn deinit(a: *App) void {
-    stop(a);
+    if (a.queue_edit) |*e| e.deinit(a.gpa);
+    a.queue_edit = null;
     a.queue.deinit();
     if (a.queue_begin) |b| a.gpa.free(b);
 }

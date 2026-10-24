@@ -136,6 +136,10 @@ pub const App = struct {
     /// This window's editor id for queue edit leases.
     instance: [36]u8 = undefined,
     instance_set: bool = false,
+    /// The project's actions, their editor, and the dock their runs show in.
+    actions: @import("app_actions.zig").Actions,
+    /// The terminal palette of the theme last drawn.
+    ansi: [16]nanoui.ui.Color = @import("theme.zig").colors(true).ansi,
     /// The surface pane and the file explorer beside the chat.
     panels: @import("app_panels.zig").Panels,
     /// The open chats, one per tab.
@@ -157,6 +161,7 @@ pub const App = struct {
             .devices = .init(gpa),
             .queue = .init(gpa),
             .panels = .init(gpa),
+            .actions = .init(gpa),
             .tabs = .init(gpa),
             .transcript = .{ .gpa = gpa },
             .harnesses = .init(gpa),
@@ -182,6 +187,7 @@ pub const App = struct {
         question.deinit(a);
         queue_mod.deinit(a);
         a.panels.deinit();
+        a.actions.deinit();
         a.transcript.deinit();
         if (a.selected) |s| a.gpa.free(s);
         if (a.space) |s| a.gpa.free(s);
