@@ -39,10 +39,11 @@ final class SessionPagerUITests: XCTestCase {
         let next = app.buttons["session-page-next"]
         XCTAssertFalse(previous.isEnabled)
         XCTAssertTrue(next.isEnabled)
-        XCTAssertGreaterThanOrEqual(next.frame.width, 44)
+        // Layout B: 28×44-point arrows, 3 points after the title.
+        XCTAssertEqual(next.frame.width, 28, accuracy: 1)
         XCTAssertGreaterThanOrEqual(next.frame.height, 44)
-        XCTAssertGreaterThanOrEqual(header.frame.width, 125)
-        XCTAssertEqual(previous.frame.minX - header.frame.maxX, 8, accuracy: 1)
+        XCTAssertGreaterThanOrEqual(header.frame.width, 120)
+        XCTAssertEqual(previous.frame.minX - header.frame.maxX, 3, accuracy: 1)
 
         let indicators = element("session-status-indicators")
         XCTAssertTrue(indicators.exists)

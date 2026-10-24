@@ -22,10 +22,12 @@ struct SessionView: View {
     private static let headerChromeInset: CGFloat = 100
     private static let topFadeHeight: CGFloat = 28
 
-    /// Room the stacked split's trailing buttons take from the title: the titled Split button, or the ×.
+    /// Room the stacked split's trailing buttons take from the title: the titled Split button (about 90pt),
+    /// or the × (36pt), each plus the bar's 16pt gap before it. The header is a trailing item too, so any
+    /// shortfall pushes the button into the bar's "More" menu instead of narrowing the title.
     private var stackedButtonsWidth: CGFloat {
-        if stackedSplit != nil { return 92 }
-        return stackedClose == nil ? 0 : 44
+        if stackedSplit != nil { return 112 }
+        return stackedClose == nil ? 0 : 56
     }
 
     /// The view's own width, the only reliable basis for capping the principal

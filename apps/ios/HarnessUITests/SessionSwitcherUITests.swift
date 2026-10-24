@@ -8,45 +8,37 @@ final class SessionSwitcherUITests: XCTestCase {
         continueAfterFailure = false
         app = XCUIApplication()
         XCUIDevice.shared.orientation = .portrait
-        app.launchArguments = ["-demo", "-sethomefilter", ""]
+        app.launchArguments = ["-demo", "-sethomefilter", "", "-phoneSplit", "off"]
         app.launch()
     }
 
-    private var rows: XCUIElementQuery {
-        app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "switcher-"))
-    }
-
-    /// Row ids top to bottom. A row with a pull request badge is two buttons
-    /// carrying the row's id, so each id counts once.
-    private var order: [String] {
-        var seen = Set<String>()
-        return rows.allElementsBoundByIndex.map(\.identifier).filter { seen.insert($0).inserted }
-    }
-
-    private func row(_ id: String) -> XCUIElement {
-        app.buttons.matching(identifier: id).firstMatch
+    private func element(_ id: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
 
     /// The demo has sessions running and waiting on you. Home shows them as the
-    /// Now strip; in a session the pill lists them in one fixed order, the open
-    /// one stays in its place, marked, and picking another swaps it in.
-    func testPillListsSessionsInOneOrderAndJumpsBetweenThem() {
+    /// Now strip; in a session the header's arrows step through them in one
+    /// fixed order (#430: the status marks beside them are display-only, so the
+    /// floating pill and its list are gone). Stepping swaps the open session in
+    /// place rather than pushing another screen.
+    func testHeaderArrowsJumpBetweenSessionsInPlace() {
         let card = app.buttons["now-card-chat-veil"]
         XCTAssertTrue(card.waitForExistence(timeout: 10))
         card.tap()
 
-        let pill = app.buttons["session-switcher"]
-        XCTAssertTrue(pill.waitForExistence(timeout: 10))
-        pill.tap()
-        XCTAssertTrue(rows.firstMatch.waitForExistence(timeout: 5))
-        let order = self.order
-        XCTAssertGreaterThan(order.count, 1)
-        XCTAssertEqual(row("switcher-chat-veil").value as? String, "Open")
-        let other = order.first { $0 != "switcher-chat-veil" }!
-        row(other).tap()
+        let header = element("session-header")
+        XCTAssertTrue(header.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["session-switcher"].exists)
+        let position = element("session-page-position")
+        XCTAssertTrue(position.label.hasPrefix("Session 1 of "), position.label)
+        let before = header.label
+
+        app.buttons["session-page-next"].tap()
+        expectation(for: NSPredicate(format: "label != %@", before), evaluatedWith: header)
+        waitForExpectations(timeout: 5)
+        XCTAssertTrue(position.label.hasPrefix("Session 2 of "), position.label)
 
         // Jumping swaps the session: one Back returns Home.
-        XCTAssertTrue(app.buttons["session-switcher"].waitForExistence(timeout: 10))
         app.navigationBars.buttons.element(boundBy: 0).tap()
         XCTAssertTrue(app.buttons["home-group-by"].waitForExistence(timeout: 5))
     }
