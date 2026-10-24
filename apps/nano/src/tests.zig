@@ -10,6 +10,9 @@ test {
     _ = @import("tools.zig");
     _ = @import("diff.zig");
     _ = @import("wizard.zig");
+    _ = @import("app_files.zig");
+    _ = @import("queue.zig");
+    _ = @import("app_queue.zig");
     _ = @import("tabs.zig");
     _ = @import("icons.zig");
     _ = @import("release.zig");

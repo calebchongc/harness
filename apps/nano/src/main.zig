@@ -27,6 +27,12 @@ pub fn main(init: std.process.Init) !void {
     try a.start();
     // A chat to open at launch, for checks that render the window offscreen.
     if (init.environ_map.get("HARNESS_NANO_OPEN_CHAT")) |id| a.openChat(id, null);
+    // Panels to open with it: "diffs", "files", or both.
+    if (init.environ_map.get("HARNESS_NANO_PANELS")) |list| {
+        a.panels.files_open = std.mem.indexOf(u8, list, "files") != null;
+        if (std.mem.indexOf(u8, list, "diffs") != null) a.panels.tabs.append(a.gpa, .{ .kind = .diffs }) catch {};
+        a.panels.host_open = a.panels.tabs.items.len > 0;
+    }
     a.release.done = .{ .ctx = &a, .func = App.releaseCame };
     a.release.start();
     try app.run();

@@ -30,17 +30,31 @@ pub fn view(a: *App, c: *ui.Context) void {
             sidebar.sidebar(c, a, k);
             _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.border }, .none, null);
         }
-        const main = ui.div(c).column().grow().w(0).hFull().clip();
+        const main = ui.div(c).row().grow().w(0).hFull();
         defer main.end();
-        header(c, a, k);
-        if (a.selected == null) {
-            @import("view_newchat.zig").canvas(c, a, k);
-        } else {
-            @import("view_transcript.zig").transcript(c, a, k);
-            @import("view_composer.zig").docked(c, a, k);
+        {
+            const chat = ui.div(c).column().grow().w(0).hFull().clip();
+            defer chat.end();
+            header(c, a, k);
+            if (a.selected == null) {
+                @import("view_newchat.zig").canvas(c, a, k);
+            } else {
+                @import("view_transcript.zig").transcript(c, a, k);
+                @import("view_composer.zig").docked(c, a, k);
+            }
+        }
+        if (a.selected != null and a.panels.host_open) {
+            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.border }, .none, null);
+            @import("view_host.zig").host(c, a, k);
+        }
+        if (a.selected != null and a.panels.files_open) {
+            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.border }, .none, null);
+            @import("view_files.zig").explorer(c, a, k);
         }
     }
     titlebar(c, a, k);
+    trailing(c, a, k);
+    @import("view_diffs.zig").overlays(c, a, k);
     @import("view_menus.zig").menus(c, a, k);
     @import("view_picker.zig").popover(c, a, k);
 }
@@ -50,6 +64,8 @@ pub fn view(a: *App, c: *ui.Context) void {
 fn keys(c: *ui.Context, a: *App) void {
     const S = ui.Shortcut;
     if (c.shortcut(.{ .key = 'b', .cmd = true })) a.view.sidebar_open = !a.view.sidebar_open;
+    if (a.selected != null and c.shortcut(.{ .key = 'e', .cmd = true })) @import("app_files.zig").toggle(a);
+    if (a.selected != null and c.shortcut(.{ .key = 'r', .cmd = true })) @import("app_panels.zig").toggleHost(a);
     if (c.shortcut(.{ .key = 't', .cmd = true }) or c.shortcut(.{ .key = 'n', .cmd = true })) a.newTab();
     if (c.shortcut(.{ .key = 'w', .cmd = true })) a.closeTab(a.tabs.active);
     if (c.shortcut(.{ .key = '[', .cmd = true }) and a.tabs.canStep(-1)) a.showTab(a.tabs.active - 1);
@@ -76,6 +92,17 @@ fn titlebar(c: *ui.Context, a: *App, k: theme.Colors) void {
     }
 }
 
+/// The title bar's right end, over the panels: the files panel and the
+/// surface pane's toggles (`shell/tabs.rs`); a new chat has none.
+fn trailing(c: *ui.Context, a: *App, k: theme.Colors) void {
+    if (a.selected == null) return;
+    const w: f32 = 28 * 2 + 4;
+    const bar = ui.div(c).fixed().offset(c.size.w - 6 - w, 4 + (34 - 28) / 2).row().gap(4).itemsCenter().layer(3);
+    defer bar.end();
+    if (kit.iconButton(c, k, .@"file-tree", .{ .size = 28, .on = a.panels.files_open })) @import("app_files.zig").toggle(a);
+    if (kit.iconButton(c, k, .@"sidebar-minimalistic", .{ .size = 28 })) @import("app_panels.zig").toggleHost(a);
+}
+
 /// The chat's identity in the title bar's row: its agent's mark, its title,
 /// and "project @ device" (`shell/tabs.rs`).
 fn header(c: *ui.Context, a: *App, k: theme.Colors) void {
@@ -88,7 +115,7 @@ fn header(c: *ui.Context, a: *App, k: theme.Colors) void {
     const chat = a.findChat(id) orelse return;
     const mark = icons.harnessMark(chat.harness orelse "graff");
     icons.icon(c, mark.name, 14, mark.brand orelse k.muted, 0);
-    const room = c.size.w - side - left - 6;
+    const room = @import("view_transcript.zig").mainWidth(c, a) - left - 6 - 70;
     const title = sidebar.chatLabel(chat);
     const title_st: ui.TextStyle = .{ .size = 12, .weight = .medium, .color = k.text.alpha(0.85) };
     const title_w = @min(c.text.width(title, title_st), room * 0.6);

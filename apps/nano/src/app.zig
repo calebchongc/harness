@@ -136,6 +136,8 @@ pub const App = struct {
     /// This window's editor id for queue edit leases.
     instance: [36]u8 = undefined,
     instance_set: bool = false,
+    /// The surface pane and the file explorer beside the chat.
+    panels: @import("app_panels.zig").Panels,
     /// The open chats, one per tab.
     tabs: Tabs,
     /// What the window shows that isn't the engine's: the sidebar, its
@@ -154,6 +156,7 @@ pub const App = struct {
             .sessions = .init(gpa),
             .devices = .init(gpa),
             .queue = .init(gpa),
+            .panels = .init(gpa),
             .tabs = .init(gpa),
             .transcript = .{ .gpa = gpa },
             .harnesses = .init(gpa),
@@ -178,6 +181,7 @@ pub const App = struct {
         a.view.deinit(a.gpa);
         question.deinit(a);
         queue_mod.deinit(a);
+        a.panels.deinit();
         a.transcript.deinit();
         if (a.selected) |s| a.gpa.free(s);
         if (a.space) |s| a.gpa.free(s);
@@ -263,6 +267,7 @@ pub const App = struct {
                 if (a.selected != null) {
                     a.watchDoc(true);
                     queue_mod.watch(a);
+                    @import("app_panels.zig").chatChanged(a);
                 }
             },
             .disconnected, .connecting => {
@@ -370,8 +375,10 @@ pub const App = struct {
             .item => |v| {
                 a.chats.replace(v) catch {};
                 workspace.sortChats(a.chats.items);
-                // The open chat's agent is known now: list its models.
+                // The open chat's agent and folder are known now: list its
+                // models, and fill panels that waited for them.
                 a.ensureModels(a.target().harness);
+                @import("app_panels.zig").chatsArrived(a);
             },
             .done, .err => a.ended(&a.w_chats),
             .ok => {},
@@ -479,6 +486,7 @@ pub const App = struct {
         a.call("Mutate", .{ .op = "markChatSeen", .chatId = chat }, .of(App, a, onNotice));
         a.watchDoc(true);
         queue_mod.watch(a);
+        @import("app_panels.zig").chatChanged(a);
         a.ensureModels(a.target().harness);
         a.redraw();
     }
