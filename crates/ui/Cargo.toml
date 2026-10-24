@@ -95,6 +95,10 @@ name = "new-project-fixture"
 required-features = ["project-palette-fixture"]
 
 [[example]]
+name = "chat-mode-fixture"
+required-features = ["project-palette-fixture"]
+
+[[example]]
 name = "sidebar-fixture"
 required-features = ["project-palette-fixture"]
 

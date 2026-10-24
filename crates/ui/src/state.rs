@@ -4891,6 +4891,7 @@ mod tests {
             reasoning: Some(harness_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
             sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+            chat_mode: false,
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -4915,6 +4916,7 @@ mod tests {
                 reasoning: None,
                 model_options: serde_json::Map::new(),
                 sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                chat_mode: false,
             },
         );
     }

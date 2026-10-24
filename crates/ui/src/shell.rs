@@ -13835,6 +13835,7 @@ mod tests {
             reasoning: None,
             model_options: serde_json::Map::new(),
             sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+            chat_mode: false,
         });
         let mut unconfigured = parent.clone();
         unconfigured.id = "unconfigured".into();
@@ -16237,6 +16238,7 @@ mod exit_regressions {
                             reasoning: Some(ReasoningLevel::High),
                             model_options: Default::default(),
                             sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                            chat_mode: false,
                         }),
                         last_message_preview: None,
                         last_message_at: None,
@@ -16630,6 +16632,7 @@ mod exit_regressions {
                         reasoning: Some(ReasoningLevel::High),
                         model_options: Default::default(),
                         sandbox: harness_proto::SandboxLevel::WorkspaceWrite,
+                        chat_mode: false,
                     }),
                     last_message_preview: None,
                     last_message_at: None,

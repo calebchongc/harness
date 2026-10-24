@@ -7464,12 +7464,18 @@ impl Composer {
     /// session would run; this names the project up front. Clicking it opens
     /// the project picker, which also offers "New project".
     fn render_new_thread_heading(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // A plain chat has no project to name or pick: say what it is.
+        let chat_mode = self.pickers.read(cx).chat_mode(cx);
         let project = self
             .state
             .read(cx)
             .selected_space_row()
             .map(|s| s.display_name().to_string());
         let (eyebrow, title) = match project {
+            _ if chat_mode => (
+                crate::chat_mode::HEADING_EYEBROW,
+                crate::chat_mode::HEADING_TITLE.to_string(),
+            ),
             Some(name) => ("New session in", name),
             None => ("New session in your home folder", "No project".to_string()),
         };
@@ -7497,18 +7503,24 @@ impl Composer {
                     .text_size(crate::typography::ui_rems(22.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(motion::hover_blend(id, theme.text.opacity(0.9), theme.text))
-                    .on_hover(motion::hover_listener(id))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.pickers
-                            .update(cx, |pickers, cx| pickers.open_project_menu(window, cx));
-                    }))
+                    .when(!chat_mode, |el| {
+                        el.on_hover(motion::hover_listener(id))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pickers.update(cx, |pickers, cx| {
+                                    pickers.open_project_menu(window, cx)
+                                });
+                            }))
+                    })
+                    .when(chat_mode, |el| el.cursor_default())
                     .child(div().min_w_0().truncate().child(SharedString::from(title)))
-                    .child(
-                        crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
-                            .size(px(16.0))
-                            .flex_none()
-                            .text_color(theme.text_muted.opacity(0.6)),
-                    ),
+                    .when(!chat_mode, |el| {
+                        el.child(
+                            crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                                .size(px(16.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.6)),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -8228,7 +8240,9 @@ impl Composer {
         // no-agents check only fires once the catalog is loaded — offline
         // and still-loading states must not block (the harness resolves from
         // the remembered default and the engine reports real failures).
-        self.pickers.read(cx).no_agents_available()
+        // A chat-mode draft also waits for an auto tier to run on.
+        let pickers = self.pickers.read(cx);
+        pickers.no_agents_available() || pickers.chat_mode_send_blocked(cx)
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
@@ -10928,6 +10942,11 @@ impl Render for Composer {
             let plan = (session_chrome_opacity > 0.0
                 && self.pickers.read(cx).uses_chatgpt_plan(cx))
             .then(|| crate::chatgpt_plan::using_plan_chip(&theme));
+            // Chat mode: say so while the selected model may bill API rates.
+            let chat_note = (session_chrome_opacity > 0.0)
+                .then(|| self.pickers.read(cx).chat_mode_note(cx))
+                .flatten()
+                .map(|note| crate::chat_mode::note_chip(note, &theme));
             container.child(
                 div()
                     .w_full()
@@ -10969,6 +10988,14 @@ impl Render for Composer {
                                         .children(footer.flatten()),
                                 )
                                 .children(plan.map(|chip| {
+                                    div()
+                                        .flex_shrink(1.0)
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .pr(px(10.0))
+                                        .child(chip)
+                                }))
+                                .children(chat_note.map(|chip| {
                                     div()
                                         .flex_shrink(1.0)
                                         .min_w_0()
