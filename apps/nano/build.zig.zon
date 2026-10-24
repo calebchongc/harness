@@ -1,0 +1,17 @@
+.{
+    .name = .harness_nano,
+    .version = "0.0.1",
+    .fingerprint = 0x642dc229bafae3e4,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .nanoui = .{
+            .url = "git+https://github.com/justrach/nanoui#3adbc6f7e6bd78e6797982c6a5f696c4efb2d502",
+            .hash = "nanoui-0.6.4-we0KMYz0EQBmGKjiiw837HeB0obYSFX4c6j5TvK8X5GN",
+        },
+        .http_zig = .{
+            .url = "git+https://github.com/justrach/http-zig#5b0324bb3ab49fe18947b2f17fe7649760e1540a",
+            .hash = "http_zig-0.1.0-2CB7E00SAwAnwnBkJDgCDm3zLwrCmZZkHNSw5t7X9Vbf",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
