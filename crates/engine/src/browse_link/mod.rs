@@ -98,8 +98,17 @@ pub struct BrowseLinkStatus {
 }
 
 struct Pending {
+    /// Which `start_pair` this is, so an older pairing's task can't clear a
+    /// newer one's code when it finishes.
+    generation: u64,
     code: String,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// A run's bearer token for the relay.
+struct RunToken {
+    token: String,
+    run_id: String,
 }
 
 pub struct BrowseLink {
@@ -107,9 +116,10 @@ pub struct BrowseLink {
     keys: KeyStore,
     pairing: Mutex<Option<Pairing>>,
     pending: Mutex<Option<Pending>>,
+    pairings_started: std::sync::atomic::AtomicU64,
     last_error: Mutex<Option<String>>,
-    /// run token → run id, for the relay.
-    runs: Mutex<HashMap<String, String>>,
+    /// Live runs' tokens, for the relay (compared in constant time).
+    runs: Mutex<Vec<RunToken>>,
     relay: tokio::sync::Mutex<Option<proxy::Relay>>,
     connect_file: Option<PathBuf>,
 }
@@ -144,14 +154,29 @@ impl std::fmt::Display for LinkError {
                 "the answer wasn't signed by the browse Harness paired with"
             ),
             Self::Refused(status, code, body) => {
-                write!(f, "browse refused ({status} {code})")?;
-                if let (Some(tool), Some(scope)) = (
-                    body.get("tool").and_then(|v| v.as_str()),
-                    body.get("scope").and_then(|v| v.as_str()),
-                ) {
-                    write!(f, ": {tool} needs the {scope} scope")?;
+                let tool = body.get("tool").and_then(|v| v.as_str());
+                let scope = body.get("scope").and_then(|v| v.as_str());
+                match (code.as_str(), tool, scope) {
+                    ("out_of_scope", Some(tool), Some("none") | None) => {
+                        write!(f, "browse doesn't let connected apps use {tool}")
+                    }
+                    ("out_of_scope", Some(tool), Some(scope)) => write!(
+                        f,
+                        "{tool} needs the {scope} scope, which Harness wasn't given; \
+                         the user can allow it in browse › Settings › Agent › Connected apps"
+                    ),
+                    ("declined", ..) => {
+                        write!(
+                            f,
+                            "the user didn't allow Harness to use their tabs in browse"
+                        )
+                    }
+                    ("stale", ..) => write!(
+                        f,
+                        "browse refused the request as stale; check this Mac's clock"
+                    ),
+                    _ => write!(f, "browse refused ({status} {code})"),
                 }
-                Ok(())
             }
             Self::Transport(message) => write!(f, "couldn't reach browse: {message}"),
         }
@@ -199,8 +224,9 @@ impl BrowseLink {
             keys,
             pairing: Mutex::new(pairing),
             pending: Mutex::new(None),
+            pairings_started: std::sync::atomic::AtomicU64::new(0),
             last_error: Mutex::new(None),
-            runs: Mutex::new(HashMap::new()),
+            runs: Mutex::new(Vec::new()),
             relay: tokio::sync::Mutex::new(None),
             connect_file,
         }
@@ -248,6 +274,10 @@ impl BrowseLink {
     /// Start pairing: returns the six digits to show. Polls browse in the
     /// background until the user confirms, declines, or the offer expires.
     pub async fn start_pair(self: &Arc<Self>) -> Result<String, String> {
+        let generation = self
+            .pairings_started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         if let Some(previous) = self.pending.lock().unwrap().take() {
             previous.task.abort();
         }
@@ -314,16 +344,30 @@ impl BrowseLink {
         );
         let this = self.clone();
         let port = found.port;
+        // Held until the pairing is recorded, so the task can't finish (and
+        // clear it) before its code is up.
+        let mut pending = self.pending.lock().unwrap();
+        if self
+            .pairings_started
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != generation
+        {
+            return Err("Another pairing started.".into());
+        }
         let task = tokio::spawn(async move {
             let outcome = this
-                .poll_pairing(port, &key, &client_id, &browse_key, expires)
+                .poll_pairing(port, &key, &client_id, &browse_key, expires, generation)
                 .await;
-            if let Err(error) = outcome {
-                *this.last_error.lock().unwrap() = Some(error);
+            let mut pending = this.pending.lock().unwrap();
+            if pending.as_ref().is_some_and(|p| p.generation == generation) {
+                if let Err(error) = outcome {
+                    *this.last_error.lock().unwrap() = Some(error);
+                }
+                pending.take();
             }
-            this.pending.lock().unwrap().take();
         });
-        *self.pending.lock().unwrap() = Some(Pending {
+        *pending = Some(Pending {
+            generation,
             code: code.clone(),
             task,
         });
@@ -337,6 +381,7 @@ impl BrowseLink {
         client_id: &str,
         browse_key: &str,
         expires: Duration,
+        generation: u64,
     ) -> Result<(), String> {
         let pinned = wire::parse_public_key(browse_key).ok_or("browse's key is malformed")?;
         let deadline = tokio::time::Instant::now() + expires;
@@ -352,15 +397,15 @@ impl BrowseLink {
             match reply.get("status").and_then(|v| v.as_str()) {
                 Some("pending") | None => continue,
                 Some("paired") => {
-                    let scopes = reply
-                        .get("scopes")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|s| s.as_str().map(str::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let scopes = string_list(reply.get("scopes"));
+                    // Cancelled (or started again) while browse was asking.
+                    if self
+                        .pairings_started
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        != generation
+                    {
+                        return Err("Pairing was cancelled.".into());
+                    }
                     self.save(Some(Pairing {
                         client_id: client_id.to_owned(),
                         browse_key: browse_key.to_owned(),
@@ -380,6 +425,8 @@ impl BrowseLink {
     /// Stop pairing, or forget a pairing (Disconnect). browse's own list
     /// keeps the app until the user revokes it there or it expires unused.
     pub fn disconnect(&self) {
+        self.pairings_started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(pending) = self.pending.lock().unwrap().take() {
             pending.task.abort();
         }
@@ -420,6 +467,33 @@ impl BrowseLink {
         result
     }
 
+    /// Settings' view, brought up to date: the scopes the user has now (they
+    /// can change them in browse) and whether browse still knows Harness (a
+    /// signed `unknown_client` forgets the pairing). Best effort and quick;
+    /// without browse it changes nothing.
+    pub async fn refresh(&self) {
+        if self.target().is_err() {
+            return;
+        }
+        let answer =
+            tokio::time::timeout(Duration::from_secs(3), self.request("/pair/status", b"{}")).await;
+        let Ok(Ok((_, body))) = answer else {
+            return;
+        };
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        if reply.get("status").and_then(|v| v.as_str()) != Some("paired") {
+            return;
+        }
+        let scopes = string_list(reply.get("scopes"));
+        let current = self.pairing.lock().unwrap().clone();
+        if let Some(mut pairing) = current
+            && pairing.scopes != scopes
+        {
+            pairing.scopes = scopes;
+            self.save(Some(pairing));
+        }
+    }
+
     /// The `browse` MCP server for a run starting now, or `None` when browse
     /// isn't paired and running (the run keeps Harness's own browser pane).
     pub async fn mcp_server_for_run(self: &Arc<Self>, run_id: &str) -> Option<McpServer> {
@@ -437,11 +511,12 @@ impl BrowseLink {
             }
             relay.as_ref()?.port()
         };
+        // 256 random bits, valid for this run only.
         let token = format!("{}{}", wire::nonce(), wire::nonce());
-        self.runs
-            .lock()
-            .unwrap()
-            .insert(token.clone(), run_id.to_owned());
+        self.runs.lock().unwrap().push(RunToken {
+            token: token.clone(),
+            run_id: run_id.to_owned(),
+        });
         Some(McpServer {
             name: "browse".into(),
             url: format!("http://127.0.0.1:{port}/mcp"),
@@ -449,8 +524,19 @@ impl BrowseLink {
         })
     }
 
+    /// The run a relay request's token belongs to. Every live token is
+    /// compared in full and in constant time, so timing says nothing about
+    /// how close a guess came.
     fn run_for_token(&self, token: &str) -> Option<String> {
-        self.runs.lock().unwrap().get(token).cloned()
+        use subtle::ConstantTimeEq as _;
+        let runs = self.runs.lock().unwrap();
+        let mut found = None;
+        for run in runs.iter() {
+            if bool::from(run.token.as_bytes().ct_eq(token.as_bytes())) {
+                found = Some(run.run_id.clone());
+            }
+        }
+        found
     }
 
     /// The run ended: its token stops working and its pages close.
@@ -458,7 +544,7 @@ impl BrowseLink {
         let had = {
             let mut runs = self.runs.lock().unwrap();
             let before = runs.len();
-            runs.retain(|_, run| run != run_id);
+            runs.retain(|run| run.run_id != run_id);
             runs.len() != before
         };
         if !had {
@@ -474,6 +560,17 @@ impl BrowseLink {
             }
         });
     }
+}
+
+fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One signed request to browse at `port`, its answer's signature checked

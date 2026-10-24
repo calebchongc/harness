@@ -39,6 +39,8 @@ nucleo-matcher.workspace = true
 # browse Connected apps (browse_link): P-256 ECDSA request signing.
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Relay tokens are compared in constant time.
+subtle = "2"
 
 tempfile.workspace = true
 

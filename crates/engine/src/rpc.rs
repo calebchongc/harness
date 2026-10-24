@@ -1718,9 +1718,12 @@ impl RpcService for EngineRpc {
                     .await;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::BROWSE_LINK_STATUS => RpcReply::value(
-                &crate::browse_link::BrowseLink::shared(self.repos.data_dir()).status(),
-            ),
+            methods::BROWSE_LINK_STATUS => {
+                let link = crate::browse_link::BrowseLink::shared(self.repos.data_dir());
+                // Scopes changed in browse, or Harness revoked there, show now.
+                link.refresh().await;
+                RpcReply::value(&link.status())
+            }
             methods::BROWSE_LINK_PAIR => {
                 let link = crate::browse_link::BrowseLink::shared(self.repos.data_dir());
                 let code = link.start_pair().await.map_err(RpcError::Failed)?;

@@ -5422,10 +5422,14 @@ mod tests {
             session_mcp_servers(json!([]), &stdio_only, &servers),
             json!([])
         );
-        assert_eq!(session_mcp_servers(json!([]), &json!({}), &servers), json!([]));
+        assert_eq!(
+            session_mcp_servers(json!([]), &json!({}), &servers),
+            json!([])
+        );
         assert_eq!(session_mcp_servers(json!([]), &http, &[]), json!([]));
         // Harness's own stdio server stays first, with or without browse.
-        let harness = json!({ "name": "harness", "command": "harness", "args": ["mcp"], "env": [] });
+        let harness =
+            json!({ "name": "harness", "command": "harness", "args": ["mcp"], "env": [] });
         assert_eq!(
             session_mcp_servers(json!([harness.clone()]), &http, &servers),
             json!([harness.clone(), browse])
@@ -5433,6 +5437,12 @@ mod tests {
         assert_eq!(
             session_mcp_servers(json!([harness.clone()]), &stdio_only, &servers),
             json!([harness])
+        );
+        // The run's token never reaches a log line.
+        let logged = format!("{:?}", servers[0]);
+        assert!(
+            logged.contains("Authorization") && !logged.contains("Bearer t"),
+            "{logged}"
         );
     }
 

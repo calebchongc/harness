@@ -391,7 +391,8 @@ impl AccountsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
-        let browse = cx.new(|cx| crate::settings::browse_link::BrowseLinkCard::new(state.clone(), cx));
+        let browse =
+            cx.new(|cx| crate::settings::browse_link::BrowseLinkCard::new(state.clone(), cx));
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.submit_code(cx);
@@ -3168,6 +3169,9 @@ impl Render for AccountsPage {
         };
 
         let scrollbar = popover::rail(self, "accounts-page-scrollbar", &theme, cx);
+        // browse runs on this Mac and pairs with this device's engine only:
+        // the card would misstate another device's pairing.
+        let show_browse = cfg!(target_os = "macos") && !self.target_is_remote(cx);
         div()
             .id("accounts-page-host")
             .relative()
@@ -3229,7 +3233,7 @@ impl Render for AccountsPage {
                                         })),
                                 )
                             })
-                            .child(self.browse.clone())
+                            .when(show_browse, |el| el.child(self.browse.clone()))
                             .child(self.render_codegraff_section(&theme, now, cx))
                             .child(self.render_chatgpt_section(&theme, cx))
                             .child(self.render_graff_logins_section(&theme, cx))

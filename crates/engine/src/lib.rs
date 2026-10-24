@@ -16,8 +16,8 @@ use harness_rpc::{RpcError, RpcReply, RpcService, methods};
 use harness_sync::DocsStore;
 
 pub mod agent_accounts;
-pub mod browse_link;
 pub mod auth;
+pub mod browse_link;
 pub mod change_requests;
 pub mod chat2_host;
 pub mod codegraff_auth;
