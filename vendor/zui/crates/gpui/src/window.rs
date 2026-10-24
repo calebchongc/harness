@@ -2753,6 +2753,8 @@ impl Window {
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
         // Drain unconditionally so a stale first-invalidation timestamp can't
         // leak into a later frame across enable/disable of frame tracing.
+        let _activity =
+            crate::foreground_activity::enter(crate::foreground_activity::ForegroundActivity::Draw);
         let frame_dirty = self.invalidator.take_frame_dirty();
         let draw_started_at = profiler::frame_trace_enabled().then(Instant::now);
 
@@ -5040,6 +5042,11 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let _activity = crate::foreground_activity::enter(
+            crate::foreground_activity::ForegroundActivity::Input(
+                crate::foreground_activity::input_kind(&event),
+            ),
+        );
         #[cfg(feature = "input-latency-histogram")]
         let dispatch_time = Instant::now();
         let update_count_before = self.invalidator.update_count();
@@ -5592,6 +5599,9 @@ impl Window {
         action: &dyn Action,
         cx: &mut App,
     ) {
+        let _activity = crate::foreground_activity::enter(
+            crate::foreground_activity::ForegroundActivity::Action(action.name()),
+        );
         self.dispatch_action_on_node_inner(node_id, action, cx);
 
         if !cx.propagate_event

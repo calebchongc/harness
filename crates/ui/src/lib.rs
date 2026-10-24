@@ -66,6 +66,7 @@ pub(crate) mod screen_access;
 pub mod settings;
 pub mod shell;
 pub mod sound;
+pub mod stall_watch;
 pub(crate) mod starters;
 pub mod state;
 pub(crate) mod surface_chrome;
@@ -221,6 +222,7 @@ pub fn run_app(config: UiConfig) {
 
         let state = cx.new(|_| state::AppState::new());
         perf_stats::start(data_dir.clone(), state.clone(), cx);
+        stall_watch::start(data_dir.join("logs"), cx);
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {

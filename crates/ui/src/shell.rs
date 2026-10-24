@@ -12599,6 +12599,25 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        {
+            let transcript = &self.state.read(cx).transcript;
+            crate::stall_watch::set_view(crate::stall_watch::View {
+                route: match self.route {
+                    Route::Chat => "chat",
+                    Route::Settings(_) => "settings",
+                },
+                tabs: self.chat_tabs.len().max(1),
+                panes: self
+                    .chat_split
+                    .as_ref()
+                    .map_or(1, |split| split.panes.len()),
+                transcript_entries: transcript.len(),
+                streaming: transcript
+                    .last()
+                    .is_some_and(|e| e.status == Some(harness_doc::MessageStatus::Streaming)),
+                window_active: window.is_window_active(),
+            });
+        }
         if let Some(command) = self.pending_workspace_command.take() {
             use crate::composer::WorkspaceCommand;
             match command {
