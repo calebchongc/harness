@@ -281,6 +281,8 @@ struct ComposerView: View {
     @State private var catalogsLoading = true
     @State private var catalogRetry = 0
     @State private var catalogSource: String?
+    /// A successful reply listed this chat's catalog (not just the cache).
+    @State private var catalogConfirmed = false
     @State private var queueEdit: QueueComposerEdit?
     private var editingQueuedId: String? { queueEdit?.lease.rowId }
     private var queueEditLease: QueueEditLease? { queueEdit?.lease }
@@ -311,7 +313,21 @@ struct ComposerView: View {
         catalogSource == catalogKey ? catalogs : [:]
     }
 
-    private var models: [ModelInfo] { scopedCatalogs[harness] ?? [] }
+    private var isChat: Bool { chat.config?.isChatMode == true }
+
+    /// Whether this chat's device lists any of the auto tiers (chat mode).
+    private var chatAvailability: ChatMode.Availability {
+        guard catalogSource == catalogKey else { return .pending }
+        let catalog = scopedCatalogs[harness] ?? []
+        return ChatMode.availability(catalog: catalog, liveHarnesses: nil,
+                                     liveModels: catalogConfirmed ? catalog : nil)
+    }
+
+    private var models: [ModelInfo] {
+        // A chat offers the three auto tiers and nothing else.
+        if isChat { return ChatMode.models(from: scopedCatalogs[harness] ?? []) }
+        return scopedCatalogs[harness] ?? []
+    }
 
     private var currentModel: ModelInfo {
         if (chat.config?.model ?? "").isEmpty, models.isEmpty {
@@ -365,6 +381,17 @@ struct ComposerView: View {
                     .monospacedDigit()
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            // Chat mode: the API-cost note for Auto (smart), on its own line
+            // so the chip row never squeezes it.
+            if isChat, let note = chatAvailability == .unavailable
+                ? ChatMode.unavailableNote : ChatMode.note(for: currentModel.id) {
+                Text(note)
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textMuted)
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("chat-mode-note")
             }
             // Pre-send honesty (composer.rs degraded notice, post-#170 copy):
             // one quiet caption line, never a warning box — the send still
@@ -477,7 +504,7 @@ struct ComposerView: View {
                     set: { writeConfig(model: chat.config?.model, reasoning: $0) }
                 ),
                 lockedHarness: true,
-                catalogs: scopedCatalogs,
+                catalogs: isChat ? [harness: models] : scopedCatalogs,
                 catalogsLoading: catalogsLoading || catalogSource != catalogKey,
                 onRetry: { catalogRetry += 1 }
             )
@@ -502,6 +529,7 @@ struct ComposerView: View {
             let ownerHarness = harness
             if catalogSource != source {
                 catalogs = [:]
+                catalogConfirmed = false
                 catalogSource = source
                 if let cached = DocDisk.loadModels(deviceId: chat.deviceId, harness: ownerHarness), !cached.isEmpty {
                     catalogs[ownerHarness] = cached
@@ -515,6 +543,7 @@ struct ComposerView: View {
             if catalog.isLive || catalogs[ownerHarness]?.isEmpty != false {
                 catalogs[ownerHarness] = catalog.items
             }
+            if catalog.isLive { catalogConfirmed = true }
             catalogsLoading = false
         }
         .task(id: queueEdit?.terminal == true ? nil : queueEditLease?.leaseId) {
