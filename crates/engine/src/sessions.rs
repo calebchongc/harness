@@ -3728,10 +3728,10 @@ async fn drive_run(
                     );
                     idle_since = None;
                     self_continued_turn = true;
-                    if !carry_human_work {
-                        turn_origin = TurnOrigin::Background;
-                        inner.journal.record_turn_origin(&chat_id, turn_origin);
-                    }
+                    // A turn the agent continues on its own (background work
+                    // it reports on, a task wake) keeps the last prompt's
+                    // owner: "tell me when it's done" must still notify,
+                    // and peer-only work stays silent (#535).
                     // The park cleared the fold; rotate to a fresh entry and
                     // fall through — this event is the new segment's first part.
                     entry_id = new_id();
@@ -3959,7 +3959,9 @@ async fn drive_run(
                 .get(&chat_id)
                 .filter(|h| h.run_id == run_id)
                 .and_then(|h| lock(&h.routed_steers).as_mut()?.pop_front());
-            let incoming_origin = incoming.as_ref().map_or(TurnOrigin::Background, |s| s.turn_origin);
+            // A boundary with no accepted steer behind it is the agent
+            // continuing on its own: it keeps the last prompt's owner.
+            let incoming_origin = incoming.as_ref().map_or(turn_origin, |s| s.turn_origin);
             turn_origin = if carry_human_work || (turn_was_active && turn_origin == TurnOrigin::Human) {
                 TurnOrigin::Human
             } else {

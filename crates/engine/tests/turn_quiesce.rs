@@ -320,11 +320,19 @@ async fn parked_self_continuation_folds_and_requiesces() {
     assert!(second_completion.is_some());
     assert_ne!(
         second_completion, first_completion,
-        "engine-settled background responses still advance the consumed marker"
+        "engine-settled responses still notify"
     );
-
-    assert!(rig.core.sessions.session_status(CHAT).unwrap().last_completed_peer_only,
-        "unsolicited native wakes must not inherit completed human ownership");
+    // "Run this in the background and tell me when it's done": the result
+    // arrives on a turn the agent continued on its own, and it belongs to the
+    // person who asked, so it chimes and notifies (#535).
+    assert!(
+        !rig.core
+            .sessions
+            .session_status(CHAT)
+            .unwrap()
+            .last_completed_peer_only,
+        "a self-continued turn keeps the last prompt's human owner"
+    );
 
     // The self-continued output is in the doc as its own COMPLETE entry —
     // this exact text was lost in the incident.
@@ -337,6 +345,64 @@ async fn parked_self_continuation_folds_and_requiesces() {
     );
 
     rig.core.sessions.shutdown().await;
+}
+
+/// A turn the agent continues on its own (a background task finishing, a
+/// task wake) reports to whoever asked for the work: a person's request still
+/// chimes and notifies when its result lands, while a peer-only request stays
+/// silent (#535, #553 review).
+#[tokio::test]
+async fn self_continued_turns_keep_the_last_prompts_owner() {
+    for origin in [TurnOrigin::Human, TurnOrigin::Peer] {
+        let rig = assemble("start the build in the background");
+        let mut request = run_request("start the build in the background");
+        request.turn_origin = origin;
+        rig.core
+            .sessions
+            .dispatch(CHAT, HarnessId::Mock, request, None)
+            .await
+            .unwrap();
+        rig.feed.send(session_started()).unwrap();
+        rig.feed.send(text("Started; I'll report back.")).unwrap();
+        rig.feed.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || status(&rig.core) == Some(SessionStatus::Idle),
+            "park after the opening turn",
+        )
+        .await;
+        let opening = rig.core.sessions.session_status(CHAT).unwrap();
+        assert_eq!(
+            opening.last_completed_peer_only,
+            origin != TurnOrigin::Human
+        );
+
+        // The background work settles and the agent reports on its own.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        rig.feed
+            .send(text("The build finished: all green."))
+            .unwrap();
+        wait_for(
+            || {
+                rig.core.sessions.session_status(CHAT).is_some_and(|s| {
+                    s.status == SessionStatus::Idle
+                        && s.last_completed_turn.is_some()
+                        && s.last_completed_turn != opening.last_completed_turn
+                })
+            },
+            "self-continued completion",
+        )
+        .await;
+        assert_eq!(
+            rig.core
+                .sessions
+                .session_status(CHAT)
+                .unwrap()
+                .last_completed_peer_only,
+            origin != TurnOrigin::Human,
+            "origin={origin:?}: the self-continued result keeps the opening prompt's owner"
+        );
+        rig.core.sessions.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -472,21 +538,30 @@ async fn quiesced_human_work_keeps_ownership_through_a_delayed_peer_boundary() {
         "quiescence must not lose the pending human completion"
     );
 
-    // Once delivered, that human ownership must not leak into future wakes.
+    // A later wake the agent starts on its own continues that human-owned
+    // work, so its result still notifies (#535).
     tokio::time::sleep(Duration::from_millis(1200)).await;
     rig.feed
-        .send(text("Unsolicited peer acknowledgement."))
+        .send(text("Background result for the human task."))
         .unwrap();
     wait_for(
         || {
             rig.core.sessions.session_status(CHAT).is_some_and(|s| {
                 s.last_completed_turn.as_deref() != Some("delayed-peer")
-                    && s.last_completed_peer_only
+                    && s.last_completed_turn.is_some()
             })
         },
-        "later background completion stays silent",
+        "later self-continued completion",
     )
     .await;
+    assert!(
+        !rig.core
+            .sessions
+            .session_status(CHAT)
+            .unwrap()
+            .last_completed_peer_only,
+        "a self-continued wake keeps the human owner"
+    );
     rig.core.sessions.shutdown().await;
 }
 
