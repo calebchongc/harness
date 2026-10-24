@@ -25,13 +25,24 @@ is `crates/engine/src/browse_link/`; the Settings card is
   needs the run-js scope"). A signed `unknown_client` (revoked in browse, or
   unused for 30 days) forgets the pairing and Settings says to connect again.
   An answer not signed by the pinned key is never believed.
+- **Settings** asks browse (`/pair/status`, signed) each time it shows the
+  card, so scopes changed in browse, or a revocation, show without waiting
+  for a run. The card is only on macOS, and only for this device.
+- **Relay tokens** are 256 random bits per run, compared in constant time,
+  and never logged (`McpServer`'s `Debug` hides header values).
 - **Without browse** running and paired, runs get no browse server and use
   Harness's own browser pane as before.
 
 ## Testing
 
 `cargo test -p harness-engine --lib browse_link` runs the wire format and a
-full flow against a fake browse that checks every signature.
+full flow against a fake browse that checks every signature, timestamp and
+nonce the way browse does. The fake answers anything else that connects to
+its port (a dev-server scanner's `HEAD /`, say) as browse would, instead of
+failing the test.
+
+Screenshots from synthetic data:
+`cargo run -p harness-ui --features appshots-fixture --example browse-link-fixture -- <dir> [light]`.
 
 Against a real browse, in a test world so the user's profile is untouched:
 
