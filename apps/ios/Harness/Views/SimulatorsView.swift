@@ -1,6 +1,7 @@
 // Settings > Simulators. The iOS Simulators on one of your Macs: open one to
 // watch it live and use it from here (SimulatorScreenView). The Mac streams
-// through a helper it installs only when you set it up here.
+// through a helper it installs only when you set it up here. Calls go to the
+// Mac's engine over its relay, like terminals, so only your own devices reach it.
 
 import SwiftUI
 
@@ -26,12 +27,8 @@ struct SimulatorsView: View {
         var id: String { simulator.id }
     }
 
-    /// Computers that can run agents, online ones first.
-    private var hosts: [DeviceRow] {
-        let candidates = model.devices.filter(\.canHostSessions)
-        return candidates.filter { model.deviceOnline($0.id) }
-            + candidates.filter { !model.deviceOnline($0.id) }
-    }
+    /// Macs (only they run iOS Simulators), online ones first.
+    private var hosts: [DeviceRow] { model.simulatorMacs }
 
     private var deviceId: String? {
         if let selectedDeviceId, hosts.contains(where: { $0.id == selectedDeviceId }) {
@@ -43,8 +40,8 @@ struct SimulatorsView: View {
     var body: some View {
         List {
             if hosts.isEmpty {
-                ContentUnavailableView("No computers yet", systemImage: "desktopcomputer",
-                    description: Text("Simulators run on your Mac. Open Harness on it and sign in."))
+                ContentUnavailableView("No Mac yet", systemImage: "desktopcomputer",
+                    description: Text("iOS Simulators run on a Mac. Open Harness on it and sign in."))
             } else {
                 if hosts.count > 1 {
                     Section {
@@ -59,10 +56,12 @@ struct SimulatorsView: View {
                         }
                         .accessibilityIdentifier("simulators-device")
                     }
+                    .harnessListRow()
                 }
                 content
             }
         }
+        .harnessGroupedList()
         .refreshable { await reload() }
         .task(id: deviceId) { await reload() }
         .navigationTitle("Simulators")
@@ -91,16 +90,19 @@ struct SimulatorsView: View {
                     Spacer()
                 }
             }
+            .harnessListRow()
         case .failed(let message):
             Section {
                 Text(message).foregroundStyle(.secondary)
             }
+            .harnessListRow()
         case .loaded(let list):
             if !list.supported {
                 Section {
                     Text(list.reason ?? "This computer can't run iOS Simulators.")
                         .foregroundStyle(.secondary)
                 }
+                .harnessListRow()
             } else if !list.setUp {
                 setUpSection
             } else if list.devices.isEmpty {
@@ -108,6 +110,7 @@ struct SimulatorsView: View {
                     Text("No iOS Simulators on \(computerName). Add one in Xcode.")
                         .foregroundStyle(.secondary)
                 }
+                .harnessListRow()
             } else {
                 deviceSections(list.devices)
             }
@@ -132,8 +135,9 @@ struct SimulatorsView: View {
             .disabled(busy != nil)
             .accessibilityIdentifier("simulators-set-up")
         } footer: {
-            Text("To stream a simulator here, \(computerName) installs a small helper with npm (Node.js 20 or newer). It only listens on that computer, and only Harness talks to it. This takes a minute.")
+            Text("To stream a simulator here, \(computerName) installs a pinned helper with npm (Node.js 20 or newer). It listens only on that Mac, answers only Harness, and stops when nobody is watching. This takes a minute.")
         }
+        .harnessListRow()
     }
 
     @ViewBuilder
@@ -144,6 +148,7 @@ struct SimulatorsView: View {
             Section("Running") {
                 ForEach(booted) { row($0) }
             }
+            .harnessListRow()
         }
         if !rest.isEmpty {
             Section {
@@ -153,6 +158,7 @@ struct SimulatorsView: View {
             } footer: {
                 Text("Opening one starts it on \(computerName).")
             }
+            .harnessListRow()
         }
     }
 
@@ -242,14 +248,6 @@ struct SimulatorsView: View {
     }
 
     private func describe(_ error: Error) -> String {
-        let name = computerName
-        if case RelayError.rpc(let message) = error {
-            if message.contains("unknown method") {
-                return "Update Harness on \(name) to use its simulators from your phone."
-            }
-            return message
-        }
-        let reason = (error as? RelayError)?.errorDescription ?? describeTransportError(error)
-        return "Couldn't reach \(name): \(reason)"
+        SimulatorHosts.failure(error, deviceName: computerName)
     }
 }

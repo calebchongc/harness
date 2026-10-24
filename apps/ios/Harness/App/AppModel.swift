@@ -913,11 +913,28 @@ final class AppModel {
         return try await workspace.agentAccounts(deviceId: deviceId, forceUsage: forceUsage)
     }
 
-    /// Where the Simulators screens send their relay calls. Demo mode has no
-    /// computer to ask.
-    func simulatorHost() throws -> WorkspaceStore {
-        guard demo == nil, let workspace else { throw RelayError.notConnected }
+    /// Demo mode's Mac simulators (Settings → Simulators offline).
+    @ObservationIgnored private lazy var demoSimulators = DemoSimulators(
+        setUp: ProcessInfo.processInfo.arguments.contains("-simulators-set-up"))
+    #if DEBUG
+    @ObservationIgnored private lazy var localSimulatorEngine: LocalEngineSimulatorHost? =
+        LocalEngineSimulatorHost.launchPort().map(LocalEngineSimulatorHost.init(port:))
+    #endif
+
+    /// Where the Simulators screens send their calls: the computer's engine
+    /// over its relay, or demo mode's made-up Mac.
+    func simulatorHost() throws -> any SimulatorHost {
+        #if DEBUG
+        if let localSimulatorEngine { return localSimulatorEngine }
+        #endif
+        if demo != nil { return demoSimulators }
+        guard let workspace else { throw RelayError.notConnected }
         return workspace
+    }
+
+    /// Computers that can run iOS Simulators (Macs), online ones first.
+    var simulatorMacs: [DeviceRow] {
+        SimulatorHosts.macs(devices, online: deviceOnline)
     }
 
     /// The cloud sandboxes of the Codegraff account one computer's engine is

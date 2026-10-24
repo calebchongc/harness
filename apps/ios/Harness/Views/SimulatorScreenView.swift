@@ -41,6 +41,7 @@ struct SimulatorScreenView: View {
     private var header: some View {
         HStack(spacing: 12) {
             circleButton("xmark", label: "Close") { dismiss() }
+                .accessibilityIdentifier("simulator-close")
             Spacer()
             Text(simulator.name)
                 .font(.headline)
@@ -77,7 +78,9 @@ struct SimulatorScreenView: View {
                 circleLabel("ellipsis")
             }
             .accessibilityLabel("More")
+            .accessibilityIdentifier("simulator-more")
             circleButton("house", label: "Home") { input.enqueue(.button(.home)) }
+                .accessibilityIdentifier("simulator-home")
         }
         .padding(.top, 4)
     }
@@ -91,6 +94,7 @@ struct SimulatorScreenView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
                     .overlay { touchSurface }
                     .accessibilityLabel("\(simulator.name) screen")
+                    .accessibilityIdentifier("simulator-screen")
             }
             if let status {
                 VStack(spacing: 10) {
@@ -136,6 +140,7 @@ struct SimulatorScreenView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .focused($draftFocused)
+                .accessibilityIdentifier("simulator-type-field")
                 .submitLabel(.send)
                 .onSubmit {
                     if !draft.isEmpty { input.enqueue(.text(draft)) }
@@ -174,13 +179,16 @@ struct SimulatorScreenView: View {
                        y: min(max(point.y / size.height, 0), 1))
     }
 
-    /// Stream frames until the view goes away, reconnecting through gaps.
+    /// Stream frames until the view goes away, reconnecting through gaps. Each
+    /// connection asks for the current network's frame rate (fewer on cellular).
     private func watch() async {
         var retry: UInt64 = 500_000_000
         while !Task.isCancelled {
             do {
+                let fps = await SimulatorStreamRate.current()
                 let stream = try await model.simulatorHost().simulatorScreen(deviceId: deviceId,
-                                                                             simulatorId: simulator.id)
+                                                                             simulatorId: simulator.id,
+                                                                             maxFps: fps)
                 for try await frame in stream {
                     guard !Task.isCancelled else { return }
                     let decoded = await Task.detached(priority: .userInitiated) {

@@ -80,13 +80,18 @@ struct SettingsView: View {
                 }
                 .harnessListRow()
 
-                Section("Devices") {
-                    NavigationLink {
-                        SimulatorsView()
-                    } label: {
-                        Text("Simulators")
+                // A Mac's iOS Simulators, live on this phone. Only Macs run
+                // them, so the row is hidden until one of your computers is a Mac.
+                if !model.simulatorMacs.isEmpty {
+                    Section("Devices") {
+                        NavigationLink {
+                            SimulatorsView()
+                        } label: {
+                            Text("Simulators")
+                        }
+                        .accessibilityIdentifier("settings-simulators")
                     }
-                    .accessibilityIdentifier("settings-simulators")
+                    .harnessListRow()
                 }
 
                 // iPad already shows the list beside the open session; a phone can too, when there is room.

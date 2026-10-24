@@ -729,6 +729,8 @@ final class WorkspaceStore {
     }
 
     // MARK: Simulators (the computer's iOS Simulators, watched and driven from here)
+    // Device-addressed relay calls like terminals: only the account's own
+    // devices can open a device's relay room.
 
     func listSimulators(deviceId: String) async throws -> SimulatorList {
         try await relay(for: deviceId).call(method: "ListSimulators", params: [:], timeoutSeconds: 25)
@@ -753,10 +755,11 @@ final class WorkspaceStore {
                                                         timeoutSeconds: 30)
     }
 
-    func simulatorScreen(deviceId: String, simulatorId: String) async throws
+    /// The simulator's screen at most `maxFps` frames a second, newest frame first.
+    func simulatorScreen(deviceId: String, simulatorId: String, maxFps: Int) async throws
         -> AsyncThrowingStream<SimulatorFrame, Error> {
         try await relay(for: deviceId).stream(method: "WatchSimulatorScreen",
-                                              params: ["simulatorId": simulatorId])
+                                              params: ["simulatorId": simulatorId, "maxFps": maxFps])
     }
 
     func simulatorInput(deviceId: String, simulatorId: String, input: SimulatorInput) async throws {
@@ -1039,3 +1042,5 @@ final class WorkspaceStore {
         afterLocalWrite()
     }
 }
+
+extension WorkspaceStore: SimulatorHost {}

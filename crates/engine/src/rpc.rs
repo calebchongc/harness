@@ -433,6 +433,16 @@ struct SimulatorParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WatchSimulatorParams {
+    simulator_id: String,
+    /// The viewer's frame-rate cap (a phone on cellular asks for fewer);
+    /// clamped to what the helper produces.
+    #[serde(default)]
+    max_fps: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SimulatorInputParams {
     simulator_id: String,
     input: crate::simulators::SimulatorInput,
@@ -810,21 +820,15 @@ impl EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_SIMULATOR_SCREEN => {
-                let p: SimulatorParams = parse_params(params)?;
+                let p: WatchSimulatorParams = parse_params(params)?;
                 let rx = simulators
                     .watch_screen(&p.simulator_id)
                     .await
                     .map_err(RpcError::Failed)?;
-                // Latest frame wins: a slow viewer skips frames instead of queueing them.
-                let stream = futures::stream::unfold(rx, |mut rx| async move {
-                    loop {
-                        rx.changed().await.ok()?;
-                        let frame = rx.borrow_and_update().clone();
-                        if let Some(frame) = frame {
-                            return Some((serde_json::to_value(&*frame).ok()?, rx));
-                        }
-                    }
-                });
+                // Latest frame wins at the viewer's own rate: a slow viewer
+                // skips frames instead of queueing them.
+                let stream = crate::simulators::viewer_frames(rx, p.max_fps)
+                    .filter_map(|frame| async move { serde_json::to_value(&*frame).ok() });
                 Ok(RpcReply::Stream(stream.boxed()))
             }
             methods::SIMULATOR_INPUT => {
@@ -4182,6 +4186,41 @@ mod tests {
         );
         assert_eq!(
             forward_deadline(methods::QUEUE_COMMAND),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// Simulator calls reach another computer only as device-addressed calls
+    /// over the relay, the same path (and the same account check at the
+    /// relay) as terminals; the screen is proxied as a stream.
+    #[test]
+    fn simulator_methods_route_to_the_mac_like_terminals() {
+        for method in [
+            methods::LIST_SIMULATORS,
+            methods::SET_UP_SIMULATORS,
+            methods::BOOT_SIMULATOR,
+            methods::SHUTDOWN_SIMULATOR,
+            methods::WATCH_SIMULATOR_SCREEN,
+            methods::SIMULATOR_INPUT,
+        ] {
+            assert!(forwardable(method), "{method}");
+            assert_eq!(
+                is_stream_method(method),
+                method == methods::WATCH_SIMULATOR_SCREEN,
+                "{method}"
+            );
+        }
+        use std::time::Duration;
+        assert_eq!(
+            forward_deadline(methods::SET_UP_SIMULATORS),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            forward_deadline(methods::BOOT_SIMULATOR),
+            Duration::from_secs(150)
+        );
+        assert_eq!(
+            forward_deadline(methods::SIMULATOR_INPUT),
             Duration::from_secs(30)
         );
     }
