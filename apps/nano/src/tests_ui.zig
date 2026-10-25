@@ -689,3 +689,499 @@ test "Organize › By project heads each project's sessions; Compact off shows w
     h.t.settle(1);
     try testing.expect(!h.t.hasText("Ledger @ Studio"));
 }
+
+/// Settings › GitHub CI open, on no engine.
+fn openGithubCi(h: *Harness) void {
+    @import("view_settings.zig").open(&h.a);
+    h.a.settings.section = .github_ci;
+    h.t.settle(1);
+}
+
+/// Shows `reply` as the engine's `CodegraffGithubRunners` answer (the GPUI
+/// test's `set_runners`).
+fn githubRunners(h: *Harness, reply: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, reply, .{});
+    defer parsed.deinit();
+    @import("view_settings_github_ci.zig").setRunners(&h.a, parsed.value);
+    h.t.settle(1);
+}
+
+const github_connected =
+    \\{"available": true, "enabled": true,
+    \\ "installUrl": "https://github.com/apps/codegraff/installations/new",
+    \\ "installations": [{
+    \\   "installationId": "4242", "account": "fieldnotes-co", "accountType": "Organization",
+    \\   "monthlyBudgetMicroUsd": 50000000, "usedThisMonthMicroUsd": 12500000, "maxConcurrent": 3,
+    \\   "repos": [{"fullName": "fieldnotes-co/app", "enabled": true, "defaultSize": "standard", "private": true},
+    \\             {"fullName": "fieldnotes-co/docs", "enabled": false}]
+    \\ }],
+    \\ "recentJobs": [{
+    \\   "repo": "fieldnotes-co/app", "workflow": "CI", "jobName": "test",
+    \\   "state": "completed", "conclusion": "success", "durationSeconds": 180, "costMicroUsd": 5000,
+    \\   "htmlUrl": "https://github.com/fieldnotes-co/app/actions/runs/1/job/2"
+    \\ }],
+    \\ "sizes": [{"key": "standard", "cpu": 2, "memoryGiB": 4, "pricePerHourMicroUsd": 100000},
+    \\           {"key": "large", "cpu": 4, "memoryGiB": 8, "pricePerHourMicroUsd": 200000}]}
+;
+
+test "Settings › GitHub CI: without an engine it says so, with Retry and Refresh" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openGithubCi(&h);
+    try testing.expect(h.t.hasText("GitHub CI"));
+    try testing.expect(h.t.hasText("Refresh"));
+    try testing.expect(h.t.hasText("Engine not connected"));
+    try testing.expect(h.t.hasText("Retry"));
+    try testing.expect(!h.t.hasText("Connect GitHub"));
+    h.snap("github-ci-no-engine");
+}
+
+test "Settings › GitHub CI: each answer shows its panel" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openGithubCi(&h);
+    try githubRunners(&h, "null");
+    try testing.expect(h.t.hasText("Sign in with Codegraff from the account menu to run GitHub Actions on Codegraff."));
+    try testing.expect(!h.t.hasText("Engine not connected"));
+    try githubRunners(&h, "{}");
+    try testing.expect(h.t.hasText("GitHub CI isn't available on Codegraff yet. This page fills in once it is."));
+    try testing.expect(h.t.hasText("Coming soon"));
+    try githubRunners(&h, "{\"available\": true, \"enabled\": false}");
+    try testing.expect(h.t.hasText("GitHub CI is coming soon to your Codegraff account."));
+    try githubRunners(&h, "{\"available\": true, \"enabled\": true}");
+    try testing.expect(h.t.hasText("Codegraff didn't send an install link. Try Refresh."));
+    try githubRunners(&h, "{\"available\": true, \"enabled\": true, \"installUrl\": \"https://github.com/apps/codegraff/installations/new\"}");
+    try testing.expect(h.t.hasText("Run GitHub Actions on Codegraff"));
+    try testing.expect(h.t.hasText("Connect GitHub"));
+    try testing.expect(h.t.hasText("In a workflow, run a job on Codegraff:"));
+    try testing.expect(h.t.hasText("    runs-on: codegraff"));
+    try testing.expect(!h.t.hasText("Recent jobs"));
+    h.snap("github-ci-not-connected");
+    // Copy puts the snippet on the clipboard, and says so for a moment.
+    try h.t.clickText("Copy");
+    h.t.settle(1);
+    try testing.expectEqualStrings(@import("runners.zig").yaml_snippet, h.t.clipboard.items);
+    try testing.expect(h.t.hasText("Copied"));
+    h.t.advance(2);
+    try testing.expect(h.t.hasText("Copy"));
+
+    h.t.resize(1200, 1400);
+    try githubRunners(&h, github_connected);
+    try testing.expect(!h.t.hasText("Connect GitHub"));
+    for ([_][]const u8{
+        "fieldnotes-co",
+        "Organization · 1 of 2 repositories on",
+        "Monthly budget",
+        "$12.50 of $50 used this month",
+        "Fork pull request budget",
+        "Jobs from outside contributors stop at this amount each month.",
+        "Concurrent jobs",
+        "3",
+        "fieldnotes-co/app",
+        "Private",
+        "Standard · $0.10/h",
+        "fieldnotes-co/docs",
+        "Connect another account",
+        "Recent jobs",
+        "fieldnotes-co/app · CI · test",
+        "Open on GitHub",
+    }) |want| {
+        if (!h.t.hasText(want)) std.debug.print("missing: {s}\n", .{want});
+        try testing.expect(h.t.hasText(want));
+    }
+    try testing.expect(h.t.hasText("Succeeded · 3m 0s · $0.005"));
+    const page = &h.a.view.github_ci;
+    try testing.expectEqualStrings("50", page.inputs.items[0].buf.text());
+    h.snap("github-ci-connected");
+}
+
+test "Settings › GitHub CI: a bad budget is refused in place, and nothing is sent" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openGithubCi(&h);
+    try githubRunners(&h, "{\"available\": true, \"enabled\": true, \"installations\": [{\"installationId\": \"1\", \"account\": \"studio\"}]}");
+    try testing.expect(h.t.hasText("No repositories yet. Choose them in the Codegraff app's settings on GitHub."));
+    try testing.expect(h.t.hasText("$0 used this month · no monthly budget"));
+    const page = &h.a.view.github_ci;
+    page.inputs.items[0].buf.set("twelve");
+    try h.t.clickText("Save");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Enter a dollar amount, like 50 or 12.50."));
+    try testing.expect(page.busy == null);
+    h.snap("github-ci-bad-budget");
+    // Editing it again clears the complaint.
+    const field = h.t.findText("twelve") orelse return error.NoField;
+    h.t.click(field.x + field.w, field.y + field.h / 2);
+    h.t.settle(1);
+    h.t.typeText("0");
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Enter a dollar amount, like 50 or 12.50."));
+}
+
+test "Settings › GitHub CI: the concurrent-jobs stepper stays within 1…8; Disconnect asks first; a size opens its menu" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openGithubCi(&h);
+    h.t.resize(1200, 1400);
+    try githubRunners(&h, "{\"available\": true, \"enabled\": true, \"installations\": [{\"installationId\": \"1\", \"account\": \"studio\", \"maxConcurrent\": 40, \"repos\": [{\"fullName\": \"studio/site\", \"enabled\": true}]}], \"sizes\": [{\"key\": \"standard\", \"cpu\": 2, \"memoryGiB\": 4, \"pricePerHourMicroUsd\": 100000}]}");
+    try testing.expect(h.t.hasText("8"));
+    try testing.expect(!h.t.hasText("40"));
+    try githubRunners(&h, "{\"available\": true, \"enabled\": true, \"installations\": [{\"installationId\": \"1\", \"account\": \"studio\", \"maxConcurrent\": 0, \"repos\": [{\"fullName\": \"studio/site\", \"enabled\": true}]}], \"sizes\": [{\"key\": \"standard\", \"cpu\": 2, \"memoryGiB\": 4, \"pricePerHourMicroUsd\": 100000}]}");
+    try testing.expect(h.t.hasText("1"));
+    try h.t.clickText("Disconnect");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Disconnect for good?"));
+    // No size named: the first.
+    try h.t.clickText("Standard · $0.10/h");
+    h.t.settle(1);
+    try testing.expect(h.t.containsText("D\u{200A}E\u{200A}F\u{200A}A\u{200A}U\u{200A}L\u{200A}T"));
+    try testing.expect(h.t.hasText("Standard · 2 vCPU · 4 GB · $0.10/h"));
+    h.snap("github-ci-size-menu");
+    h.t.click(700, 1300);
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Standard · 2 vCPU · 4 GB · $0.10/h"));
+}
+
+/// Settings › Agents open, on no engine.
+fn openAgents(h: *Harness) void {
+    @import("view_settings.zig").open(&h.a);
+    h.a.settings.section = .harnesses;
+    h.t.resize(1200, 1400);
+    h.t.settle(1);
+}
+
+/// Shows `reply` as the engine's `ListHarnesses` answer.
+fn agentList(h: *Harness, reply: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, reply, .{});
+    defer parsed.deinit();
+    @import("view_settings_agents.zig").setList(&h.a, parsed.value);
+    h.t.settle(1);
+}
+
+/// The switch on the row titled `name`: at the card's right edge, level
+/// with the middle of the title and the line under it.
+fn agentToggle(h: *Harness, name: []const u8, line: []const u8) !void {
+    const t = h.t.findText(name) orelse return error.NoRow;
+    const m = h.t.findText(line) orelse return error.NoRow;
+    const main_w = 1200 - @import("view_sidebar.zig").width;
+    const col_w = @min(main_w, 768);
+    const right = @import("view_sidebar.zig").width + (main_w - col_w) / 2 + col_w - 24 - 1 - 20;
+    h.t.click(right - 16, (t.y + m.y + m.h) / 2);
+    h.t.settle(1);
+}
+
+test "Settings › Agents: with no engine, the GPUI app's waiting page" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openAgents(&h);
+    for ([_][]const u8{
+        "Agents",
+        "This device",
+        "This GUI drives whatever agent is installed on the selected device. A custom build can point at its binary with that agent's *_EXECUTABLE variable. Downloads start only when you choose Install.",
+        "Experimental Graff ACP child agents",
+        "Session titles",
+        "Loading title settings…",
+    }) |want| try testing.expect(h.t.hasText(want));
+    // Nothing asked, nothing failed: the skeleton waits for an engine.
+    try testing.expectEqual(.idle, h.a.view.agents.phase);
+    try testing.expect(!h.t.hasText("Engine not connected"));
+    try testing.expect(!h.t.hasText("Retry"));
+    h.snap("agents-no-engine");
+}
+
+const agent_catalog =
+    \\[{"id":"codex","name":"Codex","installed":true,"enabled":true},
+    \\ {"id":"graff","name":"Graff","installed":true,"canInstall":true,"enabled":false},
+    \\ {"id":"pi","name":"Pi","installed":false,"canInstall":false},
+    \\ {"id":"cursor","name":"Cursor","installed":true,"enabled":false},
+    \\ {"id":"antigravity","name":"Antigravity","installed":true,"enabled":false},
+    \\ {"id":"mock","name":"Mock","installed":true}]
+;
+
+test "Settings › Agents: each row's blurb, hints and actions, as the GPUI app's" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openAgents(&h);
+    try agentList(&h, agent_catalog);
+    for ([_][]const u8{
+        "OpenAI's coding agent, driven through the Codex CLI.",
+        "codegraff's graff agent over ACP (graff CLI).",
+        "Install beta updates the managed Codegraff CLI for new Graff sessions.",
+        "Update",
+        "Install beta",
+        "The pi coding agent (pi CLI).",
+        "Install the pi CLI to enable. Install with `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`",
+        "Custom build: set PI_EXECUTABLE to that binary.",
+        "Off by default — turn on to use",
+        "Sign in",
+    }) |want| {
+        if (!h.t.hasText(want)) std.debug.print("missing: {s}\n", .{want});
+        try testing.expect(h.t.hasText(want));
+    }
+    // The mock is the dev rig's: hidden.
+    try testing.expect(!h.t.hasText("Scripted test harness."));
+    // Pi can't be installed from here: no Install.
+    try testing.expect(!h.t.hasText("Install"));
+    h.snap("agents-rows");
+}
+
+test "Settings › Agents: the last enabled agent can't be switched off; another can be switched on" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openAgents(&h);
+    try agentList(&h, agent_catalog);
+    // Codex is the only one on: its switch does nothing.
+    try agentToggle(&h, "Codex", "OpenAI's coding agent, driven through the Codex CLI.");
+    try testing.expect(!h.t.hasText("Engine not connected"));
+    // Cursor is installed and off: its switch asks the engine (none here).
+    try agentToggle(&h, "Cursor", "Cursor's coding agent, driven through the cursor-agent CLI.");
+    try testing.expect(h.t.hasText("Engine not connected"));
+}
+
+test "Settings › Agents: graff's compact-at pills; a point set elsewhere is named" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openAgents(&h);
+    try agentList(&h, agent_catalog);
+    try testing.expect(h.t.hasText("Compact context at"));
+    for (@import("agents.zig").compact_choices) |ch| try testing.expect(h.t.hasText(ch.label));
+    try testing.expect(h.t.hasText("How full the context window gets before Graff compacts. Applies to new Graff chats; /compact-at 70 changes one chat."));
+    @import("view_settings_agents.zig").setCompact(&h.a, 65);
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Currently 65%, set on this device."));
+    @import("view_settings_agents.zig").setCompact(&h.a, 70);
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Currently 70%, set on this device."));
+    h.snap("agents-compact-at");
+    // A pill saves through the engine; with none, the strip says so.
+    try h.t.clickText("50%");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Engine not connected"));
+    try testing.expect(!h.a.view.agents.compact_saving);
+}
+
+test "Settings › Agents: the device switcher lists each device, this one as You, and retargets the page" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"id":"d2","name":"Workbench","platform":"linux","createdAt":"2026-10-02T00:00:00Z"},
+        \\ {"id":"d1","name":"Studio","platform":"macos","createdAt":"2026-10-01T00:00:00Z"}]
+    , .{});
+    defer parsed.deinit();
+    try h.a.devices.replace(parsed.value);
+    h.a.device_id = try testing.allocator.dupe(u8, "d1");
+    openAgents(&h);
+    try agentList(&h, agent_catalog);
+    try h.t.clickText("Studio");
+    h.t.settle(1);
+    try testing.expect(h.t.containsText("D\u{200A}E\u{200A}V\u{200A}I\u{200A}C\u{200A}E\u{200A}S"));
+    try testing.expect(h.t.hasText("Workbench"));
+    try testing.expect(h.t.hasText("You"));
+    // Added first, listed first.
+    const studio = h.t.findText("You") orelse return error.NoRow;
+    const bench = h.t.findText("Workbench") orelse return error.NoRow;
+    try testing.expect(studio.y < bench.y);
+    h.snap("agents-device-menu");
+    try h.t.clickText("Workbench");
+    h.t.settle(1);
+    const p = &h.a.view.agents;
+    try testing.expectEqualStrings("d2", p.target.?);
+    try testing.expect(!p.device_menu);
+    // Another device: its rows are read again (and wait for an engine).
+    try testing.expectEqual(.idle, p.phase);
+    try testing.expect(!h.t.hasText("You"));
+    try h.t.clickText("Workbench");
+    h.t.settle(1);
+    try h.t.clickText("Studio");
+    h.t.settle(1);
+    try testing.expect(p.target == null);
+}
+
+test "Settings › Agents: session titles name the agent and model; the agent list offers those that can title" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openAgents(&h);
+    try agentList(&h, agent_catalog);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"harness\":\"claude-code\",\"model\":null}", .{});
+    defer parsed.deinit();
+    @import("view_settings_agents.zig").setTitles(&h.a, parsed.value);
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Title harness"));
+    try testing.expect(h.t.hasText("Automatic (cheapest model)"));
+    try testing.expect(!h.t.hasText("Automatic"));
+    try h.t.clickText("Claude Code");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Automatic"));
+    try testing.expectEqual(@as(?bool, false), h.a.view.agents.title_menu);
+}
+
+/// Settings › Accounts open, on no engine.
+fn openAccounts(h: *Harness) void {
+    @import("view_settings.zig").open(&h.a);
+    h.a.settings.section = .agents;
+    h.t.settle(1);
+}
+
+/// Shows `reply` as the engine's answer to `which`'s call.
+fn accountsReply(h: *Harness, comptime which: []const u8, reply: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, reply, .{});
+    defer parsed.deinit();
+    @field(@import("view_settings_accounts.zig"), which)(&h.a, parsed.value);
+    h.t.settle(1);
+}
+
+test "Settings › Accounts: without an engine, as the GPUI app's: loading cards, ChatGPT unknown, the failure with Click to retry" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openAccounts(&h);
+    for ([_][]const u8{ "Accounts", "Refresh", "CodeGraff", "View usage", "ChatGPT", "Continue with ChatGPT", "Separate from Codex · graff login chatgpt-new", "graff providers", "Engine not connected", "Click to retry" }) |want| {
+        if (!h.t.hasText(want)) std.debug.print("missing: {s}\n", .{want});
+        try testing.expect(h.t.hasText(want));
+    }
+    try testing.expect(h.t.containsText("Switching rewrites the CLI"));
+    try testing.expect(!h.t.hasText("Sign out"));
+    try testing.expect(!h.t.hasText("Add account"));
+    try testing.expect(!h.t.hasText("Claude Code"));
+    // Retrying without an engine fails again, in place.
+    try h.t.clickText("Click to retry");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Engine not connected"));
+    // Signing in needs an engine: the page says so.
+    try h.t.clickText("Continue with ChatGPT");
+    h.t.settle(1);
+    try testing.expectEqualStrings("Engine not connected", h.a.view.accounts.notice.items);
+    try testing.expect(h.a.view.accounts.login.flow == null);
+    h.snap("accounts-no-engine");
+}
+
+const accounts_snapshot =
+    \\{"accounts": [
+    \\  {"id": "c1", "harness": "claude-code", "email": "ada@example.com", "planLabel": "Max", "active": true, "switchable": true,
+    \\   "usageWindows": [{"label": "5h", "usedFraction": 0.42, "resetsAt": null}, {"label": "Weekly", "usedFraction": 0.86, "resetsAt": null}]},
+    \\  {"id": "c2", "harness": "claude-code", "email": "bea@example.com", "planLabel": "Pro", "active": false, "switchable": true},
+    \\  {"id": "c3", "harness": "claude-code", "email": null, "displayName": "Kit", "planLabel": null, "active": false, "switchable": false}],
+    \\ "warnings": [{"harness": "codex", "message": "Keychain didn't let Harness read the Codex login."}]}
+;
+
+test "Settings › Accounts: accounts with plans, Active, meters; empty providers; CodeGraff usage; graff's sign-ins" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.t.resize(1200, 2200);
+    openAccounts(&h);
+    try accountsReply(&h, "setSnapshot", accounts_snapshot);
+    try accountsReply(&h, "setUsage",
+        \\{"email": "cg@example.com", "tier": "Team", "credits_micro_usd": 12340000, "spend_30d_micro_usd": 2500000,
+        \\ "requests_30d": 31, "key_budget_monthly_micro_usd": 20000000, "key_spend_monthly_micro_usd": 5000000, "key_budget_resets_at": ""}
+    );
+    try accountsReply(&h, "setGraffLogins",
+        \\[{"id": "xai", "name": "xAI", "signedIn": true, "account": "x@example.com"},
+        \\ {"id": "kimi", "name": "Kimi", "signedIn": false},
+        \\ {"id": "chatgpt-new", "name": "ChatGPT", "signedIn": true, "account": "g@example.com", "planUsage": true}]
+    );
+    for ([_][]const u8{
+        // Three accounts and the CodeGraff sign-in.
+        "4",
+        "Sign out",
+        "cg@example.com",
+        "Graff CLI account on this device",
+        "$12.34 credits available",
+        "$2.50 spent · 31 requests in 30 days",
+        // "Key budget", cut at the meter's 48-point label as GPUI's.
+        "25% used",
+        "Team",
+        "Signed in as g@example.com · using your ChatGPT plan",
+        "Manage usage",
+        "xAI",
+        "Signed in as x@example.com",
+        "Sign in again",
+        "ChatGPT (old Codex)",
+        "Not signed in — add a Codex account below",
+        "Kimi",
+        "Sign in",
+        "Claude Code",
+        "ada@example.com",
+        "Active",
+        "Max",
+        "5h",
+        "42% used",
+        "Weekly",
+        "86% used",
+        "bea@example.com",
+        "Pro",
+        "Usage unavailable",
+        "Switch",
+        "Kit",
+        "Credentials unavailable",
+        "Keychain didn't let Harness read the Codex login.",
+        "No Codex login detected on this device — sign in with \u{201C}codex\u{201D} or add an account.",
+        "Cursor isn't connected on this device — connect it to run Cursor sessions.",
+        "Add account",
+    }) |want| {
+        if (!h.t.hasText(want)) std.debug.print("missing: {s}\n", .{want});
+        try testing.expect(h.t.hasText(want));
+    }
+    try testing.expect(!h.t.hasText("Engine not connected"));
+    // The legacy Codex row comes second, after graff's first provider.
+    try testing.expect(h.t.findText("xAI").?.y < h.t.findText("ChatGPT (old Codex)").?.y);
+    try testing.expect(h.t.findText("ChatGPT (old Codex)").?.y < h.t.findText("Kimi").?.y);
+    // The engine's order holds: the active account isn't moved first.
+    try testing.expect(h.t.findText("ada@example.com").?.y < h.t.findText("bea@example.com").?.y);
+    h.snap("accounts-ready");
+    // Switch without an engine leaves the row be.
+    try h.t.clickText("Switch");
+    h.t.settle(1);
+    try testing.expect(h.a.view.accounts.busy_account == null);
+}
+
+test "Settings › Accounts: the add-account dialog's paste-code and browser bodies; Copy, then Escape closes it" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    openAccounts(&h);
+    const p = &h.a.view.accounts;
+    // As StartAgentLogin answers for Claude: open the page, paste the code.
+    p.login.flow = .{ .stage = .paste, .harness = .claude_code, .start = .{ .login_id = "l1", .url = "https://example.com/oauth/authorize?state=demo", .mode = .paste_code } };
+    p.login.focus_code = true;
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Add Claude account"));
+    try testing.expect(h.t.hasText("Reopen the authorization page"));
+    try testing.expect(h.t.hasText("Or copy this link into any browser"));
+    try testing.expect(h.t.hasText("Add account"));
+    try testing.expect(h.t.hasText("Cancel"));
+    // The field has the keys.
+    h.t.typeText("abc123");
+    h.t.settle(1);
+    try testing.expectEqualStrings("abc123", p.login.code.text());
+    h.snap("accounts-paste-code");
+    try h.t.clickText("Copy");
+    h.t.settle(1);
+    try testing.expectEqualStrings("https://example.com/oauth/authorize?state=demo", h.t.clipboard.items);
+    try testing.expect(h.t.hasText("Copied"));
+    h.press(.{ .key = ui.Shortcut.escape });
+    try testing.expect(p.login.flow == null);
+    try testing.expect(!h.t.hasText("Add Claude account"));
+    // A graff device-code sign-in: the code to confirm, then the wait.
+    p.login.flow = .{ .stage = .browser, .harness = .graff, .provider = try testing.allocator.dupe(u8, "xai"), .start = .{ .login_id = "l2", .url = "https://example.com/device", .mode = .browser, .code = "WXYZ-1234" } };
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Sign in to xAI"));
+    try testing.expect(h.t.hasText("Finish signing in to xAI in your browser. graff saves the login itself, so nothing is copied into Harness."));
+    try testing.expect(h.t.hasText("Confirm this code on the page"));
+    try testing.expect(h.t.hasText("WXYZ-1234"));
+    try testing.expect(h.t.hasText("Waiting for the browser…"));
+    h.snap("accounts-browser");
+    try h.t.clickText("Cancel");
+    h.t.settle(1);
+    try testing.expect(p.login.flow == null);
+}

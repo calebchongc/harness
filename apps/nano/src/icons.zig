@@ -12,6 +12,7 @@ pub const Name = enum {
     @"action-lint",
     @"action-play",
     @"action-test",
+    @"add-circle",
     @"alt-arrow-down",
     @"alt-arrow-left",
     @"alt-arrow-right",

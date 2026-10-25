@@ -256,7 +256,9 @@ pub fn errorStrip(c: *ui.Context, k: theme.Colors, message: []const u8) bool {
         defer ic.end();
         icons.icon(c, .@"danger-triangle", 16, k.danger_muted.alpha(0.9), 0);
     }
-    const w = ui.div(c).column().grow().w(0);
+    // Wrapped text needs its width up front: the strip less its border,
+    // insets, icon and gap (at zero it took a line a word).
+    const w = ui.div(c).column().w(@max(set.inner_w - 2 - 2 * 17 - 16 - 8, 80));
     {
         defer w.end();
         ui.text(c, message, .{ .size = 12.5, .line_height = 12.5 * phi, .wrap = true, .color = k.danger_muted.alpha(0.9) });

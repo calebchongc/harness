@@ -80,7 +80,7 @@ fn ask(lib: [*:0]const u8, name: [*:0]const u8) bool {
 }
 
 /// Asks for one, the first time; System Settings after (`request_*_access`).
-fn request(lib: [*:0]const u8, name: [*:0]const u8) void {
+pub fn request(lib: [*:0]const u8, name: [*:0]const u8) void {
     if (comptime @import("builtin").os.tag != .macos) return;
     const h = std.c.dlopen(lib, .{ .LAZY = true }) orelse return;
     const f: *const fn () callconv(.c) bool = @ptrCast(@alignCast(std.c.dlsym(h, name) orelse return));

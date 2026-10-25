@@ -28,6 +28,12 @@ test {
     _ = @import("view_settings_appearance.zig");
     _ = @import("view_drag.zig");
     _ = @import("view_settings_mcp.zig");
+    _ = @import("runners.zig");
+    _ = @import("view_settings_github_ci.zig");
+    _ = @import("agents.zig");
+    _ = @import("view_settings_agents.zig");
+    _ = @import("accounts.zig");
+    _ = @import("view_settings_accounts.zig");
     _ = @import("pins.zig");
     _ = @import("view_chat_menu.zig");
     _ = @import("icons.zig");

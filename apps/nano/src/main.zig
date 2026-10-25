@@ -8,6 +8,9 @@ const App = @import("app.zig").App;
 const Engine = @import("engine.zig").Engine;
 const theme = @import("theme.zig");
 
+/// Warnings too, in every build: why a picture isn't drawn, say.
+pub const std_options: std.Options = .{ .log_level = .warn };
+
 pub fn main(init: std.process.Init) !void {
     theme.registerFonts();
     const app = try nanoui.App.create(init, .{ .name = "Harness" });

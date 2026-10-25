@@ -138,6 +138,14 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
     a.device_id = try gpa.dupe(u8, device);
     const devices = try json.parseFromSliceLeaky(json.Value, arena, try std.fmt.allocPrint(arena, "[{{\"id\":\"{s}\",\"name\":\"Studio\",\"platform\":\"macos\",\"lastSeenAt\":null}}]", .{device}), .{});
     try a.devices.replace(devices);
+    // Settings › Accounts' replies in place of the engine's, as the GPUI
+    // renderer's `SCENE_ACCOUNTS`.
+    const accounts_page = @import("view_settings_accounts.zig");
+    if (scene.get("accounts")) |v| accounts_page.scene_accounts = try json.Stringify.valueAlloc(gpa, v, .{});
+    defer if (accounts_page.scene_accounts) |text| {
+        gpa.free(text);
+        accounts_page.scene_accounts = null;
+    };
     if (str(scene, "selectedSpace") orelse first(scene, "spaces", "id")) |sp| a.space = try gpa.dupe(u8, sp);
     if (str(scene, "selectedChat")) |id| {
         a.openChat(id, null);

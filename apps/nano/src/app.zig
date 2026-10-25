@@ -77,8 +77,17 @@ pub const View = struct {
     composer_id: u64 = 0,
     /// Tool groups opened or closed by hand, by "<entry>/<first part>".
     groups: std.StringHashMapUnmanaged(bool) = .empty,
+    /// Settings › GitHub CI, kept between visits.
+    github_ci: @import("view_settings_github_ci.zig").Page = .{},
+    /// Settings › Agents, kept between visits.
+    agents: @import("view_settings_agents.zig").Page = .{},
+    /// Settings › Accounts, kept between visits.
+    accounts: @import("view_settings_accounts.zig").Page = .{},
 
     pub fn deinit(v: *View, gpa: Allocator) void {
+        v.github_ci.deinit(gpa);
+        v.agents.deinit(gpa);
+        v.accounts.deinit(gpa);
         v.shortcut_notice.deinit(gpa);
         v.drag.deinit(gpa);
         v.chat_menu.id.deinit(gpa);
