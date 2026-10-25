@@ -1318,3 +1318,19 @@ test "opening a chat marks it seen here at once: its Done gives way to its time 
     h.t.settle(1);
     try testing.expect(!ws.unseen(h.a.findChat("b").?));
 }
+
+test "a live snapshot asking for Settings draws it in that frame alone: the window is left as it was" {
+    if (comptime !@hasField(ui.Context, "snapshot_request")) return error.SkipZigTest;
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const section = h.a.settings.section;
+    h.t.ctx.snapshot_request = "settings:archived";
+    h.t.frame();
+    try testing.expect(h.t.hasText("Archived sessions"));
+    h.t.ctx.snapshot_request = "";
+    h.t.settle(1);
+    try testing.expect(!h.a.view.settings_open);
+    try testing.expectEqual(section, h.a.settings.section);
+    try testing.expect(!h.t.hasText("Search settings"));
+}
