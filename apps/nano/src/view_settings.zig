@@ -88,7 +88,7 @@ pub fn nav(c: *ui.Context, a: *App, k: theme.Colors) void {
             icons.icon(c, .magnifer, 14, k.muted, 0);
             const f = ui.div(c).row().grow().w(0);
             defer f.end();
-            _ = ui.textField(c, &a.view.settings_search, .{ .placeholder = "Search settings", .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 13 });
+            _ = ui.textField(c, &a.view.settings_search, .{ .placeholder = "Search settings", .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 14, .line_height = 22.75 });
         }
         const rows = ui.div(c).column().wFull().gap(2);
         defer rows.end();
