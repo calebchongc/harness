@@ -11,6 +11,7 @@ const kit = @import("view_kit.zig");
 const sidebar = @import("view_sidebar.zig");
 const transcript_view = @import("view_transcript.zig");
 const tabs = @import("tabs.zig");
+const pins = @import("pins.zig");
 const App = @import("app.zig").App;
 
 /// A row pressed: the session, where the press was, and whether the
@@ -18,9 +19,13 @@ const App = @import("app.zig").App;
 pub const Drag = struct {
     id: std.ArrayList(u8) = .empty,
     origin: ui.Point = .{},
-    /// The press's offset into its row, so the row rides where it was held.
+    /// The press's offset into its row, so the row rides where it was held,
+    /// and the row's place then.
     grip: ui.Point = .{},
+    row: ui.Rect = .{},
     active: bool = false,
+    /// Where it would land in the sidebar, as of this frame.
+    target: ?pins.Target = null,
 
     pub fn deinit(d: *Drag, gpa: std.mem.Allocator) void {
         d.id.deinit(gpa);
@@ -37,7 +42,44 @@ pub fn press(c: *ui.Context, a: *App, chat_id: []const u8, row: ?ui.Rect) void {
     d.id.appendSlice(a.gpa, chat_id) catch return;
     d.origin = c.input.mouse;
     d.grip = if (row) |r| .{ .x = c.input.mouse.x - r.x, .y = c.input.mouse.y - r.y } else .{};
+    d.row = row orelse .{};
     d.active = false;
+    d.target = null;
+}
+
+/// The session being dragged, once it is a drag.
+pub fn moving(a: *const App) ?[]const u8 {
+    return if (a.view.drag.active) a.view.drag.id.items else null;
+}
+
+pub fn sidebarTarget(a: *const App) ?pins.Target {
+    return if (a.view.drag.active) a.view.drag.target else null;
+}
+
+/// Where in the sidebar the pointer would drop it: the Pinned header (the
+/// top of the pins), among the pins (after a row past its middle; a pin
+/// taking the place it's over), or the Sessions header and rows (unpinned).
+/// Elsewhere, nowhere (`SidebarSessionDrop`).
+fn targetAt(a: *const App, p: ui.Point, from_pins: bool, pin_count: usize) ?pins.Target {
+    const v = &a.view;
+    if (!a.view.sidebar_open or a.view.settings_open or p.x >= sidebar.width) return null;
+    if (v.pin_header) |r| if (r.contains(p)) return .{ .pinned = 0 };
+    if (v.pin_rows) |r| if (p.y >= r.y and p.y <= r.y + @max(r.h, sidebar.row_slot)) {
+        if (pin_count == 0) return .{ .pinned = 0 };
+        const rel = p.y - r.y - 4;
+        if (from_pins) {
+            var heights: [256]f32 = undefined;
+            const n = @min(pin_count, heights.len);
+            @memset(heights[0..n], sidebar.row_slot - 2);
+            return .{ .pinned = pins.rowDropIndex(rel, heights[0..n], 2, true) orelse 0 };
+        }
+        const ix: usize = @intFromFloat(@max(0, @floor(rel / sidebar.row_slot)));
+        const within = rel - @as(f32, @floatFromInt(ix)) * sidebar.row_slot;
+        return .{ .pinned = @min(ix + @intFromBool(within >= (sidebar.row_slot - 2) / 2), pin_count) };
+    };
+    if (v.sessions_header) |r| if (r.contains(p)) return .regular;
+    if (v.session_rows) |r| if (p.y >= r.y - 2 and p.y <= r.y + @max(r.h, 48)) return .regular;
+    return null;
 }
 
 /// Whether a session is being dragged: its row's click is the drop's.
@@ -48,10 +90,36 @@ pub fn dragging(a: *const App) bool {
 /// Early each frame: a press becomes a drag once it has moved far enough.
 pub fn update(c: *ui.Context, a: *App) void {
     const d = &a.view.drag;
-    if (d.id.items.len == 0 or d.active or !c.input.down) return;
-    const dx = c.input.mouse.x - d.origin.x;
-    const dy = c.input.mouse.y - d.origin.y;
-    if (dx * dx + dy * dy >= threshold * threshold) d.active = true;
+    if (d.id.items.len == 0) return;
+    if (!d.active and c.input.down) {
+        const dx = c.input.mouse.x - d.origin.x;
+        const dy = c.input.mouse.y - d.origin.y;
+        if (dx * dx + dy * dy >= threshold * threshold) d.active = true;
+    }
+    if (!d.active) return;
+    const visible = sidebar.visiblePins(a, c.alloc());
+    var from_pins = false;
+    for (visible) |p| from_pins = from_pins or std.mem.eql(u8, p, d.id.items);
+    d.target = targetAt(a, c.input.mouse, from_pins, visible.len);
+}
+
+/// Dropped in the sidebar: the pins as `pins.dropPins` has them, written
+/// when they change, and the section it went to opened.
+fn dropInSidebar(a: *App, gpa: std.mem.Allocator, id: []const u8, target: pins.Target) void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const visible = sidebar.visiblePins(a, ar);
+    const next = pins.dropPins(ar, a.settings.pins.items, visible, id, target) catch return;
+    var same = next.len == a.settings.pins.items.len;
+    if (same) for (next, a.settings.pins.items) |x, y| {
+        same = same and std.mem.eql(u8, x, y);
+    };
+    if (!same) a.settings.setPins(next);
+    switch (target) {
+        .pinned => a.view.pinned_open = true,
+        .regular => a.view.sessions_open = true,
+    }
 }
 
 const Zone = struct { rect: ui.Rect, axis: tabs.Axis, label: []const u8 };
@@ -110,18 +178,22 @@ pub fn overlay(c: *ui.Context, a: *App, k: theme.Colors) void {
     defer if (id.len > 0) a.gpa.free(id);
     d.id.clearRetainingCapacity();
     d.active = false;
-    if (over) |z| a.splitOpening(z.axis, id);
+    if (over) |z| return a.splitOpening(z.axis, id);
+    if (d.target) |t| dropInSidebar(a, a.gpa, id, t);
+    d.target = null;
 }
 
-/// The dragged row, lifted, under the pointer where it was held.
+/// The dragged row, raised, in the sidebar's column at the pointer's
+/// height where it was held (`render_moving_sidebar_session`): its own
+/// place and width, `surface_raised` under a medium shadow.
 fn ghost(c: *ui.Context, a: *App, k: theme.Colors) void {
     const d = &a.view.drag;
     const ch = a.findChat(d.id.items) orelse return;
-    const w = sidebar.width - 20;
-    const row = kit.shadowLg(ui.div(c).fixed().offset(c.input.mouse.x - d.grip.x, c.input.mouse.y - d.grip.y).w(w).h(29).layer(7)
-        .row().px(8).gap(6).itemsCenter().rounded(8).bg(k.raised).border(k.border).borderW(1));
-    defer row.end();
-    kit.fadeText(c, sidebar.chatLabel(ch), kit.style(c, 13, 17, .{ .color = k.text }), w - 16);
+    if (!a.view.sidebar_open or a.view.settings_open) return;
+    const lift = ui.div(c).fixed().offset(d.row.x, c.input.mouse.y - d.grip.y).w(d.row.w).h(d.row.h).layer(7)
+        .rounded(8).bg(k.raised).shadow(.{ .color = .{ .a = 0.1 }, .blur = 6, .y = 4 }).clip();
+    defer lift.end();
+    sidebar.rowPreview(c, a, k, ch);
 }
 
 const testing = std.testing;

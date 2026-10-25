@@ -309,3 +309,72 @@ test "a drag released off the targets does nothing, and isn't a click" {
 }
 
 const tabs_axis = @import("tabs.zig").Axis;
+
+/// Presses on `from`, moves (past the drag threshold) to what `to` gives
+/// once the drag has laid the sidebar out, and lets go.
+fn dragRow(h: *Harness, from: []const u8, comptime to: fn (*Harness) ui.Point) !void {
+    // The session row: below the Sessions or Pinned header, not the tab's.
+    const r = sessionText(h, from) orelse return error.NoRow;
+    h.t.moveTo(r.x + 4, r.y + 4);
+    h.t.ctx.pointerDown();
+    h.t.frame();
+    h.t.ctx.input.mouse = .{ .x = r.x + 4, .y = r.y + 14 };
+    h.t.frame();
+    h.t.frame();
+    h.t.ctx.input.mouse = to(h);
+    h.t.frame();
+    h.t.frame();
+    h.snap(c_name(from));
+    h.t.ctx.pointerUp();
+    h.t.frame();
+    h.t.settle(1);
+}
+
+fn c_name(from: []const u8) []const u8 {
+    return if (std.mem.eql(u8, from, "Alpha")) "pin-drag-alpha" else "pin-drag-beta";
+}
+
+fn sessionText(h: *Harness, text: []const u8) ?ui.Rect {
+    const head = h.a.view.pin_header orelse h.a.view.sessions_header orelse return null;
+    const top = head.y;
+    for (h.t.ctx.nodes.items) |n| switch (n.content) {
+        .text => |t| if (std.mem.eql(u8, t.str, text) and n.rect.y > top) return n.rect,
+        else => {},
+    };
+    return null;
+}
+
+fn pinnedHeader(h: *Harness) ui.Point {
+    const r = h.a.view.pin_header.?;
+    return .{ .x = r.x + 20, .y = r.y + r.h / 2 };
+}
+
+fn belowFirstPin(h: *Harness) ui.Point {
+    const r = h.a.view.pin_rows.?;
+    return .{ .x = r.x + 20, .y = r.y + 4 + 29 * 0.75 };
+}
+
+fn sessionsHeader(h: *Harness) ui.Point {
+    const r = h.a.view.sessions_header.?;
+    return .{ .x = r.x + 20, .y = r.y + r.h / 2 };
+}
+
+test "sessions dragged onto Pinned are pinned in place, and back to Sessions unpinned" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try testing.expect(!h.t.hasText("Pinned"));
+    try dragRow(&h, "Beta", pinnedHeader);
+    try testing.expectEqual(@as(usize, 1), h.a.settings.pins.items.len);
+    try testing.expectEqualStrings("b", h.a.settings.pins.items[0]);
+    try testing.expect(h.t.hasText("Pinned"));
+    // Below the first pin's middle: after it.
+    try dragRow(&h, "Alpha", belowFirstPin);
+    try testing.expectEqual(@as(usize, 2), h.a.settings.pins.items.len);
+    try testing.expectEqualStrings("a", h.a.settings.pins.items[1]);
+    try dragRow(&h, "Beta", sessionsHeader);
+    try testing.expectEqual(@as(usize, 1), h.a.settings.pins.items.len);
+    try testing.expectEqualStrings("a", h.a.settings.pins.items[0]);
+    // A drag that ends outside the sidebar leaves the pins be.
+    try testing.expect(h.a.tabs.layout() == null);
+}

@@ -139,6 +139,9 @@ pub fn camel(comptime name: []const u8) []const u8 {
     return out;
 }
 
+/// The pin profile of a local workspace (`sidebar_pin_profile_key`).
+const pin_profile = "local";
+
 pub const Store = struct {
     gpa: Allocator,
     io: std.Io,
@@ -151,6 +154,9 @@ pub const Store = struct {
     doc: std.StringArrayHashMapUnmanaged(json.Value) = .empty,
     /// `keymap`'s combinations by key, "jumpSession.N" for the nine slots.
     keymap: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    /// This device's pinned sessions in order: the "local" profile's
+    /// `sidebarPinnedSessionIdsByProfile` (pins.zig).
+    pins: std.ArrayList([]const u8) = .empty,
     doc_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn deinit(s: *Store) void {
@@ -252,6 +258,35 @@ pub const Store = struct {
         s.write("keymap", .{ .object = obj });
     }
 
+    /// The pins, replaced and written: only this profile's, the others as
+    /// the file has them (an empty list drops the profile's key).
+    pub fn setPins(s: *Store, list: []const []const u8) void {
+        if (s.doc_arena == null) s.doc_arena = .init(s.gpa);
+        const a = s.doc_arena.?.allocator();
+        var next: std.ArrayList([]const u8) = .empty;
+        for (list) |id| next.append(a, a.dupe(u8, id) catch return) catch return;
+        s.pins = next;
+        const path = s.path orelse return;
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        const ar = arena.allocator();
+        const body = std.Io.Dir.cwd().readFileAlloc(s.io, path, ar, .limited(8 << 20)) catch "{}";
+        var byp: json.ObjectMap = .empty;
+        if (json.parseFromSliceLeaky(json.Value, ar, body, .{})) |root| {
+            if (root == .object) if (root.object.get("sidebarPinnedSessionIdsByProfile")) |v| if (v == .object) {
+                byp = v.object;
+            };
+        } else |_| {}
+        if (list.len == 0) {
+            _ = byp.orderedRemove(pin_profile);
+        } else {
+            var arr: json.Array = .init(ar);
+            for (list) |id| arr.append(.{ .string = id }) catch return;
+            byp.put(ar, pin_profile, .{ .array = arr }) catch return;
+        }
+        s.write("sidebarPinnedSessionIdsByProfile", .{ .object = byp });
+    }
+
     /// Keeps `value` (copied) as the file's `key`.
     fn remember(s: *Store, key: []const u8, value: json.Value) void {
         if (s.doc_arena == null) s.doc_arena = .init(s.gpa);
@@ -307,6 +342,12 @@ pub const Store = struct {
                 .array => |arr| for (arr.items, 0..) |v, i| if (v == .string) s.rememberCombo(e.key_ptr.*, @intCast(i), v.string),
                 else => {},
             };
+        };
+        if (o.get("sidebarPinnedSessionIdsByProfile")) |byp| if (byp == .object) if (byp.object.get(pin_profile)) |list| if (list == .array) {
+            if (s.doc_arena == null) s.doc_arena = .init(s.gpa);
+            const a = s.doc_arena.?.allocator();
+            s.pins = .empty;
+            for (list.array.items) |v| if (v == .string) s.pins.append(a, a.dupe(u8, v.string) catch continue) catch {};
         };
         // `accent`: "themeDefault", or {"preset": name}, kept as its name.
         if (o.get("accent")) |v| switch (v) {

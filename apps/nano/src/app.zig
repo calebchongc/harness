@@ -32,6 +32,13 @@ pub const View = struct {
     search_open: bool = false,
     search: nanoui.ui.TextBuffer = .{},
     sessions_open: bool = true,
+    pinned_open: bool = true,
+    /// Where the sidebar's drop places were, as last laid out: the Pinned
+    /// header and rows, the Sessions header and rows.
+    pin_header: ?nanoui.ui.Rect = null,
+    pin_rows: ?nanoui.ui.Rect = null,
+    sessions_header: ?nanoui.ui.Rect = null,
+    session_rows: ?nanoui.ui.Rect = null,
     archived_open: bool = true,
     /// Archived rows shown: 10, then 25 more at a time.
     archived_limit: usize = 10,

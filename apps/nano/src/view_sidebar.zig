@@ -122,23 +122,95 @@ fn containsIgnoreCase(s: []const u8, q: []const u8) bool {
     return false;
 }
 
+/// The pins this list shows, in pin order: listed and not archived.
+pub fn visiblePins(a: *const App, gpa: std.mem.Allocator) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (a.settings.pins.items) |id| if (a.findChat(id)) |ch| if (!ch.archived and listed(a, ch)) out.append(gpa, id) catch {};
+    return out.items;
+}
+
+fn pinned(pins: []const []const u8, id: []const u8) ?usize {
+    for (pins, 0..) |p, i| if (std.mem.eql(u8, p, id)) return i;
+    return null;
+}
+
+/// A row's slot: its 29 points and the 2 between rows.
+pub const row_slot: f32 = 29 + 2;
+
 fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
     ui.scroll(c, .{ .grow = 1, .width = .fill, .padding = .{ .left = 8, .right = 8, .top = 4, .bottom = 8 }, .gap = 2 });
     defer ui.end(c);
+    const drag = @import("view_drag.zig");
+    const moving = drag.moving(a);
+    const target = drag.sidebarTarget(a);
+    const pins = visiblePins(a, c.alloc());
+    const source_pin = if (moving) |id| pinned(pins, id) else null;
     var active: usize = 0;
     var archived: usize = 0;
     for (a.chats.items) |ch| if (listed(a, ch)) {
-        if (ch.archived) archived += 1 else active += 1;
+        if (ch.archived) archived += 1 else if (pinned(pins, ch.id) == null) active += 1;
     };
-    if (section(c, k, "Sessions", active, &a.view.sessions_open)) {
+    // Pinned, while there are pins or a session is being dragged.
+    if (pins.len > 0 or moving != null) {
+        a.view.pin_header = rectOf(c, sectionAt(c, k, "Pinned", pins.len, &a.view.pinned_open));
+        if (a.view.pinned_open) {
+            const body = ui.div(c).column().wFull().py(4).gap(2);
+            defer body.end();
+            a.view.pin_rows = rectOf(c, body);
+            const gap_at: ?usize = if (target) |t| switch (t) {
+                .pinned => |i| if (source_pin == null) i else null,
+                .regular => null,
+            } else null;
+            for (pins, 0..) |id, ix| {
+                const ch = a.findChat(id) orelse continue;
+                // Rows give way: toward the held row's place among them, or
+                // apart for one coming from Sessions.
+                var dy: f32 = 0;
+                if (source_pin) |from| {
+                    if (target) |t| if (t == .pinned) {
+                        dy = @as(f32, @floatFromInt(@import("pins.zig").slideOffset(ix, from, @min(t.pinned, pins.len - 1)))) * row_slot;
+                    };
+                    if (target != null and target.? == .regular and ix > from) dy = -row_slot;
+                } else if (gap_at) |g| {
+                    if (ix >= g) dy = row_slot;
+                }
+                const held = source_pin != null and source_pin.? == ix;
+                slotRow(c, a, k, ch, dy, held);
+            }
+            // Room for the row coming in.
+            if (gap_at != null) _ = c.leaf(.{ .height = .{ .px = row_slot - 2 } }, .none, null);
+            if (pins.len == 0 and gap_at == null) _ = c.leaf(.{ .height = .{ .px = 0 } }, .none, null);
+        } else a.view.pin_rows = null;
+        _ = c.leaf(.{ .height = .{ .px = 12 - 2 } }, .none, null);
+    } else {
+        a.view.pin_header = null;
+        a.view.pin_rows = null;
+    }
+    a.view.sessions_header = rectOf(c, sectionAt(c, k, "Sessions", active, &a.view.sessions_open));
+    if (a.view.sessions_open) {
         _ = c.leaf(.{ .height = .{ .px = 2 } }, .none, null);
-        for (a.chats.items) |ch| if (!ch.archived and listed(a, ch)) sessionRow(c, a, k, ch);
-        if (active == 0) {
+        const body = ui.div(c).column().wFull().gap(2);
+        defer body.end();
+        a.view.session_rows = rectOf(c, body);
+        const unpinning = source_pin != null and target != null and target.? == .regular;
+        for (a.chats.items) |ch| if (!ch.archived and listed(a, ch) and pinned(pins, ch.id) == null) {
+            const held = moving != null and std.mem.eql(u8, moving.?, ch.id);
+            // Dragged to the pins, a session's row leaves the list.
+            if (held and target != null and target.? == .pinned) continue;
+            slotRow(c, a, k, ch, 0, held);
+        };
+        if (unpinning) _ = c.leaf(.{ .height = .{ .px = row_slot - 2 } }, .none, null);
+        if (active == 0 and moving != null) {
+            // While a session is dragged, an empty list takes it back.
+            const e = ui.div(c).row().wFull().h(48).px(10).itemsCenter();
+            defer e.end();
+            ui.text(c, "Drop here to unpin", .{ .size = 12, .line_height = 12 * 1.618, .color = k.muted });
+        } else if (active == 0 and pins.len == 0) {
             const e = ui.div(c).row().px(8).py(6);
             defer e.end();
             ui.text(c, if (a.view.search.text().len > 0) "No matching sessions" else "No sessions yet", .{ .size = 12, .color = k.faint });
         }
-    }
+    } else a.view.session_rows = null;
     if (archived == 0) return;
     _ = c.leaf(.{ .height = .{ .px = 8 } }, .none, null);
     if (section(c, k, "Archived", archived, &a.view.archived_open)) {
@@ -157,6 +229,33 @@ fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
     }
 }
 
+/// A row, moved `dy` while rows give way; the held one keeps its place
+/// empty, drawn instead under the pointer.
+fn slotRow(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat, dy: f32, held: bool) void {
+    ui.key(c, c.print("slot-{s}", .{ch.id}));
+    var w = ui.div(c).column().wFull().offset(0, dy);
+    if (held) w = w.opacity(0);
+    defer w.end();
+    sessionRow(c, a, k, ch);
+}
+
+fn rectOf(c: *ui.Context, d: ui.Div) ?ui.Rect {
+    return c.rects.get(c.node(d.index).id);
+}
+
+/// `section` that hands back its header, for its place as a drop target.
+fn sectionAt(c: *ui.Context, k: theme.Colors, label: []const u8, count: usize, open: *bool) ui.Div {
+    ui.key(c, label);
+    const h = ui.div(c).row().wFull().h(28).px(8).gap(8).itemsCenter().rounded(8);
+    if (h.clicked()) open.* = !open.*;
+    const color = k.muted.alpha(0.5);
+    ui.text(c, if (open.*) label else c.print("{s} ({d})", .{ label, count }), .{ .size = 12, .weight = .medium, .color = color });
+    ui.spacer(c);
+    icons.icon(c, if (open.*) .@"alt-arrow-down" else .@"alt-arrow-right", 12, color, 0);
+    h.end();
+    return h;
+}
+
 /// A disclosure header ("Sessions", "Archived (12)" when shut); true while open.
 fn section(c: *ui.Context, k: theme.Colors, label: []const u8, count: usize, open: *bool) bool {
     ui.key(c, label);
@@ -170,13 +269,36 @@ fn section(c: *ui.Context, k: theme.Colors, label: []const u8, count: usize, ope
     return open.*;
 }
 
+/// A row as drawn while it's dragged: the same content, nothing to hover
+/// or click (`render_chat_row` with `preview`).
+pub fn rowPreview(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat) void {
+    const r = ui.div(c).row().wFull().h(29).px(8).gap(4).itemsCenter();
+    defer r.end();
+    const now = a.nowMs();
+    statusSlot(c, k, workspace.markOf(ch, workspace.sessionOf(a.sessions.items, ch.id), now));
+    const mark = icons.harnessMark(ch.harness orelse "graff");
+    icons.icon(c, mark.name, 13, (mark.brand orelse k.subline).alpha(0.8), 13);
+    badge(c, a, k, ch.space_id, false);
+    const time = rules.relativeTime(c.alloc().alloc(u8, 16) catch &.{}, now, ch.timeMs());
+    const title_w = width - 16 - 16 - 13 * 3 - 4 * 4 - 6 - c.text.width(time, .{ .size = 11 });
+    {
+        const t = ui.div(c).row().grow().w(0).clip();
+        defer t.end();
+        kit.fadeText(c, chatLabel(ch), kit.style(c, 13, 17, .{ .color = k.text.alpha(0.8) }), title_w);
+    }
+    const tm = ui.div(c).row().pl(6);
+    defer tm.end();
+    ui.text(c, time, .{ .size = 11, .color = k.subline });
+}
+
 fn sessionRow(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat) void {
     ui.key(c, c.print("row-{s}", .{ch.id}));
     const selected = a.selected != null and std.mem.eql(u8, a.selected.?, ch.id);
     var r = ui.div(c).row().wFull().h(29).px(8).gap(4).itemsCenter().rounded(8).clip();
     r = if (selected) r.bg(k.selected) else r.hover(k.hover);
     defer r.end();
-    const hovered = r.hovered();
+    // No hover while a session is dragged over the rows.
+    const hovered = r.hovered() and !@import("view_drag.zig").dragging(a);
     var archive = false;
     const now = a.nowMs();
     statusSlot(c, k, workspace.markOf(ch, workspace.sessionOf(a.sessions.items, ch.id), now));
