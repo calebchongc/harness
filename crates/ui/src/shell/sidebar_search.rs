@@ -392,7 +392,11 @@ impl Shell {
                                         }
                                     },
                                 ))
-                                .child(icon(icons::CLOSE).size(px(12.0))),
+                                .child(
+                                    icon(icons::CLOSE)
+                                        .size(px(12.0))
+                                        .text_color(theme.text_muted),
+                                ),
                         )
                     }),
             )
