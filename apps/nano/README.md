@@ -37,6 +37,7 @@ cd apps/nano
 zig build test          # unit tests
 zig build run           # build and open the window
 sh scripts/bundle.sh    # release build as zig-out/Harness Nano.app
+zig build snap -- scenes/narrow-panes.json /tmp/nano-snap   # draw a scene offscreen
 open "zig-out/Harness Nano.app"
 ```
 
@@ -107,3 +108,12 @@ the interface icons are Solar Linear by 480 Design (CC BY 4.0).
 | `src/icons.zig`, `src/icons/` | Harness's icons and agent marks, tinted as drawn. |
 | `src/markdown.zig`, `markdown_html.zig`, `highlight.zig` | nanoterm's Markdown parser and code highlighting, unchanged. |
 | `src/release.zig` | The newest release, over HTTP/2. |
+
+## Seeing the window without opening it
+
+`zig build snap -- scene.json out-dir` draws the window offscreen from a
+made-up scene (no window on screen, no engine) and saves a PNG for each
+`snap` step. A scene gives the window's size and theme, the spaces, chats
+and transcripts to show, and steps that press shortcuts, click, type and
+check what's drawn (`expect`, `expectNot` fail the run). The format is at
+the top of `src/snap.zig`; `scenes/` has examples.

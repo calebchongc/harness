@@ -26,16 +26,20 @@ const starters = [_]Starter{
 };
 
 pub fn canvas(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const main_w = transcript_view.mainWidth(c, a);
+    const main_w = transcript_view.paneWidth(c, a);
     const w = @min(main_w - 32, 768);
     // The pill's top, from the window's: (height − pill) / 2 + 8.
     const top = (c.size.h - pill_h) * 0.5 + 8;
     const area = ui.div(c).column().wFull().grow().itemsCenter();
     defer area.end();
-    _ = c.leaf(.{ .height = .{ .px = @max(top - heading_h - sidebar.titlebar_h, 0) } }, .none, null);
+    var lead = @max(top - heading_h - sidebar.titlebar_h, 0);
+    // In a pane of a split down the window, centred in the pane.
+    if (transcript_view.paneHeight(c, a)) |h| lead = @max((h - pill_h - heading_h) * 0.5, 0);
+    _ = c.leaf(.{ .height = .{ .px = lead } }, .none, null);
     heading(c, a, k, w);
     composer.pill(c, a, k, w, .expanded, 26);
-    if (std.mem.trim(u8, a.composer.text(), " \n\t").len == 0) starterRow(c, a, k);
+    // Only while nothing at all is typed, a space included.
+    if (a.composer.text().len == 0) starterRow(c, a, k, w);
 }
 
 fn heading(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
@@ -52,18 +56,51 @@ fn heading(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
     icons.icon(c, .@"alt-arrow-down", 16, k.muted.alpha(0.6), 0);
 }
 
-fn starterRow(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const row = ui.div(c).row().pt(16).gap(8).justifyCenter();
-    defer row.end();
+/// The starters under an empty composer, as chips in rows that wrap at
+/// the composer's width, each row centred, 6 points apart either way
+/// (`render_starter_chips`: flex_wrap, justify_center, gap 6).
+fn starterRow(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
+    const st: ui.TextStyle = .{ .size = 12 };
     const has_project = a.newChatSpace() != null;
+    var shown: [starters.len]Starter = undefined;
+    var n: usize = 0;
     for (starters) |s| {
         if (s.needs_project and !has_project) continue;
-        ui.key(c, s.title);
-        const chip = ui.div(c).row().h(28).px(10).gap(6).itemsCenter().rounded(14).border(k.border).borderW(1).hover(k.hover);
-        defer chip.end();
-        const hot = chip.hovered();
-        if (chip.clicked()) a.composer.set(s.prompt);
-        icons.icon(c, s.icon, 13, if (hot) k.text else k.muted, 0);
-        ui.text(c, s.title, .{ .size = 12, .color = if (hot) k.text else k.muted });
+        shown[n] = s;
+        n += 1;
     }
+    const box = ui.div(c).column().w(w).pt(16).gap(6).itemsCenter();
+    defer box.end();
+    var i: usize = 0;
+    while (i < n) {
+        // As many chips as fit on this row; always at least one.
+        var end = i + 1;
+        var used = chipWidth(c, shown[i], st);
+        while (end < n) : (end += 1) {
+            const next = used + 6 + chipWidth(c, shown[end], st);
+            if (next > w) break;
+            used = next;
+        }
+        const row = ui.div(c).row().gap(6).justifyCenter();
+        defer row.end();
+        for (shown[i..end]) |s| chip(c, a, k, s, st);
+        i = end;
+    }
+}
+
+/// A chip's width: 10 points either side, the 13-point icon, 6 between.
+fn chipWidth(c: *ui.Context, s: Starter, st: ui.TextStyle) f32 {
+    return 10 + 13 + 6 + c.text.width(s.title, st) + 10 + 2;
+}
+
+fn chip(c: *ui.Context, a: *App, k: theme.Colors, s: Starter, st: ui.TextStyle) void {
+    ui.key(c, s.title);
+    const ch = ui.div(c).row().h(28).px(10).gap(6).itemsCenter().rounded(14).border(k.border).borderW(1).hover(k.hover);
+    defer ch.end();
+    const hot = ch.hovered();
+    if (ch.clicked()) a.composer.set(s.prompt);
+    icons.icon(c, s.icon, 13, if (hot) k.text else k.muted, 0);
+    var t = st;
+    t.color = if (hot) k.text else k.muted;
+    ui.text(c, s.title, t);
 }

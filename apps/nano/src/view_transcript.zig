@@ -31,27 +31,49 @@ pub fn mainWidth(c: *ui.Context, a: *const App) f32 {
     return @max(w, 300);
 }
 
+/// The focused pane's width: the chat column's, less the other panes of a
+/// split across it.
+pub fn paneWidth(c: *ui.Context, a: *const App) f32 {
+    const w = mainWidth(c, a);
+    const s = a.tabs.layout() orelse return w;
+    if (s.zoomed or s.axis != .horizontal) return w;
+    return @max(w * s.shares.items[s.focus] - 1, 200);
+}
+
+/// The focused pane's height under the title bar, in a split down the
+/// window; null when it has the column's full height.
+pub fn paneHeight(c: *ui.Context, a: *const App) ?f32 {
+    const s = a.tabs.layout() orelse return null;
+    if (s.zoomed or s.axis != .vertical) return null;
+    return (c.size.h - sidebar.titlebar_h) * s.shares.items[s.focus] - 1;
+}
+
 pub fn transcript(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const col = columnWidth(mainWidth(c, a));
-    // The first row sits 64 points down the window, under the title bar.
-    // Rows settle at the bottom, over the composer, until they fill it.
-    ui.scroll(c, .{ .grow = 1, .width = .fill, .padding = .{ .top = 64 - sidebar.titlebar_h, .bottom = 24 + 8 + 10 }, .align_items = .center, .justify = .end, .follow_end = true });
+    entries(c, a, k, &a.transcript, paneWidth(c, a), a.w_doc.id != null, 64 - sidebar.titlebar_h);
+}
+
+/// A transcript `w` wide: the open chat's, or a split pane's neighbor's.
+/// The first row sits `top` points down; rows settle at the bottom, over
+/// the composer, until they fill it.
+pub fn entries(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f32, loading: bool, top: f32) void {
+    const col = columnWidth(w);
+    ui.scroll(c, .{ .grow = 1, .width = .fill, .padding = .{ .top = top, .bottom = 24 + 8 + 10 }, .align_items = .center, .justify = .end, .follow_end = true });
     defer ui.end(c);
     const body = ui.div(c).column().w(col);
     defer body.end();
-    const entries = a.transcript.entries.items;
-    if (entries.len == 0) {
+    const entries_ = t.entries.items;
+    if (entries_.len == 0) {
         const e = ui.div(c).row().wFull().pt(40).justifyCenter();
         defer e.end();
-        ui.text(c, if (a.w_doc.id != null) "Loading…" else "Nothing here yet.", .{ .size = 13, .color = k.faint });
+        ui.text(c, if (loading) "Loading…" else "Nothing here yet.", .{ .size = 13, .color = k.faint });
         return;
     }
-    for (entries, 0..) |*e, i| {
+    for (entries_, 0..) |*e, i| {
         ui.key(c, c.print("entry-{s}", .{e.id}));
         if (i > 0) _ = c.leaf(.{ .height = .{ .px = if (e.role == .user) 16 else 8 } }, .none, null);
         switch (e.role) {
             .user => user(c, k, e, col),
-            .assistant => assistant(c, a, k, e, i + 1 == entries.len),
+            .assistant => assistant(c, a, k, e, i + 1 == entries_.len),
             .system => system(c, k, e),
         }
     }

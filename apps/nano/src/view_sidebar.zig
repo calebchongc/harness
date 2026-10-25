@@ -252,9 +252,15 @@ fn footer(c: *ui.Context, a: *App, k: theme.Colors) void {
     var b = ui.div(c).row().size(21, 21).center().roundedFull();
     b = if (a.view.account_menu) b.bg(k.hover) else b.hover(k.hover.alpha(k.hover.a * 0.8));
     defer b.end();
-    if (b.clicked()) a.view.account_menu = !a.view.account_menu;
+    if (b.clicked()) {
+        a.view.account_menu = !a.view.account_menu;
+        // Opening asks the Codegraff sign-in again.
+        if (a.view.account_menu) @import("app_account.zig").refresh(a);
+    }
     if (c.rects.get(c.node(b.index).id)) |r| a.view.account_anchor = r;
     const av = ui.div(c).row().size(13, 13).center().roundedFull().bg(k.text);
     defer av.end();
-    ui.text(c, "L", .{ .size = 9, .weight = .semibold, .mono = true, .color = k.shell });
+    const acc = &a.account;
+    const letter = @import("app_account.zig").initial(@import("app_account.zig").menu(acc.scope, acc.user, acc.codegraff).line);
+    ui.text(c, c.print("{c}", .{letter}), .{ .size = 9, .weight = .semibold, .mono = true, .color = k.shell });
 }

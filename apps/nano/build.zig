@@ -36,6 +36,18 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("parity_options", opts);
     b.step("test", "Run harness-nano tests").dependOn(&b.addRunArtifact(tests).step);
 
+    // `zig build snap -- scene.json out-dir`: the window drawn offscreen
+    // from a made-up scene, a PNG per step asked for (src/snap.zig).
+    const snap = b.addExecutable(.{ .name = "harness-nano-snap", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/snap.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) });
+    const run_snap = b.addRunArtifact(snap);
+    run_snap.addPassthruArgs();
+    b.step("snap", "Draw a scene offscreen to PNGs").dependOn(&run_snap.step);
+
     // `zig build vectors`: rewrite protocol/desktop/requests.json from the
     // request builders, after changing one on purpose.
     const vectors = b.addExecutable(.{ .name = "parity-vectors", .root_module = b.createModule(.{

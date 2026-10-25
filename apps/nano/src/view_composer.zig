@@ -16,7 +16,7 @@ const App = @import("app.zig").App;
 
 /// Docked under a chat's transcript.
 pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const main_w = transcript_view.mainWidth(c, a);
+    const main_w = transcript_view.paneWidth(c, a);
     const w = @min(transcript_view.columnWidth(main_w) + 32, main_w - 32);
     const queue_view = @import("view_queue.zig");
     const queued = a.queue.items.len > 0;
@@ -85,6 +85,7 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
         "Edit queued message…"
     else
         "Do anything…";
+    const at = c.nodes.items.len;
     const r = ui.textField(c, &a.composer, .{
         .placeholder = placeholder,
         .width = .fill,
@@ -94,6 +95,7 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
         .max_lines = 11,
     });
     if (r.submitted) a.send();
+    keepFocus(c, a, c.node(@intCast(at)).id);
     // ⌘↩ with nothing typed sends the newest queued message now.
     if (c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true }) and std.mem.trim(u8, a.composer.text(), " \n\t").len == 0) {
         if (a.queue.items.len > 0) a.queueSendNow(a.queue.items[a.queue.items.len - 1].id);
@@ -104,6 +106,21 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
         defer line.end();
         ui.text(c, n, .{ .size = 11, .color = k.danger });
     }
+}
+
+/// The composer has the keys after the window moves to another chat, pane
+/// or tab (`focus_composer`), and keeps them when its field moves in the
+/// layout (into a split's pane, or taller with a second line), which
+/// gives the field another id.
+fn keepFocus(c: *ui.Context, a: *App, id: u64) void {
+    const moved = a.view.composer_id != 0 and id != a.view.composer_id and c.focus == a.view.composer_id;
+    if (a.view.focus_composer or moved) {
+        c.focus = id;
+        // Built again at once, focused: the next key finds it.
+        c.changed = true;
+        a.view.focus_composer = false;
+    }
+    a.view.composer_id = id;
 }
 
 /// The model chip: what the next message runs on.

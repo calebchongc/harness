@@ -16,6 +16,10 @@ test {
     _ = @import("queue.zig");
     _ = @import("app_queue.zig");
     _ = @import("tabs.zig");
+    _ = @import("tests_ui.zig");
+    _ = @import("app_drafts.zig");
+    _ = @import("snap.zig");
+    _ = @import("app_account.zig");
     _ = @import("icons.zig");
     _ = @import("release.zig");
     _ = @import("view.zig");

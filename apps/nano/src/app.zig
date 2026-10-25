@@ -12,11 +12,14 @@ const rpc = @import("rpc.zig");
 const engine_mod = @import("engine.zig");
 const workspace = @import("workspace.zig");
 const Transcript = @import("transcript.zig").Transcript;
-const Tabs = @import("tabs.zig").Tabs;
+const tabs_mod = @import("tabs.zig");
+const Tabs = tabs_mod.Tabs;
 const agent = @import("app_agent.zig");
 const requests = @import("requests.zig");
 const question = @import("app_question.zig");
 const queue_mod = @import("app_queue.zig");
+const drafts = @import("app_drafts.zig");
+const account = @import("app_account.zig");
 pub const uuid = @import("ids.zig").uuid;
 
 /// The window's own state, apart from the engine's.
@@ -38,9 +41,15 @@ pub const View = struct {
     filter_anchor: ?nanoui.ui.Rect = null,
     more_anchor: ?nanoui.ui.Rect = null,
     account_anchor: ?nanoui.ui.Rect = null,
+    /// The account menu's height as last drawn, to keep it in the window.
+    account_h: ?f32 = null,
     space_anchor: ?nanoui.ui.Rect = null,
     chip_anchor: ?nanoui.ui.Rect = null,
     composer_anchor: ?nanoui.ui.Rect = null,
+    /// The composer takes the keys when next drawn; its field's id as last
+    /// drawn, for keeping them when it moves.
+    focus_composer: bool = false,
+    composer_id: u64 = 0,
     /// Tool groups opened or closed by hand, by "<entry>/<first part>".
     groups: std.StringHashMapUnmanaged(bool) = .empty,
 
@@ -73,6 +82,16 @@ pub const View = struct {
     }
 };
 const Allocator = std.mem.Allocator;
+
+/// A split pane's chat other than the focused one: its own transcript,
+/// watched while it shows (the GPUI app's `peer_chat_views`).
+pub const Peer = struct {
+    id: []u8,
+    transcript: Transcript,
+    watch: ?u64 = null,
+    /// Its stream ended: watched again on the next connect, not each frame.
+    ended: bool = false,
+};
 
 /// A stream the app keeps open, and when to open it again once it ended.
 const Watch = struct {
@@ -143,8 +162,18 @@ pub const App = struct {
     ansi: [16]nanoui.ui.Color = @import("theme.zig").colors(true).ansi,
     /// The surface pane and the file explorer beside the chat.
     panels: @import("app_panels.zig").Panels,
-    /// The open chats, one per tab.
+    /// The open chats, one per tab, and their split panes.
     tabs: Tabs,
+    /// The active tab's other panes' chats, each watched.
+    peers: std.ArrayList(Peer) = .empty,
+    /// A split's divider being dragged.
+    pane_drag: ?tabs_mod.Drag = null,
+    /// Each chat's unsent prompt by its id, and "" the new chat's while a
+    /// chat shows (app_drafts.zig).
+    drafts: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// The workspace's scope, the Harness account and the Codegraff
+    /// sign-in, for the account badge's menu (app_account.zig).
+    account: account.Account = .{},
     /// What the window shows that isn't the engine's: the sidebar, its
     /// project filter and search, open sections and tool groups.
     view: View = .{},
@@ -184,6 +213,13 @@ pub const App = struct {
         a.sessions.deinit();
         a.devices.deinit();
         a.tabs.deinit();
+        for (a.peers.items) |*p| {
+            p.transcript.deinit();
+            a.gpa.free(p.id);
+        }
+        a.peers.deinit(a.gpa);
+        drafts.deinit(a);
+        a.account.deinit(a.gpa);
         a.view.deinit(a.gpa);
         question.deinit(a);
         queue_mod.deinit(a);
@@ -249,7 +285,7 @@ pub const App = struct {
         const git_path = std.fmt.bufPrint(&git_buf, "{s}/.git", .{paths[0]}) catch "";
         const git = std.Io.Dir.cwd().access(a.io, git_path, .{}) != error.FileNotFound;
         a.request(requests.createSpace(id, device, paths[0], git), .of(App, a, onNotice));
-        a.tabs.newTab();
+        a.newTab();
         a.select(null, id);
     }
 
@@ -271,6 +307,7 @@ pub const App = struct {
                 a.ensureModels(a.target().harness);
                 a.request(requests.none("EngineReady"), .of(App, a, onNotice));
                 a.watchSidebar();
+                account.watch(a);
                 if (a.selected != null) {
                     a.watchDoc(true);
                     queue_mod.watch(a);
@@ -278,6 +315,8 @@ pub const App = struct {
                 }
             },
             .disconnected, .connecting => {
+                for (a.peers.items) |*p| p.* = .{ .id = p.id, .transcript = p.transcript };
+                a.account.w_auth = null;
                 // Every stream ended with the socket; they open on reconnect.
                 a.w_devices = .{};
                 a.w_spaces = .{};
@@ -316,6 +355,7 @@ pub const App = struct {
         question.syncWizard(a);
         var next: ?f64 = question.tick(a, now);
         if (queue_mod.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
+        if (account.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (a.w_queue.retry_at) |t| if (now >= t) {
             a.w_queue = .{};
             queue_mod.watch(a);
@@ -355,26 +395,164 @@ pub const App = struct {
 
     /// Shows `chat_id` from the sidebar: in its tab, else the current one.
     pub fn openChat(a: *App, chat_id: []const u8, space_id: ?[]const u8) void {
-        a.tabs.show(chat_id);
+        if (a.tabs.find(chat_id)) |at| {
+            if (at.tab != a.tabs.active) a.showTab(at.tab);
+            if (at.pane) |ix| a.focusPane(ix);
+            return;
+        }
+        a.tabs.setCurrent(chat_id);
         a.select(chat_id, space_id);
     }
 
-    /// "+": a new chat in a tab of its own.
-    pub fn newTab(a: *App) void {
-        a.tabs.newTab();
-        a.select(null, null);
+    /// The active tab's new-chat draft, parked with it.
+    fn park(a: *App) void {
+        const d = drafts.canvas(a) catch return;
+        a.tabs.park(a.tabs.active, null, d);
     }
 
-    /// Back and forward, and the tab list's rows: show another tab.
+    /// "+", ⌘T: a new chat in a tab of its own, with the picks of the one
+    /// left and an empty prompt.
+    pub fn newTab(a: *App) void {
+        var d = drafts.canvas(a) catch return;
+        const fresh = d.fresh(a.gpa) catch return d.deinit(a.gpa);
+        a.tabs.park(a.tabs.active, null, d);
+        a.tabs.newTab();
+        a.select(null, null);
+        drafts.adopt(a, fresh);
+    }
+
+    /// Back and forward, and the tab list's rows: show another tab, its
+    /// draft back as it was left (`load_chat_tab`).
     pub fn showTab(a: *App, i: usize) void {
-        if (i >= a.tabs.items.items.len) return;
+        if (i >= a.tabs.items.items.len or i == a.tabs.active) return;
+        a.park();
         a.tabs.active = i;
         a.select(a.tabs.current(), null);
+        if (a.tabs.unpark(i, null)) |d| drafts.adopt(a, d);
     }
 
     pub fn closeTab(a: *App, i: usize) void {
+        // Another tab: the one shown stays as it is.
+        if (i != a.tabs.active) return a.tabs.close(i);
         a.tabs.close(i);
         a.select(a.tabs.current(), null);
+        if (a.tabs.unpark(a.tabs.active, null)) |d| drafts.adopt(a, d);
+    }
+
+    /// ⌘D, ⌘⇧D: the focused pane split, focus in the new pane: a new chat
+    /// with the picks of the pane left and an empty prompt (`split_chat`).
+    pub fn splitPane(a: *App, axis: tabs_mod.Axis) void {
+        var d = drafts.canvas(a) catch return;
+        var fresh = d.fresh(a.gpa) catch return d.deinit(a.gpa);
+        if (!(a.tabs.split(axis) catch false)) {
+            d.deinit(a.gpa);
+            return fresh.deinit(a.gpa);
+        }
+        a.tabs.park(a.tabs.active, a.tabs.layout().?.focus - 1, d);
+        a.select(null, null);
+        drafts.adopt(a, fresh);
+    }
+
+    /// Focus pane `ix`: the pane left keeps its draft, and `ix`'s comes
+    /// back (`select_chat_pane`).
+    pub fn focusPane(a: *App, ix: usize) void {
+        const s = a.tabs.layout() orelse return;
+        if (ix >= s.panes.items.len or ix == s.focus) return;
+        const from = s.focus;
+        const d = drafts.canvas(a) catch return;
+        a.tabs.focusPane(ix);
+        a.tabs.park(a.tabs.active, from, d);
+        const back = a.tabs.unpark(a.tabs.active, ix);
+        a.select(a.tabs.current(), null);
+        if (back) |b| {
+            var x = b;
+            if (a.selected == null) drafts.adopt(a, b) else x.deinit(a.gpa);
+        }
+    }
+
+    /// ⌘] / ⌘[: the next pane in a split, else the next tab.
+    pub fn stepPane(a: *App, forward: bool) void {
+        if (a.tabs.layout()) |s| return a.focusPane(s.cycled(forward));
+        const by: i32 = if (forward) 1 else -1;
+        if (a.tabs.canStep(by)) a.showTab(@intCast(@as(i64, @intCast(a.tabs.active)) + by));
+    }
+
+    /// ⌥⌘+arrow: the pane that way.
+    pub fn focusToward(a: *App, d: tabs_mod.Direction) void {
+        const s = a.tabs.layout() orelse return;
+        if (s.toward(d)) |ix| a.focusPane(ix);
+    }
+
+    /// ⌘W: the focused pane in a split, the next one's draft back; else
+    /// the tab.
+    pub fn closeFocused(a: *App) void {
+        if (!a.tabs.closePane()) return a.closeTab(a.tabs.active);
+        const back = a.tabs.unpark(a.tabs.active, if (a.tabs.layout()) |s| s.focus else null);
+        a.select(a.tabs.current(), null);
+        if (back) |b| {
+            var x = b;
+            if (a.selected == null) drafts.adopt(a, b) else x.deinit(a.gpa);
+        }
+    }
+
+    /// Watches the transcript of every chat in the active tab's other
+    /// panes, and lets go of those no longer shown.
+    pub fn syncPeers(a: *App) void {
+        var wanted: [tabs_mod.max_panes]?[]const u8 = @splat(null);
+        if (a.tabs.layout()) |s| if (!s.zoomed) for (s.panes.items, 0..) |p, ix| {
+            if (ix != s.focus) wanted[ix] = p;
+        };
+        const live = a.engine.state == .connected;
+        var i: usize = 0;
+        while (i < a.peers.items.len) {
+            const p = &a.peers.items[i];
+            const keep = for (wanted) |w| {
+                if (w) |x| if (std.mem.eql(u8, x, p.id)) break true;
+            } else false;
+            if (keep) {
+                if (p.watch == null and !p.ended and live) a.watchPeer(p);
+                i += 1;
+                continue;
+            }
+            if (p.watch) |w| a.engine.cancel(w);
+            p.transcript.deinit();
+            a.gpa.free(p.id);
+            _ = a.peers.swapRemove(i);
+        }
+        for (wanted) |w| if (w) |id| if (a.peer(id) == null) {
+            const owned = a.gpa.dupe(u8, id) catch return;
+            a.peers.append(a.gpa, .{ .id = owned, .transcript = .{ .gpa = a.gpa } }) catch return a.gpa.free(owned);
+            if (live) a.watchPeer(&a.peers.items[a.peers.items.len - 1]);
+        };
+    }
+
+    pub fn peer(a: *App, id: []const u8) ?*Peer {
+        for (a.peers.items) |*p| if (std.mem.eql(u8, p.id, id)) return p;
+        return null;
+    }
+
+    fn watchPeer(a: *App, p: *Peer) void {
+        p.watch = a.send_(requests.watchDoc(p.id, true), .of(App, a, onPeerDoc));
+    }
+
+    fn onPeerDoc(a: *App, id: u64, r: rpc.Reply) void {
+        for (a.peers.items) |*p| if (p.watch == id) {
+            switch (r) {
+                .item => |v| p.transcript.apply(v) catch {
+                    // Out of step: the next frame watches it afresh.
+                    a.engine.cancel(id);
+                    p.transcript.clear();
+                    p.watch = null;
+                },
+                .done, .err => {
+                    p.watch = null;
+                    p.ended = true;
+                },
+                .ok => {},
+            }
+            break;
+        };
+        a.redraw();
     }
 
     fn onSpaces(a: *App, _: u64, r: rpc.Reply) void {
@@ -432,6 +610,7 @@ pub const App = struct {
             else => return,
         };
         if (v != .object) return;
+        a.account.scope = account.readScope(v.object);
         if (v.object.get("capabilities")) |caps| if (caps == .array) {
             a.caps = queue_mod.readCaps(caps.array.items);
         };
@@ -486,6 +665,9 @@ pub const App = struct {
 
     /// Opens `chat_id`, or (null) a new chat in `space_id`.
     pub fn select(a: *App, chat_id: ?[]const u8, space_id: ?[]const u8) void {
+        drafts.leave(a);
+        defer drafts.enter(a);
+        a.view.focus_composer = true;
         if (a.w_doc.id) |id| a.engine.cancel(id);
         a.w_doc = .{};
         a.transcript.clear();
@@ -569,11 +751,12 @@ pub const App = struct {
             .reasoning = reasoning,
             .cwd = cwd,
         }), .of(App, a, onNotice));
+        // Sent: the prompt is no one's draft any more.
+        a.composer.clear();
         if (a.selected == null) {
             a.tabs.setCurrent(chat_id);
             a.select(chat_id, null);
         }
-        a.composer.clear();
         a.redraw();
     }
 
