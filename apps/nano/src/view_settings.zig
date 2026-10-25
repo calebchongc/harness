@@ -22,7 +22,8 @@ pub fn st(c: *ui.Context, size: f32, base: ui.TextStyle) ui.TextStyle {
     _ = c;
     var s = base;
     s.size = size;
-    s.line_height = size * phi;
+    // On the device pixel, as GPUI lays lines out (half a point at 2x).
+    s.line_height = @round(size * phi * 2) / 2;
     return s;
 }
 
@@ -81,13 +82,13 @@ pub fn nav(c: *ui.Context, a: *App, k: theme.Colors) void {
             ui.text(c, "Settings", st(c, 11, .{ .weight = .medium, .color = k.muted.alpha(0.6) }));
         }
         {
-            // 32.5 tall: GPUI's search is a composer input, 5 above and below.
-            const s = ui.div(c).row().wFull().h(32.5).px(8).gap(6).itemsCenter().rounded(8).bg(k.ink(0.04));
+            // 33 tall: GPUI's search is a composer input, 5 above and below.
+            const s = ui.div(c).row().wFull().h(33).px(8).gap(6).itemsCenter().rounded(8).bg(k.ink(0.04));
             defer s.end();
             icons.icon(c, .magnifer, 14, k.muted, 0);
             const f = ui.div(c).row().grow().w(0);
             defer f.end();
-            _ = ui.textField(c, &a.view.settings_search, .{ .placeholder = "Search settings", .width = .fill, .bare = true, .size = 13 });
+            _ = ui.textField(c, &a.view.settings_search, .{ .placeholder = "Search settings", .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 13 });
         }
         const rows = ui.div(c).column().wFull().gap(2);
         defer rows.end();

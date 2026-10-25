@@ -196,7 +196,7 @@ fn sizeChoice(c: *ui.Context, a: *App, k: theme.Colors, sizes: []const sandboxes
     for (sizes, 0..) |s, ix| {
         const title = sandboxes.sizeTitle(c.alloc(), s) catch "";
         const detail = sandboxes.sizeDetail(c.alloc(), s) catch "";
-        const card_w = @max(180, 2 * 12 + @max(c.text.width(title, .{ .size = 12.5, .weight = .medium }), c.text.width(detail, .{ .size = 11.5 })));
+        const card_w = @max(180, 2 * 13 + @max(c.text.width(title, .{ .size = 12.5, .weight = .medium }), c.text.width(detail, .{ .size = 11.5 })));
         // `flex_wrap`: a card that doesn't fit starts the next line.
         if (line == null or used + 8 + card_w > w) {
             if (line) |l| l.end();
