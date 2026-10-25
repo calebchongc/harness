@@ -140,3 +140,42 @@ pub fn shadowLg(d: ui.Div) ui.Div {
     if (comptime @hasDecl(ui.Shadow, "lg")) return d.shadows(&ui.Shadow.lg);
     return d.shadowLg();
 }
+
+/// `gradient_spinner` with 3-point cells: a 3×3 grid tinted per row from
+/// the sunrise gradient (`GSPIN_ROW_TINTS`), each cell pulsing once per
+/// 750 ms, the wave travelling upward.
+const cell: f32 = 3;
+pub const spinner_w: f32 = 3 * cell + 2 * cell / 2;
+const tints = [_]u24{ 0xB6D3EF, 0xEDB185, 0xF888A0 };
+
+pub fn gradientSpinner(c: *ui.Context) void {
+    const delta: f32 = @floatCast(@mod(c.time / 0.75, 1.0));
+    const g = ui.div(c).column().gap(cell / 2);
+    defer g.end();
+    for (0..3) |row| {
+        const r = ui.div(c).row().gap(cell / 2);
+        defer r.end();
+        for (0..3) |col| {
+            const d = 2 - @as(f32, @floatFromInt(row)) + @abs(@as(f32, @floatFromInt(col)) - 1);
+            const tint: ui.Color = .hex(tints[row]);
+            _ = c.leaf(.{ .width = .{ .px = cell }, .height = .{ .px = cell }, .radius = cell / 2, .background = tint.alpha(gspinOpacity(delta + d / 4, 0.1)) }, .none, null);
+        }
+    }
+    c.frameIn(1.0 / 30.0);
+}
+
+/// `gspin_opacity`: full, down to `dim` over 45% of the period, resting,
+/// then back up over the last 8%.
+pub fn gspinOpacity(t_: f32, dim: f32) f32 {
+    const t = @mod(t_, 1.0);
+    if (t < 0.45) return 1 + (dim - 1) * (t / 0.45);
+    if (t < 0.92) return dim;
+    return dim + (1 - dim) * ((t - 0.92) / 0.08);
+}
+
+test "the spinner's pulse, as GPUI's" {
+    try std.testing.expectApproxEqAbs(@as(f32, 1), gspinOpacity(0, 0.1), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), gspinOpacity(0.45, 0.1), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), gspinOpacity(0.7, 0.1), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), gspinOpacity(0.99999, 0.1), 1e-3);
+}

@@ -501,7 +501,7 @@ fn browserBody(c: *ui.Context, a: *App, k: theme.Colors, f: *Flow) void {
         set.space(c, 16);
         const w = ui.div(c).row().gap(8).itemsCenter();
         defer w.end();
-        kit.snake(c, k);
+        kit.gradientSpinner(c);
         ui.text(c, f.message orelse "Waiting for the browser…", st(c, 12.5, .{ .color = k.muted }));
     }
     set.space(c, 16);
