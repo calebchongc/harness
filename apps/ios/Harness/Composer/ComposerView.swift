@@ -34,6 +34,9 @@ struct ComposerShell<Chips: View>: View {
     var onSend: () -> Void
     var onStop: () -> Void = {}
     var onAdvanceQueue: () -> Void = {}
+    /// When a question panel last gave way to this composer: a Stop tap
+    /// within `StopGuard.graceMs` of it is ignored.
+    var questionClosedAtMs: Int64?
     /// Staged image attachments (attachment-ui.tsx AttachmentStrip inside the
     /// pill). Non-empty forces the expanded layout, like focus.
     var attachments: [StagedAttachment] = []
@@ -208,6 +211,7 @@ struct ComposerShell<Chips: View>: View {
     private var actionButton: some View {
         Button {
             if showStop, !hasContent {
+                guard StopGuard.allows(nowMs: nowMs(), questionClosedAtMs: questionClosedAtMs) else { return }
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 onStop()
             } else {
@@ -260,6 +264,7 @@ struct ComposerView: View {
     let store: SessionStore
     let chat: Chat
     let runLive: Bool
+    let questionClosedAtMs: Int64?
 
     // What was typed and not sent comes back with the chat (DraftStore).
     @State private var text: String
@@ -297,10 +302,12 @@ struct ComposerView: View {
     /// any other way.
     @State private var attachmentLease: QueueEditLease?
 
-    init(store: SessionStore, chat: Chat, runLive: Bool, attachmentDraft: AttachmentDraft) {
+    init(store: SessionStore, chat: Chat, runLive: Bool, attachmentDraft: AttachmentDraft,
+         questionClosedAtMs: Int64? = nil) {
         self.store = store
         self.chat = chat
         self.runLive = runLive
+        self.questionClosedAtMs = questionClosedAtMs
         self.attachmentDraft = attachmentDraft
         _text = State(initialValue: DraftStore.load(DraftStore.chatKey(chat.id)))
     }
@@ -445,6 +452,7 @@ struct ComposerView: View {
                 onSend: send,
                 onStop: { store.sendInterrupt() },
                 onAdvanceQueue: advanceQueue,
+                questionClosedAtMs: questionClosedAtMs,
                 attachments: editingQueuedId == nil ? attachments : [],
                 onAttach: editingQueuedId == nil ? { showPicker = true } : nil,
                 onPasteImages: editingQueuedId == nil ? { stagePasted($0) } : nil,
