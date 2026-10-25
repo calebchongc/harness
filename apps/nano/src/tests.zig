@@ -21,8 +21,10 @@ test {
     _ = @import("snap.zig");
     _ = @import("app_account.zig");
     _ = @import("settings.zig");
+    _ = @import("shortcuts.zig");
     _ = @import("view_settings.zig");
     _ = @import("view_settings_devices.zig");
+    _ = @import("view_settings_shortcuts.zig");
     _ = @import("icons.zig");
     _ = @import("release.zig");
     _ = @import("view.zig");

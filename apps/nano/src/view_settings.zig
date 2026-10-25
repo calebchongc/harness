@@ -154,6 +154,7 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         .files => files(c, a, k),
         .archived => archived(c, a, k),
         .devices => @import("view_settings_devices.zig").page(c, a, k),
+        .shortcuts => @import("view_settings_shortcuts.zig").page(c, a, k),
         else => |s| {
             header(c, k, s.label(), null);
             subtitle(c, k, "This section isn't in Harness Nano yet: open it in Harness.", false);

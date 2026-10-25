@@ -6,6 +6,7 @@
 const std = @import("std");
 const json = std.json;
 const icons = @import("icons.zig");
+const shortcuts = @import("shortcuts.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Section = enum {
@@ -93,6 +94,7 @@ pub const Prefs = struct {
     files_word_wrap: bool = false,
     files_show_all: bool = false,
     archive_sessions_on_close: bool = false,
+    escape_stops_active_agent: bool = false,
 };
 
 /// One of `Prefs`'s switches.
@@ -108,6 +110,7 @@ pub const Flag = enum {
     files_word_wrap,
     files_show_all,
     archive_sessions_on_close,
+    escape_stops_active_agent,
 };
 
 comptime {
@@ -139,9 +142,105 @@ pub const Store = struct {
     path: ?[]u8 = null,
     prefs: Prefs = .{},
     section: Section = .devices,
+    /// The file's other keys as last read or written: a choice, a number or
+    /// a name a page shows (`text`, `number`).
+    doc: std.StringArrayHashMapUnmanaged(json.Value) = .empty,
+    /// `keymap`'s combinations by key, "jumpSession.N" for the nine slots.
+    keymap: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    doc_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn deinit(s: *Store) void {
         if (s.path) |p| s.gpa.free(p);
+        if (s.doc_arena) |*a| a.deinit();
+    }
+
+    /// A string the file holds under `key`, if it holds one.
+    pub fn text(s: *const Store, key: []const u8) ?[]const u8 {
+        const v = s.doc.get(key) orelse return null;
+        return if (v == .string) v.string else null;
+    }
+
+    /// A number the file holds under `key`, if it holds one.
+    pub fn number(s: *const Store, key: []const u8) ?f64 {
+        const v = s.doc.get(key) orelse return null;
+        return switch (v) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => null,
+        };
+    }
+
+    pub fn setText(s: *Store, key: []const u8, value: []const u8) void {
+        s.remember(key, .{ .string = value });
+        s.write(key, .{ .string = value });
+    }
+
+    pub fn setNumber(s: *Store, key: []const u8, value: f64) void {
+        const v: json.Value = if (@floor(value) == value and @abs(value) < 1e15) .{ .integer = @intFromFloat(value) } else .{ .float = value };
+        s.remember(key, v);
+        s.write(key, v);
+    }
+
+    fn rememberCombo(s: *Store, key: []const u8, slot: ?u8, keys: []const u8) void {
+        if (s.doc_arena == null) s.doc_arena = .init(s.gpa);
+        const a = s.doc_arena.?.allocator();
+        const k = (if (slot) |n| std.fmt.allocPrint(a, "{s}.{d}", .{ key, n }) else a.dupe(u8, key)) catch return;
+        s.keymap.put(a, k, a.dupe(u8, keys) catch return) catch {};
+    }
+
+    /// The combination `sc` has: the file's, else its default.
+    pub fn combo(s: *const Store, sc: shortcuts.Shortcut) []const u8 {
+        var buf: [64]u8 = undefined;
+        const k = if (sc.slot) |n| std.fmt.bufPrint(&buf, "{s}.{d}", .{ sc.key, n }) catch return sc.default else sc.key;
+        return s.keymap.get(k) orelse sc.default;
+    }
+
+    /// Rebinds `sc` (null: back to its default), and writes the keymap whole
+    /// as the GPUI app writes it.
+    pub fn setCombo(s: *Store, sc: shortcuts.Shortcut, value: ?[]const u8) void {
+        s.rememberCombo(sc.key, sc.slot, value orelse sc.default);
+        s.writeKeymap();
+    }
+
+    /// Every shortcut back to its default.
+    pub fn resetKeymap(s: *Store) void {
+        for (shortcuts.all) |sc| s.rememberCombo(sc.key, sc.slot, sc.default);
+        s.writeKeymap();
+    }
+
+    /// Whether any shortcut differs from its default.
+    pub fn keymapChanged(s: *const Store) bool {
+        for (shortcuts.all) |sc| if (!std.mem.eql(u8, s.combo(sc), sc.default)) return true;
+        return false;
+    }
+
+    fn writeKeymap(s: *Store) void {
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var obj: json.ObjectMap = .empty;
+        // What this app doesn't show (an Appshot's key) as the file had it.
+        obj.put(a, "captureAppshot", .{ .string = s.keymap.get("captureAppshot") orelse "ctrl-alt-space" }) catch return;
+        var jump: json.Array = .init(a);
+        for (shortcuts.all) |sc| {
+            if (sc.slot != null) {
+                jump.append(.{ .string = s.combo(sc) }) catch return;
+            } else obj.put(a, sc.key, .{ .string = s.combo(sc) }) catch return;
+        }
+        obj.put(a, "jumpSession", .{ .array = jump }) catch return;
+        s.write("keymap", .{ .object = obj });
+    }
+
+    /// Keeps `value` (copied) as the file's `key`.
+    fn remember(s: *Store, key: []const u8, value: json.Value) void {
+        if (s.doc_arena == null) s.doc_arena = .init(s.gpa);
+        const a = s.doc_arena.?.allocator();
+        const v: json.Value = switch (value) {
+            .string => |str| .{ .string = a.dupe(u8, str) catch return },
+            else => value,
+        };
+        const k = if (s.doc.getKey(key)) |have| have else a.dupe(u8, key) catch return;
+        s.doc.put(a, k, v) catch {};
     }
 
     /// The file in Harness's data folder: `HARNESS_DATA_DIR`, else
@@ -162,13 +261,13 @@ pub const Store = struct {
     /// Reads what the file says; what it doesn't say keeps its default.
     pub fn load(s: *Store) void {
         const path = s.path orelse return;
-        const text = std.Io.Dir.cwd().readFileAlloc(s.io, path, s.gpa, .limited(8 << 20)) catch return;
-        defer s.gpa.free(text);
-        s.apply(text);
+        const body = std.Io.Dir.cwd().readFileAlloc(s.io, path, s.gpa, .limited(8 << 20)) catch return;
+        defer s.gpa.free(body);
+        s.apply(body);
     }
 
-    pub fn apply(s: *Store, text: []const u8) void {
-        const parsed = json.parseFromSlice(json.Value, s.gpa, text, .{}) catch return;
+    pub fn apply(s: *Store, body: []const u8) void {
+        const parsed = json.parseFromSlice(json.Value, s.gpa, body, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value != .object) return;
         const o = parsed.value.object;
@@ -179,6 +278,20 @@ pub const Store = struct {
         }
         if (o.get("settingsSection")) |v| if (v == .string) if (Section.fromKey(v.string)) |sec| {
             s.section = sec;
+        };
+        if (o.get("keymap")) |km| if (km == .object) {
+            var kit = km.object.iterator();
+            while (kit.next()) |e| switch (e.value_ptr.*) {
+                .string => |keys| s.rememberCombo(e.key_ptr.*, null, keys),
+                .array => |arr| for (arr.items, 0..) |v, i| if (v == .string) s.rememberCombo(e.key_ptr.*, @intCast(i), v.string),
+                else => {},
+            };
+        };
+        // The scalars, for pages to read: strings and numbers.
+        var it = o.iterator();
+        while (it.next()) |e| switch (e.value_ptr.*) {
+            .string, .integer, .float => s.remember(e.key_ptr.*, e.value_ptr.*),
+            else => {},
         };
     }
 
@@ -208,8 +321,8 @@ pub const Store = struct {
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const text = std.Io.Dir.cwd().readFileAlloc(s.io, path, a, .limited(8 << 20)) catch "{}";
-        const out = merged(a, text, key, value) catch return;
+        const body = std.Io.Dir.cwd().readFileAlloc(s.io, path, a, .limited(8 << 20)) catch "{}";
+        const out = merged(a, body, key, value) catch return;
         const tmp = std.fmt.allocPrint(a, "{s}.nano-tmp", .{path}) catch return;
         std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = tmp, .data = out }) catch return;
         std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, s.io) catch return;
@@ -238,6 +351,7 @@ test "sections in the GPUI app's order, groups and saved keys" {
 
 test "the file's switches are read, and a change keeps every other key" {
     var s: Store = .{ .gpa = testing.allocator, .io = testing.io };
+    defer s.deinit();
     s.apply(
         \\{"soundEnabled":false,"filesWordWrap":true,"settingsSection":"files","sidebarWidth":300}
     );
@@ -245,6 +359,19 @@ test "the file's switches are read, and a change keeps every other key" {
     try testing.expect(s.get(.files_word_wrap));
     try testing.expect(s.get(.notifications_enabled));
     try testing.expectEqual(Section.files, s.section);
+    try testing.expectEqual(@as(?f64, 300), s.number("sidebarWidth"));
+    try testing.expect(s.text("sidebarWidth") == null);
+    s.setText("accent", "violet");
+    try testing.expectEqualStrings("violet", s.text("accent").?);
+    s.setNumber("transcriptWidth", 832);
+    s.apply(
+        \\{"keymap":{"saveFile":"mod-alt-s","jumpSession":["mod-1","ctrl-2"]}}
+    );
+    try testing.expectEqualStrings("mod-alt-s", s.combo(shortcuts.all[0]));
+    try testing.expectEqualStrings("ctrl-2", s.combo(shortcuts.all[shortcuts.all.len - 8]));
+    try testing.expectEqualStrings("mod-b", s.combo(shortcuts.all[2]));
+    try testing.expect(s.keymapChanged());
+    try testing.expectEqual(@as(?f64, 832), s.number("transcriptWidth"));
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

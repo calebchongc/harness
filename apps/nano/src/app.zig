@@ -46,6 +46,10 @@ pub const View = struct {
     /// The Settings page is open, in the sidebar's place; its search.
     settings_open: bool = false,
     settings_search: nanoui.ui.TextBuffer = .{},
+    /// Settings › Shortcuts: the shortcut whose chip waits for keys, and
+    /// why the last combination was refused.
+    recording: ?usize = null,
+    shortcut_notice: std.ArrayList(u8) = .empty,
     space_anchor: ?nanoui.ui.Rect = null,
     chip_anchor: ?nanoui.ui.Rect = null,
     composer_anchor: ?nanoui.ui.Rect = null,
@@ -57,6 +61,7 @@ pub const View = struct {
     groups: std.StringHashMapUnmanaged(bool) = .empty,
 
     pub fn deinit(v: *View, gpa: Allocator) void {
+        v.shortcut_notice.deinit(gpa);
         if (v.filter) |f| gpa.free(f);
         var it = v.groups.keyIterator();
         while (it.next()) |key| gpa.free(key.*);

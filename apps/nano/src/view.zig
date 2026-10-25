@@ -178,6 +178,9 @@ fn neighbor(c: *ui.Context, a: *App, k: theme.Colors, ix: usize, chat_id: ?[]con
 /// (protocol/keymap-macos.json, the GPUI app's `shell::` bindings).
 fn keys(c: *ui.Context, a: *App) void {
     const S = ui.Shortcut;
+    // A shortcut being rebound takes the keys first.
+    const rebinding = @import("view_settings_shortcuts.zig");
+    if (rebinding.recording(a)) return rebinding.capture(c, a);
     if (c.shortcut(.{ .key = 'b', .cmd = true })) a.view.sidebar_open = !a.view.sidebar_open;
     if (c.shortcut(.{ .key = ',', .cmd = true })) settings_view.open(a);
     if (a.selected != null and c.shortcut(.{ .key = 'e', .cmd = true })) @import("app_files.zig").toggle(a);

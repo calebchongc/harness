@@ -94,7 +94,16 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
         .multiline = true,
         .max_lines = 11,
     });
-    if (r.submitted) a.send();
+    // "Send messages with" (Settings › Shortcuts): Enter sends, or starts a
+    // new line and ⌘↩ sends (`composerSendBehavior`).
+    const on_enter = @import("view_settings_shortcuts.zig").sendsOnEnter(a);
+    if (r.submitted) {
+        if (on_enter) a.send() else {
+            _ = a.composer.insert(r.caret, "\n");
+            a.composer.want_caret = r.caret + 1;
+        }
+    }
+    if (!on_enter and std.mem.trim(u8, a.composer.text(), " \n\t").len > 0 and c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true })) a.send();
     keepFocus(c, a, c.node(@intCast(at)).id);
     // ⌘↩ with nothing typed sends the newest queued message now.
     if (c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true }) and std.mem.trim(u8, a.composer.text(), " \n\t").len == 0) {

@@ -200,3 +200,44 @@ test "a second line makes the docked composer taller and keeps the keys" {
     typeKeys(&h, "two");
     try testing.expectEqualStrings("one\ntwo", h.a.composer.text());
 }
+
+test "Settings › Shortcuts: a chip takes the next keys; a clash is refused, as the GPUI app says" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const shortcuts = @import("shortcuts.zig");
+    @import("view_settings.zig").open(&h.a);
+    h.a.settings.section = .shortcuts;
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Keyboard shortcuts"));
+    try h.t.clickText("Cmd+S");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Press keys…"));
+    // While it records, ⌘B is the chip's, not the sidebar's.
+    h.press(.{ .key = 'b', .cmd = true, .alt = true });
+    try testing.expectEqualStrings("mod-alt-b", h.a.settings.combo(shortcuts.all[0]));
+    try testing.expect(h.t.hasText("Cmd+Opt+B"));
+    try testing.expect(h.t.hasText("Reset"));
+    try h.t.clickText("Cmd+Shift+R");
+    h.t.settle(1);
+    h.press(.{ .key = 'b', .cmd = true, .alt = true });
+    try testing.expectEqualStrings("mod-shift-r", h.a.settings.combo(shortcuts.all[1]));
+    try testing.expect(h.t.hasText("Cmd+Opt+B is already assigned to Save file."));
+    try h.t.clickText("Restore defaults");
+    h.t.settle(1);
+    try testing.expectEqualStrings("mod-s", h.a.settings.combo(shortcuts.all[0]));
+}
+
+test "with ⌘ Enter chosen, Enter starts a new line and ⌘↩ sends" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.a.settings.setText("composerSendBehavior", "mod-enter");
+    h.a.view.focus_composer = true;
+    h.t.settle(1);
+    typeKeys(&h, "one");
+    h.t.key(.enter);
+    h.t.settle(1);
+    typeKeys(&h, "two");
+    try testing.expectEqualStrings("one\ntwo", h.a.composer.text());
+}
