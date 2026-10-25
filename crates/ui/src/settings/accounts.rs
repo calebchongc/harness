@@ -334,11 +334,18 @@ impl LoginFlow {
 
 /// The engine's replies to the page's calls, for headless scenes
 /// (examples/ui-scenes.rs `accounts`): `snapshot` (ListAgentAccounts),
-/// `codegraffUsage`, `codegraffJobs`, `graffLogins` and
-/// `codegraffSandboxes`.
+/// `codegraffUsage`, `codegraffJobs`, `graffLogins`, `codegraffSandboxes`,
+/// and `loginStart` (StartAgentLogin, for the add-account dialog).
 #[cfg(feature = "ui-scenes")]
 pub static SCENE_ACCOUNTS: std::sync::Mutex<Option<serde_json::Value>> =
     std::sync::Mutex::new(None);
+
+/// A scene's `loginStart`: what StartAgentLogin answers in it.
+#[cfg(feature = "ui-scenes")]
+fn scene_login_start() -> Option<AgentLoginStart> {
+    let fixture = SCENE_ACCOUNTS.lock().ok()?.clone()?;
+    serde_json::from_value(fixture.get("loginStart")?.clone()).ok()
+}
 
 pub struct AccountsPage {
     state: Entity<AppState>,
@@ -1462,6 +1469,32 @@ impl AccountsPage {
         reauthenticate: bool,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "ui-scenes")]
+        if let Some(start) = scene_login_start() {
+            // A scene's `loginStart`: the dialog as the engine's reply would open it.
+            self.error = None;
+            self.code_input
+                .update(cx, |input, cx| input.set_text("", cx));
+            self.login = Some(match start.mode {
+                AgentLoginMode::PasteCode | AgentLoginMode::RelayBrowser => LoginFlow::PasteCode {
+                    harness,
+                    provider,
+                    start,
+                    submitting: false,
+                    error: None,
+                },
+                _ => LoginFlow::Browser {
+                    harness,
+                    provider,
+                    reauthenticate,
+                    start,
+                    message: None,
+                    error: None,
+                },
+            });
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine not connected".into());
             cx.notify();
