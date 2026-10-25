@@ -637,6 +637,22 @@ fn retain_live_interrupts(pending: &mut HashSet<String>, mut is_live: impl FnMut
     pending.retain(|chat_id| is_live(chat_id));
 }
 
+/// How long the Stop button is ignored after a question panel gives way to
+/// the composer (#149). The panel's Submit is the footer's right-most control,
+/// where Stop shows up once it closes on a live run, so the second click of a
+/// double-click on Submit would stop the run it just answered. Pinned with
+/// the phones in `apps/parity/vectors/composer-stop.json`.
+const STOP_GRACE_MS: i64 = 1_500;
+
+/// Whether a Stop click at `now_ms` goes through, given when a question panel
+/// last closed (`None`: none has). A clock that went back never holds Stop off.
+fn stop_allowed(now_ms: i64, question_closed_at_ms: Option<i64>) -> bool {
+    match question_closed_at_ms {
+        None => true,
+        Some(closed) => now_ms < closed || now_ms - closed >= STOP_GRACE_MS,
+    }
+}
+
 fn interrupt_params(chat_id: &str) -> serde_json::Value {
     serde_json::json!({
         "chatId": chat_id,
@@ -5748,6 +5764,9 @@ pub struct Composer {
     /// another chat's request when the user navigates quickly.
     interrupting: HashSet<String>,
     interrupt_tasks: HashMap<String, Task<()>>,
+    /// The chat whose question panel last gave way to the composer, and when
+    /// (`stop_allowed`).
+    question_closed: Option<(String, Instant)>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -5985,6 +6004,7 @@ impl Composer {
             send_task: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
+            question_closed: None,
             editing_queued: None,
             queue_edit_lease_id: None,
             queue_edit_base_text_hash: None,
@@ -8249,6 +8269,12 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
+                        self.question_closed = self
+                            .state
+                            .read(cx)
+                            .selected_chat
+                            .clone()
+                            .map(|chat| (chat, Instant::now()));
                         let draft = self
                             .drafts
                             .get(&self.current_key)
@@ -9306,6 +9332,18 @@ impl Composer {
         self.interrupt_chat(chat_id, cx);
     }
 
+    /// The Stop button: `interrupt_selected`, unless a question panel on this
+    /// chat closed a moment ago (`stop_allowed`).
+    fn stop_from_button(&mut self, cx: &mut Context<Self>) {
+        let held = self.question_closed.as_ref().is_some_and(|(chat, at)| {
+            self.state.read(cx).selected_chat.as_deref() == Some(chat.as_str())
+                && !stop_allowed(at.elapsed().as_millis() as i64, Some(0))
+        });
+        if !held {
+            self.interrupt_selected(cx);
+        }
+    }
+
     pub(crate) fn interrupt_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -9542,6 +9580,7 @@ impl Composer {
         let answer_text = self.input.read(cx).text().to_string();
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
+        self.question_closed = Some((chat_id.clone(), Instant::now()));
         let draft = self
             .drafts
             .get(&self.current_key)
@@ -9984,7 +10023,7 @@ impl Composer {
                 .justify_center()
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.85))
-                .on_click(cx.listener(|this, _, _, cx| this.interrupt_selected(cx)))
+                .on_click(cx.listener(|this, _, _, cx| this.stop_from_button(cx)))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
             SendButtonMode::Send | SendButtonMode::Queue => {
@@ -13514,6 +13553,75 @@ mod tests {
         // written its frame into the channel by the time the executor parks.
         cx.run_until_parked();
         assert!(server_in.try_recv().is_err());
+    }
+
+    #[test]
+    fn stop_grace_matches_the_phones() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../apps/parity/vectors/composer-stop.json"
+        ))
+        .unwrap();
+        assert_eq!(v["graceMs"].as_i64(), Some(STOP_GRACE_MS));
+        for case in v["cases"].as_array().unwrap() {
+            assert_eq!(
+                stop_allowed(
+                    case["nowMs"].as_i64().unwrap(),
+                    case["questionClosedAtMs"].as_i64()
+                ),
+                case["allowed"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    /// #149: Stop takes the answered question panel's place on a live run, so
+    /// the second click of a double-click on Submit lands on it. That click
+    /// must not stop the run it just answered; a Stop once the grace is over
+    /// still does.
+    #[gpui::test]
+    fn stop_right_after_answering_a_question_is_ignored(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, _requests) = tokio::sync::mpsc::channel(64);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                        harness_rpc::RpcClient::new(out, inbound),
+                    ));
+                });
+                let questions = vec![question("custom", &["Yes", "No"], false)];
+                switch_question_draft_chat(composer, "c", Some(("ask", questions)), cx);
+                composer.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, "Go ahead", window, cx);
+                });
+                composer.state.update(cx, |state, _| {
+                    state.begin_pending_send("c", "m1", chrono::Utc::now());
+                });
+                composer.on_submit(cx);
+                assert!(composer.wizard.is_none());
+                assert_eq!(composer.button_mode(cx), SendButtonMode::Stop);
+
+                composer.stop_from_button(cx);
+                assert!(
+                    !composer.interrupting.contains("c"),
+                    "the double-click's second half"
+                );
+
+                let earlier = Instant::now()
+                    .checked_sub(Duration::from_millis(1_600))
+                    .unwrap();
+                composer.question_closed = Some(("c".into(), earlier));
+                composer.stop_from_button(cx);
+                assert!(composer.interrupting.contains("c"), "a deliberate Stop");
+            })
+            .unwrap();
     }
 
     #[gpui::test]
