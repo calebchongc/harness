@@ -298,7 +298,15 @@ fn server(c: *ui.Context, a: *App, k: theme.Colors, s: Server) void {
     {
         defer r.end();
         set.tile(c, k, if (std.mem.eql(u8, s.transport, "http")) .@"remote-server" else .terminal);
-        const words = ui.div(c).column().grow().w(0);
+        // Wrapped text needs its width up front: the row less its edge,
+        // insets, tile, the buttons after and the gaps (at zero, the
+        // problem's line took a word a line and the row grew that tall).
+        const sign_in = std.mem.eql(u8, s.state, "needs_login");
+        var trailing: f32 = 14 + 40;
+        if (sign_in) trailing += 14 + buttonW(c, if (busy) "Signing in…" else "Sign in");
+        if (s.enabled) trailing += 14 + buttonW(c, if (busy) "Connecting…" else "Reconnect");
+        const words_w = @max(set.inner_w - 2 - 2 * 20 - 36 - 14 - trailing, 80);
+        const words = ui.div(c).column().w(words_w);
         {
             defer words.end();
             const t = ui.div(c).row().gap(8).itemsCenter();
@@ -332,7 +340,7 @@ fn server(c: *ui.Context, a: *App, k: theme.Colors, s: Server) void {
                 ui.text(c, p, .{ .size = 12, .line_height = 12 * phi, .wrap = true, .color = k.danger_muted.alpha(0.9) });
             }
         }
-        if (std.mem.eql(u8, s.state, "needs_login")) {
+        if (sign_in) {
             if (button(c, k, .@"key-minimalistic", if (busy) "Signing in…" else "Sign in", busy)) act(a, "login", s.name);
         }
         if (s.enabled) if (button(c, k, .restart, if (busy) "Connecting…" else "Reconnect", busy)) act(a, "reconnect", s.name);
@@ -370,6 +378,10 @@ pub fn badge(c: *ui.Context, k: theme.Colors, label: []const u8) void {
 }
 
 /// `action_button`: a bordered ghost action with its icon.
+fn buttonW(c: *ui.Context, label: []const u8) f32 {
+    return 2 * 11 + 2 + 14 + 6 + c.text.width(label, .{ .size = 12 });
+}
+
 fn button(c: *ui.Context, k: theme.Colors, icon: icons.Name, label: []const u8, busy: bool) bool {
     var b = ui.div(c).row().px(11).py(7).gap(6).itemsCenter().rounded(8).border(k.border).borderW(1).hover(k.ink(0.06));
     if (busy) b = b.opacity(0.5);

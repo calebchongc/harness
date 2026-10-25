@@ -77,14 +77,25 @@ pub fn fadeText(c: *ui.Context, s: []const u8, st: ui.TextStyle, max_w: f32) voi
 /// list's titles).
 pub fn ellipsisText(c: *ui.Context, s: []const u8, st: ui.TextStyle, max_w: f32) void {
     if (c.text.width(s, st) <= max_w) return ui.text(c, s, st);
-    var end: usize = 0;
+    ui.text(c, c.print("{s}…", .{s[0..truncateAt(c, s, st, max_w)]}), st);
+}
+
+/// Where GPUI cuts `s` for an ellipsis (`LineWrapper::should_truncate_line`):
+/// each character's own width added up, the cut at the last character
+/// before which the text and the ellipsis still come in under `max_w`.
+pub fn truncateAt(c: *ui.Context, s: []const u8, st: ui.TextStyle, max_w: f32) usize {
+    const suffix = c.text.width("…", st);
+    var width: f32 = 0;
+    var cut: usize = 0;
+    var at: usize = 0;
     var it = std.unicode.Utf8View.initUnchecked(s).iterator();
     while (it.nextCodepointSlice()) |cp| {
-        const next = end + cp.len;
-        if (c.text.width(c.print("{s}…", .{s[0..next]}), st) > max_w) break;
-        end = next;
+        if (width + suffix < max_w) cut = at;
+        width += c.text.width(cp, st);
+        if (@floor(width) > max_w) return cut;
+        at += cp.len;
     }
-    ui.text(c, c.print("{s}…", .{std.mem.trimEnd(u8, s[0..end], " ")}), st);
+    return s.len;
 }
 
 /// The 2×3 "snake" a working session shows: rows in the accent's three

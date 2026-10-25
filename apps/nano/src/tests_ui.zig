@@ -1276,3 +1276,25 @@ test "Settings › Accounts: cloud sandboxes with each one's buttons, Delete ask
     try testing.expect(!h.t.hasText("Cloud sandboxes"));
     try testing.expect(!h.t.hasText("Turn off all"));
 }
+
+test "a failed MCP server's problem line keeps its row the height of its text" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const v = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"name":"alpha-tools","source":"global","transport":"stdio","origin":"alpha","enabled":true,"state":"failed","error":"the server exited during startup","toolCount":0,"tools":[]},
+        \\ {"name":"beta-tools","source":"global","transport":"stdio","origin":"beta","enabled":true,"state":"on_demand","toolCount":2,"tools":[]}]
+    , .{});
+    defer v.deinit();
+    try h.a.mcp.servers.replace(v.value);
+    h.a.mcp.phase = .loaded;
+    h.a.settings.section = .mcp;
+    @import("view_settings.zig").open(&h.a);
+    h.t.settle(1);
+    const problem = h.t.findText("the server exited during startup").?;
+    const next = h.t.findText("beta-tools").?;
+    // One line of problem, the row's 14 below, the divider, 14 above the
+    // next name: well under 60 (at a word a line it was ~150).
+    try testing.expect(next.y - (problem.y + problem.h) < 60);
+    h.snap("mcp-failed-row");
+}
