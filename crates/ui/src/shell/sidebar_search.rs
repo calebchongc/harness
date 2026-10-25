@@ -89,7 +89,12 @@ impl Shell {
                     window.prevent_default();
                 }
             })
-            .child(icon(icons::MAGNIFER).size(px(16.0)))
+            // An svg takes no color from its parent: name it, or it isn't drawn.
+            .child(icon(icons::MAGNIFER).size(px(16.0)).text_color(if open {
+                theme.accent
+            } else {
+                theme.text_muted
+            }))
             .into_any_element()
     }
 
