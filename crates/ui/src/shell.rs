@@ -13432,10 +13432,11 @@ impl Render for Shell {
         // ride the same clock; their once-per-frame tick lives here (this is
         // the window's root render — it runs exactly once per frame).
         let hover_fading = motion::hover_fades_active();
-        if hover_fading {
+        if hover_fading || motion::hover_fades_held() {
             // The sidebar is a cached view: unnotified, its rows would read
-            // their fade once and keep that first frame's color, and the
-            // unread fade is pruned.
+            // their fade once and keep that first frame's color, and a fade
+            // left unread through a frame (a menu animating over a hovered
+            // trigger) is pruned as unmounted.
             self.sidebar_pane.update(cx, |_, cx| cx.notify());
         }
         if self.motion_active.get() | hover_fading {
