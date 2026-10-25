@@ -22,4 +22,7 @@ cat > "$app/Info.plist" <<'PLIST'
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 </dict></plist>
 PLIST
+# The linker signs only the binary; sign the bundle (ad hoc) so it runs on
+# another Mac.
+codesign --force --sign - "zig-out/Harness Nano.app"
 echo "zig-out/Harness Nano.app"
