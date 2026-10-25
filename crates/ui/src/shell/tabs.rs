@@ -339,9 +339,9 @@ impl Shell {
             }
         };
 
-        // The new-session `+` renders in the WINDOW-CONTROL CLUSTER whenever a
-        // session is selected (`render_titlebar_cluster`) — this row budgets
-        // one button slot so the title never sits under it.
+        // The new-session `+` renders in the WINDOW-CONTROL CLUSTER on both
+        // draft and established chat tabs — this row budgets one button slot
+        // so the title never sits under it or shifts after the first prompt.
         let sidebar_now = self.sidebar_now();
         // The update control, when shown, takes the next slot after it.
         let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx)
