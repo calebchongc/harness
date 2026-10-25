@@ -29,6 +29,9 @@ pub fn view(a: *App, c: *ui.Context) void {
     a.ansi = k.ansi;
     if (a.tick(c.time)) |wait| c.frameIn(wait);
     c.title_bar_height = sidebar.titlebar_h;
+    @import("view_kit.zig").beginFrame(c);
+    // Hover as GPUI's: none after the keyboard until the pointer moves.
+    if (comptime @hasField(ui.Context, "keyboard_hides_hover")) c.keyboard_hides_hover = true;
     // A live snapshot asking for Settings (nanoui's NANOUI_LIVE_SNAPSHOT,
     // "settings" or "settings:<section>"): drawn in that frame alone, which
     // isn't shown; what the window shows is put back after.

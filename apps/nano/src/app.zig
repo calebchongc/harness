@@ -92,6 +92,8 @@ pub const View = struct {
     archived: @import("view_settings_archived.zig").Page = .{},
     /// Settings › Devices' Rename, Remove and copied id.
     devices: @import("view_settings_devices.zig").Page = .{},
+    /// Boxes hovered as GPUI's `hover_listener` hovers them (kit.listenerHover).
+    hovers: std.AutoHashMapUnmanaged(u64, bool) = .empty,
 
     pub fn deinit(v: *View, gpa: Allocator) void {
         v.github_ci.deinit(gpa);
@@ -100,6 +102,7 @@ pub const View = struct {
         v.accounts.deinit(gpa);
         v.archived.deinit(gpa);
         v.devices.deinit(gpa);
+        v.hovers.deinit(gpa);
         v.shortcut_notice.deinit(gpa);
         v.drag.deinit(gpa);
         v.chat_menu.id.deinit(gpa);

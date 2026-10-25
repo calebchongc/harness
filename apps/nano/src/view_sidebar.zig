@@ -76,13 +76,16 @@ fn filterRow(c: *ui.Context, a: *App, k: theme.Colors) void {
     const row = ui.div(c).row().wFull().px(8).pt(8).pb(4).gap(4).itemsCenter();
     defer row.end();
     {
-        var t = ui.div(c).row().grow().h(29).px(8).gap(8).itemsCenter().rounded(8).clip();
-        t = if (a.view.filter_menu) t.bg(k.hover) else t.hover(k.hover);
+        const base = ui.div(c).row().grow().h(29).px(8).gap(8).itemsCenter().rounded(8).clip();
+        // Hovered as GPUI's trigger is (its `hover_listener`): by the
+        // pointer's moves, not the keys.
+        const lh = kit.listenerHover(&a.view.hovers, if (a.view.filter_menu) base.bg(k.hover) else base, k.hover);
+        const t = lh.div;
         defer t.end();
         if (t.clicked()) if (a.view.filter_menu) menus.close(a) else menus.openProjects(a);
         if (c.rects.get(c.node(t.index).id)) |r| a.view.filter_anchor = r;
         icons.icon(c, .folder, 16, k.muted, 0);
-        const color = if (t.hovered() or a.view.filter_menu) k.text else k.text.alpha(0.8);
+        const color = if (lh.hovered) k.text else k.text.alpha(0.8);
         // The trigger less its insets, icon, chevron and gaps.
         const room = width - 16 - 2 * 29 - 2 * 4 - 16 - 16 - 14 - 2 * 8;
         if (a.findSpace(a.view.filter)) |s| {
@@ -617,13 +620,13 @@ fn sessionRow(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat) void
         ui.div(c).row().wFull().h(29).px(8).pt(6).pb(5).gap(4).itemsCenter().rounded(8).clip()
     else
         ui.div(c).column().wFull().h(rowHeight(a, ch)).px(8).py(6).gap(2).rounded(8).clip();
-    r = if (selected) r.bg(k.selected) else r.hover(k.hover);
+    // Hovered as GPUI's row is (its `hover_listener`): by the pointer's
+    // moves, so its menu opening under a still pointer leaves it hovered.
+    const lh = kit.listenerHover(&a.view.hovers, if (selected) r.bg(k.selected) else r, if (selected) k.selected else k.hover);
+    r = lh.div;
     defer r.end();
     // No hover while a session is dragged over the rows.
-    // Its menu open, the row stays as hovered: the menu's backdrop takes
-    // the pointer, but the GPUI app's row keeps its actions shown.
-    const menu_here = a.view.chat_menu.open and std.mem.eql(u8, a.view.chat_menu.id.items, ch.id);
-    const hovered = (r.hovered() or menu_here) and !@import("view_drag.zig").dragging(a);
+    const hovered = lh.hovered and !@import("view_drag.zig").dragging(a);
     var archive = false;
     var menu = false;
     const now = a.nowMs();

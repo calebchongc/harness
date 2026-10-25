@@ -217,6 +217,68 @@ pub fn secondaryClicked(d: ui.Div) bool {
     return false;
 }
 
+/// The menu cards drawn (`noteCard`), last frame's and this one's, for
+/// `pressedOutside`.
+var cards: [2][16]ui.Rect = undefined;
+var cards_n: [2]usize = .{ 0, 0 };
+
+/// A secondary press this frame (nanoui 0.7 has none).
+fn secondary(c: *ui.Context) bool {
+    return if (comptime @hasField(@TypeOf(c.input), "secondary")) c.input.secondary else false;
+}
+
+/// A new frame: this frame's cards become last frame's, and whether the
+/// pointer moved (or pressed) since the last.
+pub fn beginFrame(c: *ui.Context) void {
+    cards[0] = cards[1];
+    cards_n[0] = cards_n[1];
+    cards_n[1] = 0;
+    const m = c.input.mouse;
+    pointer_moved = m.x != last_mouse.x or m.y != last_mouse.y or c.input.pressed or secondary(c);
+    last_mouse = m;
+}
+
+var last_mouse: ui.Point = .{ .x = -1e6, .y = -1e6 };
+var pointer_moved = false;
+/// GPUI's `on_hover` listener (`motion::hover_listener`): the box's hover
+/// flips only when the pointer moves or presses, so a menu or dialog that
+/// opens under a still pointer leaves it hovered, and one that closes
+/// doesn't hover what was under it. Its fill eases as `Div.hover`'s.
+/// `hovers` keeps each box's, by id.
+pub fn listenerHover(hovers: *std.AutoHashMapUnmanaged(u64, bool), d: ui.Div, color: ui.Color) struct { div: ui.Div, hovered: bool } {
+    const c = d.c;
+    const id = c.node(d.index).id;
+    const gop = hovers.getOrPut(c.gpa, id) catch return .{ .div = d.hover(color), .hovered = d.hovered() };
+    if (!gop.found_existing) gop.value_ptr.* = false;
+    if (pointer_moved) gop.value_ptr.* = d.hovered();
+    const on = gop.value_ptr.*;
+    const t = c.animate(id, 0x484f56, if (on) 1 else 0, 18);
+    const st = &c.node(d.index).style;
+    const base = st.background orelse color.alpha(0);
+    st.background = base.mix(color, t);
+    return .{ .div = d, .hovered = on };
+}
+
+/// A menu card, as it was last drawn.
+pub fn noteCard(c: *ui.Context, d: ui.Div) void {
+    const r = c.rects.get(c.node(d.index).id) orelse return;
+    if (cards_n[1] == cards[1].len) return;
+    cards[1][cards_n[1]] = r;
+    cards_n[1] += 1;
+}
+
+/// `on_mouse_down_out`: a press (either button) begun this frame outside
+/// every menu card drawn last frame and outside `trigger`. The press goes
+/// on to what's under it, as GPUI's does; a menu not yet drawn isn't
+/// pressed out of.
+pub fn pressedOutside(c: *ui.Context, trigger: ?ui.Rect) bool {
+    if (!c.input.pressed and !secondary(c)) return false;
+    if (cards_n[0] == 0) return false;
+    if (trigger) |t| if (t.contains(c.input.mouse)) return false;
+    for (cards[0][0..cards_n[0]]) |r| if (r.contains(c.input.mouse)) return false;
+    return true;
+}
+
 pub fn shadowLg(d: ui.Div) ui.Div {
     if (comptime @hasDecl(ui.Shadow, "lg")) return d.shadows(&ui.Shadow.lg);
     return d.shadowLg();

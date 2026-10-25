@@ -65,4 +65,5 @@ test {
     _ = @import("tests_ui_palette.zig");
     _ = @import("tests_ui_archived.zig");
     _ = @import("tests_ui_devices.zig");
+    _ = @import("tests_ui_hover.zig");
 }

@@ -126,10 +126,10 @@ pub fn keys(c: *ui.Context, a: *App) void {
 pub fn menus(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (!anyOpen(a)) return;
     {
-        // A press anywhere else closes them (`on_mouse_down_out`).
-        const back = ui.div(c).fixed().offset(0, 0).size(c.size.w, c.size.h).layer(4);
-        defer back.end();
-        if (back.clicked()) return close(a);
+        // A press anywhere else closes them (`on_mouse_down_out`); their
+        // triggers toggle them themselves.
+        const trigger = if (a.view.filter_menu) a.view.filter_anchor else if (a.view.more_menu) a.view.more_anchor else null;
+        if (kit.pressedOutside(c, trigger)) return close(a);
     }
     if (a.view.filter_menu) if (a.view.filter_anchor) |r| projects(c, a, k, r);
     if (a.view.filter_menu and a.view.menus.ctx_at != null) spaceMenu(c, a, k);
@@ -372,6 +372,7 @@ fn card_(c: *ui.Context, k: theme.Colors, x: f32, y: f32, w: f32) ui.Div {
 /// outside closes the menu (`on_mouse_down_out`).
 pub fn held(d: ui.Div) ui.Div {
     _ = d.interaction();
+    kit.noteCard(d.c, d);
     return d;
 }
 

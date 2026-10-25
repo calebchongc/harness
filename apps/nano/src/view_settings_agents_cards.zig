@@ -84,10 +84,7 @@ pub fn deviceMenu(c: *ui.Context, a: *App, k: theme.Colors, at: ui.Rect) void {
     const p = &a.view.agents;
     {
         // A press anywhere else closes it (`on_mouse_down_out`).
-        ui.key(c, "agents-device-backdrop");
-        const back = ui.div(c).fixed().offset(0, 0).size(c.size.w, c.size.h).layer(4);
-        defer back.end();
-        if (back.clicked()) {
+        if (kit.pressedOutside(c, at)) {
             p.device_menu = false;
             return a.redraw();
         }

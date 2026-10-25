@@ -681,10 +681,9 @@ fn repoRow(c: *ui.Context, a: *App, k: theme.Colors, inst: *const runners.Instal
 /// (`anchored_menu_below_end`): "Default size", then each size.
 fn sizeMenu(c: *ui.Context, a: *App, k: theme.Colors, inst: *const runners.Installation, repo: *const runners.Repo, sizes: []const runners.Size, at: ui.Rect) void {
     {
-        // A press anywhere else closes it (`on_mouse_down_out`).
-        const back = ui.div(c).fixed().offset(0, 0).size(c.size.w, c.size.h).layer(4);
-        defer back.end();
-        if (back.clicked()) return closeSizeMenu(a);
+        // A press anywhere else closes it (`on_mouse_down_out`); its
+        // trigger toggles it itself.
+        if (kit.pressedOutside(c, at)) return closeSizeMenu(a);
     }
     const w: f32 = 260;
     const x = rules.snapToWindow(at.x + at.w - w, w, c.size.w, 8);

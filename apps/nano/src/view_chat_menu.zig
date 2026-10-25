@@ -102,9 +102,7 @@ fn menu(c: *ui.Context, a: *App, k: theme.Colors) void {
     const ch = a.findChat(m.id.items) orelse return close(a);
     {
         // A press anywhere else closes it (`on_mouse_down_out`).
-        const back = ui.div(c).fixed().offset(0, 0).size(c.size.w, c.size.h).layer(4);
-        defer back.end();
-        if (back.clicked()) return close(a);
+        if (kit.pressedOutside(c, null)) return close(a);
     }
     const w: f32 = 216;
     const h = a.view.chat_menu_h orelse 200;
