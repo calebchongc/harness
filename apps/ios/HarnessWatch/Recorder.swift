@@ -26,6 +26,19 @@ final class Recorder {
     static let maxSeconds: TimeInterval = 60
 
     func start(id: String) async {
+        if WatchStore.screen == "recording" {
+            // Screenshot rig: the simulator has no microphone, so the level is made up.
+            state = .recording(started: Date().addingTimeInterval(-7))
+            meter = Task { @MainActor [weak self] in
+                var t = 0.0
+                while !Task.isCancelled, let self {
+                    t += 0.35
+                    self.level = 0.25 + 0.55 * abs(sin(t)) * (0.6 + 0.4 * abs(sin(t * 2.7)))
+                    try? await Task.sleep(for: .milliseconds(80))
+                }
+            }
+            return
+        }
         guard await AVAudioApplication.requestRecordPermission() else {
             state = .denied
             return

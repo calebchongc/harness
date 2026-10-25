@@ -1,5 +1,5 @@
-// The Watch complication and Smart Stack widget (#322): one tap opens
-// Harness on the Watch already recording.
+// The Watch complication and Smart Stack widget (#322): the Harness mark,
+// one tap from recording a message for a chat.
 
 import SwiftUI
 import WidgetKit
@@ -21,6 +21,9 @@ struct DictateProvider: TimelineProvider {
     }
 }
 
+/// Codegraff Dark's amber, for faces that show full colour.
+private let amber = Color(red: 0xE8 / 255, green: 0xA3 / 255, blue: 0x3D / 255)
+
 struct DictateView: View {
     @Environment(\.widgetFamily) private var family
 
@@ -34,23 +37,33 @@ struct DictateView: View {
         switch family {
         case .accessoryRectangular:
             HStack(spacing: 8) {
-                Image(systemName: "mic.fill").font(.title3)
-                VStack(alignment: .leading, spacing: 0) {
+                HarnessMarkShape()
+                    .fill(amber)
+                    .widgetAccentable()
+                    .frame(width: 30, height: 30)
+                VStack(alignment: .leading, spacing: 1) {
                     Text("Harness").font(.headline)
-                    Text("Speak to a chat").font(.caption)
+                    Label("Speak to a chat", systemImage: "mic.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
             }
         case .accessoryInline:
             Label("Speak to Harness", systemImage: "mic.fill")
         case .accessoryCorner:
-            Image(systemName: "mic.fill")
-                .font(.title3)
-                .widgetLabel("Harness")
+            HarnessMarkShape()
+                .fill(amber)
+                .widgetAccentable()
+                .padding(4)
+                .widgetLabel("Speak")
         default:
             ZStack {
                 AccessoryWidgetBackground()
-                Image(systemName: "mic.fill").font(.title3)
+                HarnessMarkShape()
+                    .fill(amber)
+                    .widgetAccentable()
+                    .padding(9)
             }
         }
     }
