@@ -332,6 +332,13 @@ impl LoginFlow {
     }
 }
 
+/// The engine's replies to the page's calls, for headless scenes
+/// (examples/ui-scenes.rs `accounts`): `snapshot` (ListAgentAccounts),
+/// `codegraffUsage`, `codegraffJobs` and `graffLogins`.
+#[cfg(feature = "ui-scenes")]
+pub static SCENE_ACCOUNTS: std::sync::Mutex<Option<serde_json::Value>> =
+    std::sync::Mutex::new(None);
+
 pub struct AccountsPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
@@ -650,6 +657,12 @@ impl AccountsPage {
     }
 
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
+        #[cfg(feature = "ui-scenes")]
+        if let Some(fixture) = SCENE_ACCOUNTS.lock().ok().and_then(|f| f.clone()) {
+            self.load_scene(&fixture);
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.snapshot = Loadable::Error("Engine not connected".into());
             return;
@@ -678,6 +691,27 @@ impl AccountsPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// A headless scene's replies in place of the engine's
+    /// (`SCENE_ACCOUNTS`): each read as its call's would be.
+    #[cfg(feature = "ui-scenes")]
+    fn load_scene(&mut self, fixture: &serde_json::Value) {
+        fn read<T: serde::de::DeserializeOwned>(
+            fixture: &serde_json::Value,
+            key: &str,
+        ) -> Loadable<T> {
+            match serde_json::from_value(
+                fixture.get(key).cloned().unwrap_or(serde_json::Value::Null),
+            ) {
+                Ok(value) => Loadable::Ready(value),
+                Err(err) => Loadable::Error(err.to_string()),
+            }
+        }
+        self.snapshot = read(fixture, "snapshot");
+        self.codegraff_usage = read(fixture, "codegraffUsage");
+        self.codegraff_jobs = read(fixture, "codegraffJobs");
+        self.graff_logins = read(fixture, "graffLogins");
     }
 
     fn load_graff_logins(&mut self, cx: &mut Context<Self>) {

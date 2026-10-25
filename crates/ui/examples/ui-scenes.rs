@@ -41,6 +41,10 @@ struct Scene {
     /// `<name>-<NN>.png` and the step's cost noted in `<name>.steps.json`.
     #[serde(default)]
     steps: Vec<Step>,
+    /// Settings › Accounts' replies in place of the engine's
+    /// (`settings::accounts::SCENE_ACCOUNTS`).
+    #[serde(default)]
+    accounts: Option<serde_json::Value>,
 }
 
 /// One interaction, in points from the window's top left. Keys as
@@ -158,6 +162,7 @@ fn main() -> anyhow::Result<()> {
     let dispatcher = executor.dispatcher().as_bench().unwrap();
 
     for scene in scenes {
+        *settings::accounts::SCENE_ACCOUNTS.lock().unwrap() = scene.accounts.clone();
         app.update(|cx| {
             appearance::set_mode(
                 match scene.appearance {
