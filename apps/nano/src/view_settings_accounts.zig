@@ -23,6 +23,8 @@ const accounts = @import("accounts.zig");
 const rows = @import("view_settings_accounts_rows.zig");
 const login = @import("view_settings_accounts_login.zig");
 const graff = @import("view_settings_accounts_graff.zig");
+const cloud = @import("view_settings_accounts_sandboxes.zig");
+const sandboxes = @import("sandboxes.zig");
 const App = @import("app.zig").App;
 const Allocator = std.mem.Allocator;
 
@@ -99,8 +101,14 @@ pub const Page = struct {
     /// "You're using your ChatGPT plan", once, until Got it.
     confirmation: ?[]u8 = null,
     login: login.State = .{},
+    /// The account's cloud sandboxes (`CodegraffSandboxes`), and the card's
+    /// own state.
+    sandboxes: Slot(?sandboxes.List) = .{},
+    cloud: cloud.Cloud = .{},
 
     pub fn deinit(p: *Page, gpa: Allocator) void {
+        p.sandboxes.deinit(gpa);
+        p.cloud.deinit(gpa);
         p.snapshot.deinit(gpa);
         p.usage.deinit(gpa);
         p.jobs.deinit(gpa);
@@ -152,6 +160,7 @@ pub fn load(a: *App, t: accounts.Trigger) void {
     loadUsage(a);
     loadJobs(a);
     loadGraff(a);
+    cloud.refresh(a);
     p.snapshot.call = a.engine.call("ListAgentAccounts", .{ .forceUsage = accounts.forceUsage(t), .targetDeviceId = target(a) }, .of(App, a, handler("snapshot", accounts.parseSnapshot)));
 }
 
@@ -208,11 +217,17 @@ fn feed(a: *App, comptime field: []const u8, comptime parse: anytype, v: json.Va
         } else false else false;
         a.view.accounts.jobs_poll_at = if (working) a.now + jobs_poll_s else null;
     }
+    if (comptime std.mem.eql(u8, field, "sandboxes")) cloud.schedule(a);
+}
+
+/// The cloud sandboxes' answer (state/cloud_sandboxes.rs reads it).
+pub fn feedSandboxes(a: *App, v: json.Value) void {
+    feed(a, "sandboxes", sandboxes.parse, v);
 }
 
 /// A headless scene's replies in place of the engine's (snap.zig; the GPUI
 /// renderer's `SCENE_ACCOUNTS`): `snapshot`, `codegraffUsage`,
-/// `codegraffJobs` and `graffLogins`, as JSON text.
+/// `codegraffJobs`, `graffLogins` and `codegraffSandboxes`, as JSON text.
 pub var scene_accounts: ?[]const u8 = null;
 
 /// Each of the scene's replies read as its call's would be (`load_scene`).
@@ -223,6 +238,7 @@ fn loadScene(a: *App, text: []const u8) void {
     feed(a, "snapshot", accounts.parseSnapshot, o.get("snapshot") orelse .null);
     feed(a, "usage", accounts.parseUsage, o.get("codegraffUsage") orelse .null);
     feed(a, "jobs", accounts.parseJobs, o.get("codegraffJobs") orelse .null);
+    if (o.get("codegraffSandboxes")) |v| feedSandboxes(a, v);
     feed(a, "graff", accounts.parseGraffLogins, o.get("graffLogins") orelse .null);
     a.redraw();
 }
@@ -295,6 +311,7 @@ fn onSignOut(a: *App, _: u64, r: rpc.Reply) void {
     }
     loadUsage(a);
     loadJobs(a);
+    cloud.refresh(a);
     a.redraw();
 }
 
@@ -361,6 +378,7 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         } else c.frameIn(@floatCast(t - c.time));
     }
     login.tick(c, a);
+    cloud.tick(c, a);
     const now = a.nowMs();
     header(c, a, k);
     set.subtitle(c, k, "CodeGraff usage, graff's provider sign-ins, and the Claude Code, Codex, and Cursor logins on this device. Harness keeps local agent logins backed up and can swap between them.", false);
@@ -516,6 +534,7 @@ fn codegraff(c: *ui.Context, a: *App, k: theme.Colors, now: i64) void {
         }
     }
     jobsCard(c, a, k);
+    cloud.card(c, a, k);
 }
 
 /// The signed-in CodeGraff account: credits, 30 days' spend, the key budget.

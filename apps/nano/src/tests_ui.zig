@@ -1185,3 +1185,94 @@ test "Settings › Accounts: the add-account dialog's paste-code and browser bod
     h.t.settle(1);
     try testing.expect(p.login.flow == null);
 }
+
+const sandboxes_reply =
+    \\{"enabled": true,
+    \\ "sandboxes": [
+    \\  {"id": "sbx-run", "provider": "fleet", "name": "Field cloud", "state": "running", "harness": true, "keepRunning": false,
+    \\   "cpu": 2, "memoryGiB": 4, "pricePerHourMicroUsd": 100000},
+    \\  {"id": "sbx-bare", "provider": "fleet", "name": "Half set up", "state": "running", "harness": false},
+    \\  {"id": "sbx-nap", "provider": "fleet", "name": "Napping box", "state": "paused", "harness": true},
+    \\  {"id": "tmp-7", "provider": "daytona", "state": "paused", "tier": "ephemeral"}],
+    \\ "sizes": [
+    \\  {"id": "standard", "cpu": 2, "memoryGiB": 4, "diskGiB": 40, "pricePerHourMicroUsd": 100000, "default": true},
+    \\  {"id": "large", "cpu": 4, "memoryGiB": 8, "diskGiB": 80, "pricePerHourMicroUsd": 200000}]}
+;
+
+test "Settings › Accounts: cloud sandboxes with each one's buttons, Delete asking first, the size choice, and the running strip" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.t.resize(1200, 2400);
+    openAccounts(&h);
+    try testing.expect(!h.t.hasText("Cloud sandboxes"));
+    try accountsReply(&h, "feedSandboxes", sandboxes_reply);
+    for ([_][]const u8{
+        "Cloud sandboxes",
+        "Field cloud",
+        "Running · 2 vCPU · 4 GB · $0.10/h",
+        "Keep running",
+        "Half set up",
+        "Running · Harness not set up",
+        "Set up Harness",
+        "Napping box",
+        "Paused — memory and files kept",
+        "Start",
+        "Temporary sandbox",
+        "Paused",
+        "Copy ID",
+        "Harness cloud",
+        "Standard",
+        "2 vCPU · 4 GB · 40 GB · $0.10/h",
+        "Large",
+        "4 vCPU · 8 GB · 80 GB · $0.20/h",
+        "Create",
+        "Create temporary",
+        // The strip in the settings sidebar: two running, so Turn off all.
+        "Turn off all",
+    }) |want| {
+        if (!h.t.hasText(want)) std.debug.print("missing: {s}\n", .{want});
+        try testing.expect(h.t.hasText(want));
+    }
+    try testing.expect(h.t.containsText("Cloud sandbox"));
+    // Cut to the strip's width: "Billed per second until you turn it off".
+    try testing.expect(h.t.containsText("Billed per"));
+    h.snap("accounts-sandboxes");
+    const cl = &h.a.view.accounts.cloud;
+    // Delete asks first; nothing is sent.
+    var deletes: usize = 0;
+    for (h.t.ctx.nodes.items) |n| switch (n.content) {
+        .text => |t| if (std.mem.eql(u8, t.str, "Delete")) {
+            deletes += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 4), deletes);
+    try h.t.clickText("Delete");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Delete for good?"));
+    try testing.expectEqualStrings("sbx-run", cl.confirm_delete.?);
+    try testing.expect(cl.busy == null);
+    // Copy ID puts the temporary one's id on the clipboard.
+    try h.t.clickText("Copy ID");
+    h.t.settle(1);
+    try testing.expectEqualStrings("tmp-7", h.t.clipboard.items);
+    // The size choice: Standard by default, Large once picked.
+    try testing.expect(cl.size == null);
+    try h.t.clickText("Large");
+    h.t.settle(1);
+    try testing.expectEqualStrings("large", cl.size.?);
+    // Without an engine, Create starts nothing.
+    try h.t.clickText("Create");
+    h.t.settle(1);
+    try testing.expect(!cl.creating);
+    // A Turn off under way reads so, and dims its row's buttons.
+    cl.busy = try testing.allocator.dupe(u8, "sbx-run");
+    cl.busy_action = "stop";
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Turning off…"));
+    // Where the feature is off, no card and no strip.
+    try accountsReply(&h, "feedSandboxes", "{\"enabled\": false, \"sandboxes\": []}");
+    try testing.expect(!h.t.hasText("Cloud sandboxes"));
+    try testing.expect(!h.t.hasText("Turn off all"));
+}
