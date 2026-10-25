@@ -159,8 +159,10 @@ fn chip(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (b.clicked()) a.togglePicker();
     if (c.rects.get(c.node(b.index).id)) |r| a.view.chip_anchor = r;
     // Before the engine lists them: the glyph spinner for an agent not yet
-    // known, a pulsing bar for its model (`trigger_chip` loading).
-    if (a.harnesses.items.len == 0) {
+    // known (an open chat's is: its own), a pulsing bar for its model
+    // (`trigger_chip` loading, `chip_icon_loading`).
+    const chat_harness = if (a.selected) |id| (if (a.findChat(id)) |ch| ch.harness != null else false) else false;
+    if (a.harnesses.items.len == 0 and !chat_harness) {
         kit.snake(c, k);
     } else {
         const mark = icons.harnessMark(t.harness);

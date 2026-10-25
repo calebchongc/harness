@@ -29,6 +29,23 @@ pub fn view(a: *App, c: *ui.Context) void {
     a.ansi = k.ansi;
     if (a.tick(c.time)) |wait| c.frameIn(wait);
     c.title_bar_height = sidebar.titlebar_h;
+    // A live snapshot asking for Settings (nanoui's NANOUI_LIVE_SNAPSHOT,
+    // "settings" or "settings:<section>"): drawn in that frame alone, which
+    // isn't shown; what the window shows is put back after.
+    const peek: []const u8 = if (comptime @hasField(ui.Context, "snapshot_request")) c.snapshot_request else "";
+    const Shown = struct { open: bool, section: @import("settings.zig").Section };
+    var shown: ?Shown = null;
+    if (std.mem.startsWith(u8, peek, "settings")) {
+        shown = .{ .open = a.view.settings_open, .section = a.settings.section };
+        a.view.settings_open = true;
+        if (std.mem.indexOfScalar(u8, peek, ':')) |at| if (@import("settings.zig").Section.fromKey(peek[at + 1 ..])) |sec| {
+            a.settings.section = sec;
+        };
+    }
+    defer if (shown) |was| {
+        a.view.settings_open = was.open;
+        a.settings.section = was.section;
+    };
     // Text breaks into lines where the GPUI app breaks it, with a nanoui
     // that has its rule (justrach/nanoui gpui-wrap).
     if (comptime @hasField(@TypeOf(c.text.*), "wrap_rule")) c.text.wrap_rule = .glyph_positions;
