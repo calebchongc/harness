@@ -45,6 +45,14 @@ struct Scene {
     /// (`settings::accounts::SCENE_ACCOUNTS`).
     #[serde(default)]
     accounts: Option<serde_json::Value>,
+    /// Made-up engine replies, by method: the app gets an engine that
+    /// answers each call with its entry (`{"$items": [...]}` streams them,
+    /// then ends), and "isn't in this scene" for any other.
+    #[serde(default)]
+    replies: Option<serde_json::Map<String, serde_json::Value>>,
+    /// More devices, after this one ("Studio").
+    #[serde(default)]
+    devices: Vec<serde_json::Value>,
 }
 
 /// One interaction, in points from the window's top left. Keys as
@@ -196,6 +204,11 @@ fn main() -> anyhow::Result<()> {
                     }))
                     .unwrap(),
                 ];
+                for d in &scene.devices {
+                    if let Ok(d) = serde_json::from_value(d.clone()) {
+                        s.devices.push(d);
+                    }
+                }
                 s.spaces = scene.spaces.clone();
                 s.chats = scene.chats.clone();
                 s.selected_chat = scene.selected_chat.clone();
@@ -209,6 +222,12 @@ fn main() -> anyhow::Result<()> {
                 s
             })
         });
+        if let Some(replies) = scene.replies.clone() {
+            app.update(|cx| {
+                let engine = scene_engine(gpui_tokio::Tokio::handle(cx), replies);
+                state.update(cx, |s, _| s.set_test_engine(engine));
+            });
+        }
         let boot = EngineBootConfig {
             data_dir: data_dir.clone(),
             ipc_port: 0,
@@ -388,4 +407,61 @@ fn perform(window: &mut gpui::Window, cx: &mut gpui::App, step: &Step) {
         }
         Step::Wait { .. } => {}
     }
+}
+
+/// An engine whose replies are the scene's (`Scene::replies`).
+fn scene_engine(
+    runtime: tokio::runtime::Handle,
+    replies: serde_json::Map<String, serde_json::Value>,
+) -> state::EngineHandle {
+    let _guard = runtime.enter();
+    let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+    let (answers, inbound) = tokio::sync::mpsc::channel::<String>(256);
+    let client = harness_rpc::RpcClient::new(out, inbound);
+    runtime.spawn(async move {
+        while let Some(payload) = requests.recv().await {
+            for line in payload.lines() {
+                let Ok(frame) = serde_json::from_str::<harness_rpc::ClientFrame>(line) else {
+                    continue;
+                };
+                let Some(method) = frame.method else {
+                    continue;
+                };
+                let id = frame.id;
+                let mut frames = Vec::new();
+                match replies.get(&method) {
+                    Some(reply) if reply.get("$items").is_some() => {
+                        for item in reply["$items"].as_array().cloned().unwrap_or_default() {
+                            frames.push(harness_rpc::ServerFrame {
+                                id,
+                                item: Some(item),
+                                ..Default::default()
+                            });
+                        }
+                        frames.push(harness_rpc::ServerFrame {
+                            id,
+                            done: true,
+                            ..Default::default()
+                        });
+                    }
+                    Some(reply) => frames.push(harness_rpc::ServerFrame {
+                        id,
+                        ok: Some(reply.clone()),
+                        ..Default::default()
+                    }),
+                    None => frames.push(harness_rpc::ServerFrame {
+                        id,
+                        err: Some(format!("{method} isn't in this scene")),
+                        ..Default::default()
+                    }),
+                }
+                for frame in frames {
+                    if let Ok(text) = serde_json::to_string(&frame) {
+                        let _ = answers.send(text).await;
+                    }
+                }
+            }
+        }
+    });
+    state::EngineHandle::from_test_client(client)
 }
