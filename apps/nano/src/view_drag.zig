@@ -93,9 +93,10 @@ pub fn overlay(c: *ui.Context, a: *App, k: theme.Colors) void {
     };
     for (targets) |z| {
         const hot = over != null and over.?.axis == z.axis;
-        // GPUI dashes its border; nanoui draws it solid.
-        const box = ui.div(c).fixed().offset(z.rect.x, z.rect.y).size(z.rect.w, z.rect.h).layer(6).center().rounded(12)
+        var box = ui.div(c).fixed().offset(z.rect.x, z.rect.y).size(z.rect.w, z.rect.h).layer(6).center().rounded(12)
             .border(if (hot) k.accent.alpha(0.7) else k.border).borderW(1).bg(if (hot) k.accent.alpha(0.14) else k.ink(0.02));
+        // Dashed, as GPUI's, with a nanoui that dashes (justrach/nanoui#21).
+        if (comptime @hasDecl(ui.Div, "dashed")) box = box.dashed();
         defer box.end();
         ui.text(c, z.label, .{ .size = 12.5, .line_height = 12.5 * 1.618, .color = if (hot) k.accent else k.muted });
     }
