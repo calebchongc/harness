@@ -29,6 +29,8 @@ pub const View = struct {
     filter: ?[]u8 = null,
     filter_menu: bool = false,
     more_menu: bool = false,
+    /// The header's project and view menus (view_sidebar_menus.zig).
+    menus: @import("view_sidebar_menus.zig").State = .{},
     search_open: bool = false,
     search: nanoui.ui.TextBuffer = .{},
     sessions_open: bool = true,
@@ -78,6 +80,7 @@ pub const View = struct {
         v.drag.deinit(gpa);
         v.chat_menu.id.deinit(gpa);
         v.dialogs.deinit(gpa);
+        v.menus.deinit(gpa);
         if (v.filter) |f| gpa.free(f);
         var it = v.groups.keyIterator();
         while (it.next()) |key| gpa.free(key.*);
@@ -419,6 +422,20 @@ pub const App = struct {
         a.redraw();
     }
 
+    /// The sessions in the sidebar's order (Settings' `sidebarSort`).
+    pub fn resort(a: *App) void {
+        workspace.sortChatsBy(a.chats.items, a.settings.sort() == .created);
+    }
+
+    /// The sidebar's project filter, kept in the settings as the GPUI app
+    /// keeps it; with no session open, the new one goes there too.
+    pub fn setSpaceFilter(a: *App, id: ?[]const u8) void {
+        a.view.setFilter(a.gpa, id);
+        a.settings.setSpaceFilter(id);
+        if (id) |s| if (a.selected == null) a.select(null, s);
+        a.redraw();
+    }
+
     pub fn deviceName(a: *const App, id: ?[]const u8) []const u8 {
         const want = id orelse return "Unknown device";
         for (a.devices.items) |d| if (std.mem.eql(u8, d.id, want)) return d.name;
@@ -613,7 +630,7 @@ pub const App = struct {
         switch (r) {
             .item => |v| {
                 a.chats.replace(v) catch {};
-                workspace.sortChats(a.chats.items);
+                a.resort();
                 // The open chat's agent and folder are known now: list its
                 // models, and fill panels that waited for them.
                 a.ensureModels(a.target().harness);

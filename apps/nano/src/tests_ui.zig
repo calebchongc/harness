@@ -453,6 +453,10 @@ test "Rename… opens its dialog holding the title, Escape closes it; Delete… 
     h.t.settle(1);
     try testing.expect(h.t.hasText("Rename session"));
     try testing.expectEqualStrings("Beta", h.a.view.dialogs.name.text());
+    // Its field has the keys once the menu under it is gone.
+    h.t.typeText(" two");
+    h.t.settle(1);
+    try testing.expectEqualStrings("Beta two", h.a.view.dialogs.name.text());
     h.snap("rename-dialog");
     h.press(.{ .key = ui.Shortcut.escape });
     try testing.expect(!h.t.hasText("Rename session"));
@@ -466,4 +470,222 @@ test "Rename… opens its dialog holding the title, Escape closes it; Delete… 
     h.t.settle(1);
     try testing.expect(!h.t.hasText("Delete session?"));
     try testing.expect(h.a.findChat("b") != null);
+}
+
+/// A right-click, with a nanoui that has them; the test is skipped before.
+fn rightClick(h: *Harness, x: f32, y: f32) !void {
+    if (comptime !@hasDecl(ui.Tester, "secondaryClick")) return error.SkipZigTest;
+    h.t.secondaryClick(x, y);
+}
+
+/// Projects on this device and on one away since September, with a
+/// session in each of two.
+fn withProjects(h: *Harness) !void {
+    const spaces =
+        \\[{"id":"s1","deviceId":"d","path":"/work/fieldnotes"},
+        \\ {"id":"s2","deviceId":"d","path":"/work/Ledger"},
+        \\ {"id":"s3","deviceId":"far","path":"/work/attic"},
+        \\ {"id":"s4","deviceId":"d","path":"/work/atlas"}]
+    ;
+    const devices =
+        \\[{"id":"d","name":"Studio","platform":"macos","lastSeenAt":null},
+        \\ {"id":"far","name":"Cabin","platform":"linux","lastSeenAt":"2026-09-01T00:00:00Z"}]
+    ;
+    const in_spaces =
+        \\[{"id":"a","deviceId":"d","title":"Alpha","spaceId":"s1","archived":false,"lastMessageAt":"2026-10-03T00:00:00Z","createdAt":"2026-09-01T00:00:00Z"},
+        \\ {"id":"b","deviceId":"d","title":"Beta","spaceId":"s2","archived":false,"lastMessageAt":"2026-10-02T00:00:00Z","createdAt":"2026-10-01T00:00:00Z"}]
+    ;
+    inline for (.{ .{ spaces, &h.a.spaces }, .{ devices, &h.a.devices }, .{ in_spaces, &h.a.chats } }) |l| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, l[0], .{});
+        defer parsed.deinit();
+        try l[1].replace(parsed.value);
+    }
+    h.a.resort();
+    if (h.a.device_id) |old| testing.allocator.free(old);
+    h.a.device_id = try testing.allocator.dupe(u8, "d");
+    h.t.settle(1);
+}
+
+test "the project menu: All projects, then by name with the away device's last; a search ranks them; ↓ and Return pick one" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try withProjects(&h);
+    const menus = @import("view_sidebar_menus.zig");
+    try h.t.clickText("All projects");
+    h.t.settle(1);
+    try testing.expect(h.a.view.filter_menu);
+    try testing.expect(h.t.hasText("New project"));
+    try testing.expect(h.t.hasText("Offline"));
+    try testing.expect(h.t.hasText("@ Cabin"));
+    h.snap("project-menu");
+    const rows = try menus.projectRows(&h.a, testing.allocator);
+    defer testing.allocator.free(rows);
+    try testing.expectEqual(menus.Row.all, rows[0]);
+    const want = [_][]const u8{ "s4", "s1", "s2", "s3" };
+    for (want, rows[1..]) |id, r| try testing.expectEqualStrings(id, r.space);
+    // The search takes the keys: "le" puts Ledger first.
+    h.t.typeText("le");
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("All projects") or h.t.findText("All projects").?.y < 120);
+    h.press(.{ .key = ui.Shortcut.enter });
+    try testing.expect(!h.a.view.filter_menu);
+    try testing.expectEqualStrings("s2", h.a.view.filter.?);
+    // Only Ledger's session is listed (Alpha stays on as its tab's title).
+    try testing.expect(h.t.hasText("Beta"));
+    try testing.expect(h.t.findText("Alpha").?.y < 80);
+    try testing.expectEqualStrings("s2", h.a.settings.spaceFilter().?);
+    // Back to all, by the keys from the filter's own row.
+    try h.t.clickText("Ledger");
+    h.t.settle(1);
+    try testing.expectEqual(@as(usize, 3), h.a.view.menus.active);
+    h.press(.{ .key = ui.Shortcut.up });
+    h.press(.{ .key = ui.Shortcut.up });
+    h.press(.{ .key = ui.Shortcut.up });
+    h.press(.{ .key = ui.Shortcut.enter });
+    try testing.expect(h.a.view.filter == null);
+    try testing.expect(h.a.settings.spaceFilter() == null);
+}
+
+test "the project menu closes on Escape, and on a press outside; New project is last" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try withProjects(&h);
+    try h.t.clickText("All projects");
+    h.t.settle(1);
+    h.press(.{ .key = ui.Shortcut.escape });
+    try testing.expect(!h.a.view.filter_menu);
+    try h.t.clickText("All projects");
+    h.t.settle(1);
+    h.t.click(700, 600);
+    h.t.settle(1);
+    try testing.expect(!h.a.view.filter_menu);
+    try testing.expect(h.t.findText("New project") == null);
+}
+
+test "the view menu: Sort › Created reorders the sessions; Show › Archived and Compact switch and are kept" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try withProjects(&h);
+    // Alpha was called last: first.
+    try testing.expectEqualStrings("a", h.a.chats.items[0].id);
+    const more = h.a.view.more_anchor.?;
+    h.t.click(more.x + more.w / 2, more.y + more.h / 2);
+    h.t.settle(1);
+    try testing.expect(h.a.view.more_menu);
+    try testing.expect(h.t.hasText("Last called"));
+    h.snap("view-menu");
+    const sort = h.t.findText("Sort").?;
+    h.t.moveTo(sort.x + 4, sort.y + sort.h / 2);
+    h.t.settle(1);
+    try testing.expect(h.t.containsText("S\u{200A}O\u{200A}R\u{200A}T"));
+    h.snap("view-menu-sort");
+    try h.t.clickText("Created");
+    h.t.settle(1);
+    try testing.expectEqual(@import("settings.zig").Sort.created, h.a.settings.sort());
+    // Beta was made last: first now; the menu stays, its value updated.
+    try testing.expect(h.a.view.more_menu);
+    try testing.expectEqualStrings("b", h.a.chats.items[0].id);
+    const show = h.t.findText("Show").?;
+    h.t.moveTo(show.x + 4, show.y + show.h / 2);
+    h.t.settle(1);
+    try h.t.clickText("Archived");
+    h.t.settle(1);
+    try testing.expect(!h.a.settings.get(.sidebar_show_archived));
+    // Show's menu stays open for the next switch.
+    try testing.expect(h.t.hasText("Project icon"));
+    try h.t.clickText("Compact");
+    h.t.settle(1);
+    try testing.expect(!h.a.settings.get(.sidebar_compact));
+    h.press(.{ .key = ui.Shortcut.escape });
+    h.press(.{ .key = ui.Shortcut.escape });
+    try testing.expect(!h.a.view.more_menu);
+}
+
+test "a right-click on a session's row opens its menu where it's clicked" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try withProjects(&h);
+    const beta = h.t.findText("Beta").?;
+    try rightClick(&h, beta.x + 4, beta.y + beta.h / 2);
+    h.t.settle(1);
+    try testing.expect(h.a.view.chat_menu.open);
+    try testing.expectEqualStrings("b", h.a.view.chat_menu.id.items);
+    try testing.expect(h.t.hasText("Rename…"));
+    // Not a click: Beta isn't opened.
+    try testing.expectEqualStrings("a", h.a.selected.?);
+}
+
+test "a project right-clicked in the project menu: Rename… and Remove…, each asking first" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try withProjects(&h);
+    try h.t.clickText("All projects");
+    h.t.settle(1);
+    const ledger = h.t.findText("Ledger").?;
+    try rightClick(&h, ledger.x + 4, ledger.y + ledger.h / 2);
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Rename…"));
+    try testing.expect(h.t.hasText("Remove…"));
+    h.snap("space-menu");
+    try h.t.clickText("Remove…");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Remove project?"));
+    try testing.expect(h.t.containsText("permanently deletes its 1 session on Studio"));
+    h.snap("remove-project");
+    // Escape closes the dialog alone; the project menu is still there.
+    h.press(.{ .key = ui.Shortcut.escape });
+    try testing.expect(!h.t.hasText("Remove project?"));
+    try testing.expect(h.a.view.filter_menu);
+    const again = h.t.findText("Ledger").?;
+    try rightClick(&h, again.x + 4, again.y + again.h / 2);
+    h.t.settle(1);
+    try h.t.clickText("Rename…");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Rename project"));
+    try testing.expectEqualStrings("Ledger", h.a.view.dialogs.name.text());
+    // The field has the keys, the menu under it gone or not.
+    h.t.typeText(" books");
+    h.t.settle(1);
+    try testing.expectEqualStrings("Ledger books", h.a.view.dialogs.name.text());
+    // Return in the field is the dialog's, not the menu's.
+    h.t.textOps(&.{.{ .command = .insert_newline }});
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Rename project"));
+    try testing.expect(h.a.view.filter == null);
+}
+
+test "Organize › By project heads each project's sessions; Compact off shows where each runs" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try withProjects(&h);
+    h.a.settings.setText("sidebarOrganization", "byProject");
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Sessions"));
+    try testing.expect(h.t.hasText("fieldnotes"));
+    try testing.expect(h.t.hasText("Ledger"));
+    // fieldnotes' session was called last: its group first.
+    try testing.expect(h.t.findText("fieldnotes").?.y < h.t.findText("Ledger").?.y);
+    h.snap("organize-by-project");
+    // A group shut says how many it holds.
+    try h.t.clickText("Ledger");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Ledger (1)"));
+    h.a.settings.setText("sidebarOrganization", "byDevice");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Studio"));
+    h.a.settings.setText("sidebarOrganization", "inOneList");
+    h.a.settings.set(.sidebar_compact, false);
+    h.t.settle(1);
+    // (The open chat's header says "fieldnotes @ Studio" too.)
+    try testing.expect(h.t.hasText("Ledger @ Studio"));
+    h.snap("expanded-rows");
+    h.a.settings.set(.sidebar_show_project_label, false);
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Ledger @ Studio"));
 }

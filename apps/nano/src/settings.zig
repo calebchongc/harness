@@ -97,6 +97,13 @@ pub const Prefs = struct {
     escape_stops_active_agent: bool = false,
     transcript_compact_mode: bool = false,
     pause_animations_in_background: bool = false,
+    // The sidebar's ⋯ menu (`sidebar_*`): all on, as the GPUI app's.
+    sidebar_compact: bool = true,
+    sidebar_show_project_icon: bool = true,
+    sidebar_show_harness: bool = true,
+    sidebar_show_branch: bool = true,
+    sidebar_show_project_label: bool = true,
+    sidebar_show_archived: bool = true,
 };
 
 /// One of `Prefs`'s switches.
@@ -115,7 +122,47 @@ pub const Flag = enum {
     escape_stops_active_agent,
     transcript_compact_mode,
     pause_animations_in_background,
+    sidebar_compact,
+    sidebar_show_project_icon,
+    sidebar_show_harness,
+    sidebar_show_branch,
+    sidebar_show_project_label,
+    sidebar_show_archived,
 };
+
+/// How the sidebar groups sessions (`SidebarOrganization`), as saved.
+pub const Organization = enum {
+    by_device,
+    by_project,
+    in_one_list,
+
+    pub fn key(o: Organization) []const u8 {
+        return switch (o) {
+            .by_device => "byDevice",
+            .by_project => "byProject",
+            .in_one_list => "inOneList",
+        };
+    }
+};
+
+/// The sessions' order (`SidebarSort`): when last prompted, or made.
+pub const Sort = enum {
+    last_updated,
+    created,
+
+    pub fn key(o: Sort) []const u8 {
+        return switch (o) {
+            .last_updated => "lastUpdated",
+            .created => "created",
+        };
+    }
+};
+
+fn fromKey(comptime E: type, k: ?[]const u8, default: E) E {
+    const want = k orelse return default;
+    inline for (comptime std.enums.values(E)) |e| if (std.mem.eql(u8, e.key(), want)) return e;
+    return default;
+}
 
 comptime {
     // A switch for every pref, and a pref for every switch.
@@ -376,6 +423,25 @@ pub const Store = struct {
         s.set(flag, !s.get(flag));
     }
 
+    pub fn organization(s: *const Store) Organization {
+        return fromKey(Organization, s.text("sidebarOrganization"), .in_one_list);
+    }
+
+    pub fn sort(s: *const Store) Sort {
+        return fromKey(Sort, s.text("sidebarSort"), .last_updated);
+    }
+
+    /// The sidebar's project filter (`spaceFilter`): a space's id, or all.
+    pub fn spaceFilter(s: *const Store) ?[]const u8 {
+        return s.text("spaceFilter");
+    }
+
+    pub fn setSpaceFilter(s: *Store, id: ?[]const u8) void {
+        if (id) |v| return s.setText("spaceFilter", v);
+        _ = s.doc.orderedRemove("spaceFilter");
+        s.write("spaceFilter", .null);
+    }
+
     /// The page last shown, for the next time Settings opens.
     pub fn setSection(s: *Store, sec: Section) void {
         s.section = sec;
@@ -453,4 +519,24 @@ test "the file's switches are read, and a change keeps every other key" {
     // A file that isn't there, or isn't JSON, starts from nothing.
     const fresh = try merged(arena.allocator(), "not json", "filesShowAll", .{ .bool = true });
     try testing.expect((try json.parseFromSliceLeaky(json.Value, arena.allocator(), fresh, .{})).object.get("filesShowAll").?.bool);
+}
+
+test "the sidebar's view options read as the GPUI app saves them" {
+    var s: Store = .{ .gpa = testing.allocator, .io = testing.io };
+    defer s.deinit();
+    try testing.expectEqual(Organization.in_one_list, s.organization());
+    try testing.expectEqual(Sort.last_updated, s.sort());
+    try testing.expect(s.get(.sidebar_compact) and s.get(.sidebar_show_archived));
+    try testing.expect(s.spaceFilter() == null);
+    s.apply(
+        \\{"sidebarOrganization":"byProject","sidebarSort":"created","sidebarCompact":false,"spaceFilter":"s1"}
+    );
+    try testing.expectEqual(Organization.by_project, s.organization());
+    try testing.expectEqual(Sort.created, s.sort());
+    try testing.expect(!s.get(.sidebar_compact));
+    try testing.expectEqualStrings("s1", s.spaceFilter().?);
+    s.setSpaceFilter(null);
+    try testing.expect(s.spaceFilter() == null);
+    s.setText("sidebarOrganization", "nonsense");
+    try testing.expectEqual(Organization.in_one_list, s.organization());
 }

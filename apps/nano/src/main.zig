@@ -16,6 +16,7 @@ pub fn main(init: std.process.Init) !void {
     defer a.deinit();
     a.new_harness = try init.gpa.dupe(u8, init.environ_map.get("HARNESS_NANO_HARNESS") orelse "graff");
     a.settings = .open(init.gpa, init.io, init.environ_map);
+    a.view.setFilter(init.gpa, a.settings.spaceFilter());
     // System, Light or Dark, as Settings › Appearance has it.
     a.dark = switch (@import("view_settings_appearance.zig").mode(&a)) {
         .system => null,

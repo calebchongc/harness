@@ -118,6 +118,13 @@ pub fn dot(c: *ui.Context, size: f32, color: ui.Color) void {
 
 /// GPUI's `shadow_lg` (Tailwind's): two faint layers, with a nanoui that
 /// has layered shadows (justrach/nanoui#21); its own large one before.
+/// A right-click on `d` (its context menu), with a nanoui that has them
+/// (justrach/nanoui secondary clicks); never, before.
+pub fn secondaryClicked(d: ui.Div) bool {
+    if (comptime @hasDecl(ui.Div, "secondaryClicked")) return d.secondaryClicked();
+    return false;
+}
+
 pub fn shadowLg(d: ui.Div) ui.Div {
     if (comptime @hasDecl(ui.Shadow, "lg")) return d.shadows(&ui.Shadow.lg);
     return d.shadowLg();

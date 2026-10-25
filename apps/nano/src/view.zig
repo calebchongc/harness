@@ -35,12 +35,13 @@ pub fn view(a: *App, c: *ui.Context) void {
     {
         const root = ui.div(c).row().sizeFull().bg(k.shell);
         defer root.end();
-        if (a.view.settings_open) {
-            settings_view.nav(c, a, k);
-            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.border }, .none, null);
-        } else if (a.view.sidebar_open) {
-            sidebar.sidebar(c, a, k);
-            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.border }, .none, null);
+        if (a.view.settings_open or a.view.sidebar_open) {
+            // The edge is drawn over the sidebar's last column, as the
+            // GPUI app's: on its colour, and the rows keep all 256 points.
+            const side = ui.div(c).row().hFull();
+            defer side.end();
+            if (a.view.settings_open) settings_view.nav(c, a, k) else sidebar.sidebar(c, a, k);
+            ui.div(c).absolute().offset(sidebar.width - 1, 0).size(1, c.size.h).bg(k.border).end();
         }
         const main = ui.div(c).row().grow().w(0).hFull();
         defer main.end();
@@ -71,6 +72,7 @@ pub fn view(a: *App, c: *ui.Context) void {
     @import("view_diffs.zig").overlays(c, a, k);
     @import("view_actions.zig").overlays(c, a, k);
     @import("view_menus.zig").menus(c, a, k);
+    @import("view_sidebar_menus.zig").menus(c, a, k);
     @import("view_picker.zig").popover(c, a, k);
     @import("view_drag.zig").overlay(c, a, k);
     @import("view_chat_menu.zig").overlays(c, a, k);
@@ -186,6 +188,13 @@ fn keys(c: *ui.Context, a: *App) void {
     // A shortcut being rebound takes the keys first.
     const rebinding = @import("view_settings_shortcuts.zig");
     if (rebinding.recording(a)) return rebinding.capture(c, a);
+    // A dialog has the keys; else an open header menu takes Escape, the
+    // arrows and Return.
+    const chat_menu = @import("view_chat_menu.zig");
+    const header_menus = @import("view_sidebar_menus.zig");
+    if (chat_menu.anyDialog(a)) {
+        if (c.shortcut(.{ .key = S.escape })) chat_menu.dismiss(a);
+    } else if (header_menus.anyOpen(a)) header_menus.keys(c, a);
     if (c.shortcut(.{ .key = 'b', .cmd = true })) a.view.sidebar_open = !a.view.sidebar_open;
     if (c.shortcut(.{ .key = ',', .cmd = true })) settings_view.open(a);
     if (a.selected != null and c.shortcut(.{ .key = 'e', .cmd = true })) @import("app_files.zig").toggle(a);

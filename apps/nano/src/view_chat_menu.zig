@@ -26,6 +26,9 @@ pub const Dialogs = struct {
     name: ui.TextBuffer = .{},
     focus_name: bool = false,
     delete: ?std.ArrayList(u8) = null,
+    /// They're a project's (the project menu's Rename… and Remove…), not
+    /// a session's.
+    space: bool = false,
 
     pub fn deinit(d: *Dialogs, gpa: std.mem.Allocator) void {
         if (d.rename) |*r| r.deinit(gpa);
@@ -48,7 +51,32 @@ fn close(a: *App) void {
 
 /// Whether a menu or dialog of these is up, for Escape.
 pub fn anyOpen(a: *const App) bool {
-    return a.view.chat_menu.open or a.view.dialogs.rename != null or a.view.dialogs.delete != null;
+    return a.view.chat_menu.open or anyDialog(a);
+}
+
+/// A dialog is up: it has the keys.
+pub fn anyDialog(a: *const App) bool {
+    return a.view.dialogs.rename != null or a.view.dialogs.delete != null;
+}
+
+/// Rename… on a project (`open_rename_space`): its name to edit.
+pub fn renameSpace(a: *App, space: workspace.Space) void {
+    var id: std.ArrayList(u8) = .empty;
+    id.appendSlice(a.gpa, space.id) catch return;
+    if (a.view.dialogs.rename) |*old| old.deinit(a.gpa);
+    a.view.dialogs.rename = id;
+    a.view.dialogs.space = true;
+    a.view.dialogs.name.set(space.name);
+    a.view.dialogs.focus_name = true;
+}
+
+/// Remove… on a project: asks first (`delete_space_confirm`).
+pub fn removeSpace(a: *App, space_id: []const u8) void {
+    var id: std.ArrayList(u8) = .empty;
+    id.appendSlice(a.gpa, space_id) catch return;
+    if (a.view.dialogs.delete) |*old| old.deinit(a.gpa);
+    a.view.dialogs.delete = id;
+    a.view.dialogs.space = true;
 }
 
 /// Escape: the dialog, else the menu.
@@ -81,8 +109,8 @@ fn menu(c: *ui.Context, a: *App, k: theme.Colors) void {
     const h = a.view.chat_menu_h orelse 200;
     const x = std.math.clamp(m.at.x, 8, c.size.w - 8 - w);
     const y = std.math.clamp(m.at.y, 8, c.size.h - 8 - h);
-    const card = kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(5).gap(2)
-        .bg(k.composer).border(k.border).borderW(1).rounded(12));
+    const card = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(5).gap(2)
+        .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer card.end();
     if (c.rects.get(c.node(card.index).id)) |r| a.view.chat_menu_h = r.h;
     switch (m.page) {
@@ -105,6 +133,7 @@ fn menu(c: *ui.Context, a: *App, k: theme.Colors) void {
                 id.appendSlice(a.gpa, ch.id) catch return;
                 if (a.view.dialogs.delete) |*old| old.deinit(a.gpa);
                 a.view.dialogs.delete = id;
+                a.view.dialogs.space = false;
             }
         },
         .copy => {
@@ -216,12 +245,15 @@ fn startRename(a: *App, ch: workspace.Chat) void {
     id.appendSlice(a.gpa, ch.id) catch return;
     if (a.view.dialogs.rename) |*old| old.deinit(a.gpa);
     a.view.dialogs.rename = id;
+    a.view.dialogs.space = false;
     a.view.dialogs.name.set(ch.title orelse "");
     a.view.dialogs.focus_name = true;
 }
 
-/// The scrim a dialog sits on, centring it.
+/// The scrim a dialog sits on, centring it. Keyed: its field keeps the
+/// focus when a menu drawn before it goes.
 fn scrim(c: *ui.Context, k: theme.Colors) ui.Div {
+    ui.key(c, "dialog-scrim");
     return ui.div(c).fixed().offset(0, 0).size(c.size.w, c.size.h).layer(6).bg(.{ .a = if (k.dark) 0.35 else 0.32 }).center();
 }
 
@@ -256,7 +288,8 @@ fn renameDialog(c: *ui.Context, a: *App, k: theme.Colors) void {
     defer back.end();
     const card = dialog(c, k);
     defer card.end();
-    ui.text(c, "Rename session", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    const space = a.view.dialogs.space;
+    ui.text(c, if (space) "Rename project" else "Rename session", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
     _ = c.leaf(.{ .height = .{ .px = 12 } }, .none, null);
     var submit = false;
     {
@@ -275,7 +308,12 @@ fn renameDialog(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (pressed == .cancel) return endRename(a);
     if (pressed == .confirm or submit) {
         const title = std.mem.trim(u8, a.view.dialogs.name.text(), " \t\n");
-        if (title.len > 0) a.call("Mutate", .{ .op = "renameChat", .chatId = id, .title = title }, .of(App, a, App.onNotice));
+        if (title.len > 0) {
+            if (space)
+                a.call("Mutate", .{ .op = "renameSpace", .spaceId = id, .name = title }, .of(App, a, App.onNotice))
+            else
+                a.call("Mutate", .{ .op = "renameChat", .chatId = id, .title = title }, .of(App, a, App.onNotice));
+        }
         endRename(a);
     }
 }
@@ -287,6 +325,7 @@ fn endRename(a: *App) void {
 
 fn deleteDialog(c: *ui.Context, a: *App, k: theme.Colors) void {
     const id = (a.view.dialogs.delete orelse return).items;
+    if (a.view.dialogs.space) return removeSpaceDialog(c, a, k, id);
     const back = scrim(c, k);
     defer back.end();
     const card = dialog(c, k);
@@ -302,6 +341,42 @@ fn deleteDialog(c: *ui.Context, a: *App, k: theme.Colors) void {
         a.tabs.forget(id);
         endDelete(a);
     }
+}
+
+/// "Remove project?" (`delete_space_confirm`): what goes with it, then
+/// `deleteSpace`.
+fn removeSpaceDialog(c: *ui.Context, a: *App, k: theme.Colors, id: []const u8) void {
+    const back = scrim(c, k);
+    defer back.end();
+    const card = dialog(c, k);
+    defer card.end();
+    const space = a.findSpace(id);
+    ui.text(c, "Remove project?", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    _ = c.leaf(.{ .height = .{ .px = 6 } }, .none, null);
+    ui.text(c, removeCopy(c, a, id, space), .{ .size = 13, .line_height = 19, .wrap = true, .color = k.muted });
+    const pressed = buttons(c, k, "Remove", true);
+    if (pressed == .cancel) return endDelete(a);
+    if (pressed == .confirm) {
+        a.call("Mutate", .{ .op = "deleteSpace", .spaceId = id }, .of(App, a, App.onNotice));
+        endDelete(a);
+    }
+}
+
+/// How many sessions go with the project, and from which device.
+fn removeCopy(c: *ui.Context, a: *const App, id: []const u8, space: ?workspace.Space) []const u8 {
+    var count: usize = 0;
+    for (a.chats.items) |ch| if (!ch.archived and ch.parent_chat_id == null and ch.space_id != null and std.mem.eql(u8, ch.space_id.?, id)) {
+        count += 1;
+    };
+    const name = if (space) |s| s.name else "this project";
+    const device = if (space) |s| known: {
+        for (a.devices.items) |d| if (s.device_id != null and std.mem.eql(u8, d.id, s.device_id.?)) break :known d.name;
+        break :known "its device";
+    } else "its device";
+    return if (count == 1)
+        c.print("Removing \u{201C}{s}\u{201D} permanently deletes its 1 session on {s}. This can\u{2019}t be undone.", .{ name, device })
+    else
+        c.print("Removing \u{201C}{s}\u{201D} permanently deletes its {d} sessions on {s}. This can\u{2019}t be undone.", .{ name, count, device });
 }
 
 fn endDelete(a: *App) void {

@@ -38,6 +38,8 @@ pub const Chat = struct {
     cwd: ?[]const u8,
     /// The harness's own id for the chat's latest run (`harnessSessionId`).
     harness_session_id: ?[]const u8 = null,
+    /// The branch it runs on now, when known (`conversation_branch`).
+    branch: ?[]const u8 = null,
 
     /// The sidebar's order: "last called" (`last_prompt_at`, then
     /// `last_message_at`, then `created_at`).
@@ -185,7 +187,26 @@ fn parseChat(a: Allocator, o: json.ObjectMap) ?Chat {
         .reasoning = if (config) |c| str(a, c, "reasoning") else null,
         .cwd = str(a, o, "cwd"),
         .harness_session_id = str(a, o, "harnessSessionId"),
+        .branch = currentBranch(a, o),
     };
+}
+
+/// The source context's branch, only while it says where the chat runs now
+/// (`current_source_context`): not after a run couldn't see its checkout,
+/// nor once the chat moved to another folder.
+fn currentBranch(a: Allocator, o: json.ObjectMap) ?[]const u8 {
+    const v = o.get("sourceContext") orelse return null;
+    if (v != .object) return null;
+    if (o.get("sourceContextUnavailableAt")) |u| if (u != .null) return null;
+    const src = v.object;
+    const src_cwd = if (src.get("cwd")) |c| (if (c == .string) c.string else "") else "";
+    if (o.get("cwd")) |c| if (c == .string) {
+        const trim = "/\\";
+        if (!std.mem.eql(u8, std.mem.trimEnd(u8, c.string, trim), std.mem.trimEnd(u8, src_cwd, trim))) return null;
+    };
+    const b = str(a, src, "branch") orelse return null;
+    const t = std.mem.trim(u8, b, " \t\n");
+    return if (t.len == 0) null else t;
 }
 
 fn parseHarness(a: Allocator, o: json.ObjectMap) ?Harness {
@@ -226,10 +247,16 @@ fn parseSession(a: Allocator, o: json.ObjectMap) ?Session {
 
 /// Chats newest first, as the sidebar lists them.
 pub fn sortChats(chats: []Chat) void {
-    std.mem.sort(Chat, chats, {}, struct {
-        fn lt(_: void, x: Chat, y: Chat) bool {
-            const a = x.calledMs();
-            const b = y.calledMs();
+    sortChatsBy(chats, false);
+}
+
+/// Newest first, by when last called or (`created`) when made; ties by id
+/// (`compare_sidebar_chats`).
+pub fn sortChatsBy(chats: []Chat, created: bool) void {
+    std.mem.sort(Chat, chats, created, struct {
+        fn lt(by_created: bool, x: Chat, y: Chat) bool {
+            const a = if (by_created) x.created_ms else x.calledMs();
+            const b = if (by_created) y.created_ms else y.calledMs();
             if (a != b) return a > b;
             // Ties by id, ascending, as `sort_active` breaks them.
             return std.mem.order(u8, x.id, y.id) == .lt;
@@ -346,4 +373,27 @@ test "sessions map statuses" {
     try testing.expectEqual(Status.working, statusOf(sessions.items, "a"));
     try testing.expectEqual(Status.awaiting_input, statusOf(sessions.items, "b"));
     try testing.expectEqual(Status.idle, statusOf(sessions.items, "c"));
+}
+
+test "a chat's branch is its source context's while that says where it runs" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ \\{"id":"a","cwd":"/w/x/","sourceContext":{"cwd":"/w/x","branch":"feat/one"}}
+        , "feat/one" },
+        .{ \\{"id":"a","cwd":"/w/y","sourceContext":{"cwd":"/w/x","branch":"feat/one"}}
+        , null },
+        .{ \\{"id":"a","cwd":"/w/x","sourceContextUnavailableAt":"2026-10-01T00:00:00Z","sourceContext":{"cwd":"/w/x","branch":"main"}}
+        , null },
+        .{ \\{"id":"a","cwd":"/w/x","sourceContext":{"cwd":"/w/x","branch":"  "}}
+        , null },
+        .{ \\{"id":"a","cwd":"/w/x"}
+        , null },
+    };
+    for (cases) |case| {
+        const v = try json.parseFromSliceLeaky(json.Value, a, case[0], .{});
+        const ch = parseChat(a, v.object).?;
+        if (case[1]) |want| try std.testing.expectEqualStrings(want, ch.branch.?) else try std.testing.expect(ch.branch == null);
+    }
 }

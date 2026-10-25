@@ -137,6 +137,58 @@ pub fn reasoningLabel(level: []const u8) []const u8 {
     return level;
 }
 
+/// How well `label` answers a picker's `query` (`popover::match_rank`):
+/// 0 starts with it, 1 has it (or the query is empty), 2 and 3 the same
+/// with only letters and digits compared, 4 every word found; null, none.
+pub fn matchRank(query_in: []const u8, label: []const u8) ?u8 {
+    var qb: [128]u8 = undefined;
+    var lb: [256]u8 = undefined;
+    const query = lower(&qb, std.mem.trim(u8, query_in, " \t"));
+    if (query.len == 0) return 1;
+    const l = lower(&lb, label);
+    if (std.mem.startsWith(u8, l, query)) return 0;
+    if (std.mem.indexOf(u8, l, query) != null) return 1;
+    var cqb: [128]u8 = undefined;
+    var clb: [256]u8 = undefined;
+    const cq = alnum(&cqb, query);
+    const cl = alnum(&clb, l);
+    if (cq.len > 0 and std.mem.startsWith(u8, cl, cq)) return 2;
+    if (cq.len > 0 and std.mem.indexOf(u8, cl, cq) != null) return 3;
+    var words = std.mem.tokenizeAny(u8, query, " \t");
+    var long = false;
+    while (words.next()) |w| {
+        if (w.len > 1) long = true;
+        var wb: [128]u8 = undefined;
+        const cw = alnum(&wb, w);
+        if (std.mem.indexOf(u8, l, w) == null and (cw.len == 0 or std.mem.indexOf(u8, cl, cw) == null)) return null;
+    }
+    return if (long) 4 else null;
+}
+
+fn lower(buf: []u8, s: []const u8) []const u8 {
+    const n = @min(buf.len, s.len);
+    for (s[0..n], 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    return buf[0..n];
+}
+
+fn alnum(buf: []u8, s: []const u8) []const u8 {
+    var n: usize = 0;
+    for (s) |ch| if (std.ascii.isAlphanumeric(ch) and n < buf.len) {
+        buf[n] = ch;
+        n += 1;
+    };
+    return buf[0..n];
+}
+
+/// A menu's highlight moved `delta` rows of `count`, wrapping; from none, to
+/// the edge it heads for (`popover::menu_step`).
+pub fn menuStep(active: ?usize, count: usize, delta: isize) ?usize {
+    if (count == 0) return null;
+    const n: isize = @intCast(count);
+    const from = active orelse return if (delta >= 0) 0 else count - 1;
+    return @intCast(@mod(@as(isize, @intCast(from)) + delta, n));
+}
+
 const testing = std.testing;
 
 test "lightness moves in HSL, hue and saturation kept" {
@@ -178,4 +230,25 @@ test "a monogram is the name's letter in a colour fixed by the path" {
 test "reasoning labels" {
     try testing.expectEqualStrings("Medium", reasoningLabel("medium"));
     try testing.expectEqualStrings("X-High", reasoningLabel("xhigh"));
+}
+
+test "a picker ranks matches as the GPUI app's" {
+    try testing.expectEqual(@as(?u8, 0), matchRank("re", "release"));
+    try testing.expectEqual(@as(?u8, 1), matchRank("lease", "release"));
+    try testing.expectEqual(@as(?u8, null), matchRank("x", "release"));
+    try testing.expectEqual(@as(?u8, 1), matchRank("", "anything"));
+    try testing.expectEqual(@as(?u8, 2), matchRank("grok 4.7", "grok-4.7"));
+    try testing.expectEqual(@as(?u8, 2), matchRank("Grok 4.7", "grok-4.7"));
+    try testing.expectEqual(@as(?u8, 4), matchRank("sol 6", "gpt-5.6-sol"));
+    try testing.expectEqual(@as(?u8, 4), matchRank("Sol 6", "GPT-5.6-Sol"));
+}
+
+test "a menu's highlight wraps and enters at the edge" {
+    try testing.expectEqual(@as(?usize, null), menuStep(null, 0, 1));
+    try testing.expectEqual(@as(?usize, null), menuStep(3, 0, 1));
+    try testing.expectEqual(@as(?usize, 0), menuStep(null, 3, 1));
+    try testing.expectEqual(@as(?usize, 2), menuStep(null, 3, -1));
+    try testing.expectEqual(@as(?usize, 0), menuStep(2, 3, 1));
+    try testing.expectEqual(@as(?usize, 2), menuStep(0, 3, -1));
+    try testing.expectEqual(@as(?usize, 2), menuStep(1, 3, 1));
 }
