@@ -73,6 +73,7 @@ pub fn view(a: *App, c: *ui.Context) void {
     @import("view_menus.zig").menus(c, a, k);
     @import("view_picker.zig").popover(c, a, k);
     @import("view_drag.zig").overlay(c, a, k);
+    @import("view_chat_menu.zig").overlays(c, a, k);
 }
 
 /// The focused pane: its chat's transcript over the composer, or a new
@@ -202,7 +203,10 @@ fn keys(c: *ui.Context, a: *App) void {
         if (c.shortcut(.{ .key = x[0], .cmd = true, .alt = true })) a.focusToward(x[1]);
         if (c.shortcut(.{ .key = x[0], .cmd = true, .ctrl = true })) a.tabs.resize(x[1]);
     }
-    if (c.shortcut(.{ .key = S.escape }) and a.queue_edit == null) {
+    // A session menu or its dialog, over everything, takes Escape first.
+    if (@import("view_chat_menu.zig").anyOpen(a) and c.shortcut(.{ .key = S.escape })) {
+        @import("view_chat_menu.zig").dismiss(a);
+    } else if (c.shortcut(.{ .key = S.escape }) and a.queue_edit == null) {
         a.picker = .none;
         a.view.filter_menu = false;
         a.view.more_menu = false;

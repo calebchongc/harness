@@ -58,6 +58,10 @@ pub const View = struct {
     recording: ?usize = null,
     /// A session row being dragged toward a split target (view_drag.zig).
     drag: @import("view_drag.zig").Drag = .{},
+    /// A session row's menu and the dialogs it leads to.
+    chat_menu: @import("view_chat_menu.zig").Menu = .{},
+    chat_menu_h: ?f32 = null,
+    dialogs: @import("view_chat_menu.zig").Dialogs = .{},
     shortcut_notice: std.ArrayList(u8) = .empty,
     space_anchor: ?nanoui.ui.Rect = null,
     chip_anchor: ?nanoui.ui.Rect = null,
@@ -72,6 +76,8 @@ pub const View = struct {
     pub fn deinit(v: *View, gpa: Allocator) void {
         v.shortcut_notice.deinit(gpa);
         v.drag.deinit(gpa);
+        v.chat_menu.id.deinit(gpa);
+        v.dialogs.deinit(gpa);
         if (v.filter) |f| gpa.free(f);
         var it = v.groups.keyIterator();
         while (it.next()) |key| gpa.free(key.*);

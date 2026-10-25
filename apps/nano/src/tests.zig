@@ -29,6 +29,7 @@ test {
     _ = @import("view_drag.zig");
     _ = @import("view_settings_mcp.zig");
     _ = @import("pins.zig");
+    _ = @import("view_chat_menu.zig");
     _ = @import("icons.zig");
     _ = @import("release.zig");
     _ = @import("view.zig");

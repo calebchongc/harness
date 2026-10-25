@@ -36,6 +36,8 @@ pub const Chat = struct {
     model: ?[]const u8,
     reasoning: ?[]const u8 = null,
     cwd: ?[]const u8,
+    /// The harness's own id for the chat's latest run (`harnessSessionId`).
+    harness_session_id: ?[]const u8 = null,
 
     /// The sidebar's order: "last called" (`last_prompt_at`, then
     /// `last_message_at`, then `created_at`).
@@ -182,6 +184,7 @@ fn parseChat(a: Allocator, o: json.ObjectMap) ?Chat {
         .model = if (config) |c| str(a, c, "model") else null,
         .reasoning = if (config) |c| str(a, c, "reasoning") else null,
         .cwd = str(a, o, "cwd"),
+        .harness_session_id = str(a, o, "harnessSessionId"),
     };
 }
 

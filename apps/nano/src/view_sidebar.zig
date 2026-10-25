@@ -298,8 +298,12 @@ fn sessionRow(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat) void
     r = if (selected) r.bg(k.selected) else r.hover(k.hover);
     defer r.end();
     // No hover while a session is dragged over the rows.
-    const hovered = r.hovered() and !@import("view_drag.zig").dragging(a);
+    // Its menu open, the row stays as hovered: the menu's backdrop takes
+    // the pointer, but the GPUI app's row keeps its actions shown.
+    const menu_here = a.view.chat_menu.open and std.mem.eql(u8, a.view.chat_menu.id.items, ch.id);
+    const hovered = (r.hovered() or menu_here) and !@import("view_drag.zig").dragging(a);
     var archive = false;
+    var menu = false;
     const now = a.nowMs();
     statusSlot(c, k, workspace.markOf(ch, workspace.sessionOf(a.sessions.items, ch.id), now));
     const mark = icons.harnessMark(ch.harness orelse "graff");
@@ -327,12 +331,17 @@ fn sessionRow(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat) void
         const tm = ui.div(c).row().pl(6);
         defer tm.end();
         if (hovered) {
-            icons.icon(c, .@"more-horizontal", 13, k.muted, 18);
+            // The session menu (`{row}-menu`): opens where it's clicked.
+            const m = ui.div(c).row().size(18, 18).center().rounded(4).hover(k.wash(0.10));
+            defer m.end();
+            if (m.clicked()) menu = true;
+            icons.icon(c, .@"more-horizontal", 13, k.muted, 0);
         } else {
             ui.text(c, time, .{ .size = 11, .color = k.subline });
         }
     }
     if (archive) return a.setArchived(ch.id, !ch.archived);
+    if (menu) return @import("view_chat_menu.zig").open(a, ch.id, c.input.mouse);
     // Pressed, it may be dragged onto the chat to split it; a release that
     // ends a drag isn't a click.
     const drag = @import("view_drag.zig");
@@ -357,9 +366,11 @@ fn statusSlot(c: *ui.Context, k: theme.Colors, mark: workspace.Mark) void {
 pub fn badge(c: *ui.Context, a: *const App, k: theme.Colors, space_id: ?[]const u8, lit: bool) void {
     const space = a.findSpace(space_id);
     const m = rules.monogram(if (space) |s| s.name else "Home", if (space) |s| s.path else null, k.dark);
-    const tile = ui.div(c).row().size(13, 13).center().rounded(3).bg(k.tone.alpha(if (lit) 0.24 else 0.08));
+    // The project's own tone (`project_icon::monogram`), its letter's
+    // lightness raised (lowered, in light) when the row is lit.
+    const tile = ui.div(c).row().size(13, 13).center().rounded(3).bg(m.color.alpha(if (lit) 0.24 else 0.08));
     defer tile.end();
-    const letter = if (lit) (if (k.dark) m.color.mix(.{ .r = 1, .g = 1, .b = 1 }, 0.25) else m.color.mix(.{}, 0.2)) else m.color.alpha(0.85);
+    const letter = if (lit) rules.shiftLightness(m.color, if (k.dark) 0.12 else -0.10, 0.15, 0.95) else m.color.alpha(0.85);
     ui.text(c, c.print("{c}", .{m.letter}), .{ .size = 9, .weight = .medium, .mono = true, .color = letter });
 }
 

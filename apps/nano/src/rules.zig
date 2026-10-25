@@ -96,6 +96,35 @@ pub fn monogram(name: []const u8, path: ?[]const u8, dark: bool) Monogram {
     };
 }
 
+/// `c` with its HSL lightness moved by `dl`, kept within [lo, hi] (the
+/// GPUI app's `hsla.l` edits).
+pub fn shiftLightness(c: Color, dl: f32, lo: f32, hi: f32) Color {
+    const mx = @max(c.r, @max(c.g, c.b));
+    const mn = @min(c.r, @min(c.g, c.b));
+    const l = (mx + mn) / 2;
+    const d = mx - mn;
+    var h: f32 = 0;
+    var sat: f32 = 0;
+    if (d > 0) {
+        sat = d / (1 - @abs(2 * l - 1));
+        h = if (mx == c.r) @mod((c.g - c.b) / d, 6) else if (mx == c.g) (c.b - c.r) / d + 2 else (c.r - c.g) / d + 4;
+        h /= 6;
+    }
+    const nl = if (dl >= 0) @min(l + dl, hi) else @max(l + dl, lo);
+    const q = (1 - @abs(2 * nl - 1)) * sat;
+    const x = q * (1 - @abs(@mod(h * 6, 2) - 1));
+    const m = nl - q / 2;
+    const rgb: [3]f32 = switch (@as(u3, @intFromFloat(@min(5, @floor(h * 6))))) {
+        0 => .{ q, x, 0 },
+        1 => .{ x, q, 0 },
+        2 => .{ 0, q, x },
+        3 => .{ 0, x, q },
+        4 => .{ x, 0, q },
+        else => .{ q, 0, x },
+    };
+    return .{ .r = rgb[0] + m, .g = rgb[1] + m, .b = rgb[2] + m, .a = c.a };
+}
+
 /// A reasoning level as the model chip names it.
 pub fn reasoningLabel(level: []const u8) []const u8 {
     const pairs = .{
@@ -109,6 +138,16 @@ pub fn reasoningLabel(level: []const u8) []const u8 {
 }
 
 const testing = std.testing;
+
+test "lightness moves in HSL, hue and saturation kept" {
+    const c = shiftLightness(.hex(0x3a8a5c), 0.12, 0.15, 0.95);
+    // #3a8a5c is hsl(145°, 41%, 38.4%); +0.12 gives about #4db479.
+    try testing.expectApproxEqAbs(@as(f32, 0x4d) / 255, c.r, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0xb4) / 255, c.g, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0x79) / 255, c.b, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.95), shiftLightness(.white, 0.12, 0.15, 0.95).r, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.15), shiftLightness(.black, -0.10, 0.15, 0.95).r, 0.001);
+}
 
 test "times parse in UTC and with offsets" {
     try testing.expectEqual(@as(?i64, 0), parseTime("1970-01-01T00:00:00Z"));

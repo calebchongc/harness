@@ -378,3 +378,92 @@ test "sessions dragged onto Pinned are pinned in place, and back to Sessions unp
     // A drag that ends outside the sidebar leaves the pins be.
     try testing.expect(h.a.tabs.layout() == null);
 }
+
+/// Hovers a session row and clicks its ⋯ (`{row}-menu`).
+fn openRowMenu(h: *Harness, title: []const u8) !void {
+    const r = sessionText(h, title) orelse return error.NoRow;
+    h.t.moveTo(r.x + 4, r.y + 4);
+    h.t.frame();
+    // The row's last icon, at its right end.
+    var best: ?ui.Rect = null;
+    for (h.t.ctx.nodes.items) |n| switch (n.content) {
+        .image => if (n.rect.x < 256 and n.rect.y < r.y + r.h and n.rect.y + n.rect.h > r.y and
+            (best == null or n.rect.x > best.?.x)) {
+            best = n.rect;
+        },
+        else => {},
+    };
+    const b = best orelse return error.NoMenuButton;
+    h.t.click(b.x + b.w / 2, b.y + b.h / 2);
+    h.t.settle(1);
+}
+
+test "a session's ⋯ menu pins it after the last pin, and unpins it" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try openRowMenu(&h, "Beta");
+    try testing.expect(h.t.hasText("Rename…"));
+    try testing.expect(h.t.hasText("Delete…"));
+    h.snap("chat-menu");
+    try h.t.clickText("Pin");
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Rename…"));
+    try testing.expectEqual(@as(usize, 1), h.a.settings.pins.items.len);
+    try testing.expectEqualStrings("b", h.a.settings.pins.items[0]);
+    try openRowMenu(&h, "Alpha");
+    try h.t.clickText("Pin");
+    h.t.settle(1);
+    try testing.expectEqualStrings("a", h.a.settings.pins.items[1]);
+    try openRowMenu(&h, "Beta");
+    try h.t.clickText("Unpin");
+    h.t.settle(1);
+    try testing.expectEqual(@as(usize, 1), h.a.settings.pins.items.len);
+    try testing.expectEqualStrings("a", h.a.settings.pins.items[0]);
+}
+
+test "Copy › Harness conversation link copies the GPUI app's link; a press outside closes the menu" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.a.device_id = try testing.allocator.dupe(u8, "dev");
+    try openRowMenu(&h, "Beta");
+    try h.t.clickText("Copy");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Back"));
+    try testing.expect(!h.t.hasText("Harness session ID"));
+    h.snap("chat-menu-copy");
+    try h.t.clickText("Harness conversation link");
+    h.t.settle(1);
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(@import("view_chat_menu.zig").conversationLink(&buf, "b", "dev").?, h.t.clipboard.items);
+    try testing.expectEqualStrings("Harness conversation link copied", h.a.noticeText().?);
+    try openRowMenu(&h, "Beta");
+    h.t.click(700, 400);
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Rename…"));
+}
+
+test "Rename… opens its dialog holding the title, Escape closes it; Delete… asks first" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try openRowMenu(&h, "Beta");
+    try h.t.clickText("Rename…");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Rename session"));
+    try testing.expectEqualStrings("Beta", h.a.view.dialogs.name.text());
+    h.snap("rename-dialog");
+    h.press(.{ .key = ui.Shortcut.escape });
+    try testing.expect(!h.t.hasText("Rename session"));
+    try openRowMenu(&h, "Beta");
+    try h.t.clickText("Delete…");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Delete session?"));
+    try testing.expect(h.t.containsText("\u{201C}Beta\u{201D} will be permanently deleted."));
+    h.snap("delete-dialog");
+    try h.t.clickText("Cancel");
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Delete session?"));
+    try testing.expect(h.a.findChat("b") != null);
+}
