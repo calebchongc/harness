@@ -76,11 +76,66 @@ pub fn fadeText(c: *ui.Context, s: []const u8, st: ui.TextStyle, max_w: f32) voi
     ui.richText(c, s[0..at], spans.items, plain);
 }
 
+/// `fadeText` with `query`'s words washed as a search result shows them
+/// (`popover::search_highlight`): the match in the accent (`code_text`) on
+/// its rounded wash (`code_wash`, 1 point past the glyphs, 1.5 in from the
+/// line), case aside; no query or no match is `fadeText`.
+pub fn highlightText(c: *ui.Context, k: theme.Colors, s: []const u8, st: ui.TextStyle, max_w: f32, query: []const u8) void {
+    if (max_w <= 0) return;
+    if (std.mem.trim(u8, query, " \t").len == 0) return fadeText(c, s, st, max_w);
+    const ranges = @import("palette.zig").matchRanges(c.alloc(), s, query) catch &.{};
+    if (ranges.len == 0) return fadeText(c, s, st, max_w);
+    const base = st.color orelse c.theme.text;
+    const wash = k.accent.alpha(if (k.dark) 0.12 else 0.10);
+    var plain = st;
+    plain.color = base;
+    if (comptime @hasField(ui.TextStyle, "span_box")) plain.span_box = .{ .pad_x = 1, .inset_y = 1.5, .radius = 3 };
+    const total = c.text.width(s, st);
+    const band: f32 = 20;
+    const fades = total > max_w;
+    const p = std.math.clamp((total - max_w) / band, 0, 1);
+    const right = max_w + band * (1 - p * p * (3 - 2 * p));
+    var spans: std.ArrayList(ui.Span) = .empty;
+    var at: usize = 0;
+    var x0: f32 = 0;
+    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+    while (it.nextCodepointSlice()) |cp| {
+        if (fades and x0 >= max_w) break;
+        const x1 = if (fades) c.text.width(s[0 .. at + cp.len], st) else 0;
+        const t: f32 = if (fades) std.math.clamp((right - (x0 + x1) / 2) / band, 0, 1) else 1;
+        const lit = for (ranges) |r| {
+            if (at >= r.start and at < r.end) break true;
+        } else false;
+        if (lit or t < 1) spans.append(c.alloc(), .{
+            .start = @intCast(at),
+            .end = @intCast(at + cp.len),
+            .color = if (lit) k.accent.alpha(k.accent.a * t) else base.alpha(base.a * t),
+            .background = if (lit) wash.alpha(wash.a * t) else null,
+        }) catch break;
+        at += cp.len;
+        x0 = x1;
+    }
+    if (!fades) return ui.richText(c, s, spans.items, plain);
+    const box = ui.div(c).row().w(max_w).clip();
+    defer box.end();
+    ui.richText(c, s[0..at], spans.items, plain);
+}
+
+/// A muted key-cap inside a row or header (`popover::kbd_hint`): 5 across,
+/// 1 down, rounded 5, on ink(0.05), 10-point mono.
+pub fn kbdHint(c: *ui.Context, k: theme.Colors, label: []const u8) void {
+    const b = ui.div(c).row().px(5).py(1).rounded(5).bg(k.ink(0.05)).itemsCenter();
+    defer b.end();
+    ui.text(c, label, .{ .size = 10, .line_height = 10 * 1.618, .mono = true, .color = k.muted });
+}
+
 /// `s` in one line at most `max_w` wide, cut with an ellipsis (the tab
 /// list's titles).
 pub fn ellipsisText(c: *ui.Context, s: []const u8, st: ui.TextStyle, max_w: f32) void {
     if (c.text.width(s, st) <= max_w) return ui.text(c, s, st);
-    ui.text(c, c.print("{s}…", .{s[0..truncateAt(c, s, st, max_w)]}), st);
+    // `truncate_line`: the cut's trailing blanks and ASCII punctuation go.
+    const kept = std.mem.trimEnd(u8, s[0..truncateAt(c, s, st, max_w)], " \t\n\r!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~");
+    ui.text(c, c.print("{s}…", .{kept}), st);
 }
 
 /// Where GPUI cuts `s` for an ellipsis (`LineWrapper::should_truncate_line`):
