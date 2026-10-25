@@ -14,6 +14,8 @@ pub const Space = struct {
     device_id: ?[]const u8 = null,
     /// `name`, else the last part of `path`, as the GPUI app shows it.
     name: []const u8,
+    /// A git checkout: a new chat offers its checkout and ref.
+    git: bool = false,
 };
 
 pub const Chat = struct {
@@ -158,6 +160,7 @@ fn parseSpace(a: Allocator, o: json.ObjectMap) ?Space {
         .path = path,
         .device_id = str(a, o, "deviceId"),
         .name = str(a, o, "name") orelse std.fs.path.basename(path),
+        .git = if (o.get("gitDetected")) |v| v == .bool and v.bool else false,
     };
 }
 

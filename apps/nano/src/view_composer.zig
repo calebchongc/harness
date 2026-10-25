@@ -56,21 +56,36 @@ pub fn pill(c: *ui.Context, a: *App, k: theme.Colors, w: f32, shape: Shape, radi
         return;
     }
     {
-        const area = ui.div(c).column().wFull().px(16).pt(16).pb(4);
+        // At least 76 tall, as GPUI's text area, growing with its lines.
+        const area = ui.div(c).row().wFull();
         defer area.end();
+        _ = c.leaf(.{ .width = .{ .px = 0 }, .height = .{ .px = 76 } }, .none, null);
+        const inner = ui.div(c).column().grow().w(0).px(16).pt(16).pb(4);
+        defer inner.end();
         input(c, a, k, .expanded);
     }
+    // Expanded, the model sits after the paperclip, at most 45% of the
+    // pill; Send keeps the end (`morph_cluster`).
     const actions = ui.div(c).row().wFull().h(42).px(12).pt(2).pb(8).itemsCenter();
     defer actions.end();
     attachButtons(c, a, k);
+    {
+        const m = ui.div(c).row().pl(2).maxW(w * 0.45).clip();
+        defer m.end();
+        chip(c, a, k);
+    }
     ui.spacer(c);
-    chip(c, a, k);
     send(c, a, k);
 }
+
+/// Whether this device can dictate: the mic shows only then, as the GPUI
+/// app's does when it detects dictation, which macOS has.
+const dictation = @import("builtin").os.tag == .macos;
 
 fn attachButtons(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (kit.iconButton(c, k, .paperclip, .{ .size = 28, .radius = 14, .icon = 18 }))
         a.setNotice("Attachments aren't in Harness Nano yet.");
+    if (!dictation) return;
     _ = c.leaf(.{ .width = .{ .px = 2 } }, .none, null);
     if (kit.iconButton(c, k, .microphone, .{ .size = 28, .radius = 14, .icon = 17 }))
         a.setNotice("Dictation isn't in Harness Nano yet.");
@@ -91,6 +106,9 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
         .width = .fill,
         .bare = true,
         .size = 14,
+        // GPUI's composer: 22.75-point lines, its placeholder faint.
+        .line_height = 22.75,
+        .placeholder_color = k.faint,
         .multiline = true,
         .max_lines = 11,
     });
@@ -140,10 +158,25 @@ fn chip(c: *ui.Context, a: *App, k: theme.Colors) void {
     defer b.end();
     if (b.clicked()) a.togglePicker();
     if (c.rects.get(c.node(b.index).id)) |r| a.view.chip_anchor = r;
-    const mark = icons.harnessMark(t.harness);
-    icons.icon(c, mark.name, 16, mark.brand orelse k.muted, 0);
-    ui.text(c, a.modelLabel(t.model), .{ .size = 12, .weight = .medium, .color = k.text.alpha(0.9) });
-    if (t.reasoning) |level| ui.text(c, rules.reasoningLabel(level), .{ .size = 12, .weight = .medium, .color = k.muted.alpha(0.7) });
+    // Before the engine lists them: the glyph spinner for an agent not yet
+    // known, a pulsing bar for its model (`trigger_chip` loading).
+    if (a.harnesses.items.len == 0) {
+        kit.snake(c, k);
+    } else {
+        const mark = icons.harnessMark(t.harness);
+        icons.icon(c, mark.name, 16, mark.brand orelse k.muted, 0);
+    }
+    if (a.models.items.len == 0 and t.model == null) return skeleton(c);
+    ui.text(c, a.modelLabel(t.model), .{ .size = 12, .line_height = 12 * 1.618, .weight = .medium, .color = k.text.alpha(0.9) });
+    if (t.reasoning) |level| ui.text(c, rules.reasoningLabel(level), .{ .size = 12, .line_height = 12 * 1.618, .weight = .medium, .color = k.muted.alpha(0.7) });
+}
+
+/// A label still loading: a 56 by 11 bar whose opacity breathes between
+/// 0.35 and 0.75 every 2.4 s (popover.rs `skeleton_bar`).
+fn skeleton(c: *ui.Context) void {
+    const phase = @sin(@as(f32, @floatCast(c.time)) * std.math.tau / 2.4) * 0.5 + 0.5;
+    c.frameIn(1.0 / 30.0);
+    _ = c.leaf(.{ .width = .{ .px = 56 }, .height = .{ .px = 11 }, .radius = 5.5, .background = .{ .r = 1, .g = 1, .b = 1, .a = 0.08 * (0.35 + 0.4 * phase) } }, .none, null);
 }
 
 /// Send (or queue, while a run goes); Stop with nothing typed mid-run.
@@ -164,6 +197,6 @@ fn send(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (stop) {
         _ = c.leaf(.{ .width = .{ .px = 11 }, .height = .{ .px = 11 }, .radius = 3, .background = k.shell }, .none, null);
     } else {
-        icons.icon(c, .@"arrow-up", 14, k.shell, 0);
+        icons.icon(c, .@"arrow-up", 14, k.background, 0);
     }
 }
