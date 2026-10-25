@@ -203,6 +203,8 @@ class AppModel(
     accountApi: AccountApi? = null,
     /** Where live writes run: off the main thread, one at a time, so they reach the doc in the order they were made. */
     private val writes: CoroutineDispatcher = Dispatchers.IO.limitedParallelism(1),
+    /** Where blocking core reads run (opening a chat from disk, a background flush). Tests pass their own dispatcher. */
+    private val io: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
     private val _workspace: MutableStateFlow<WorkspaceState>
     private val _entries: MutableStateFlow<Map<String, List<MessageEntry>>>
@@ -876,7 +878,7 @@ class AppModel(
     /** A session screen opened: the live core hydrates the chat from disk and joins its room. */
     fun attachSession(chatId: String) {
         val live = live ?: return
-        viewModelScope.launch(Dispatchers.IO) { live.feed.sessionChanged(live.core.openSession(chatId)) }
+        viewModelScope.launch(io) { live.feed.sessionChanged(live.core.openSession(chatId)) }
     }
 
     /** The session screen went away; the chat stays warm until it is among the coldest. */
@@ -893,7 +895,7 @@ class AppModel(
     fun backgrounded() {
         val live = live ?: return
         live.core.backgrounded()
-        viewModelScope.launch(Dispatchers.IO) { live.core.flush() }
+        viewModelScope.launch(io) { live.core.flush() }
     }
 
     override fun onCleared() {

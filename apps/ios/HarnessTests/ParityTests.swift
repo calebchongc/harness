@@ -433,6 +433,16 @@ final class ParityTests: XCTestCase {
         }
     }
 
+    func testTheComposerStopGuardMatches() throws {
+        let v = try load("vectors/composer-stop.json")
+        XCTAssertEqual((v["graceMs"] as? NSNumber)?.int64Value, StopGuard.graceMs)
+        for c in try rows(v, "cases") {
+            let closed = (c["questionClosedAtMs"] as? NSNumber)?.int64Value
+            XCTAssertEqual(StopGuard.allows(nowMs: (c["nowMs"] as! NSNumber).int64Value, questionClosedAtMs: closed),
+                           c["allowed"] as? Bool, "\(c["name"] ?? "")")
+        }
+    }
+
     func testTheAgentReadinessRulesMatch() throws {
         let v = try load("vectors/agent-readiness.json")
         XCTAssertEqual(v["agents"] as? [String], OnboardingAgent.all.map(\.id))

@@ -26,6 +26,7 @@ import harness.codegraff.android.model.QueueDeliveryGate
 import harness.codegraff.android.model.QueueEditFinishResult
 import harness.codegraff.android.model.QueueEditLease
 import harness.codegraff.android.model.QueuedMessage
+import harness.codegraff.android.model.StopGuard
 import harness.codegraff.android.perf.Perf
 import harness.codegraff.android.perf.PerfPolicy
 import harness.codegraff.android.perf.PerfBatchMeta
@@ -347,6 +348,16 @@ class ParityTest {
         for (n in v.rows("notes")) {
             val model = if (n.isNull("model")) null else n.getString("model")
             assertEquals("$model", if (n.isNull("note")) null else n.getString("note"), ChatMode.note(model))
+        }
+    }
+
+    @Test
+    fun theComposerStopGuardMatches() {
+        val v = load("vectors/composer-stop.json")
+        assertEquals(v.getLong("graceMs"), StopGuard.GRACE_MS)
+        for (c in v.rows("cases")) {
+            val closed = if (c.isNull("questionClosedAtMs")) null else c.getLong("questionClosedAtMs")
+            assertEquals(c.getString("name"), c.getBoolean("allowed"), StopGuard.allows(c.getLong("nowMs"), closed))
         }
     }
 

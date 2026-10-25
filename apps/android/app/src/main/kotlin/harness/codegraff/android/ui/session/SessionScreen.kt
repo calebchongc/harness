@@ -140,6 +140,14 @@ fun SessionScreen(
     val topInset = statusBarHeight()
     val jumpVisible by remember { derivedStateOf { listState.firstVisibleItemIndex > 1 } }
     val openRequest = entries.asReversed().flatMap { it.parts }.filterIsInstance<MessagePart.Input>().firstOrNull { !it.resolved }
+    // When the question panel last gave way to the composer (StopGuard).
+    val openRequestId = openRequest?.requestId
+    var shownRequestId by remember(chat.id) { mutableStateOf(openRequestId) }
+    var questionClosedAt by remember(chat.id) { mutableStateOf<Long?>(null) }
+    LaunchedEffect(chat.id, openRequestId) {
+        if (openRequestId == null && shownRequestId != null) questionClosedAt = System.currentTimeMillis()
+        shownRequestId = openRequestId
+    }
 
     Box(modifier.fillMaxSize().background(p.bg)) {
         Column(Modifier.fillMaxSize().imePadding().navigationBarsPadding()) {
@@ -184,7 +192,7 @@ fun SessionScreen(
                     if (openRequest != null) {
                         QuestionPanel(openRequest.requestId, openRequest.questions) { id, answers -> model.respondInput(chat.id, id, answers) }
                     } else {
-                        ChatComposer(state, model, chat, runLive = status == SessionStatus.Working)
+                        ChatComposer(state, model, chat, runLive = status == SessionStatus.Working, questionClosedAtMs = questionClosedAt)
                     }
                 }
             }
@@ -259,7 +267,7 @@ private fun StatusStrip(chat: Chat, status: SessionStatus?, state: WorkspaceStat
 
 /** The live-chat composer: input, the photo attach button, the model and trait chips (harness stays locked mid-chat), and the morphing action button. */
 @Composable
-private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, runLive: Boolean) {
+private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, runLive: Boolean, questionClosedAtMs: Long? = null) {
     val clipboard = LocalClipboardManager.current
     var draft by rememberSaveable(chat.id) { mutableStateOf("") }
     var attachments by remember(chat.id) { mutableStateOf(listOf<StagedAttachment>()) }
@@ -445,6 +453,7 @@ private fun ChatComposer(state: WorkspaceState, model: AppModel, chat: Chat, run
                 }
             },
             onStop = { model.interrupt(chat.id) },
+            questionClosedAtMs = questionClosedAtMs,
             attachments = if (editingId == null) attachments else emptyList(),
             // A live send can't carry photos until they upload to the computer; the demo keeps the picker.
             onAttach = if (editingId == null && !model.isLive) ({ picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }) else null,
