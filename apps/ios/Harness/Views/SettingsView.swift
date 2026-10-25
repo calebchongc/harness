@@ -7,6 +7,12 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @AppStorage(PhoneSplit.storageKey) private var phoneSplitRaw = PhoneSplit.off.rawValue
+    /// Opens straight onto Crash reports (the `-sheet crashreports` rig).
+    @State private var showCrashReports: Bool
+
+    init(openCrashReports: Bool = false) {
+        _showCrashReports = State(initialValue: openCrashReports)
+    }
 
     /// "Codegraff · System", or the two variant names when light and dark
     /// come from different families.
@@ -124,6 +130,12 @@ struct SettingsView: View {
                         LabeledContent("Performance", value: Perf.shared.startupMs.map { "Started in \($0) ms" } ?? "")
                     }
                     .accessibilityIdentifier("settings-performance")
+                    NavigationLink {
+                        CrashReportsView()
+                    } label: {
+                        Text("Crash reports")
+                    }
+                    .accessibilityIdentifier("settings-crash-reports")
                 }
                 .harnessListRow()
 
@@ -137,6 +149,7 @@ struct SettingsView: View {
             }
             .harnessGroupedList()
             .navigationTitle("Settings")
+            .navigationDestination(isPresented: $showCrashReports) { CrashReportsView() }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

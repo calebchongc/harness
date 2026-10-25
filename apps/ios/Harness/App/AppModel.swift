@@ -55,6 +55,10 @@ final class AppModel {
     }
 
     var phase: Phase = .signedOut
+    /// `restore()` has read the saved account (or is waiting to): a second
+    /// call, from the window or from a Watch message on a background launch,
+    /// changes nothing.
+    @ObservationIgnored private var restoreStarted = false
     /// The edge rejected the stored sign-in (it was revoked or spent). The app keeps everything it has
     /// and asks for a fresh sign-in, instead of redialing a dead credential behind "connecting".
     var sessionExpired = false
@@ -122,6 +126,7 @@ final class AppModel {
 
     func restore() {
         if demo != nil { return }
+        guard !restoreStarted else { return }
         // After a restart iOS can launch the app in the background before the first unlock, when the
         // Keychain, the saved account and the cached docs can't be read yet. Read then, a sign-in that is
         // there looks absent and the phone opens signed out. Wait for the unlock instead.
@@ -129,6 +134,7 @@ final class AppModel {
             restoreAfterUnlock()
             return
         }
+        restoreStarted = true
         DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
         // Debug-rig config overrides (cfprefsd caching defeats external
@@ -265,6 +271,7 @@ final class AppModel {
             let refresh = Keychain.read(key: "codegraffRefreshToken")
             let access = Keychain.read(key: "codegraffAccessToken")
             if refresh == .unavailable || access == .unavailable {
+                restoreStarted = false
                 restoreAfterUnlock()
                 return
             }
@@ -437,6 +444,7 @@ final class AppModel {
         demoPinnedSessionIds = []
         DraftStore.persistsToDisk = false
         phase = .ready
+        WatchBridge.shared.modelReady()
     }
 
     func signOut() {
@@ -519,6 +527,7 @@ final class AppModel {
         startConnectivity()
         phase = .ready
         PushNotifications.shared.signedIn(model: self)
+        WatchBridge.shared.modelReady()
     }
 
     /// The live sign-in, for the edge calls notifications make (none in demo mode).
@@ -1183,6 +1192,8 @@ final class AppModel {
         refreshSignInIfDue()
         kickAllRooms()
         probeEdgeHealth()
+        // A recording waiting on the speech permission can ask now.
+        WatchBridge.shared.modelReady()
     }
 
     /// Background hook: stop scheduling status wake-ups; iOS suspends the app anyway, and `foregrounded()`
