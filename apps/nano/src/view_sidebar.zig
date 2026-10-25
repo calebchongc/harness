@@ -211,7 +211,12 @@ fn sessionRow(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat) void
         }
     }
     if (archive) return a.setArchived(ch.id, !ch.archived);
-    if (r.clicked() and !selected) a.openChat(ch.id, ch.space_id);
+    // Pressed, it may be dragged onto the chat to split it; a release that
+    // ends a drag isn't a click.
+    const drag = @import("view_drag.zig");
+    const it = r.interaction();
+    if (it.pressed and c.input.pressed) drag.press(c, a, ch.id, it.rect);
+    if (r.clicked() and !selected and !drag.dragging(a)) a.openChat(ch.id, ch.space_id);
 }
 
 fn statusSlot(c: *ui.Context, k: theme.Colors, mark: workspace.Mark) void {

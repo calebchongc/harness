@@ -49,6 +49,8 @@ pub const View = struct {
     /// Settings › Shortcuts: the shortcut whose chip waits for keys, and
     /// why the last combination was refused.
     recording: ?usize = null,
+    /// A session row being dragged toward a split target (view_drag.zig).
+    drag: @import("view_drag.zig").Drag = .{},
     shortcut_notice: std.ArrayList(u8) = .empty,
     space_anchor: ?nanoui.ui.Rect = null,
     chip_anchor: ?nanoui.ui.Rect = null,
@@ -62,6 +64,7 @@ pub const View = struct {
 
     pub fn deinit(v: *View, gpa: Allocator) void {
         v.shortcut_notice.deinit(gpa);
+        v.drag.deinit(gpa);
         if (v.filter) |f| gpa.free(f);
         var it = v.groups.keyIterator();
         while (it.next()) |key| gpa.free(key.*);
@@ -463,6 +466,19 @@ pub const App = struct {
         a.tabs.park(a.tabs.active, a.tabs.layout().?.focus - 1, d);
         a.select(null, null);
         drafts.adopt(a, fresh);
+    }
+
+    /// A session dropped on a split target: the focused pane split along
+    /// `axis`, `chat_id` opened in the new pane. Dragging the chat already
+    /// open moves it; the pane it leaves is a new chat (`split_chat_opening`).
+    pub fn splitOpening(a: *App, axis: tabs_mod.Axis, chat_id: []const u8) void {
+        if (a.findChat(chat_id) == null or !a.tabs.canSplit(axis)) return;
+        var d = drafts.canvas(a) catch return;
+        if (!(a.tabs.split(axis) catch false)) return d.deinit(a.gpa);
+        a.tabs.park(a.tabs.active, a.tabs.layout().?.focus - 1, d);
+        a.tabs.detach(chat_id);
+        a.tabs.setCurrent(chat_id);
+        a.select(chat_id, null);
     }
 
     /// Focus pane `ix`: the pane left keeps its draft, and `ix`'s comes

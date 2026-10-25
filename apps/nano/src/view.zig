@@ -30,6 +30,7 @@ pub fn view(a: *App, c: *ui.Context) void {
     if (a.tick(c.time)) |wait| c.frameIn(wait);
     c.title_bar_height = sidebar.titlebar_h;
     keys(c, a);
+    @import("view_drag.zig").update(c, a);
     a.syncPeers();
     {
         const root = ui.div(c).row().sizeFull().bg(k.shell);
@@ -71,6 +72,7 @@ pub fn view(a: *App, c: *ui.Context) void {
     @import("view_actions.zig").overlays(c, a, k);
     @import("view_menus.zig").menus(c, a, k);
     @import("view_picker.zig").popover(c, a, k);
+    @import("view_drag.zig").overlay(c, a, k);
 }
 
 /// The focused pane: its chat's transcript over the composer, or a new

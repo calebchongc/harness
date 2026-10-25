@@ -262,3 +262,50 @@ test "Settings › Appearance: Light switches the window, an accent recolours it
     h.t.settle(1);
     try testing.expectEqual(@as(f32, 1008), @import("view_transcript.zig").column_w);
 }
+
+test "a session dragged from the sidebar onto the right target opens in a new pane to the right" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const beta = h.t.findText("Beta") orelse return error.NoRow;
+    // Press on Beta's row, drag over the chat's right edge: the targets show.
+    h.t.moveTo(beta.x + 4, beta.y + 4);
+    h.t.ctx.pointerDown();
+    h.t.frame();
+    h.t.ctx.input.mouse = .{ .x = 900, .y = 300 };
+    h.t.frame();
+    h.t.ctx.input.mouse = .{ .x = 1100, .y = 400 };
+    h.t.frame();
+    try testing.expect(h.t.hasText("Open to the right ◨"));
+    try testing.expect(h.t.hasText("Open below ⬓"));
+    h.snap("drag-to-split");
+    h.t.ctx.pointerUp();
+    h.t.frame();
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Open to the right ◨"));
+    const s = h.a.tabs.layout() orelse return error.NoSplit;
+    try testing.expectEqual(tabs_axis.horizontal, s.axis);
+    try testing.expectEqualStrings("b", h.a.selected.?);
+    try testing.expectEqualStrings("a", s.panes.items[0].?);
+}
+
+test "a drag released off the targets does nothing, and isn't a click" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const beta = h.t.findText("Beta") orelse return error.NoRow;
+    h.t.moveTo(beta.x + 4, beta.y + 4);
+    h.t.ctx.pointerDown();
+    h.t.frame();
+    h.t.ctx.input.mouse = .{ .x = beta.x + 40, .y = beta.y + 4 };
+    h.t.frame();
+    h.t.ctx.input.mouse = .{ .x = beta.x + 4, .y = beta.y + 4 };
+    h.t.frame();
+    h.t.ctx.pointerUp();
+    h.t.frame();
+    h.t.settle(1);
+    try testing.expect(h.a.tabs.layout() == null);
+    try testing.expectEqualStrings("a", h.a.selected.?);
+}
+
+const tabs_axis = @import("tabs.zig").Axis;

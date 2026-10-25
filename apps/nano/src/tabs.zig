@@ -316,6 +316,27 @@ pub const Tabs = struct {
         }
     }
 
+    /// Whether `split(axis)` would split: no split yet, or one along `axis`
+    /// with room for another pane (`can_split`).
+    pub fn canSplit(t: *const Tabs, axis: Axis) bool {
+        const s = t.layout() orelse return true;
+        return s.axis == axis and s.panes.items.len < max_panes;
+    }
+
+    /// `id` out of every pane and every other tab, which are left on a new
+    /// chat: dragged into a new pane, a chat moves rather than shows twice
+    /// (`detach_chat_from_tab_snapshots`).
+    pub fn detach(t: *Tabs, id: []const u8) void {
+        for (t.splits.items) |*sp| if (sp.*) |*s| for (s.panes.items) |*p| if (p.*) |have| if (std.mem.eql(u8, have, id)) {
+            t.gpa.free(have);
+            p.* = null;
+        };
+        for (t.items.items, 0..) |*c, i| if (i != t.active) if (c.*) |have| if (std.mem.eql(u8, have, id)) {
+            t.gpa.free(have);
+            c.* = null;
+        };
+    }
+
     /// ⌘D (right) or ⌘⇧D (down): the focused pane split in two, every pane
     /// then the same size, the new one a new chat with focus. Nothing at
     /// the cap or across an existing split's axis (`split_chat`).
@@ -545,4 +566,21 @@ test "dragging a divider moves only its two panes, never below the minimum" {
     try testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), sh[2], 1e-6);
     t.dragDivider(d, 0.9);
     try testing.expectApproxEqAbs(@as(f32, 0.15), t.layout().?.shares.items[1], 1e-6);
+}
+
+test "a dragged chat moves into its new pane, out of every other place" {
+    var t: Tabs = .init(testing.allocator);
+    defer t.deinit();
+    t.show("a");
+    t.newTab();
+    t.show("b");
+    try testing.expect(t.canSplit(.vertical));
+    try testing.expect(try t.split(.horizontal));
+    try testing.expect(!t.canSplit(.vertical));
+    // "a", open in the first tab, dragged in: that tab is left on a new chat.
+    t.detach("a");
+    t.setCurrent("a");
+    try testing.expectEqualStrings("a", t.current().?);
+    try testing.expect(t.items.items[0] == null);
+    try testing.expectEqualStrings("b", t.layout().?.panes.items[0].?);
 }
