@@ -45,32 +45,32 @@ pub fn iconButton(c: *ui.Context, k: theme.Colors, name: icons.Name, o: IconButt
 pub fn fadeText(c: *ui.Context, s: []const u8, st: ui.TextStyle, max_w: f32) void {
     const base = st.color orelse c.theme.text;
     if (max_w <= 0) return;
-    if (c.text.width(s, st) <= max_w) return ui.text(c, s, st);
-    // The longest prefix (at a character boundary) that fits.
-    var end: usize = 0;
+    const total = c.text.width(s, st);
+    if (total <= max_w) return ui.text(c, s, st);
+    // GPUI's `edge_faded` label: a 20-point ramp to the box's right edge,
+    // pushed out past it while the text barely overflows
+    // (`label_fade_outset`), the glyph cut by the box. GPUI fades each
+    // pixel; here each glyph takes the alpha at its middle.
+    const band: f32 = 20;
+    const p = std.math.clamp((total - max_w) / band, 0, 1);
+    const right = max_w + band * (1 - p * p * (3 - 2 * p));
+    var spans: std.ArrayList(ui.Span) = .empty;
+    var at: usize = 0;
+    var x0: f32 = 0;
     var it = std.unicode.Utf8View.initUnchecked(s).iterator();
     while (it.nextCodepointSlice()) |cp| {
-        const next = end + cp.len;
-        if (c.text.width(s[0..next], st) > max_w) break;
-        end = next;
-    }
-    const shown = s[0..end];
-    var spans: std.ArrayList(ui.Span) = .empty;
-    const fade: f32 = 20;
-    const full = c.text.width(shown, st);
-    var at: usize = 0;
-    var it2 = std.unicode.Utf8View.initUnchecked(shown).iterator();
-    while (it2.nextCodepointSlice()) |cp| {
-        const x = c.text.width(shown[0 .. at + cp.len], st);
-        if (x > full - fade) {
-            const t = std.math.clamp((full - x) / fade, 0, 1);
-            spans.append(c.alloc(), .{ .start = @intCast(at), .end = @intCast(at + cp.len), .color = base.alpha(base.a * t) }) catch break;
-        }
+        if (x0 >= max_w) break;
+        const x1 = c.text.width(s[0 .. at + cp.len], st);
+        const t = std.math.clamp((right - (x0 + x1) / 2) / band, 0, 1);
+        if (t < 1) spans.append(c.alloc(), .{ .start = @intCast(at), .end = @intCast(at + cp.len), .color = base.alpha(base.a * t) }) catch break;
         at += cp.len;
+        x0 = x1;
     }
+    const box = ui.div(c).row().w(max_w).clip();
+    defer box.end();
     var plain = st;
     plain.color = base;
-    ui.richText(c, shown, spans.items, plain);
+    ui.richText(c, s[0..at], spans.items, plain);
 }
 
 /// `s` in one line at most `max_w` wide, cut with an ellipsis (the tab
