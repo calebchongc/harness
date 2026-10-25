@@ -241,3 +241,24 @@ test "with ⌘ Enter chosen, Enter starts a new line and ⌘↩ sends" {
     typeKeys(&h, "two");
     try testing.expectEqualStrings("one\ntwo", h.a.composer.text());
 }
+
+test "Settings › Appearance: Light switches the window, an accent recolours it, the width slider moves the column" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const look = @import("view_settings_appearance.zig");
+    @import("view_settings.zig").open(&h.a);
+    h.a.settings.section = .appearance;
+    h.t.settle(1);
+    try h.t.clickText("Light");
+    h.t.settle(1);
+    try testing.expectEqual(@as(?bool, false), h.a.dark);
+    try testing.expectEqual(look.Mode.light, look.mode(&h.a));
+    h.a.settings.setAccent("green");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Green · Controls, glyphs, selections, code, and activity."));
+    try testing.expectEqual(@as(u24, 0x15803d), look.presetNamed("green").?.light);
+    h.a.settings.setNumber("transcriptWidth", 1008);
+    h.t.settle(1);
+    try testing.expectEqual(@as(f32, 1008), @import("view_transcript.zig").column_w);
+}

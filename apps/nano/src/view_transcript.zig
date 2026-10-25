@@ -14,8 +14,9 @@ const tr = @import("transcript.zig");
 const sidebar = @import("view_sidebar.zig");
 const App = @import("app.zig").App;
 
-/// The column's width (`transcript_width`'s default).
-pub const column_w: f32 = 736;
+/// The column's width: Settings › Appearance's conversation width
+/// (`transcript_width`, 736 unless set), as of this frame.
+pub var column_w: f32 = 736;
 
 /// The column's width in a main area `w` wide, with its gutters.
 pub fn columnWidth(w: f32) f32 {

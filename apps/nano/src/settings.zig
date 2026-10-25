@@ -95,6 +95,8 @@ pub const Prefs = struct {
     files_show_all: bool = false,
     archive_sessions_on_close: bool = false,
     escape_stops_active_agent: bool = false,
+    transcript_compact_mode: bool = false,
+    pause_animations_in_background: bool = false,
 };
 
 /// One of `Prefs`'s switches.
@@ -111,6 +113,8 @@ pub const Flag = enum {
     files_show_all,
     archive_sessions_on_close,
     escape_stops_active_agent,
+    transcript_compact_mode,
+    pause_animations_in_background,
 };
 
 comptime {
@@ -168,6 +172,23 @@ pub const Store = struct {
             .float => |f| f,
             else => null,
         };
+    }
+
+    /// The accent preset's name, or null for the theme's own.
+    pub fn accent(s: *const Store) ?[]const u8 {
+        const v = s.text("accent") orelse return null;
+        return if (std.mem.eql(u8, v, "themeDefault")) null else v;
+    }
+
+    pub fn setAccent(s: *Store, preset: ?[]const u8) void {
+        s.remember("accent", .{ .string = preset orelse "themeDefault" });
+        if (preset) |name| {
+            var arena: std.heap.ArenaAllocator = .init(s.gpa);
+            defer arena.deinit();
+            var obj: json.ObjectMap = .empty;
+            obj.put(arena.allocator(), "preset", .{ .string = name }) catch return;
+            s.write("accent", .{ .object = obj });
+        } else s.write("accent", .{ .string = "themeDefault" });
     }
 
     pub fn setText(s: *Store, key: []const u8, value: []const u8) void {
@@ -286,6 +307,12 @@ pub const Store = struct {
                 .array => |arr| for (arr.items, 0..) |v, i| if (v == .string) s.rememberCombo(e.key_ptr.*, @intCast(i), v.string),
                 else => {},
             };
+        };
+        // `accent`: "themeDefault", or {"preset": name}, kept as its name.
+        if (o.get("accent")) |v| switch (v) {
+            .string => s.remember("accent", v),
+            .object => |obj| if (obj.get("preset")) |pre| if (pre == .string) s.remember("accent", pre),
+            else => {},
         };
         // The scalars, for pages to read: strings and numbers.
         var it = o.iterator();

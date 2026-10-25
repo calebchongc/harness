@@ -23,7 +23,9 @@ const cluster_w: f32 = 24 * 3 + 8 + 2;
 pub fn view(a: *App, c: *ui.Context) void {
     const dark = a.dark orelse nanoui.isDark();
     c.theme = theme.ui(dark);
-    const k = theme.colors(dark);
+    // The accent Settings › Appearance chose, in place of the theme's.
+    const k = @import("view_settings_appearance.zig").withAccent(theme.colors(dark), a);
+    @import("view_transcript.zig").column_w = @import("view_settings_appearance.zig").transcriptWidth(a);
     a.ansi = k.ansi;
     if (a.tick(c.time)) |wait| c.frameIn(wait);
     c.title_bar_height = sidebar.titlebar_h;

@@ -124,6 +124,8 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
     a.new_harness = try gpa.dupe(u8, "graff");
     const dark = !std.mem.eql(u8, str(scene, "appearance") orelse "dark", "light");
     a.dark = dark;
+    // As the renderer sets it: the scene's appearance is the chosen one.
+    a.settings.setText("appearance", if (dark) "dark" else "light");
     inline for (.{ .{ "spaces", &a.spaces }, .{ "chats", &a.chats }, .{ "sessions", &a.sessions } }) |l| {
         if (scene.get(l[0])) |v| try l[1].replace(v);
     }

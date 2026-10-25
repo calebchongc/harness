@@ -216,7 +216,7 @@ fn row(c: *ui.Context, a: *App, k: theme.Colors, sc: shortcuts.Shortcut, ix: usi
         ui.text(c, "Reset", set.st(c, 11, .{ .color = if (hot) k.text else k.muted.alpha(0.7) }));
         if (reset.clicked()) a.settings.setCombo(sc, null);
     }
-    var chip = ui.div(c).row().minW(96).px(12).py(6).rounded(8).justifyCenter().borderW(1);
+    var chip = ui.div(c).row().minW(96).px(13).py(7).rounded(8).justifyCenter().borderW(1);
     chip = if (recording_this) chip.bg(k.text).border(k.text.alpha(0.3)) else chip.bg(k.background).border(k.border).hover(k.ink(0.03));
     defer chip.end();
     var buf: [64]u8 = undefined;
