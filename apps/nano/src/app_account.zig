@@ -180,6 +180,9 @@ fn onCodegraff(a: *App, _: u64, r: rpc.Reply) void {
     const pending = acc.poll_at != null and !got.signed_in;
     acc.codegraff = got;
     if (pending) acc.codegraff.pending = true;
+    // A sign-in just finished: the account may already have a sandbox
+    // running.
+    if (got.signed_in and !got.pending and acc.poll_at != null) @import("app_sandboxes.zig").refresh(a);
     if (got.signed_in) acc.poll_at = null;
     a.redraw();
 }

@@ -32,6 +32,7 @@ pub const Name = enum {
     @"claude-mark",
     @"clock-circle",
     close,
+    cloud,
     copy,
     @"cursor-mark",
     @"danger-triangle",

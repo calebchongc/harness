@@ -3,7 +3,10 @@
 //! `cancel_login` in settings/accounts.rs): `StartAgentLogin` opens the
 //! browser, then either a code is pasted back (`CompleteAgentLogin`) or the
 //! dialog asks every 1.5 seconds until the browser flow lands
-//! (`PollAgentLogin`). Cancel tells the engine (`CancelAgentLogin`).
+//! (`PollAgentLogin`). Cancel tells the engine (`CancelAgentLogin`). A
+//! relayed ChatGPT sign-in for another computer is caught on this one's
+//! loopback (relay_callback.zig, `spawn_relay_capture`) and sent on; the
+//! paste field stays as the way back when the port is busy.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -13,6 +16,7 @@ const set = @import("view_settings.zig");
 const rpc = @import("rpc.zig");
 const accounts = @import("accounts.zig");
 const page_mod = @import("view_settings_accounts.zig");
+const relay_cb = @import("relay_callback.zig");
 const App = @import("app.zig").App;
 const Allocator = std.mem.Allocator;
 
@@ -65,9 +69,12 @@ pub const State = struct {
     code: ui.TextBuffer = .{},
     focus_code: bool = false,
     copied_until: ?f64 = null,
+    /// Listening on this computer's loopback during a relayed sign-in.
+    relay: ?*relay_cb.Capture = null,
 
     pub fn deinit(s: *State, gpa: Allocator) void {
         if (s.flow) |*f| f.deinit(gpa);
+        if (s.relay) |r| r.cancel();
     }
 };
 
@@ -87,6 +94,50 @@ fn drop(a: *App) void {
     const s = state(a);
     if (s.flow) |*f| f.deinit(a.gpa);
     s.flow = null;
+    stopRelay(a);
+}
+
+fn stopRelay(a: *App) void {
+    const s = state(a);
+    if (s.relay) |r| r.cancel();
+    s.relay = null;
+}
+
+/// How a landing reaches the UI thread (`nanoui.App.after`); tests hold
+/// it and run it themselves.
+pub var hop: *const fn (ctx: ?*anyopaque, func: *const fn (?*anyopaque) callconv(.c) void) void = afterNow;
+
+fn afterNow(ctx: ?*anyopaque, func: *const fn (?*anyopaque) callconv(.c) void) void {
+    nanoui.App.after(0, ctx, func);
+}
+
+/// `spawn_relay_capture`: catch the browser's loopback redirect for a
+/// relayed sign-in and send it on. A busy port leaves the paste field as
+/// the way to finish.
+pub fn spawnRelay(a: *App, url: []const u8) void {
+    var buf: [2048]u8 = undefined;
+    const t = relay_cb.callbackTarget(&buf, url) orelse return;
+    state(a).relay = relay_cb.start(a.gpa, a.io, t.port, t.path, .{ .ctx = a, .func = landed }) orelse {
+        std.log.info("harness-nano: loopback port {d} busy; relayed sign-in falls back to pasting", .{t.port});
+        return;
+    };
+}
+
+/// On the listener's thread: on to the UI thread.
+fn landed(_: ?*anyopaque, cap: *relay_cb.Capture) void {
+    hop(cap, delivered);
+}
+
+fn delivered(ctx: ?*anyopaque) callconv(.c) void {
+    const cap: *relay_cb.Capture = @ptrCast(@alignCast(ctx.?));
+    const a: *App = @ptrCast(@alignCast(cap.landed.ctx.?));
+    defer cap.release();
+    if (cap.isCancelled() or state(a).relay != cap) return;
+    const f = flowPtr(a) orelse return;
+    if (f.stage != .paste) return;
+    state(a).code.set(cap.address);
+    submit(a);
+    a.redraw();
 }
 
 /// Whether the page shows another computer's logins.
@@ -97,6 +148,7 @@ fn targetIsRemote(a: *App) bool {
 
 /// Add account, or a graff provider's sign-in (`begin_login`).
 pub fn begin(a: *App, harness: accounts.Harness, provider: ?[]const u8) void {
+    if (page_mod.scene_accounts) |text| if (sceneStart(a, harness, provider, text)) return;
     if (!page_mod.engineUp(a)) {
         page_mod.setNotice(a, "Engine not connected");
         return a.redraw();
@@ -121,6 +173,19 @@ pub fn begin(a: *App, harness: accounts.Harness, provider: ?[]const u8) void {
     a.redraw();
 }
 
+/// A scene's `loginStart` (the GPUI renderer's too): the dialog as the
+/// engine's reply would open it, no call made and no browser opened.
+fn sceneStart(a: *App, harness: accounts.Harness, provider: ?[]const u8, text: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.gpa, text, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const start = parsed.value.object.get("loginStart") orelse return false;
+    drop(a);
+    state(a).flow = .{ .harness = harness, .provider = if (provider) |p| a.gpa.dupe(u8, p) catch null else null };
+    onStart(a, 0, .{ .ok = start });
+    return true;
+}
+
 fn fresh(f: *Flow, id: u64) bool {
     if (id != 0 and f.call != id) return false;
     f.call = null;
@@ -139,12 +204,13 @@ fn onStart(a: *App, id: u64, r: rpc.Reply) void {
             };
             f.arena = ar;
             f.start = start;
-            if (start.mode != .host_browser and start.url.len > 0) _ = nanoui.shell.openUrl(start.url);
+            if (start.mode != .host_browser and start.url.len > 0 and page_mod.scene_accounts == null) _ = nanoui.shell.openUrl(start.url);
             switch (start.mode) {
                 .paste_code, .relay_browser => {
                     f.stage = .paste;
                     state(a).code.clear();
                     state(a).focus_code = true;
+                    if (start.mode == .relay_browser and page_mod.scene_accounts == null) spawnRelay(a, start.url);
                 },
                 .browser, .host_browser, .device_code => {
                     f.stage = .browser;

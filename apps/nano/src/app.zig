@@ -217,11 +217,15 @@ pub const App = struct {
     /// The workspace's scope, the Harness account and the Codegraff
     /// sign-in, for the account badge's menu (app_account.zig).
     account: account.Account = .{},
+    /// The account's Codegraff cloud sandboxes (app_sandboxes.zig).
+    cloud_sandboxes: @import("app_sandboxes.zig").State = .{},
     /// What the window shows that isn't the engine's: the sidebar, its
     /// project filter and search, open sections and tool groups.
     view: View = .{},
     /// The newest Harness release, asked of GitHub over HTTP/2.
     release: @import("release.zig").Check,
+    /// Failed runs' in-chat ChatGPT reconnects (app_reauth.zig).
+    reauth: @import("app_reauth.zig").State,
 
     pub fn init(gpa: Allocator, io: std.Io, port: u16) App {
         return .{
@@ -242,6 +246,7 @@ pub const App = struct {
             .harnesses = .init(gpa),
             .models = .init(gpa),
             .release = .{ .gpa = gpa, .io = io },
+            .reauth = .init(gpa),
         };
     }
 
@@ -265,6 +270,7 @@ pub const App = struct {
         a.peers.deinit(a.gpa);
         drafts.deinit(a);
         a.account.deinit(a.gpa);
+        a.cloud_sandboxes.deinit();
         a.settings.deinit();
         a.mcp.deinit(a.gpa);
         a.view.deinit(a.gpa);
@@ -282,6 +288,7 @@ pub const App = struct {
         a.gpa.free(a.new_harness);
         a.harnesses.deinit();
         a.models.deinit();
+        a.reauth.deinit();
     }
 
     pub const setHarness = agent.setHarness;
@@ -355,6 +362,9 @@ pub const App = struct {
                 a.request(requests.none("EngineReady"), .of(App, a, onNotice));
                 a.watchSidebar();
                 account.watch(a);
+                // A cloud sandbox left running keeps costing credit: show it
+                // from the start.
+                @import("app_sandboxes.zig").refresh(a);
                 if (a.selected != null) {
                     a.watchDoc(true);
                     queue_mod.watch(a);
@@ -403,6 +413,8 @@ pub const App = struct {
         var next: ?f64 = question.tick(a, now);
         if (queue_mod.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (account.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
+        if (@import("app_reauth.zig").tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
+        if (@import("app_sandboxes.zig").tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (a.w_queue.retry_at) |t| if (now >= t) {
             a.w_queue = .{};
             queue_mod.watch(a);

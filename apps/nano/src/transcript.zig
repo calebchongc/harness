@@ -42,6 +42,9 @@ pub const Part = struct {
     /// A tool has finished, or an input request was answered.
     resolved: bool = false,
     is_error: bool = false,
+    /// An error's typed sign-in route (`MessagePart::Error.reauth`), only
+    /// when it's one of the allowlisted ones.
+    reauth: ?@import("reauth_recovery.zig").Provider = null,
     /// An input part's request and its questions, in `arena`.
     request_id: []const u8 = "",
     questions: []const Question = &.{},
@@ -188,7 +191,10 @@ fn parsePart(gpa: Allocator, o: json.ObjectMap) !Part {
     errdefer p.deinit(gpa);
     switch (kind) {
         .text, .reasoning => try p.text.appendSlice(gpa, string(o.get("text")) orelse ""),
-        .@"error" => try p.text.appendSlice(gpa, string(o.get("message")) orelse ""),
+        .@"error" => {
+            try p.text.appendSlice(gpa, string(o.get("message")) orelse "");
+            p.reauth = @import("reauth_recovery.zig").Provider.parse(string(o.get("reauth")) orelse "");
+        },
         .tool => {
             p.resolved = if (o.get("resolved")) |r| r == .bool and r.bool else false;
             p.is_error = if (o.get("isError")) |r| r == .bool and r.bool else false;
@@ -330,4 +336,20 @@ test "remove, a tool's summary, and replacing an entry by id" {
         \\{"remove":["b"],"upsert":[{"after":null,"entry":{"id":"a","role":"assistant","status":"complete","parts":[]}}],"count":1}
     );
     try testing.expectEqual(@as(usize, 0), t.entries.items[0].parts.items.len);
+}
+
+test "an error keeps its typed sign-in route, only an allowlisted one" {
+    var t: Transcript = .{ .gpa = testing.allocator };
+    defer t.deinit();
+    try applyText(&t,
+        \\{"reset":[{"id":"a","role":"assistant","parts":[
+        \\  {"kind":"error","id":"e1","message":"ChatGPT needs you to sign in again.","reauth":"chatgpt-new"},
+        \\  {"kind":"error","id":"e2","message":"rejected","reauth":"arbitrary-command"},
+        \\  {"kind":"error","id":"e3","message":"plain"}]}]}
+    );
+    const ps = t.entries.items[0].parts.items;
+    try testing.expectEqual(@as(?@import("reauth_recovery.zig").Provider, .chatgpt_new), ps[0].reauth);
+    try testing.expect(ps[1].reauth == null);
+    try testing.expect(ps[2].reauth == null);
+    try testing.expectEqualStrings("plain", ps[2].text.items);
 }

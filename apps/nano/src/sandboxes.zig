@@ -122,19 +122,21 @@ pub fn parse(ar: Allocator, v: json.Value) !?List {
     };
     var sizes: std.ArrayList(Size) = .empty;
     if (o.get("sizes")) |a| if (a == .array) for (a.array.items) |item| {
-        if (item != .object) continue;
-        const s = item.object;
-        const price = num(s, "pricePerHourMicroUsd");
-        try sizes.append(ar, .{
-            .id = (try str(ar, s, "id")) orelse "",
-            .cpu = @intFromFloat(@max(num(s, "cpu") orelse 0, 0)),
-            .memory_gib = @intFromFloat(@max(num(s, "memoryGiB") orelse 0, 0)),
-            .disk_gib = @intFromFloat(@max(num(s, "diskGiB") orelse 0, 0)),
-            .price_per_hour_micro_usd = if (price) |p| @intFromFloat(p) else null,
-            .default = flag(s, "default") orelse false,
-        });
+        if (item == .object) try sizes.append(ar, try parseSize(ar, item.object));
     };
     return .{ .enabled = flag(o, "enabled") orelse false, .sandboxes = list.items, .sizes = sizes.items };
+}
+
+pub fn parseSize(ar: Allocator, s: json.ObjectMap) !Size {
+    const price = num(s, "pricePerHourMicroUsd");
+    return .{
+        .id = (try str(ar, s, "id")) orelse "",
+        .cpu = @intFromFloat(@max(num(s, "cpu") orelse 0, 0)),
+        .memory_gib = @intFromFloat(@max(num(s, "memoryGiB") orelse 0, 0)),
+        .disk_gib = @intFromFloat(@max(num(s, "diskGiB") orelse 0, 0)),
+        .price_per_hour_micro_usd = if (price) |p| @intFromFloat(p) else null,
+        .default = flag(s, "default") orelse false,
+    };
 }
 
 // The rules.

@@ -35,6 +35,14 @@ test {
     _ = @import("accounts.zig");
     _ = @import("view_settings_accounts.zig");
     _ = @import("sandboxes.zig");
+    _ = @import("app_sandboxes.zig");
+    _ = @import("parity_sandboxes.zig");
+    _ = @import("tests_ui_sandboxes.zig");
+    _ = @import("run_errors.zig");
+    _ = @import("reauth_recovery.zig");
+    _ = @import("relay_callback.zig");
+    _ = @import("view_reauth.zig");
+    _ = @import("tests_ui_reauth.zig");
     _ = @import("pins.zig");
     _ = @import("view_chat_menu.zig");
     _ = @import("icons.zig");

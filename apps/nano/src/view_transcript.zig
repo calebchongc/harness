@@ -3,6 +3,9 @@
 //! user's messages as bubbles on the right, the agent's Markdown, its tool
 //! calls and reasoning folded into groups ("Ran 2 commands"), errors as
 //! chips, and under each message a lane whose copy button shows on hover.
+//! An error signing in fixes says so and offers "Log in" (run_errors.zig);
+//! a typed ChatGPT sign-in error carries its reconnect card
+//! (view_reauth.zig).
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -13,6 +16,7 @@ const tools = @import("tools.zig");
 const tr = @import("transcript.zig");
 const sidebar = @import("view_sidebar.zig");
 const App = @import("app.zig").App;
+const rows_st = @import("view_settings_accounts_rows.zig").st;
 
 /// The column's width: Settings › Appearance's conversation width
 /// (`transcript_width`, 736 unless set), as of this frame.
@@ -63,6 +67,10 @@ pub fn entries(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript
     const body = ui.div(c).column().w(col);
     defer body.end();
     const entries_ = t.entries.items;
+    // The chat these are, for routing a sign-in: the open one's or a pane's.
+    const chat_id: ?[]const u8 = if (t == &a.transcript) a.selected else for (a.peers.items) |*p| {
+        if (&p.transcript == t) break p.id;
+    } else null;
     if (entries_.len == 0) {
         const e = ui.div(c).row().wFull().pt(40).justifyCenter();
         defer e.end();
@@ -71,11 +79,13 @@ pub fn entries(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript
     }
     for (entries_, 0..) |*e, i| {
         ui.key(c, c.print("entry-{s}", .{e.id}));
-        if (i > 0) _ = c.leaf(.{ .height = .{ .px = if (e.role == .user) 16 else 8 } }, .none, null);
+        // `top_gap_for`: every entry's first row opens a turn (`SPACE_LG`).
+        if (i > 0) _ = c.leaf(.{ .height = .{ .px = 16 } }, .none, null);
+        const at: At = .{ .chat_id = chat_id, .entries = entries_, .index = i, .col = col };
         switch (e.role) {
             .user => user(c, k, e, col),
-            .assistant => assistant(c, a, k, e, i + 1 == entries_.len),
-            .system => system(c, k, e),
+            .assistant => assistant(c, a, k, e, at),
+            .system => system(c, a, k, e, at),
         }
     }
 }
@@ -113,7 +123,16 @@ fn lane(c: *ui.Context, k: theme.Colors, e: *const tr.Entry, hovered: bool, righ
     }
 }
 
-fn assistant(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, last: bool) void {
+/// Where an entry is: its chat, its place among the entries, the column.
+const At = struct {
+    chat_id: ?[]const u8,
+    entries: []const tr.Entry,
+    index: usize,
+    col: f32,
+};
+
+fn assistant(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, at: At) void {
+    const last = at.index + 1 == at.entries.len;
     const col = ui.div(c).column().wFull().gap(12);
     defer col.end();
     const hovered = col.hovered();
@@ -129,7 +148,7 @@ fn assistant(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, last:
         }
         switch (p.kind) {
             .text => @import("view_markdown.zig").markdown(c, k, p.text.items),
-            .@"error" => errorChip(c, k, p.text.items),
+            .@"error" => errorPart(c, a, k, e, p, at),
             .image => attachment(c, k, .document, p.text.items),
             .visual => attachment(c, k, .widget, p.text.items),
             .delegation => attachment(c, k, .widget, "Delegated to a subagent"),
@@ -234,21 +253,75 @@ fn limitLines(s: []const u8, n: usize) []const u8 {
     return s;
 }
 
-/// An error, as the transcript's notice chip draws it (`notice.rs`).
-fn errorChip(c: *ui.Context, k: theme.Colors, message: []const u8) void {
-    const outer = ui.div(c).column().wFull().py(4);
-    defer outer.end();
-    const chip = ui.div(c).column().wFull().rounded(10).px(10).py(8).gap(6).border(k.danger.alpha(0.16)).borderW(1).bg(k.danger.alpha(0.05));
-    defer chip.end();
+/// An error part: a typed sign-in error's reconnect card, else the chip.
+fn errorPart(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, p: *const tr.Part, at: At) void {
+    const row_id = c.print("{s}#{s}", .{ e.id, p.id });
+    // Harness-generated; the chip is one line.
+    const message = singleLine(c, p.text.items);
+    const provider = p.reauth orelse return errorChip(c, a, k, at.chat_id, message);
+    // The chat moved on: a person's message after this error.
+    const later = for (at.entries[at.index + 1 ..]) |x| {
+        if (x.role == .user) break true;
+    } else false;
+    @import("view_reauth.zig").card(c, a, k, .{ .chat_id = at.chat_id, .row_id = row_id, .message = message, .provider = provider, .later_activity = later, .col = at.col });
+}
+
+/// `single_line`: every run of whitespace as one space, none at the ends.
+fn singleLine(c: *ui.Context, s: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, s, " \t\r\n\x0b\x0c");
+    while (it.next()) |w| {
+        if (out.items.len > 0) out.append(c.alloc(), ' ') catch return s;
+        out.appendSlice(c.alloc(), w) catch return s;
+    }
+    return out.items;
+}
+
+/// `notice_chip` with its tile (notice.rs): the danger triangle, `label`,
+/// Copy, then the message wrapped. The caller adds what goes under it and
+/// ends it.
+pub fn noticeChip(c: *ui.Context, k: theme.Colors, label: []const u8, message: []const u8) ui.Div {
+    // GPUI's edge insets what's inside it; here it's drawn over the box.
+    const chip = ui.div(c).column().wFull().rounded(10).px(10 + 1).py(8 + 1).gap(6).border(k.danger.alpha(0.16)).borderW(1).bg(k.danger.alpha(0.05));
     {
-        const h = ui.div(c).row().gap(6).itemsCenter();
+        const h = ui.div(c).row().wFull().gap(8).itemsCenter();
         defer h.end();
         const tile = ui.div(c).row().size(20, 20).center().rounded(6).bg(k.danger.alpha(0.12));
         icons.icon(c, .@"danger-triangle", 12, k.danger_muted.alpha(0.8), 0);
         tile.end();
-        ui.text(c, "Error", .{ .size = 12, .weight = .medium, .color = k.danger_muted.alpha(0.8) });
+        ui.text(c, label, .{ .size = 12, .weight = .medium, .color = k.danger_muted.alpha(0.8) });
+        ui.spacer(c);
+        const copy = ui.div(c).row().size(20, 20).center().rounded(6).hover(k.danger.alpha(0.12));
+        icons.icon(c, .copy, 12, k.danger_muted.alpha(0.8), 0);
+        copy.end();
+        if (copy.clicked()) c.clipboard.write(c.clipboard.ctx, message);
     }
-    ui.text(c, message, kit.style(c, 12, 18, .{ .wrap = true, .color = k.text.alpha(0.8) }));
+    // GPUI's line height (phi), as the GPUI renderer draws the chip.
+    ui.text(c, message, rows_st(c, 12, .{ .wrap = true, .color = k.text.alpha(0.8) }));
+    return chip;
+}
+
+/// `error_chip`: the message wraps; a refusal that signing in fixes says so
+/// in the label, and with a chat to route it carries "Log in" under the
+/// message (`sign_in_for_chat`).
+fn errorChip(c: *ui.Context, a: *App, k: theme.Colors, chat_id: ?[]const u8, message: []const u8) void {
+    const run_errors = @import("run_errors.zig");
+    // The ChatGPT plan's own limit has its plan-usage card in the GPUI app,
+    // never "Log in".
+    const problem = if (run_errors.isPlanUsageLimit(message)) null else run_errors.providerProblem(message);
+    const outer = ui.div(c).column().wFull().py(4);
+    defer outer.end();
+    const chip = noticeChip(c, k, if (problem) |p| p.label() else "Error", message);
+    defer chip.end();
+    const p = problem orelse return;
+    const id = chat_id orelse return;
+    const r = ui.div(c).row().pt(2);
+    defer r.end();
+    // `btn_primary` at px(10) py(5) rounded(7), 12 points.
+    const b = ui.div(c).row().px(10).py(5).rounded(7).bg(k.solid);
+    defer b.end();
+    ui.text(c, p.actionLabel(), rows_st(c, 12, .{ .weight = .medium, .color = k.on_solid }));
+    if (b.clicked()) @import("app_reauth.zig").signInForChat(a, id);
 }
 
 fn attachment(c: *ui.Context, k: theme.Colors, icon: icons.Name, label: []const u8) void {
@@ -258,10 +331,10 @@ fn attachment(c: *ui.Context, k: theme.Colors, icon: icons.Name, label: []const 
     ui.text(c, label, .{ .size = 12, .color = k.muted });
 }
 
-fn system(c: *ui.Context, k: theme.Colors, e: *const tr.Entry) void {
+fn system(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, at: At) void {
     for (e.parts.items) |*p| switch (p.kind) {
         .text => ui.text(c, p.text.items, kit.style(c, 12, 18, .{ .wrap = true, .color = k.faint })),
-        .@"error" => errorChip(c, k, p.text.items),
+        .@"error" => errorPart(c, a, k, e, p, at),
         else => {},
     };
 }

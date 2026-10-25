@@ -2,7 +2,8 @@
 //! shell/chat_tabs.rs, shell/spaces.rs): the open tabs, the project filter
 //! with search and view options, then Sessions and Archived, each row a
 //! status mark, the agent's mark, the project's monogram, a fading title
-//! and how long ago; the account badge at the foot.
+//! and how long ago; a running cloud sandbox's strip and the account badge
+//! at the foot.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -646,6 +647,9 @@ fn firstLine(s: []const u8) []const u8 {
 }
 
 fn footer(c: *ui.Context, a: *App, k: theme.Colors) void {
+    // A running cloud sandbox is billed until it is turned off: always in
+    // view, above the account badge.
+    @import("view_sandbox_strip.zig").strip(c, a, k, 0);
     const f = ui.div(c).row().wFull().p(8);
     defer f.end();
     var b = ui.div(c).row().size(21, 21).center().roundedFull();

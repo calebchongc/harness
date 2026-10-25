@@ -5,10 +5,9 @@
 //! account (view_settings_accounts_login.zig). The device switcher in the
 //! header points every call at another device (`targetDeviceId`).
 //!
-//! Not here: the cloud sandboxes card, which reads the GPUI app's
-//! `AppState::cloud_sandboxes` (Harness Nano doesn't keep them), and the
-//! relayed ChatGPT sign-in's loopback catcher: pasting the address it lands
-//! on finishes it instead.
+//! The cloud sandboxes card reads the list the app keeps
+//! (app_sandboxes.zig, the GPUI app's `AppState::cloud_sandboxes`). A
+//! failed run's "Log in" lands here through `signIn`.
 const std = @import("std");
 const rules = @import("rules.zig");
 const json = std.json;
@@ -101,13 +100,10 @@ pub const Page = struct {
     /// "You're using your ChatGPT plan", once, until Got it.
     confirmation: ?[]u8 = null,
     login: login.State = .{},
-    /// The account's cloud sandboxes (`CodegraffSandboxes`), and the card's
-    /// own state.
-    sandboxes: Slot(?sandboxes.List) = .{},
+    /// The cloud sandboxes card's own state (the list is the app's).
     cloud: cloud.Cloud = .{},
 
     pub fn deinit(p: *Page, gpa: Allocator) void {
-        p.sandboxes.deinit(gpa);
         p.cloud.deinit(gpa);
         p.snapshot.deinit(gpa);
         p.usage.deinit(gpa);
@@ -217,12 +213,12 @@ fn feed(a: *App, comptime field: []const u8, comptime parse: anytype, v: json.Va
         } else false else false;
         a.view.accounts.jobs_poll_at = if (working) a.now + jobs_poll_s else null;
     }
-    if (comptime std.mem.eql(u8, field, "sandboxes")) cloud.schedule(a);
 }
 
-/// The cloud sandboxes' answer (state/cloud_sandboxes.rs reads it).
+/// The cloud sandboxes' answer, kept on the app
+/// (`apply_cloud_sandboxes_value`).
 pub fn feedSandboxes(a: *App, v: json.Value) void {
-    feed(a, "sandboxes", sandboxes.parse, v);
+    @import("app_sandboxes.zig").apply(a, v);
 }
 
 /// A headless scene's replies in place of the engine's (snap.zig; the GPUI
@@ -275,6 +271,20 @@ fn setTarget(a: *App, to: ?[]const u8) void {
     p.graff = .{ .why = p.graff.why };
     p.notice.clearRetainingCapacity();
     load(a, .mount);
+}
+
+/// A failed run's "Log in" (`sign_in`): `target_device`'s logins (null:
+/// this one's) and, for an agent with a sign-in here (Claude Code, Codex,
+/// Cursor), Add account started. Other agents (graff's provider sign-ins
+/// among them) just land on the page: the chat says which agent, not which
+/// of its providers.
+pub fn signIn(a: *App, target_device: ?[]const u8, harness: ?accounts.Harness) void {
+    setTarget(a, target_device);
+    if (harness) |h| for (accounts.providers) |pv| if (pv.harness == h) {
+        login.begin(a, h, null);
+        break;
+    };
+    a.redraw();
 }
 
 /// Switch (`ActivateAgentAccount`) or Forget (`ForgetAgentAccount`).
@@ -378,7 +388,6 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         } else c.frameIn(@floatCast(t - c.time));
     }
     login.tick(c, a);
-    cloud.tick(c, a);
     const now = a.nowMs();
     header(c, a, k);
     set.subtitle(c, k, "CodeGraff usage, graff's provider sign-ins, and the Claude Code, Codex, and Cursor logins on this device. Harness keeps local agent logins backed up and can swap between them.", false);

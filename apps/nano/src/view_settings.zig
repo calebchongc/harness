@@ -115,7 +115,7 @@ pub fn nav(c: *ui.Context, a: *App, k: theme.Colors) void {
         }
     }
     // A running cloud sandbox stays in view on every settings page too.
-    @import("view_settings_accounts_sandboxes.zig").strip(c, a, k);
+    @import("view_sandbox_strip.zig").strip(c, a, k, 4);
     const foot = ui.div(c).column().wFull().px(8).pb(12);
     defer foot.end();
     const back = ui.div(c).row().wFull().px(8).py(6).gap(6).itemsCenter().rounded(8).hover(k.hover);

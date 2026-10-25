@@ -29,6 +29,9 @@ pub fn view(a: *App, c: *ui.Context) void {
     a.ansi = k.ansi;
     if (a.tick(c.time)) |wait| c.frameIn(wait);
     c.title_bar_height = sidebar.titlebar_h;
+    // Text breaks into lines where the GPUI app breaks it, with a nanoui
+    // that has its rule (justrach/nanoui gpui-wrap).
+    if (comptime @hasField(@TypeOf(c.text.*), "wrap_rule")) c.text.wrap_rule = .glyph_positions;
     keys(c, a);
     @import("view_drag.zig").update(c, a);
     a.syncPeers();
@@ -226,6 +229,10 @@ fn keys(c: *ui.Context, a: *App) void {
 }
 
 fn titlebar(c: *ui.Context, a: *App, k: theme.Colors) void {
+    // With no sidebar in view, a running cloud sandbox (billed until turned
+    // off) still shows under the sidebar toggle. The GPUI app hides its
+    // settings sidebar with the sidebar; this one keeps it, with the strip.
+    if (!a.view.sidebar_open and !a.view.settings_open) @import("view_sandbox_strip.zig").chip(c, a, k);
     const bar = ui.div(c).fixed().offset(cluster_x, 4 + (34 - 24) / 2).row().itemsCenter().layer(3);
     defer bar.end();
     if (kit.iconButton(c, k, .@"sidebar-minimalistic-left", .{})) a.view.sidebar_open = !a.view.sidebar_open;

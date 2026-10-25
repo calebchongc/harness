@@ -3,11 +3,11 @@
 //! state/cloud_sandboxes.rs keeps it): each sandbox with Copy ID, Start or
 //! Set up Harness, Keep running, Turn off and Delete (asking first), then
 //! "Harness cloud" with its sizes and Create, and "Temporary sandbox" with
-//! Create temporary. Shown only when the list says it's enabled; read when
-//! the page loads and every 60 seconds while one runs. The calls are never
+//! Create temporary. Shown only when the list says it's enabled. The list is
+//! the app's (app_sandboxes.zig): read when the page loads, after each
+//! action, and every 60 seconds while one runs. The calls are never
 //! retargeted: the sandboxes belong to this device's Codegraff sign-in.
 const std = @import("std");
-const json = std.json;
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
@@ -15,6 +15,7 @@ const kit = @import("view_kit.zig");
 const set = @import("view_settings.zig");
 const rpc = @import("rpc.zig");
 const sandboxes = @import("sandboxes.zig");
+const state = @import("app_sandboxes.zig");
 const rows = @import("view_settings_accounts_rows.zig");
 const page = @import("view_settings_accounts.zig");
 const App = @import("app.zig").App;
@@ -22,12 +23,8 @@ const Allocator = std.mem.Allocator;
 
 const st = rows.st;
 
-/// How often a running sandbox's state is read again (`REFRESH_EVERY`).
-const refresh_s: f64 = 60;
-
-/// The card's own state; the list is the page's `sandboxes` slot.
+/// The card's own state; the list is the app's.
 pub const Cloud = struct {
-    next_read: ?f64 = null,
     /// The sandbox with an action in flight, and which (`start`, `stop`,
     /// `keep-running-on`, `delete`).
     busy: ?[]u8 = null,
@@ -37,8 +34,6 @@ pub const Cloud = struct {
     creating: bool = false,
     /// The size picked for the next sandbox (null: the default).
     size: ?[]u8 = null,
-    /// The strip's Turn off is in flight, and how many pauses it waits for.
-    turning_off: usize = 0,
 
     pub fn deinit(cl: *Cloud, gpa: Allocator) void {
         inline for (.{ "busy", "confirm_delete", "size" }) |f| if (@field(cl, f)) |x| gpa.free(x);
@@ -49,47 +44,10 @@ fn cloud(a: *App) *Cloud {
     return &a.view.accounts.cloud;
 }
 
-/// The list, when there is one to show.
-fn list(a: *App) ?sandboxes.List {
-    const l = (a.view.accounts.sandboxes.get() orelse return null) orelse return null;
-    return if (l.enabled) l else null;
-}
+const list = state.shown;
 
-/// Read the list now (`refresh_cloud_sandboxes`).
-pub fn refresh(a: *App) void {
-    if (!page.engineUp(a)) return;
-    cloud(a).next_read = null;
-    const s = &a.view.accounts.sandboxes;
-    s.call = a.engine.call("CodegraffSandboxes", rpc.empty, .of(App, a, onList));
-}
-
-fn onList(a: *App, id: u64, r: rpc.Reply) void {
-    const s = &a.view.accounts.sandboxes;
-    if (id != 0 and s.call != id) return;
-    s.call = null;
-    switch (r) {
-        .ok => |v| page.feedSandboxes(a, v),
-        // A failed read keeps the last answer, and tries again on the timer.
-        else => schedule(a),
-    }
-    a.redraw();
-}
-
-/// One timer while anything runs; none otherwise.
-pub fn schedule(a: *App) void {
-    const l = (a.view.accounts.sandboxes.get() orelse null) orelse {
-        cloud(a).next_read = null;
-        return;
-    };
-    cloud(a).next_read = if (sandboxes.needsRefresh(l)) a.now + refresh_s else null;
-}
-
-/// From the page's frame: read again when it's time.
-pub fn tick(c: *ui.Context, a: *App) void {
-    const t = cloud(a).next_read orelse return;
-    if (c.time >= t) return refresh(a);
-    c.frameIn(@floatCast(t - c.time));
-}
+/// Read the list now (`load_codegraff_sandboxes`): the app's read.
+pub const refresh = state.refresh;
 
 /// Start, Turn off, Keep running or Delete (`CodegraffSandboxAction`).
 fn act(a: *App, id: []const u8, action: []const u8) void {
@@ -257,64 +215,4 @@ fn sizeChoice(c: *ui.Context, a: *App, k: theme.Colors, sizes: []const sandboxes
         if (!cl.creating and b.clicked()) page.replace(a.gpa, &cl.size, s.id);
     }
     if (line) |l| l.end();
-}
-
-/// The "Cloud sandbox running" strip (shell/cloud_sandbox_strip.rs), in
-/// the settings sidebar above Back: a live dot, what it costs or why it
-/// will pause, and a one-click Turn off. Its label opens Accounts.
-pub fn strip(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const l = list(a) orelse return;
-    const sum = (sandboxes.runningSummary(c.alloc(), l, a.nowMs()) catch return) orelse return;
-    const cl = cloud(a);
-    const tone = if (sum.warning) k.warning else k.accent;
-    const w: f32 = @import("view_sidebar.zig").width - 2 * 8;
-    const pad = ui.div(c).column().wFull().px(8).pb(4);
-    defer pad.end();
-    ui.key(c, "cloud-sandbox-strip");
-    const s = ui.div(c).row().w(w).px(9).py(7).gap(8).itemsCenter().rounded(6)
-        .bg(if (sum.warning) k.warning.alpha(0.12) else k.accent_wash).border(tone.alpha(0.3)).borderW(1);
-    defer s.end();
-    const label: []const u8 = if (cl.turning_off > 0) sandboxes.turn_off[1] else if (sum.running_ids.len == 1) sandboxes.turn_off[0] else "Turn off all";
-    const button_w: f32 = if (sum.running_ids.len > 0) 8 + 18 + c.text.width(label, .{ .size = 11, .weight = .medium }) else 0;
-    const text_w = w - 2 * 9 - button_w;
-    {
-        const open = ui.div(c).column().w(text_w).gap(1);
-        defer open.end();
-        {
-            const top = ui.div(c).row().gap(6).itemsCenter();
-            defer top.end();
-            kit.dot(c, 6, tone);
-            kit.ellipsisText(c, sum.label, st(c, 11, .{ .weight = .medium, .color = k.text }), text_w - 12);
-        }
-        {
-            const d = ui.div(c).row().pl(12);
-            defer d.end();
-            kit.ellipsisText(c, sum.detail, st(c, 10.5, .{ .color = if (sum.warning) k.warning else k.muted }), text_w - 12);
-        }
-        if (open.clicked()) {
-            a.settings.setSection(.agents);
-            a.redraw();
-        }
-    }
-    if (sum.running_ids.len == 0) return;
-    var b = ui.div(c).row().px(9).py(4).rounded(6).border(k.border).borderW(1).bg(k.raised);
-    if (cl.turning_off > 0) b = b.opacity(0.6) else b = b.hover(k.raised.mix(k.text, 0.06));
-    defer b.end();
-    ui.text(c, label, st(c, 11, .{ .weight = .medium, .color = k.text }));
-    if (cl.turning_off == 0 and b.clicked() and page.engineUp(a)) {
-        // Pause every running one, then read the list again.
-        cl.turning_off = sum.running_ids.len;
-        for (sum.running_ids) |id| a.call("CodegraffSandboxAction", .{ .id = id, .action = "stop" }, .of(App, a, onTurnedOff));
-    }
-}
-
-fn onTurnedOff(a: *App, _: u64, r: rpc.Reply) void {
-    const cl = cloud(a);
-    if (r == .err) {
-        var buf: [256]u8 = undefined;
-        a.setNotice(std.fmt.bufPrint(&buf, "Couldn't turn off the cloud sandbox: {s}", .{page.why(r.err)}) catch "Couldn't turn off the cloud sandbox");
-    }
-    cl.turning_off -|= 1;
-    if (cl.turning_off == 0) refresh(a);
-    a.redraw();
 }

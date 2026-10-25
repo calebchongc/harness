@@ -57,6 +57,8 @@ pub fn build(b: *std.Build) void {
     const protocol = b.root.joinString(b.allocator, "../../protocol/desktop") catch @panic("OOM");
     const opts = b.addOptions();
     opts.addOption([]const u8, "protocol_dir", protocol);
+    // And the app rules the phones share (apps/parity/vectors).
+    opts.addOption([]const u8, "vectors_dir", b.root.joinString(b.allocator, "../parity/vectors") catch @panic("OOM"));
     tests.root_module.addOptions("parity_options", opts);
     b.step("test", "Run harness-nano tests").dependOn(&b.addRunArtifact(tests).step);
 
