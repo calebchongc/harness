@@ -139,6 +139,7 @@
 		A4000000000000000000E002 /* Exceptions for "HarnessWatch" folder in "Harness" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				Shared/HarnessMarkShape.swift,
 				Shared/WatchLink.swift,
 			);
 			target = A1000000000000000000T001 /* Harness */;
@@ -146,6 +147,7 @@
 		A4000000000000000000E003 /* Exceptions for "HarnessWatch" folder in "HarnessWatchWidgets" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				Shared/HarnessMarkShape.swift,
 				Shared/WatchLink.swift,
 			);
 			target = A5000000000000000000T001 /* HarnessWatchWidgets */;
@@ -156,6 +158,16 @@
 				Info.plist,
 			);
 			target = A5000000000000000000T001 /* HarnessWatchWidgets */;
+		};
+		A4000000000000000000E004 /* Exceptions for "Harness" folder in "HarnessWatch" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Fonts/Geist-Medium.ttf,
+				Fonts/Geist-SemiBold.ttf,
+				Fonts/Geist.ttf,
+				Fonts/GeistMono.ttf,
+			);
+			target = A4000000000000000000T001 /* HarnessWatch */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -174,6 +186,7 @@
 			exceptions = (
 				A100000000000000000000E1 /* Exceptions for "Harness" folder in "Harness" target */,
 				13F0799F6C34AAD8E1B2B457 /* Exceptions for "Harness" folder in "HarnessWidgets" target */,
+				A4000000000000000000E004 /* Exceptions for "Harness" folder in "HarnessWatch" target */,
 			);
 			path = Harness;
 			sourceTree = "<group>";

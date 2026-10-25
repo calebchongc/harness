@@ -146,7 +146,16 @@ final class WatchStore: NSObject {
     private func take(_ message: [String: Any]) {
         if let context = WatchLink.body(WatchLink.Context.self, of: message, as: .context) {
             self.context = context
+            let before = sent
             sent = WatchLink.applying(context.receipts, to: sent)
+            // A tap on the wrist when a message lands, or doesn't.
+            if let changed = zip(before, sent).first(where: { $0.state != $1.state })?.1 {
+                switch changed.state {
+                case .delivered: WatchTheme.haptic(.success)
+                case .failed: WatchTheme.haptic(.failure)
+                case .waiting: break
+                }
+            }
             let settled = Set(context.receipts.map(\.id))
             outbox.removeAll { settled.contains($0.id) }
             save()
@@ -192,6 +201,13 @@ final class WatchStore: NSObject {
         send(args[ix + 1])
     }
 
+    /// Screenshot rig: `-watchScreen picker|review|recording` opens that screen.
+    static let screen: String? = {
+        let args = ProcessInfo.processInfo.arguments
+        guard let ix = args.firstIndex(of: "-watchScreen"), ix + 1 < args.count else { return nil }
+        return args[ix + 1]
+    }()
+
     static func newId() -> String { UUID().uuidString.lowercased() }
     static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
@@ -203,8 +219,12 @@ final class WatchStore: NSObject {
             .init(id: "demo-2", title: "Release notes for 2.4", status: .idle, calledAt: now - 3_600_000),
             .init(id: "demo-3", title: "Plan the settings page", status: .needsInput, calledAt: now - 7_200_000),
         ], receipts: [])
-        sent = [WatchLink.Sent(id: "demo-sent", text: "Also check the retry path when the upload times out",
-                               chatTitle: "Fix the flaky upload test", state: .delivered, createdAt: now - 30_000)]
+        sent = [
+            WatchLink.Sent(id: "demo-sent", text: "Also check the retry path when the upload times out",
+                           chatTitle: "Fix the flaky upload test", state: .delivered, createdAt: now - 30_000),
+            WatchLink.Sent(id: "demo-older", text: "Keep the settings page to one column on phones",
+                           chatTitle: "Plan the settings page", state: .delivered, createdAt: now - 3_600_000),
+        ]
     }
 }
 
