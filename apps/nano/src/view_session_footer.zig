@@ -2,8 +2,8 @@
 //! `render_footer`): for a project with git, read-only labels at the left,
 //! where the chat runs ("Graff worktree", "Worktree" or "Local checkout")
 //! and its branch (else "No ref"); a Graff worktree adds its actions
-//! (`render_graff_worktree_actions`). The GPUI app's PR badge isn't here:
-//! nano doesn't watch change requests.
+//! (`render_graff_worktree_actions`). At the right, the branch's pull
+//! request: its merge controls, then its badge (view_change_requests.zig).
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -13,6 +13,7 @@ const kit = @import("view_kit.zig");
 const workspace = @import("workspace.zig");
 const graff_worktree = @import("graff_worktree.zig");
 const actions = @import("app_graff_worktree.zig");
+const prs = @import("view_change_requests.zig");
 const App = @import("app.zig").App;
 
 /// The slot the composer keeps for it (`SESSION_FOOTER_HEIGHT`), 8 points
@@ -67,6 +68,12 @@ pub fn footer(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
     label(c, k, kind.icon(), kind.label());
     label(c, k, .@"git-branch", chat.row_branch orelse "No ref");
     if (kind == .graff) if (chat.cwd) |cwd| if (graff_worktree.GraffWorktree.fromPath(cwd)) |tree| card(c, a, k, chat.id, tree);
+    // PR and merge are the trailing group, whatever the branch's length.
+    const spring = ui.div(c).grow().w(0);
+    spring.end();
+    const pr = @import("app_change_requests.zig").forChat(a, chat) orelse return;
+    prs.mergeControls(c, a, k, chat, pr[0]);
+    prs.badge(c, k, pr[0], pr[1], .composer, true);
 }
 
 /// `footer_label`: a 12-point glyph and words, quiet, 20 tall.

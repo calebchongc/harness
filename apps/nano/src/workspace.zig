@@ -16,6 +16,18 @@ pub const Space = struct {
     name: []const u8,
     /// A git checkout: a new chat offers its checkout and ref.
     git: bool = false,
+    /// The project folder's own checkout (`Space::checkout_id`): a chat
+    /// working there shares its branch (change_requests.zig).
+    checkout_id: ?[]const u8 = null,
+};
+
+/// Where a chat's latest run found itself (`ConversationSourceContext`):
+/// which checkout, its repository root, the folder and the branch.
+pub const Source = struct {
+    checkout_id: []const u8,
+    repo_root: []const u8,
+    cwd: []const u8,
+    branch: []const u8,
 };
 
 pub const Chat = struct {
@@ -43,6 +55,11 @@ pub const Chat = struct {
     /// The row's own `branch` (`Chat::branch`), which the composer's
     /// session footer names (pickers.rs `render_footer`).
     row_branch: ?[]const u8 = null,
+    /// The source context as sent (`sourceContext`), and whether the latest
+    /// run couldn't observe its checkout (`sourceContextUnavailableAt`);
+    /// change_requests.zig `currentSource` says when it is current.
+    source: ?Source = null,
+    source_unavailable: bool = false,
 
     /// The sidebar's order: "last called" (`last_prompt_at`, then
     /// `last_message_at`, then `created_at`).
@@ -168,6 +185,7 @@ fn parseSpace(a: Allocator, o: json.ObjectMap) ?Space {
         .device_id = str(a, o, "deviceId"),
         .name = str(a, o, "name") orelse std.fs.path.basename(path),
         .git = if (o.get("gitDetected")) |v| v == .bool and v.bool else false,
+        .checkout_id = str(a, o, "checkoutId"),
     };
 }
 
@@ -192,6 +210,20 @@ fn parseChat(a: Allocator, o: json.ObjectMap) ?Chat {
         .harness_session_id = str(a, o, "harnessSessionId"),
         .branch = currentBranch(a, o),
         .row_branch = str(a, o, "branch"),
+        .source = parseSource(a, o),
+        .source_unavailable = if (o.get("sourceContextUnavailableAt")) |u| u != .null else false,
+    };
+}
+
+/// `sourceContext`, when it names its checkout, root, folder and branch.
+fn parseSource(a: Allocator, o: json.ObjectMap) ?Source {
+    const v = o.get("sourceContext") orelse return null;
+    if (v != .object) return null;
+    return .{
+        .checkout_id = str(a, v.object, "checkoutId") orelse return null,
+        .repo_root = str(a, v.object, "repoRoot") orelse return null,
+        .cwd = str(a, v.object, "cwd") orelse return null,
+        .branch = str(a, v.object, "branch") orelse return null,
     };
 }
 

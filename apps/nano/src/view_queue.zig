@@ -9,6 +9,7 @@ const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const kit = @import("view_kit.zig");
+const tip = @import("view_tooltip.zig");
 const queue = @import("queue.zig");
 const App = @import("app.zig").App;
 
@@ -58,24 +59,29 @@ fn row(c: *ui.Context, a: *App, k: theme.Colors, r: queue.Row, newest: bool, com
         if (textButton(c, k, .close, "Cancel", true)) a.queueFinishEdit(.cancel);
         return;
     }
-    if (rowButton(c, k, .@"trash-bin-minimalistic", !gated)) a.queueRemove(r.id);
-    if (!r.agent and rowButton(c, k, .pen, !gated and a.queue_edit == null)) a.queueBeginEdit(r.id);
+    if (rowButton(c, k, .@"trash-bin-minimalistic", "Remove", !gated)) a.queueRemove(r.id);
+    if (!r.agent and rowButton(c, k, .pen, "Edit", !gated and a.queue_edit == null)) a.queueBeginEdit(r.id);
     const can_send = a.caps.actions and !gated;
+    // `QueuePrimaryAction::tooltip`, or why it waits.
+    const send_tip = if (can_send) "Send now (interrupt)" else "Waiting for provider capabilities";
     const label = if (newest and c.input.cmd) "⌘ Enter" else "Send now";
     if (compact) {
-        if (rowButton(c, k, .@"arrow-up", can_send)) a.queueSendNow(r.id);
+        if (rowButton(c, k, .@"arrow-up", send_tip, can_send)) a.queueSendNow(r.id);
     } else {
         var b = ui.div(c).row().size(72, 28).center().rounded(5).opacity(if (can_send) 0.72 else 0.45);
         if (can_send) b = b.hover(k.ink(0.07));
+        b = tip.on(b, k, .{ .text = send_tip, .delay = tip.quick, .look = .queue });
         defer b.end();
         if (b.clicked() and can_send) a.queueSendNow(r.id);
         ui.text(c, label, .{ .size = 11.5, .color = k.muted });
     }
 }
 
-fn rowButton(c: *ui.Context, k: theme.Colors, name: icons.Name, enabled: bool) bool {
+/// A `queue_action`: its icon, and `label` as its tooltip.
+fn rowButton(c: *ui.Context, k: theme.Colors, name: icons.Name, label: []const u8, enabled: bool) bool {
     var b = ui.div(c).row().size(28, 28).center().rounded(5).opacity(if (enabled) 0.72 else 0.45);
     if (enabled) b = b.hover(k.ink(0.07));
+    b = tip.on(b, k, .{ .text = label, .delay = tip.quick, .look = .queue });
     defer b.end();
     const hot = b.hovered() and enabled;
     icons.icon(c, name, 13, if (hot) k.text else k.muted.alpha(0.8), 0);
@@ -85,6 +91,7 @@ fn rowButton(c: *ui.Context, k: theme.Colors, name: icons.Name, enabled: bool) b
 fn textButton(c: *ui.Context, k: theme.Colors, name: icons.Name, label: []const u8, enabled: bool) bool {
     var b = ui.div(c).row().h(28).px(8).gap(5).itemsCenter().rounded(5).hover(k.ink(0.07));
     if (!enabled) b = b.opacity(0.45);
+    b = tip.on(b, k, .{ .text = label, .delay = tip.quick, .look = .queue });
     defer b.end();
     icons.icon(c, name, 13, k.muted, 0);
     ui.text(c, label, .{ .size = 11.5, .color = k.muted });

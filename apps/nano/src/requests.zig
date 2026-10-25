@@ -192,3 +192,16 @@ pub fn closeTerminal(terminal_id: []const u8, host: ?[]const u8) Request(struct 
 pub fn graffWorktreeAction(chat_id: []const u8, action: []const u8, host: ?[]const u8) Request(struct { chatId: []const u8, action: []const u8, targetDeviceId: ?[]const u8 }) {
     return .{ .method = "GraffWorktreeAction", .params = .{ .chatId = chat_id, .action = action, .targetDeviceId = host } };
 }
+
+// ── pull requests ────────────────────────────────────────────────────
+
+/// `WatchCheckoutChangeRequest` (state.rs `spawn_change_request_watch`):
+/// the branch's PR on the checkout at `cwd`, a checked stream.
+pub fn watchChangeRequest(p: @import("change_requests.zig").WatchParams) Request(@import("change_requests.zig").WatchParams) {
+    return .{ .method = "WatchCheckoutChangeRequest", .params = p };
+}
+
+/// `MergeChangeRequest` (pickers.rs `run_change_request_merge`).
+pub fn mergeChangeRequest(p: @import("change_requests.zig").MergeParams) Request(@import("change_requests.zig").MergeParams) {
+    return .{ .method = "MergeChangeRequest", .params = p };
+}

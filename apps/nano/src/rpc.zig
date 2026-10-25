@@ -29,6 +29,16 @@ pub const Reply = union(enum) {
 pub const Handler = struct {
     ctx: ?*anyopaque,
     func: *const fn (ctx: ?*anyopaque, id: u64, reply: Reply) void,
+    /// A checked stream (`subscribe_checked`): the engine first answers
+    /// `ok` (`{"stream": true}`) to say it started, so `ok` doesn't end it,
+    /// and an older engine's `unknown method` comes back as `err`.
+    checked: bool = false,
+
+    pub fn checkedStream(h: Handler) Handler {
+        var x = h;
+        x.checked = true;
+        return x;
+    }
 
     pub fn of(comptime T: type, ctx: *T, comptime func: fn (*T, u64, Reply) void) Handler {
         return .{ .ctx = ctx, .func = struct {
@@ -96,7 +106,11 @@ pub const Mux = struct {
         else
             .{ .ok = obj.get("ok") orelse .null };
         const handler = m.pending.get(id) orelse return;
-        const last = reply != .item;
+        const last = switch (reply) {
+            .item => false,
+            .ok => !handler.checked,
+            else => true,
+        };
         if (last) _ = m.pending.remove(id);
         handler.func(handler.ctx, id, reply);
     }
@@ -182,4 +196,19 @@ test "cancel forgets the stream and says so to the engine" {
     try testing.expectEqualStrings("{\"id\":1,\"cancel\":true}", f);
     try m.dispatch("{\"id\":1,\"item\":{}}");
     try testing.expectEqual(@as(usize, 0), log.items);
+}
+
+test "a checked stream's ok says it started; its items follow until done" {
+    var m: Mux = .{ .gpa = testing.allocator };
+    defer m.deinit();
+    var log: Log = .{};
+    const c = try m.call("WatchCheckoutChangeRequest", .{ .cwd = "/r", .branch = "b" }, Handler.of(Log, &log, Log.on).checkedStream());
+    defer testing.allocator.free(c.frame);
+    try m.dispatch("{\"id\":1,\"ok\":{\"stream\":true}}");
+    try m.dispatch("{\"id\":1,\"item\":{}}");
+    try testing.expectEqual(@as(usize, 1), log.oks);
+    try testing.expectEqual(@as(usize, 1), log.items);
+    try m.dispatch("{\"id\":1,\"done\":true}");
+    try testing.expect(log.done);
+    try testing.expectEqual(@as(usize, 0), m.pending.count());
 }

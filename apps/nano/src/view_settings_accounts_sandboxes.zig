@@ -128,6 +128,9 @@ pub fn card(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (rows.ghost(c, k, temp_g) and !cl.creating) create(a, true);
 }
 
+/// Keep running's tooltip (settings/accounts.rs).
+const keep_running_hint = "Keep it running until you turn it off, billed per second from your Codegraff credit.";
+
 /// One sandbox: its title and detail, then the actions it offers.
 fn sandboxRow(c: *ui.Context, a: *App, k: theme.Colors, s: sandboxes.Sandbox, now: i64) void {
     const cl = cloud(a);
@@ -139,7 +142,7 @@ fn sandboxRow(c: *ui.Context, a: *App, k: theme.Colors, s: sandboxes.Sandbox, no
     var gs: [5]G = undefined;
     var n: usize = 0;
     if (sandboxes.isTemporary(s)) {
-        gs[n] = .{ .g = .{ .label = "Copy ID" }, .what = .copy };
+        gs[n] = .{ .g = .{ .label = "Copy ID", .tip = "Use this ID with sandbox API/tools." }, .what = .copy };
         n += 1;
     }
     if (sandboxes.canStart(s)) {
@@ -147,11 +150,11 @@ fn sandboxRow(c: *ui.Context, a: *App, k: theme.Colors, s: sandboxes.Sandbox, no
         n += 1;
     }
     if (sandboxes.canKeepRunning(s)) {
-        gs[n] = .{ .g = .{ .label = if (eqOpt(busy, "keep-running-on")) "Keeping running…" else "Keep running", .dim = any }, .what = .keep };
+        gs[n] = .{ .g = .{ .label = if (eqOpt(busy, "keep-running-on")) "Keeping running…" else "Keep running", .dim = any, .tip = keep_running_hint }, .what = .keep };
         n += 1;
     }
     if (sandboxes.canStop(s)) {
-        gs[n] = .{ .g = .{ .label = if (eqOpt(busy, "stop")) sandboxes.turn_off[1] else sandboxes.turn_off[0], .dim = any }, .what = .stop };
+        gs[n] = .{ .g = .{ .label = if (eqOpt(busy, "stop")) sandboxes.turn_off[1] else sandboxes.turn_off[0], .dim = any, .tip = sandboxes.turn_off_hint }, .what = .stop };
         n += 1;
     }
     gs[n] = .{ .g = .{ .label = if (eqOpt(busy, "delete")) "Deleting…" else if (confirming) "Delete for good?" else "Delete", .dim = any }, .what = .delete };

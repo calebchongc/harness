@@ -10,6 +10,7 @@ const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const kit = @import("view_kit.zig");
+const tip = @import("view_tooltip.zig");
 const rules = @import("rules.zig");
 const workspace = @import("workspace.zig");
 const App = @import("app.zig").App;
@@ -103,7 +104,7 @@ fn filterRow(c: *ui.Context, a: *App, k: theme.Colors) void {
         a.view.search_open = !a.view.search_open;
         if (!a.view.search_open) a.view.search.clear();
     }
-    const more = ui.div(c).row();
+    const more = tip.on(ui.div(c).row(), k, .{ .text = "Sidebar view options", .delay = tip.quick });
     defer more.end();
     if (kit.iconButton(c, k, .@"more-horizontal", .{ .size = 29, .radius = 8, .icon = 16, .color = k.muted.alpha(0.6), .on = a.view.more_menu }))
         if (a.view.more_menu) menus.close(a) else menus.openView(a);
@@ -424,7 +425,9 @@ fn marks(c: *ui.Context, a: *const App, k: theme.Colors, ch: workspace.Chat, l: 
         icons.icon(c, mark.name, 13, (mark.brand orelse k.subline).alpha(if (muted) 0.4 else 0.8), 13);
     }
     if (l.icon) {
-        const b = ui.div(c).row().opacity(if (muted) 0.4 else 1);
+        // `project_icon_frame`: the project and its device on hover.
+        const space = a.findSpace(ch.space_id);
+        const b = tip.project(c, ui.div(c).row().opacity(if (muted) 0.4 else 1), k, if (space) |sp| sp.name else "Home", a.deviceName(ch.device_id));
         defer b.end();
         badge(c, a, k, ch.space_id, lit);
     }

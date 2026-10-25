@@ -9,6 +9,7 @@ const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const kit = @import("view_kit.zig");
+const tip_quick = @import("view_tooltip.zig").quick;
 const panels = @import("app_panels.zig");
 const files = @import("app_files.zig");
 const App = @import("app.zig").App;
@@ -40,7 +41,11 @@ fn toolbar(c: *ui.Context, a: *App, k: theme.Colors) void {
             if (r.changed) files.search(a);
         }
         const on = a.panels.show_all;
-        if (kit.iconButton(c, k, if (on) .eye else .@"eye-closed", .{ .icon = 14, .on = on, .color = if (on) k.text else k.muted }))
+        if (kit.iconButton(c, k, if (on) .eye else .@"eye-closed", .{ .icon = 14, .on = on, .color = if (on) k.text else k.muted, .tip = .{
+            .text = if (on) "Hide hidden and ignored files" else "Show all files (even hidden)",
+            .delay = tip_quick,
+            .look = .file,
+        } }))
             files.setShowAll(a, !on);
     }
     _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.border }, .none, null);

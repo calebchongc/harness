@@ -20,6 +20,7 @@ const question = @import("app_question.zig");
 const queue_mod = @import("app_queue.zig");
 const drafts = @import("app_drafts.zig");
 const account = @import("app_account.zig");
+const change_requests = @import("app_change_requests.zig");
 pub const uuid = @import("ids.zig").uuid;
 
 /// The window's own state, apart from the engine's.
@@ -231,6 +232,9 @@ pub const App = struct {
     /// The session footer's Graff worktree action and verdict
     /// (app_graff_worktree.zig).
     graff_worktree: @import("app_graff_worktree.zig").State = .{},
+    /// Each active chat's branch's pull request, watched, and the session
+    /// footer's merge (app_change_requests.zig).
+    change_requests: change_requests.State,
 
     pub fn init(gpa: Allocator, io: std.Io, port: u16) App {
         return .{
@@ -252,6 +256,7 @@ pub const App = struct {
             .models = .init(gpa),
             .release = .{ .gpa = gpa, .io = io },
             .reauth = .init(gpa),
+            .change_requests = .init(gpa),
         };
     }
 
@@ -295,6 +300,7 @@ pub const App = struct {
         a.models.deinit();
         a.reauth.deinit();
         a.graff_worktree.deinit(a.gpa);
+        a.change_requests.deinit();
     }
 
     pub const setHarness = agent.setHarness;
@@ -367,6 +373,7 @@ pub const App = struct {
                 a.ensureModels(a.target().harness);
                 a.request(requests.none("EngineReady"), .of(App, a, onNotice));
                 a.watchSidebar();
+                change_requests.reconcile(a);
                 account.watch(a);
                 // A cloud sandbox left running keeps costing credit: show it
                 // from the start.
@@ -387,6 +394,7 @@ pub const App = struct {
                 a.w_sessions = .{};
                 a.w_doc = .{};
                 a.w_queue = .{};
+                change_requests.disconnected(a);
             },
         }
         a.redraw();
@@ -421,6 +429,7 @@ pub const App = struct {
         if (account.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (@import("app_reauth.zig").tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (@import("app_sandboxes.zig").tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
+        if (change_requests.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (a.w_queue.retry_at) |t| if (now >= t) {
             a.w_queue = .{};
             queue_mod.watch(a);
@@ -445,7 +454,10 @@ pub const App = struct {
 
     fn onDevices(a: *App, _: u64, r: rpc.Reply) void {
         switch (r) {
-            .item => |v| a.devices.replace(v) catch {},
+            .item => |v| {
+                a.devices.replace(v) catch {};
+                change_requests.devicesArrived(a);
+            },
             .done, .err => a.ended(&a.w_devices),
             .ok => {},
         }
@@ -649,7 +661,10 @@ pub const App = struct {
 
     fn onSpaces(a: *App, _: u64, r: rpc.Reply) void {
         switch (r) {
-            .item => |v| a.spaces.replace(v) catch {},
+            .item => |v| {
+                a.spaces.replace(v) catch {};
+                change_requests.reconcile(a);
+            },
             .done, .err => a.ended(&a.w_spaces),
             .ok => {},
         }
@@ -665,6 +680,7 @@ pub const App = struct {
                 // models, and fill panels that waited for them.
                 a.ensureModels(a.target().harness);
                 @import("app_panels.zig").chatsArrived(a);
+                change_requests.reconcile(a);
             },
             .done, .err => a.ended(&a.w_chats),
             .ok => {},
@@ -710,6 +726,8 @@ pub const App = struct {
         if (id != .string) return;
         if (a.device_id) |d| a.gpa.free(d);
         a.device_id = a.gpa.dupe(u8, id.string) catch null;
+        // Watches opened before routed through `targetDeviceId`.
+        change_requests.restart(a);
     }
 
     fn onHarnesses(a: *App, _: u64, r: rpc.Reply) void {

@@ -74,6 +74,9 @@ pub fn cases(gpa: std.mem.Allocator) ![]Case {
         try case(gpa, "delete a project action", r.deleteAction(space, "test", null), false),
         // The chat isn't in a Graff worktree: the engine refuses it, understood.
         try case(gpa, "merge a Graff worktree back", r.graffWorktreeAction(chat, "merge", null), false),
+        // The project isn't a git checkout: no PR to watch or merge, answered.
+        try case(gpa, "watch a branch's pull request", r.watchChangeRequest(.{ .cwd = dir, .branch = "main" }), true),
+        try case(gpa, "merge a branch's pull request", r.mergeChangeRequest(.{ .cwd = dir, .branch = "main", .number = 90 }), false),
     };
     return gpa.dupe(Case, &list);
 }

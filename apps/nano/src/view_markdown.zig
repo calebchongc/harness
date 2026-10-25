@@ -118,7 +118,8 @@ fn codeBlock(c: *ui.Context, lang: []const u8, src: []const u8) void {
         defer h.end();
         ui.text(c, if (lang.len > 0) lang else "code", .{ .size = 11, .color = k.muted });
         ui.spacer(c);
-        _ = kit.iconButton(c, k, .@"wrap-text", .{ .size = 22, .radius = 6, .icon = 13 });
+        // The fit toggle (`CodeBlockTooltip`); nano's blocks always scroll.
+        _ = kit.iconButton(c, k, .@"wrap-text", .{ .size = 22, .radius = 6, .icon = 13, .tip = .{ .text = "Fit content" } });
         if (kit.iconButton(c, k, .copy, .{ .size = 22, .radius = 5, .icon = 12 })) c.clipboard.write(c.clipboard.ctx, src);
     }
     _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.border }, .none, null);

@@ -6,6 +6,7 @@ const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
+const tip = @import("view_tooltip.zig");
 const icons = @import("icons.zig");
 const kit = @import("view_kit.zig");
 const set = @import("view_settings.zig");
@@ -82,6 +83,8 @@ pub const Ghost = struct {
     icon: ?icons.Name = null,
     size: f32 = 12,
     dim: bool = false,
+    /// Its `text_tooltip`, after GPUI's default wait.
+    tip: []const u8 = "",
 };
 
 /// `ghost_action`: muted words, maybe a 16-point icon, a wash under the
@@ -89,6 +92,7 @@ pub const Ghost = struct {
 pub fn ghost(c: *ui.Context, k: theme.Colors, g: Ghost) bool {
     var b = ui.div(c).row().px(10).py(6).gap(6).itemsCenter().rounded(8).hover(k.ink(0.06));
     if (g.dim) b = b.opacity(0.5);
+    b = tip.on(b, k, .{ .text = g.tip });
     defer b.end();
     const hot = b.hovered();
     if (g.icon) |i| icons.icon(c, i, 16, k.muted, 0);

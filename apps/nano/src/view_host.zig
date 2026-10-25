@@ -9,6 +9,7 @@ const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const kit = @import("view_kit.zig");
+const tip = @import("view_tooltip.zig");
 const panels = @import("app_panels.zig");
 const highlight = @import("highlight.zig");
 const App = @import("app.zig").App;
@@ -37,6 +38,8 @@ fn band(c: *ui.Context, a: *App, k: theme.Colors) void {
         const on = i == a.panels.active;
         var chip = ui.div(c).row().size(112, 24).px(6).gap(5).itemsCenter().rounded(6).clip();
         chip = if (on) chip.bg(k.wash(0.10)) else chip.hover(k.wash(0.06));
+        // `SurfaceTabTooltip`: a file tab's path.
+        if (t.kind == .file) chip = tip.on(chip, k, .{ .text = t.path, .delay = tip.quick, .look = .tab });
         defer chip.end();
         const hot = chip.hovered();
         if (chip.clicked() and !on) show = i;
@@ -68,7 +71,8 @@ fn picker(c: *ui.Context, a: *App, k: theme.Colors) void {
 
 fn file(c: *ui.Context, a: *App, k: theme.Colors, path: []const u8) void {
     {
-        const bar = ui.div(c).row().wFull().h(32).px(12).gap(5).itemsCenter().border(k.border).borderW(0).clip();
+        // The breadcrumbs' `FileEditorTooltip`: the whole path.
+        const bar = tip.on(ui.div(c).row().wFull().h(32).px(12).gap(5).itemsCenter().border(k.border).borderW(0).clip(), k, .{ .text = path, .delay = tip.quick, .look = .file });
         defer bar.end();
         icons.icon(c, .document, 12, k.muted, 0);
         var it = std.mem.splitScalar(u8, path, '/');

@@ -17,6 +17,7 @@ const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const kit = @import("view_kit.zig");
+const tip = @import("view_tooltip.zig");
 const sandboxes = @import("sandboxes.zig");
 const state = @import("app_sandboxes.zig");
 const sidebar = @import("view_sidebar.zig");
@@ -49,6 +50,7 @@ fn turnOff(c: *ui.Context, a: *App, k: theme.Colors, ids: []const []const u8) vo
     // GPUI's px 8, py 3 and a 1-point border, which nanoui draws inside.
     var b = ui.div(c).row().px(9).py(4).rounded(6).border(k.border).borderW(1).bg(k.raised);
     b = if (busy) b.opacity(0.6) else b.hover(k.raised.mix(k.text, 0.06));
+    b = tip.on(b, k, .{ .text = sandboxes.turn_off_hint, .delay = tip.quick });
     defer b.end();
     ui.text(c, turnOffLabel(a, ids.len), st(c, 11, .{ .weight = .medium, .color = k.text }));
     if (!busy and b.clicked()) state.turnOff(a, ids);
@@ -108,7 +110,11 @@ pub fn chip(c: *ui.Context, a: *App, k: theme.Colors) void {
         .rounded(6 + 3).border(tone.alpha(0.35)).borderW(1).bg(k.composer));
     defer card.end();
     {
-        const open = ui.div(c).row().px(7).py(4).gap(5).itemsCenter().rounded(6).hover(k.ink(0.06));
+        // `compact_tooltip`: what runs and what it costs.
+        const open = tip.on(ui.div(c).row().px(7).py(4).gap(5).itemsCenter().rounded(6).hover(k.ink(0.06)), k, .{
+            .text = sandboxes.compactTooltip(c.alloc(), sum) catch "",
+            .delay = tip.quick,
+        });
         defer open.end();
         kit.dot(c, 6, tone);
         icons.icon(c, .cloud, 13, k.muted, 0);

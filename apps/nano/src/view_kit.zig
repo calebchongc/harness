@@ -27,12 +27,15 @@ pub const IconButton = struct {
     /// Drawn behind it while its menu or panel is open.
     on: bool = false,
     disabled: bool = false,
+    /// Its tooltip, where the GPUI app has one.
+    tip: ?@import("view_tooltip.zig").Tip = null,
 };
 
 /// A square button holding one icon; true when clicked.
 pub fn iconButton(c: *ui.Context, k: theme.Colors, name: icons.Name, o: IconButton) bool {
     var b = ui.div(c).row().size(o.size, o.size).center().rounded(o.radius);
     if (o.on) b = b.bg(k.hover) else if (!o.disabled) b = b.hover(k.hover);
+    if (o.tip) |t| b = @import("view_tooltip.zig").on(b, k, t);
     defer b.end();
     const clicked = b.clicked() and !o.disabled;
     const color = o.color orelse k.muted;
