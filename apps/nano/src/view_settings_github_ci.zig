@@ -10,6 +10,7 @@
 //! `CodegraffGithubRunners` (the rules in runners.zig) and acts through
 //! `CodegraffGithubRunnerAction`.
 const std = @import("std");
+const rules = @import("rules.zig");
 const json = std.json;
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -683,7 +684,7 @@ fn sizeMenu(c: *ui.Context, a: *App, k: theme.Colors, inst: *const runners.Insta
         if (back.clicked()) return closeSizeMenu(a);
     }
     const w: f32 = 260;
-    const x = std.math.clamp(at.x + at.w - w, 8, @max(8, c.size.w - 8 - w));
+    const x = rules.snapToWindow(at.x + at.w - w, w, c.size.w, 8);
     const y = at.y + at.h + 6;
     const m = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(4 + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));

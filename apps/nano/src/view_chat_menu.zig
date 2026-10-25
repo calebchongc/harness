@@ -2,6 +2,7 @@
 //! Rename…, Pin or Unpin, Archive, Copy (a page of what to copy), and
 //! Delete…, with the rename and delete dialogs (`popover::dialog_card`).
 const std = @import("std");
+const rules = @import("rules.zig");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
@@ -107,8 +108,8 @@ fn menu(c: *ui.Context, a: *App, k: theme.Colors) void {
     }
     const w: f32 = 216;
     const h = a.view.chat_menu_h orelse 200;
-    const x = std.math.clamp(m.at.x, 8, c.size.w - 8 - w);
-    const y = std.math.clamp(m.at.y, 8, c.size.h - 8 - h);
+    const x = rules.snapToWindow(m.at.x, w, c.size.w, 8);
+    const y = rules.snapToWindow(m.at.y, h, c.size.h, 8);
     const card = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(5).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer card.end();

@@ -189,6 +189,17 @@ pub fn menuStep(active: ?usize, count: usize, delta: isize) ?usize {
     return @intCast(@mod(@as(isize, @intCast(from)) + delta, n));
 }
 
+/// Where a menu `size` long starting at `pos` goes in a window `limit`
+/// long (`anchored().snap_to_window_with_margin`): left alone unless it
+/// runs past the window's edge, then pulled back to `margin` inside it;
+/// from the start, at `margin` if it's past that one.
+pub fn snapToWindow(pos: f32, size: f32, limit: f32, margin: f32) f32 {
+    var at = pos;
+    if (at + size > limit) at -= at + size - limit + margin;
+    if (at < 0) at = margin;
+    return @round(at);
+}
+
 const testing = std.testing;
 
 test "lightness moves in HSL, hue and saturation kept" {
@@ -251,4 +262,15 @@ test "a menu's highlight wraps and enters at the edge" {
     try testing.expectEqual(@as(?usize, 0), menuStep(2, 3, 1));
     try testing.expectEqual(@as(?usize, 2), menuStep(0, 3, -1));
     try testing.expectEqual(@as(?usize, 2), menuStep(1, 3, 1));
+}
+
+test "a menu moves only when it runs past the window, then to its margin" {
+    // Up to the window's edge: where it was (GPUI doesn't keep the margin then).
+    try testing.expectEqual(@as(f32, 980), snapToWindow(980, 220, 1200, 8));
+    // Past it: its far edge 8 inside.
+    try testing.expectEqual(@as(f32, 972), snapToWindow(990, 220, 1200, 8));
+    // Past the near edge: at the margin.
+    try testing.expectEqual(@as(f32, 8), snapToWindow(-30, 220, 1200, 8));
+    // Wider than the window: the near edge wins.
+    try testing.expectEqual(@as(f32, 8), snapToWindow(100, 1300, 1200, 8));
 }

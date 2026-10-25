@@ -10,6 +10,7 @@
 //! relayed ChatGPT sign-in's loopback catcher: pasting the address it lands
 //! on finishes it instead.
 const std = @import("std");
+const rules = @import("rules.zig");
 const json = std.json;
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -452,7 +453,7 @@ fn deviceMenu(c: *ui.Context, a: *App, k: theme.Colors) void {
         }
     }
     const w: f32 = 220;
-    const x = std.math.clamp(at.x, 8, @max(8, c.size.w - 8 - w));
+    const x = rules.snapToWindow(at.x, w, c.size.w, 8);
     const m = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, at.y + 6).w(w).layer(5).column().p(4 + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer m.end();

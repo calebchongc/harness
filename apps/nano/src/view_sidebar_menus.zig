@@ -216,8 +216,8 @@ fn projects(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
     // Under the trigger, 6 below, across the header row (`anchored_menu_below`).
     const w = sidebar.width - 2 * 8;
     const h = m.h orelse 160;
-    const x = std.math.clamp(r.x, 8, c.size.w - 8 - w);
-    const y = std.math.clamp(r.y + r.h + 6, 8, c.size.h - 8 - h);
+    const x = rules.snapToWindow(r.x, w, c.size.w, 8);
+    const y = rules.snapToWindow(r.y + r.h + 6, h, c.size.h, 8);
     ui.key(c, "spaces-menu");
     const card = card_(c, k, x, y, w);
     defer card.end();
@@ -325,8 +325,8 @@ fn spaceMenu(c: *ui.Context, a: *App, k: theme.Colors) void {
     }
     const w: f32 = 170;
     const h = m.ctx_h orelse 90;
-    const x = std.math.clamp(at.x, 8, c.size.w - 8 - w);
-    const y = std.math.clamp(at.y, 8, c.size.h - 8 - h);
+    const x = rules.snapToWindow(at.x, w, c.size.w, 8);
+    const y = rules.snapToWindow(at.y, h, c.size.h, 8);
     // No gap between its rows (`.flex_col()` only).
     const card = held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(7).column().p(inset + 1)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
@@ -486,7 +486,7 @@ fn view(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
     const m = &a.view.menus;
     // Right of the ⋯, 6 along, level with it (`anchored_menu_right`).
     const w = sidebar.width - 2 * 8;
-    const x = @min(r.x + r.w + 6, c.size.w - 8 - w);
+    const x = rules.snapToWindow(r.x + r.w + 6, w, c.size.w, 8);
     const y = @max(8, r.y);
     ui.key(c, "sidebar-view-menu");
     const card = card_(c, k, x, y, w);
@@ -545,7 +545,7 @@ fn submenu(c: *ui.Context, a: *App, k: theme.Colors, g: Group, row: ui.Rect) voi
     const left = row.x + row.w + 244 > c.size.w;
     const x = if (left) row.x - inset - 6 - w else row.x + row.w + inset + 6;
     const est: f32 = 30 + @as(f32, @floatFromInt(g.rows.len)) * 35;
-    const y = std.math.clamp(row.y, 8, c.size.h - 8 - est);
+    const y = rules.snapToWindow(row.y, est, c.size.h, 8);
     const card = held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(6).column().p(inset + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer card.end();

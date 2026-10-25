@@ -2,6 +2,7 @@
 //! (harnesses.rs `render_device_switcher`, `render_screen_access`,
 //! `render_graff_draft_subagents`, `render_titles`).
 const std = @import("std");
+const rules = @import("rules.zig");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
@@ -92,10 +93,10 @@ pub fn deviceMenu(c: *ui.Context, a: *App, k: theme.Colors, at: ui.Rect) void {
         }
     }
     const w: f32 = 220;
-    // `anchored_menu` from the trigger's end, 6 below its middle, kept 8
-    // inside the window.
-    const x = std.math.clamp(at.x + at.w - 2, 8, @max(8, c.size.w - 8 - w));
-    const y = at.y + at.h / 2 + 6;
+    // `anchored_menu`: pinned at the trigger's top left, 6 down (over it),
+    // moved only when it would leave the window.
+    const x = rules.snapToWindow(at.x, w, c.size.w, 8);
+    const y = at.y + 6;
     ui.key(c, "agents-device-menu");
     const m = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(4 + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));

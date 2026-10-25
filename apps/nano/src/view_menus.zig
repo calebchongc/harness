@@ -3,6 +3,7 @@
 //! header's are view_sidebar_menus.zig).
 //! A click outside closes them.
 const std = @import("std");
+const rules = @import("rules.zig");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
@@ -54,8 +55,8 @@ fn accountMenu(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
     const w = @import("view_sidebar.zig").width - 2 * 8;
     // Its height as last drawn; a first guess before that.
     const h = a.view.account_h orelse 150;
-    const x = @min(r.x + r.w + 6, c.size.w - 8 - w);
-    const y = @max(8, @min(r.y, c.size.h - 8 - h));
+    const x = rules.snapToWindow(r.x + r.w + 6, w, c.size.w, 8);
+    const y = rules.snapToWindow(r.y, h, c.size.h, 8);
     // The inset, and the 1-point border GPUI insets by too.
     const card = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(card_inset + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
