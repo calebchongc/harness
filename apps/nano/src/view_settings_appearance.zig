@@ -147,7 +147,7 @@ fn options(c: *ui.Context, a: *App, k: theme.Colors) void {
     }
 }
 
-fn setMode(a: *App, m: Mode) void {
+pub fn setMode(a: *App, m: Mode) void {
     a.settings.setText("appearance", @tagName(m));
     a.dark = switch (m) {
         .system => null,

@@ -332,7 +332,7 @@ pub fn markOf(chat: Chat, session: ?Session, now_ms: i64) Mark {
     return if (unseen(chat)) .completed else .idle;
 }
 
-fn unseen(chat: Chat) bool {
+pub fn unseen(chat: Chat) bool {
     return chat.last_message_ms != 0 and chat.last_seen_ms < chat.last_message_ms;
 }
 

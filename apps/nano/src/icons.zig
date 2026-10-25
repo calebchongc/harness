@@ -70,6 +70,7 @@ pub const Name = enum {
     @"palette-search",
     paperclip,
     pen,
+    @"pen-new-square",
     @"pi-mark",
     pin,
     plus,

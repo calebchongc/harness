@@ -278,6 +278,12 @@ pub const Tabs = struct {
         t.active = at;
     }
 
+    /// A new tab after the last, shown (`create_chat_tab`'s push).
+    pub fn appendTab(t: *Tabs) void {
+        t.append() catch return;
+        t.active = t.items.items.len - 1;
+    }
+
     /// Closes tab `i`; the last tab left becomes a new chat instead.
     pub fn close(t: *Tabs, i: usize) void {
         if (i >= t.items.items.len) return;

@@ -4,7 +4,7 @@
 //! merged or closed, #357), hover deepening it, a click opening the PR,
 //! and after 350 ms at rest its card (`ChangeRequestTooltip`). The session
 //! footer's is the Composer surface, with the PR glyph; the Sidebar surface
-//! is the command palette's, which nano doesn't have yet. And the footer's
+//! is the command palette's results'. And the footer's
 //! merge controls beside an open PR (pickers.rs `render_change_request_merge`).
 const std = @import("std");
 const nanoui = @import("nanoui");
@@ -39,6 +39,12 @@ pub fn badgeColor(k: theme.Colors, s: cr.Summary, p: cr.Provenance) ui.Color {
 /// The badge; `interactive` false is the drag preview's
 /// (`pull_request_badge_preview`): the same geometry, no hover, card or click.
 pub fn badge(c: *ui.Context, k: theme.Colors, s: cr.Summary, p: cr.Provenance, surface: Surface, interactive: bool) void {
+    badgeQuery(c, k, s, p, surface, interactive, "");
+}
+
+/// `badge` with a search's words washed in its number, as the command
+/// palette's results show it (`pull_request_badge_with_query`).
+pub fn badgeQuery(c: *ui.Context, k: theme.Colors, s: cr.Summary, p: cr.Provenance, surface: Surface, interactive: bool, query: []const u8) void {
     const m = cr.model(c.alloc(), s);
     const color = badgeColor(k, s, p);
     const composer = surface == .composer;
@@ -67,7 +73,9 @@ pub fn badge(c: *ui.Context, k: theme.Colors, s: cr.Summary, p: cr.Provenance, s
     if (interactive and b.clicked()) _ = nanoui.shell.openUrl(s.url);
     if (composer) icons.icon(c, .@"pull-request", 11, color.alpha(0.85), 0);
     const size: f32 = if (composer) 11 else 10;
-    ui.text(c, m.number, .{ .size = size, .line_height = size * phi, .weight = .medium, .mono = true, .color = if (hot) color else color.alpha(0.85) });
+    const st: ui.TextStyle = .{ .size = size, .line_height = size * phi, .weight = .medium, .mono = true, .color = if (hot) color else color.alpha(0.85) };
+    if (query.len > 0) return kit.highlightText(c, k, m.number, st, c.text.width(m.number, st) + 1, query);
+    ui.text(c, m.number, st);
 }
 
 /// `ChangeRequestTooltip`: "PR #N · State" in the tone, the title in one

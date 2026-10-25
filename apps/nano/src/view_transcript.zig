@@ -110,10 +110,9 @@ fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f3
     const chat_id: ?[]const u8 = if (t == &a.transcript) a.selected else for (a.peers.items) |*p| {
         if (&p.transcript == t) break p.id;
     } else null;
+    // Nothing to show, loading or empty: nothing drawn, as GPUI's.
     if (entries_.len == 0) {
-        const e = ui.div(c).row().wFull().pt(40).justifyCenter();
-        defer e.end();
-        ui.text(c, if (loading) "Loading…" else "Nothing here yet.", .{ .size = 13, .color = k.faint });
+        _ = loading;
         return drawn;
     }
     for (entries_, 0..) |*e, i| {

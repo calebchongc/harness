@@ -24,8 +24,11 @@ pub fn sidebar(c: *ui.Context, a: *App, k: theme.Colors) void {
     defer side.end();
     tabList(c, a, k);
     filterRow(c, a, k);
-    if (a.view.search_open) searchField(c, a, k);
-    lists(c, a, k);
+    // The session search's field, and its results in the lists' place
+    // while it filters (view_sidebar_search.zig).
+    const search = @import("view_sidebar_search.zig");
+    search.controls(c, a, k);
+    if (!search.results(c, a, k)) lists(c, a, k);
     footer(c, a, k);
 }
 
@@ -99,11 +102,9 @@ fn filterRow(c: *ui.Context, a: *App, k: theme.Colors) void {
         icons.icon(c, .@"alt-arrow-down", 14, k.muted.alpha(0.6), 0);
     }
     // The magnifier, accent while the search is open (`render_sidebar_search_trigger`).
-    if (kit.iconButton(c, k, .magnifer, .{ .size = 29, .radius = 8, .icon = 16, .color = if (a.view.search_open) k.accent else k.muted, .on = a.view.search_open })) {
-        menus.close(a);
-        a.view.search_open = !a.view.search_open;
-        if (!a.view.search_open) a.view.search.clear();
-    }
+    const searching = a.view.search.open;
+    if (kit.iconButton(c, k, .magnifer, .{ .size = 29, .radius = 8, .icon = 16, .color = if (searching) k.accent else k.muted, .on = searching }))
+        @import("view_sidebar_search.zig").toggle(a);
     const more = tip.on(ui.div(c).row(), k, .{ .text = "Sidebar view options", .delay = tip.quick });
     defer more.end();
     if (kit.iconButton(c, k, .@"more-horizontal", .{ .size = 29, .radius = 8, .icon = 16, .color = k.muted.alpha(0.6), .on = a.view.more_menu }))
@@ -111,35 +112,15 @@ fn filterRow(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (c.rects.get(c.node(more.index).id)) |r| a.view.more_anchor = r;
 }
 
-fn searchField(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const box = ui.div(c).row().wFull().px(8).pb(4);
-    defer box.end();
-    const field = ui.div(c).row().wFull().h(29).px(8).gap(6).itemsCenter().rounded(8).bg(k.ink(0.05)).border(k.border).borderW(1);
-    defer field.end();
-    icons.icon(c, .magnifer, 14, k.muted, 0);
-    _ = ui.textField(c, &a.view.search, .{ .placeholder = "Search sessions", .width = .fill, .bare = true, .size = 13 });
-    if (c.shortcut(.{ .key = ui.Shortcut.escape })) {
-        a.view.search.clear();
-        a.view.search_open = false;
-    }
-}
-
 /// The rows the lists show: top-level chats in a project that still
-/// exists (or none), narrowed by the project filter and the search.
+/// exists (or none), narrowed by the project filter. (The session search
+/// shows its own results in their place: view_sidebar_search.zig.)
 fn listed(a: *const App, chat: workspace.Chat) bool {
     if (chat.parent_chat_id != null) return false;
     if (chat.space_id) |sid| if (a.findSpace(sid) == null) return false;
     // A filter on a project that's gone shows them all, as its label does.
     if (a.view.filter) |f| if (a.findSpace(f) != null) if (chat.space_id == null or !std.mem.eql(u8, chat.space_id.?, f)) return false;
-    const q = std.mem.trim(u8, a.view.search.text(), " ");
-    if (q.len > 0 and !containsIgnoreCase(chatLabel(chat), q)) return false;
     return true;
-}
-
-fn containsIgnoreCase(s: []const u8, q: []const u8) bool {
-    if (q.len > s.len) return false;
-    for (0..s.len - q.len + 1) |i| if (std.ascii.eqlIgnoreCase(s[i..][0..q.len], q)) return true;
-    return false;
 }
 
 /// The pins this list shows, in pin order: listed and not archived.
@@ -236,7 +217,7 @@ fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
         } else if (active == 0 and pins.len == 0) {
             const e = ui.div(c).row().px(8).py(6);
             defer e.end();
-            ui.text(c, if (a.view.search.text().len > 0) "No matching sessions" else "No sessions yet", .{ .size = 12, .color = k.faint });
+            ui.text(c, "No sessions yet", .{ .size = 12, .color = k.faint });
         }
     }
     // Show › Archived off: no shelf.
@@ -510,6 +491,12 @@ fn statusWord(mark: workspace.Mark) ?[]const u8 {
 /// The expanded row's corner: its status in words, or how long ago;
 /// Archive under the pointer (true when clicked).
 fn corner(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat, hovered: bool) bool {
+    return cornerIn(c, a, k, ch, hovered, k.subline);
+}
+
+/// `corner` with the time in `subline`: a search result's is the muted
+/// text itself, the sidebar's half of it.
+fn cornerIn(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat, hovered: bool, subline: ui.Color) bool {
     const box = ui.div(c).row().h(14).itemsCenter();
     defer box.end();
     if (hovered) {
@@ -538,8 +525,79 @@ fn corner(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat, hovered:
         ui.text(c, word, .{ .size = 10, .weight = .medium, .color = color });
         return false;
     }
-    ui.text(c, rules.relativeTime(c.alloc().alloc(u8, 16) catch &.{}, now, ch.timeMs()), .{ .size = 10, .weight = .medium, .color = k.subline });
+    ui.text(c, rules.relativeTime(c.alloc().alloc(u8, 16) catch &.{}, now, ch.timeMs()), .{ .size = 10, .weight = .medium, .color = subline });
     return false;
+}
+
+/// A session as a search shows it (`render_chat_row` with `search_query`):
+/// never compact, "project @ device" over the agent's mark and the title,
+/// both with the query's words washed, everything at full strength, 10
+/// round; the branch (and the pull request's badge) on a third line when
+/// given. `inner` is the room inside its 8-point sides. What the pointer
+/// did to it comes back.
+pub const SearchRow = struct {
+    folder: []const u8,
+    lit: bool,
+    query: []const u8,
+    inner: f32,
+    branch: ?[]const u8 = null,
+    pr: ?struct { @import("change_requests.zig").Summary, @import("change_requests.zig").Provenance } = null,
+};
+
+pub const SearchHit = struct { clicked: bool = false, pressed: bool = false };
+
+pub fn searchRow(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat, o: SearchRow) SearchHit {
+    const meta: f32 = if (o.pr != null) 16 else if (o.branch != null) 14 else 0;
+    const h: f32 = if (meta == 0) 45 else 47 + meta;
+    var r = ui.div(c).column().wFull().h(h).px(8).py(6).gap(2).rounded(10).clip();
+    r = if (o.lit) r.bg(k.selected) else r.hover(k.hover);
+    defer r.end();
+    const hovered = r.hovered() and !@import("view_drag.zig").dragging(a);
+    const subline = k.muted;
+    var archive = false;
+    {
+        const line = ui.div(c).row().wFull().gap(8).itemsCenter();
+        defer line.end();
+        const corner_w = cornerWidth(c, a, ch, hovered);
+        {
+            const t = ui.div(c).row().grow().w(0).clip();
+            defer t.end();
+            kit.highlightText(c, k, o.folder, .{ .size = 11, .line_height = 14, .color = subline }, o.inner - 8 - corner_w, o.query);
+        }
+        archive = cornerIn(c, a, k, ch, hovered, subline);
+    }
+    {
+        const line = ui.div(c).row().wFull().gap(8).itemsCenter();
+        defer line.end();
+        var marks_w: f32 = 0;
+        if (a.settings.get(.sidebar_show_harness)) {
+            const mark = icons.harnessMark(ch.harness orelse "graff");
+            icons.icon(c, mark.name, 13, (mark.brand orelse subline).alpha(0.8), 13);
+            marks_w = 13 + 8;
+        }
+        const t = ui.div(c).row().grow().w(0).clip();
+        defer t.end();
+        kit.highlightText(c, k, if (ch.title) |x| firstLine(x) else "New session", kit.style(c, 13, 17, .{ .color = k.text }), o.inner - marks_w, o.query);
+    }
+    if (meta > 0) {
+        const line = ui.div(c).row().wFull().gap(4).itemsCenter();
+        defer line.end();
+        var room = o.inner;
+        if (o.pr) |pr| room -= c.text.width(@import("change_requests.zig").model(c.alloc(), pr[0]).number, .{ .size = 10, .weight = .medium, .mono = true }) + 8 + 4;
+        if (o.branch) |b| {
+            icons.icon(c, .@"git-branch", 11, subline, 0);
+            const t = ui.div(c).row().grow().w(0).clip();
+            defer t.end();
+            kit.highlightText(c, k, b, .{ .size = 11, .line_height = 14, .color = subline }, room - 15, o.query);
+        } else ui.spacer(c);
+        if (o.pr) |pr| @import("view_change_requests.zig").badgeQuery(c, k, pr[0], pr[1], .sidebar, true, o.query);
+    }
+    if (archive) {
+        a.setArchived(ch.id, !ch.archived);
+        return .{};
+    }
+    const it = r.interaction();
+    return .{ .clicked = r.clicked(), .pressed = it.pressed and c.input.pressed };
 }
 
 fn sessionRow(c: *ui.Context, a: *App, k: theme.Colors, ch: workspace.Chat) void {

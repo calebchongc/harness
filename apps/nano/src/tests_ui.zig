@@ -61,8 +61,8 @@ test "⌘D splits the chat to the right, the new pane a new chat with focus; ⌘
     try testing.expectEqual(@as(usize, 2), s.panes.items.len);
     try testing.expectEqual(@as(f32, 0.5), s.shares.items[0]);
     try testing.expect(h.a.selected == null);
-    // Alpha's pane, read only, says what it has.
-    try testing.expect(h.t.hasText("Nothing here yet."));
+    // Alpha's pane shows nothing when it has nothing (as GPUI's).
+    try testing.expect(!h.t.hasText("Nothing here yet."));
     h.snap("split-right");
     h.press(.{ .key = '[', .cmd = true });
     try testing.expectEqualStrings("a", h.a.selected.?);
@@ -99,7 +99,8 @@ test "clicking the other pane focuses it" {
     try h.init();
     defer h.deinit();
     h.press(.{ .key = 'd', .cmd = true });
-    try h.t.clickText("Nothing here yet.");
+    // The left pane's middle: Alpha's.
+    h.t.click(256 + (1200 - 256) / 4, 300);
     h.t.settle(1);
     try testing.expectEqualStrings("a", h.a.selected.?);
     try testing.expectEqual(@as(usize, 0), h.a.tabs.layout().?.focus);
@@ -1297,4 +1298,23 @@ test "a failed MCP server's problem line keeps its row the height of its text" {
     // next name: well under 60 (at a word a line it was ~150).
     try testing.expect(next.y - (problem.y + problem.h) < 60);
     h.snap("mcp-failed-row");
+}
+
+test "opening a chat marks it seen here at once: its Done gives way to its time (mark_chat_seen)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const chats_ =
+        \\[{"id":"a","deviceId":"d","title":"Alpha","archived":false,"lastMessageAt":"2026-10-03T00:00:00Z","lastSeenAt":"2026-10-04T00:00:00Z"},
+        \\ {"id":"b","deviceId":"d","title":"Beta","archived":false,"lastMessageAt":"2026-10-02T00:00:00Z"}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, chats_, .{});
+    defer parsed.deinit();
+    try h.a.chats.replace(parsed.value);
+    h.t.settle(1);
+    const ws = @import("workspace.zig");
+    try testing.expect(ws.unseen(h.a.findChat("b").?));
+    h.a.openChat("b", null);
+    h.t.settle(1);
+    try testing.expect(!ws.unseen(h.a.findChat("b").?));
 }

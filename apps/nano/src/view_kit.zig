@@ -86,7 +86,7 @@ pub fn highlightText(c: *ui.Context, k: theme.Colors, s: []const u8, st: ui.Text
     const ranges = @import("palette.zig").matchRanges(c.alloc(), s, query) catch &.{};
     if (ranges.len == 0) return fadeText(c, s, st, max_w);
     const base = st.color orelse c.theme.text;
-    const wash = k.accent.alpha(if (k.dark) 0.12 else 0.10);
+    const wash = k.accent_wash;
     var plain = st;
     plain.color = base;
     if (comptime @hasField(ui.TextStyle, "span_box")) plain.span_box = .{ .pad_x = 1, .inset_y = 1.5, .radius = 3 };
@@ -109,8 +109,8 @@ pub fn highlightText(c: *ui.Context, k: theme.Colors, s: []const u8, st: ui.Text
         if (lit or t < 1) spans.append(c.alloc(), .{
             .start = @intCast(at),
             .end = @intCast(at + cp.len),
-            .color = if (lit) k.accent.alpha(k.accent.a * t) else base.alpha(base.a * t),
-            .background = if (lit) wash.alpha(wash.a * t) else null,
+            .color = if (lit) k.accent.alpha(t) else base.alpha(t),
+            .background = if (lit) wash.alpha(t) else null,
         }) catch break;
         at += cp.len;
         x0 = x1;
@@ -126,7 +126,30 @@ pub fn highlightText(c: *ui.Context, k: theme.Colors, s: []const u8, st: ui.Text
 pub fn kbdHint(c: *ui.Context, k: theme.Colors, label: []const u8) void {
     const b = ui.div(c).row().px(5).py(1).rounded(5).bg(k.ink(0.05)).itemsCenter();
     defer b.end();
-    ui.text(c, label, .{ .size = 10, .line_height = 10 * 1.618, .mono = true, .color = k.muted });
+    // In the frame's memory: the text is drawn after the caller returns.
+    glyphText(c, c.alloc().dupe(u8, label) catch return, .{ .size = 10, .line_height = 16, .mono = true, .color = k.muted });
+}
+
+/// `s` with its key glyphs (⌘, ⇧, ↵, ↑…), which Geist hasn't, in the
+/// system's font, as GPUI falls back to it; the rest in `st`.
+pub fn glyphText(c: *ui.Context, s: []const u8, st: ui.TextStyle) void {
+    if (!comptime @hasField(ui.TextStyle, "system_font")) return ui.text(c, s, st);
+    const r = ui.div(c).row().itemsCenter();
+    defer r.end();
+    var at: usize = 0;
+    while (at < s.len) {
+        const ascii = s[at] < 0x80;
+        var end = at;
+        while (end < s.len and (s[end] < 0x80) == ascii) end += 1;
+        // A non-ASCII run ends where an ASCII byte starts.
+        var part = st;
+        if (!ascii) {
+            part.system_font = true;
+            part.mono = false;
+        }
+        ui.text(c, s[at..end], part);
+        at = end;
+    }
 }
 
 /// `s` in one line at most `max_w` wide, cut with an ellipsis (the tab

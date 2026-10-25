@@ -32,8 +32,10 @@ pub const View = struct {
     more_menu: bool = false,
     /// The header's project and view menus (view_sidebar_menus.zig).
     menus: @import("view_sidebar_menus.zig").State = .{},
-    search_open: bool = false,
-    search: nanoui.ui.TextBuffer = .{},
+    /// The session search under the header (view_sidebar_search.zig).
+    search: @import("view_sidebar_search.zig").State = .{},
+    /// ⌘K's command palette (view_palette.zig).
+    palette: @import("view_palette.zig").State = .{},
     sessions_open: bool = true,
     pinned_open: bool = true,
     /// Where the sidebar's drop places were, as last laid out: the Pinned
@@ -89,6 +91,7 @@ pub const View = struct {
 
     pub fn deinit(v: *View, gpa: Allocator) void {
         v.github_ci.deinit(gpa);
+        v.palette.deinit(gpa);
         v.agents.deinit(gpa);
         v.accounts.deinit(gpa);
         v.shortcut_notice.deinit(gpa);
@@ -495,6 +498,36 @@ pub const App = struct {
         a.select(chat_id, space_id);
     }
 
+    /// Shows `chat_id` keeping the tabs as they are, as the command palette
+    /// and the session search do (`open_chat_in_tab`): the open chat stays
+    /// (the composer takes the keys), a chat in another pane or tab is shown
+    /// there, and any other gets a new tab of its own at the end.
+    pub fn openChatInTab(a: *App, chat_id: []const u8) void {
+        if (a.findChat(chat_id) == null) return;
+        a.view.settings_open = false;
+        if (a.selected) |s| if (std.mem.eql(u8, s, chat_id)) {
+            a.view.focus_composer = true;
+            return a.redraw();
+        };
+        if (a.tabs.find(chat_id)) |at| {
+            if (at.tab != a.tabs.active) a.showTab(at.tab);
+            if (at.pane) |ix| a.focusPane(ix);
+            return;
+        }
+        a.park();
+        a.tabs.appendTab();
+        a.tabs.setCurrent(chat_id);
+        a.select(chat_id, null);
+    }
+
+    /// `/resume`'s choice: `chat_id` in the current tab (or pane), wherever
+    /// else it's open (`open_chat`).
+    pub fn replaceCurrent(a: *App, chat_id: ?[]const u8) void {
+        a.view.settings_open = false;
+        a.tabs.setCurrent(chat_id);
+        a.select(chat_id, null);
+    }
+
     /// The active tab's new-chat draft, parked with it.
     fn park(a: *App) void {
         const d = drafts.canvas(a) catch return;
@@ -791,12 +824,23 @@ pub const App = struct {
         }
         const chat = a.selected orelse return a.redraw();
         a.request(requests.focusChat(chat), .of(App, a, onNotice));
-        a.request(requests.markChatSeen(chat), .of(App, a, onNotice));
+        a.markSeen(chat);
         a.watchDoc(true);
         queue_mod.watch(a);
         @import("app_panels.zig").chatChanged(a);
         a.ensureModels(a.target().harness);
         a.redraw();
+    }
+
+    /// Opened, a chat is seen (`mark_chat_seen`): here at once, its
+    /// Done giving way to its time, then on the host; only when unseen.
+    pub fn markSeen(a: *App, id: []const u8) void {
+        for (a.chats.items) |*ch| if (std.mem.eql(u8, ch.id, id)) {
+            if (!workspace.unseen(ch.*)) return;
+            ch.last_seen_ms = a.nowMs();
+            a.request(requests.markChatSeen(id), .of(App, a, onNotice));
+            return;
+        };
     }
 
     pub fn findChat(a: *const App, id: []const u8) ?workspace.Chat {
@@ -819,6 +863,12 @@ pub const App = struct {
     pub fn send(a: *App) void {
         if (a.queue_edit != null) return queue_mod.finishEdit(a, .commit);
         const prompt = std.mem.trim(u8, a.composer.text(), " \n\t");
+        // `/resume` is the workspace's, not the agent's: the palette that
+        // puts a chat in this tab (`WorkspaceCommand::Resume`).
+        if (std.mem.eql(u8, prompt, "/resume")) {
+            a.composer.clear();
+            return @import("view_palette.zig").toggle(a, .replace_current);
+        }
         if (prompt.len == 0 or a.engine.state != .connected) return;
         if (a.queues()) {
             queue_mod.queueMessage(a, prompt);

@@ -99,6 +99,8 @@ pub fn view(a: *App, c: *ui.Context) void {
     @import("view_picker.zig").popover(c, a, k);
     @import("view_drag.zig").overlay(c, a, k);
     @import("view_chat_menu.zig").overlays(c, a, k);
+    // Over everything, as the GPUI app's deferred palette (priority 2).
+    @import("view_palette.zig").overlay(c, a, k);
 }
 
 /// The focused pane: its chat's transcript over the composer, or a new
@@ -211,6 +213,11 @@ fn keys(c: *ui.Context, a: *App) void {
     // A shortcut being rebound takes the keys first.
     const rebinding = @import("view_settings_shortcuts.zig");
     if (rebinding.recording(a)) return rebinding.capture(c, a);
+    // ⌘K, the command palette (fixed, as the GPUI app binds it); open, it
+    // takes ↑↓, Return and Escape before anything else.
+    const palette = @import("view_palette.zig");
+    if (c.shortcut(@import("shortcuts.zig").command_palette)) palette.toggle(a, .preserve_tabs);
+    palette.keys(c, a);
     // A dialog has the keys; else an open header menu takes Escape, the
     // arrows and Return.
     const chat_menu = @import("view_chat_menu.zig");
@@ -219,8 +226,15 @@ fn keys(c: *ui.Context, a: *App) void {
     if (a.view.settings_open) @import("view_settings_accounts.zig").escape(c, a);
     if (chat_menu.anyDialog(a)) {
         if (c.shortcut(.{ .key = S.escape })) chat_menu.dismiss(a);
-    } else if (header_menus.anyOpen(a)) header_menus.keys(c, a);
-    if (c.shortcut(.{ .key = 'b', .cmd = true })) a.view.sidebar_open = !a.view.sidebar_open;
+    } else if (header_menus.anyOpen(a)) header_menus.keys(c, a) else if (!a.view.palette.open) {
+        // The session search, while it holds the keys.
+        @import("view_sidebar_search.zig").keys(c, a);
+    }
+    if (c.shortcut(.{ .key = 'b', .cmd = true })) {
+        a.view.sidebar_open = !a.view.sidebar_open;
+        // A hidden sidebar's search goes with it.
+        if (!a.view.sidebar_open) @import("view_sidebar_search.zig").close(a);
+    }
     if (c.shortcut(.{ .key = ',', .cmd = true })) settings_view.open(a);
     if (a.selected != null and c.shortcut(.{ .key = 'e', .cmd = true })) @import("app_files.zig").toggle(a);
     if (a.selected != null and c.shortcut(.{ .key = 'r', .cmd = true })) @import("app_panels.zig").toggleHost(a);

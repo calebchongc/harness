@@ -108,6 +108,29 @@ pub const fixed = [_]Fixed{
     .{ .title = "Settings", .keys = "Cmd+," },
 };
 
+/// "mod-shift-n" as a key-cap shows it, "⇧⌘N" (`badge_combo` on the Mac):
+/// the modifiers' glyphs in ⌃⌥⇧⌘ order, then the key, its first letter
+/// upper case.
+pub fn badge(buf: []u8, combo: []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    const cut = std.mem.lastIndexOfScalar(u8, combo, '-');
+    const key = if (cut) |i| combo[i + 1 ..] else combo;
+    const mods = if (cut) |i| combo[0..i] else "";
+    const order = [_][2][]const u8{ .{ "ctrl", "⌃" }, .{ "alt", "⌥" }, .{ "shift", "⇧" }, .{ "mod", "⌘" } };
+    for (order) |o| {
+        var it = std.mem.splitScalar(u8, mods, '-');
+        while (it.next()) |part| if (std.mem.eql(u8, part, o[0])) {
+            w.writeAll(o[1]) catch {};
+            break;
+        };
+    }
+    if (key.len > 0) {
+        w.writeByte(std.ascii.toUpper(key[0])) catch {};
+        w.writeAll(key[1..]) catch {};
+    }
+    return w.buffered();
+}
+
 /// "mod-shift-r" as the page shows it, "Cmd+Shift+R" (`display_combo`):
 /// the stored order, each part named, a key's first letter upper case.
 pub fn display(buf: []u8, combo: []const u8) []const u8 {
@@ -179,3 +202,17 @@ test "combinations shown and stored as the GPUI app's" {
     try testing.expectEqual(@as(usize, 17 + 9), all.len);
     try testing.expectEqualStrings("mod-9", all[all.len - 1].default);
 }
+
+test "key-caps as the GPUI app's badges on the Mac (`badge_combos_use_mac_glyphs`)" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("⌘1", badge(&buf, "mod-1"));
+    try testing.expectEqualStrings("⇧⌘A", badge(&buf, "mod-shift-a"));
+    try testing.expectEqualStrings("⇧⌘N", badge(&buf, "shift-mod-n"));
+    try testing.expectEqualStrings("⌃⌥⌘Space", badge(&buf, "mod-alt-ctrl-space"));
+    try testing.expectEqualStrings("⌘,", badge(&buf, "mod-,"));
+    try testing.expectEqualStrings("⌘K", badge(&buf, "mod-k"));
+}
+
+/// The command palette's key: fixed, as the GPUI app binds it
+/// (`KeyBinding::new(&platform_combo("mod-k"), ToggleCommandPalette)`).
+pub const command_palette: ui.Shortcut = .{ .key = 'k', .cmd = true };
