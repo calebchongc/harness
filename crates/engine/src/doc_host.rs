@@ -5561,7 +5561,24 @@ impl DocHost {
                 // `take()` resolves the request before dispatch, so the journal
                 // and steer→new-turn fallbacks reuse the created path instead of
                 // minting another checkout.
-                let worktree_spec = request.worktree.take();
+                let mut worktree_spec = request.worktree.take();
+                if let Some(spec) = worktree_spec.as_mut()
+                    && spec.base.is_empty()
+                {
+                    let repos = self
+                        .inner
+                        .repos
+                        .get()
+                        .ok_or_else(|| EngineError::Other("repositories unavailable".into()))?;
+                    spec.base = repos
+                        .branches(Path::new(&spec.repo_path))
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            EngineError::Other("No committed base for a new worktree.".into())
+                        })?;
+                }
                 let fresh_worktree = match &worktree_spec {
                     // Graff owns its worktrees: the adapter launches
                     // `graff acp -w <name>` from the repo, and Graff creates
@@ -6023,6 +6040,8 @@ impl DocHost {
                 harness_proto::peer_mail::ARCHIVED_REFUSAL.into(),
             ));
         }
+        let mut request = request;
+        self.retarget_independent_request(chat_id, &mut request)?;
         let context = self.capture_source_context(&request.cwd).await;
         if let Some(context) = &context
             && let Some(drift) = self.drift_since_last_turn(sessions, chat_id, context).await
@@ -6325,6 +6344,8 @@ fn encode_part_segment(part_id: &str) -> String {
 
 #[path = "doc_host_branch_drift.rs"]
 mod branch_drift;
+#[path = "doc_host_checkout_isolation.rs"]
+mod checkout_isolation;
 
 #[cfg(test)]
 mod transfer_progress_tests {
