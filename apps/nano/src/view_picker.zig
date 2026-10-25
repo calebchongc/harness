@@ -36,8 +36,8 @@ pub fn popover(c: *ui.Context, a: *App, k: theme.Colors) void {
         }
     }
     const x = std.math.clamp(anchor.x + anchor.w - w, 8, c.size.w - w - 8);
-    const panel = ui.div(c).fixed().offset(x, @max(anchor.y - h - 6, 8)).w(w).h(h).layer(5).column().p(4).gap(1)
-        .scrollY().bg(k.composer).border(k.border).borderW(1).rounded(10).shadowLg();
+    const panel = @import("view_kit.zig").shadowLg(ui.div(c).fixed().offset(x, @max(anchor.y - h - 6, 8)).w(w).h(h).layer(5).column().p(4).gap(1)
+        .scrollY().bg(k.composer).border(k.border).borderW(1).rounded(10));
     defer panel.end();
     if (agents > 0) {
         head(c, k, "Agent");

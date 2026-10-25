@@ -87,8 +87,8 @@ fn menu(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
         }
     }
     const w: f32 = 280;
-    const m = ui.div(c).fixed().offset(@min(r.x, c.size.w - w - 8), r.y + r.h + 6).w(w).layer(5).column().p(4).gap(2)
-        .bg(k.composer).border(k.border).borderW(1).rounded(12).shadowLg();
+    const m = kit.shadowLg(ui.div(c).fixed().offset(@min(r.x, c.size.w - w - 8), r.y + r.h + 6).w(w).layer(5).column().p(4).gap(2)
+        .bg(k.composer).border(k.border).borderW(1).rounded(12));
     defer m.end();
     {
         const h = ui.div(c).row().px(8).pt(6).pb(4);
@@ -142,8 +142,8 @@ fn editor(c: *ui.Context, a: *App, k: theme.Colors) void {
         if (scrim.clicked()) return actions.closeEditor(a);
     }
     const w: f32 = 440;
-    const card = ui.div(c).fixed().offset((c.size.w - w) / 2, @max(40, c.size.h * 0.18)).w(w).layer(7).column().p(20)
-        .bg(k.composer).border(k.wash(0.10)).borderW(1).rounded(16).shadowLg();
+    const card = kit.shadowLg(ui.div(c).fixed().offset((c.size.w - w) / 2, @max(40, c.size.h * 0.18)).w(w).layer(7).column().p(20)
+        .bg(k.composer).border(k.wash(0.10)).borderW(1).rounded(16));
     defer card.end();
     if (e.confirm_delete) return confirmDelete(c, a, k, e);
     ui.text(c, if (e.id == null) "Add action" else "Edit action", .{ .size = 15, .weight = .semibold, .color = k.text });

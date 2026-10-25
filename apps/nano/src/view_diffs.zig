@@ -188,8 +188,8 @@ pub fn overlays(c: *ui.Context, a: *App, k: theme.Colors) void {
             defer back.end();
             if (back.clicked()) p.scope_menu = false;
         }
-        const m = ui.div(c).fixed().offset(r.x, r.y + r.h + 4).w(180).layer(5).column().p(4).gap(1)
-            .bg(k.composer).border(k.border).borderW(1).rounded(10).shadowLg();
+        const m = kit.shadowLg(ui.div(c).fixed().offset(r.x, r.y + r.h + 4).w(180).layer(5).column().p(4).gap(1)
+            .bg(k.composer).border(k.border).borderW(1).rounded(10));
         defer m.end();
         for (std.enums.values(panels.Scope)) |s| {
             ui.key(c, @tagName(s));
@@ -207,8 +207,8 @@ pub fn overlays(c: *ui.Context, a: *App, k: theme.Colors) void {
             if (scrim.clicked()) p.discard_confirm = false;
         }
         const w: f32 = 360;
-        const d = ui.div(c).fixed().offset((c.size.w - w) / 2, c.size.h * 0.32).w(w).layer(7).column().p(20).gap(8)
-            .bg(k.composer).border(k.wash(0.10)).borderW(1).rounded(16).shadowLg();
+        const d = kit.shadowLg(ui.div(c).fixed().offset((c.size.w - w) / 2, c.size.h * 0.32).w(w).layer(7).column().p(20).gap(8)
+            .bg(k.composer).border(k.wash(0.10)).borderW(1).rounded(16));
         defer d.end();
         ui.text(c, "Discard working tree changes?", .{ .size = 15, .weight = .semibold, .color = k.text });
         ui.text(c, "Discard all uncommitted changes in this working tree? This can’t be undone.", kit.style(c, 13, 19, .{ .wrap = true, .color = k.muted }));

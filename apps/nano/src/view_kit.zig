@@ -115,3 +115,10 @@ pub fn snake(c: *ui.Context, k: theme.Colors) void {
 pub fn dot(c: *ui.Context, size: f32, color: ui.Color) void {
     _ = c.leaf(.{ .width = .{ .px = size }, .height = .{ .px = size }, .radius = size / 2, .background = color }, .none, null);
 }
+
+/// GPUI's `shadow_lg` (Tailwind's): two faint layers, with a nanoui that
+/// has layered shadows (justrach/nanoui#21); its own large one before.
+pub fn shadowLg(d: ui.Div) ui.Div {
+    if (comptime @hasDecl(ui.Shadow, "lg")) return d.shadows(&ui.Shadow.lg);
+    return d.shadowLg();
+}

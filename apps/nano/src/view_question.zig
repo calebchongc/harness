@@ -15,7 +15,7 @@ pub fn panel(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
     const q = wz.question();
     const typed_empty = std.mem.trim(u8, a.composer.text(), " \n\t").len == 0;
     keys(c, a, q.options.len, typed_empty);
-    const box = ui.div(c).column().w(w).bg(k.composer).border(k.border).borderW(1).rounded(26).shadowLg();
+    const box = kit.shadowLg(ui.div(c).column().w(w).bg(k.composer).border(k.border).borderW(1).rounded(26));
     defer box.end();
     {
         const body = ui.div(c).column().wFull().px(16).pt(16).pb(12);

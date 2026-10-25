@@ -85,8 +85,8 @@ fn accountMenu(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
     const x = @min(r.x + r.w + 6, c.size.w - 8 - w);
     const y = @max(8, @min(r.y, c.size.h - 8 - h));
     // The inset, and the 1-point border GPUI insets by too.
-    const card = ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(card_inset + 1).gap(2)
-        .bg(k.composer).border(k.border).borderW(1).rounded(12).shadowLg();
+    const card = kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(card_inset + 1).gap(2)
+        .bg(k.composer).border(k.border).borderW(1).rounded(12));
     defer card.end();
     if (c.rects.get(c.node(card.index).id)) |cr| a.view.account_h = cr.h;
     {
@@ -151,8 +151,8 @@ fn separator(c: *ui.Context, a: *App, w: f32) void {
 }
 
 fn panel(c: *ui.Context, k: theme.Colors, x: f32, y: f32, w: f32) ui.Div {
-    return ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(4).gap(1)
-        .bg(k.composer).border(k.border).borderW(1).rounded(10).shadowLg();
+    return kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(4).gap(1)
+        .bg(k.composer).border(k.border).borderW(1).rounded(10));
 }
 
 fn item(c: *ui.Context, k: theme.Colors, icon: icons.Name, label: []const u8, on: bool) bool {

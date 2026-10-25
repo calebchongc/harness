@@ -44,7 +44,7 @@ pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
 pub const Shape = enum { compact, expanded };
 
 pub fn pill(c: *ui.Context, a: *App, k: theme.Colors, w: f32, shape: Shape, radius: f32) void {
-    const p = ui.div(c).w(w).bg(k.composer).border(k.border).borderW(1).rounded(radius).shadowLg();
+    const p = kit.shadowLg(ui.div(c).w(w).bg(k.composer).border(k.border).borderW(1).rounded(radius));
     const box = if (shape == .compact) p.row().h(49).px(8).itemsCenter() else p.column();
     defer box.end();
     if (c.rects.get(c.node(box.index).id)) |r| a.view.composer_anchor = r;
