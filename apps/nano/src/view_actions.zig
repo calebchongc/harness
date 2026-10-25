@@ -34,7 +34,8 @@ pub fn controlWidth(c: *ui.Context, a: *const App) f32 {
 pub fn control(c: *ui.Context, a: *App, k: theme.Colors) void {
     const x = &a.actions;
     if (controlWidth(c, a) == 0) return;
-    const frame = ui.div(c).row().h(24).rounded(6).border(k.border).borderW(1).clip();
+    // `border_1` inside the box, as GPUI's: the segments a point in.
+    const frame = ui.div(c).row().h(24).rounded(6).border(k.border).borderW(1).p(1).clip();
     defer frame.end();
     if (c.rects.get(c.node(frame.index).id)) |r| x.anchor = r;
     if (actions.preferred(a)) |p| {

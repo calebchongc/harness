@@ -72,6 +72,8 @@ pub fn cases(gpa: std.mem.Allocator) ![]Case {
         try case(gpa, "watch a terminal", r.subscribeTerminal("terminal-parity", null), true),
         try case(gpa, "close a terminal", r.closeTerminal("terminal-parity", null), false),
         try case(gpa, "delete a project action", r.deleteAction(space, "test", null), false),
+        // The chat isn't in a Graff worktree: the engine refuses it, understood.
+        try case(gpa, "merge a Graff worktree back", r.graffWorktreeAction(chat, "merge", null), false),
     };
     return gpa.dupe(Case, &list);
 }

@@ -226,6 +226,9 @@ pub const App = struct {
     release: @import("release.zig").Check,
     /// Failed runs' in-chat ChatGPT reconnects (app_reauth.zig).
     reauth: @import("app_reauth.zig").State,
+    /// The session footer's Graff worktree action and verdict
+    /// (app_graff_worktree.zig).
+    graff_worktree: @import("app_graff_worktree.zig").State = .{},
 
     pub fn init(gpa: Allocator, io: std.Io, port: u16) App {
         return .{
@@ -289,6 +292,7 @@ pub const App = struct {
         a.harnesses.deinit();
         a.models.deinit();
         a.reauth.deinit();
+        a.graff_worktree.deinit(a.gpa);
     }
 
     pub const setHarness = agent.setHarness;

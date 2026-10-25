@@ -61,8 +61,33 @@ pub fn transcript(c: *ui.Context, a: *App, k: theme.Colors) void {
 /// The first row sits `top` points down; rows settle at the bottom, over
 /// the composer, until they fill it.
 pub fn entries(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f32, loading: bool, top: f32) void {
+    const frame = ui.div(c).column().grow().wFull().h(0);
+    defer frame.end();
+    rows(c, a, k, t, w, loading, top);
+    topFade(c, k);
+}
+
+/// `TRANSCRIPT_FADE_BAND`: rows scrolled up fade out over the 24 points
+/// under the title bar, gone by its edge (shell.rs `edge_faded`, its
+/// `inset_top(TITLEBAR_HEIGHT)`), here as the column's colour laid over
+/// them a point at a time.
+fn topFade(c: *ui.Context, k: theme.Colors) void {
+    const band: f32 = 24;
+    var y: f32 = 0;
+    while (y < band) : (y += 1) {
+        _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.shell.alpha(1 - (y + 0.5) / band), .absolute = true, .offset = .{ .x = 0, .y = y } }, .none, null);
+    }
+}
+
+fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f32, loading: bool, top: f32) void {
     const col = columnWidth(w);
-    ui.scroll(c, .{ .grow = 1, .width = .fill, .padding = .{ .top = top, .bottom = 24 + 8 + 10 }, .align_items = .center, .justify = .end, .follow_end = true });
+    // The last row clears the status strip over the composer and the fade
+    // band above it (`bottom_clearance + TRANSCRIPT_FADE_BAND + 8`); the
+    // composer itself is under the scroll, not over it. Its bar shows
+    // while it scrolls, as GPUI's overlay rail.
+    var st: ui.Style = .{ .grow = 1, .width = .fill, .padding = .{ .top = top, .bottom = 24 + 24 + 8 }, .align_items = .center, .justify = .end, .follow_end = true };
+    if (@hasField(ui.Style, "scrollbar")) st.scrollbar = .{ .overlay = k.faint.alpha(0.5) };
+    ui.scroll(c, st);
     defer ui.end(c);
     const body = ui.div(c).column().w(col);
     defer body.end();
@@ -133,9 +158,12 @@ const At = struct {
 
 fn assistant(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, at: At) void {
     const last = at.index + 1 == at.entries.len;
-    const col = ui.div(c).column().wFull().gap(12);
+    const col = ui.div(c).column().wFull();
     defer col.end();
     const hovered = col.hovered();
+    // Its parts 12 apart; the lane right under the last (the row's
+    // `strip`, with no gap of its own).
+    const parts_box = ui.div(c).column().wFull().gap(12);
     var buf: [256]tools.Run = undefined;
     const rs = tools.runs(&buf, e.parts.items);
     for (rs, 0..) |r, i| {
@@ -161,6 +189,7 @@ fn assistant(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, at: A
         }
     }
     if (e.status == .streaming and e.parts.items.len == 0) ui.text(c, "Working…", .{ .size = 12, .color = k.muted });
+    parts_box.end();
     if (e.status != .streaming) lane(c, k, e, hovered, false);
 }
 

@@ -28,10 +28,11 @@ pub fn markdown(c: *ui.Context, colors: theme.Colors, src: []const u8) void {
     const col = ui.div(c).column().wFull();
     defer col.end();
     for (blocks, 0..) |b, i| {
-        // Items of a list sit close; other blocks get room.
+        // Items of a list sit 4 apart (the list's `gap(4)`); other blocks
+        // 12 (`MD_BLOCK_GAP`).
         if (i > 0) {
             const tight = b == .item and blocks[i - 1] == .item;
-            _ = c.leaf(.{ .height = .{ .px = if (tight) 3 else 12 } }, .none, null);
+            _ = c.leaf(.{ .height = .{ .px = if (tight) 4 else 12 } }, .none, null);
         }
         ui.key(c, c.print("md-{d}", .{i}));
         block(c, b, i == 0);
@@ -85,7 +86,7 @@ fn item(c: *ui.Context, it: @FieldType(md.Block, "item")) void {
         if (it.task) |done| {
             icons.icon(c, .check, 13, if (done) k.success else k.muted, 0);
         } else if (std.mem.eql(u8, it.marker, "•")) {
-            _ = c.leaf(.{ .width = .{ .px = 5 }, .height = .{ .px = 5 }, .radius = 2.5, .background = k.accent, .offset = .{ .x = 4 } }, .none, null);
+            _ = c.leaf(.{ .width = .{ .px = 5 }, .height = .{ .px = 5 }, .radius = 2.5, .background = k.accent, .offset = .{ .x = 1 } }, .none, null);
         } else {
             var st = body;
             st.color = k.accent;
@@ -101,10 +102,12 @@ fn item(c: *ui.Context, it: @FieldType(md.Block, "item")) void {
 }
 
 fn codeBlock(c: *ui.Context, lang: []const u8, src: []const u8) void {
-    const box = ui.div(c).column().wFull().bg(k.code_bg).rounded(10).border(k.border).borderW(1).clip();
+    // GPUI's `border_1` is inside the box: header and code a point in.
+    const box = ui.div(c).column().wFull().bg(k.code_bg).rounded(10).border(k.border).borderW(1).p(1).clip();
     defer box.end();
     {
-        const h = ui.div(c).row().wFull().h(28).pl(12).pr(5).gap(2).itemsCenter().bg(k.code_header);
+        // `CODE_HEADER_HEIGHT` 28 with its `border_b_1`, the hairline under it.
+        const h = ui.div(c).row().wFull().h(28 - 1).pl(12).pr(5).gap(2).itemsCenter().bg(k.code_header);
         defer h.end();
         ui.text(c, if (lang.len > 0) lang else "code", .{ .size = 11, .color = k.muted });
         ui.spacer(c);

@@ -131,13 +131,15 @@ fn starterRow(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
 }
 
 /// A chip's width: 10 points either side, the 13-point icon, 6 between.
+/// Its border, `px(10)` inside it, the icon, the gap and the title.
 fn chipWidth(c: *ui.Context, s: Starter, st: ui.TextStyle) f32 {
-    return 10 + 13 + 6 + c.text.width(s.title, st) + 10 + 2;
+    return 1 + 10 + 13 + 6 + c.text.width(s.title, st) + 10 + 1;
 }
 
 fn chip(c: *ui.Context, a: *App, k: theme.Colors, s: Starter, st: ui.TextStyle) void {
     ui.key(c, s.title);
-    const ch = ui.div(c).row().h(28).px(10).gap(6).itemsCenter().rounded(14).border(k.border).borderW(1).hover(k.hover);
+    // GPUI's `border_1` sits inside the box, so its `px(10)` starts a point in.
+    const ch = ui.div(c).row().h(28).px(10 + 1).gap(6).itemsCenter().rounded(14).border(k.border).borderW(1).hover(k.hover);
     defer ch.end();
     const hot = ch.hovered();
     if (ch.clicked()) a.composer.set(s.prompt);

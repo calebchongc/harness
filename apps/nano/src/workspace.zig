@@ -40,6 +40,9 @@ pub const Chat = struct {
     harness_session_id: ?[]const u8 = null,
     /// The branch it runs on now, when known (`conversation_branch`).
     branch: ?[]const u8 = null,
+    /// The row's own `branch` (`Chat::branch`), which the composer's
+    /// session footer names (pickers.rs `render_footer`).
+    row_branch: ?[]const u8 = null,
 
     /// The sidebar's order: "last called" (`last_prompt_at`, then
     /// `last_message_at`, then `created_at`).
@@ -188,6 +191,7 @@ fn parseChat(a: Allocator, o: json.ObjectMap) ?Chat {
         .cwd = str(a, o, "cwd"),
         .harness_session_id = str(a, o, "harnessSessionId"),
         .branch = currentBranch(a, o),
+        .row_branch = str(a, o, "branch"),
     };
 }
 
@@ -396,4 +400,16 @@ test "a chat's branch is its source context's while that says where it runs" {
         const ch = parseChat(a, v.object).?;
         if (case[1]) |want| try std.testing.expectEqualStrings(want, ch.branch.?) else try std.testing.expect(ch.branch == null);
     }
+}
+
+test "the row's own branch is kept apart from the source context's" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try json.parseFromSliceLeaky(json.Value, a,
+        \\{"id":"a","cwd":"/w/x","branch":"feat/footer","sourceContext":{"cwd":"/w/y","branch":"main"}}
+    , .{});
+    const ch = parseChat(a, v.object).?;
+    try std.testing.expectEqualStrings("feat/footer", ch.row_branch.?);
+    try std.testing.expect(ch.branch == null);
 }

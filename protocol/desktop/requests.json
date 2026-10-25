@@ -44,6 +44,7 @@
     {"name": "change a project action", "method": "UpsertProjectAction", "stream": false, "params": {"spaceId":"space-parity","actionId":"test","action":{"name":"Test","command":"echo hello","icon":"play","runOnWorktreeCreate":true}}},
     {"name": "watch a terminal", "method": "SubscribeTerminal", "stream": true, "params": {"terminalId":"terminal-parity"}},
     {"name": "close a terminal", "method": "CloseTerminal", "stream": false, "params": {"terminalId":"terminal-parity"}},
-    {"name": "delete a project action", "method": "DeleteProjectAction", "stream": false, "params": {"spaceId":"space-parity","actionId":"test"}}
+    {"name": "delete a project action", "method": "DeleteProjectAction", "stream": false, "params": {"spaceId":"space-parity","actionId":"test"}},
+    {"name": "merge a Graff worktree back", "method": "GraffWorktreeAction", "stream": false, "params": {"chatId":"chat-parity","action":"merge"}}
   ]
 }

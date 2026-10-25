@@ -184,3 +184,11 @@ pub fn subscribeTerminal(terminal_id: []const u8, host: ?[]const u8) Request(str
 pub fn closeTerminal(terminal_id: []const u8, host: ?[]const u8) Request(struct { terminalId: []const u8, targetDeviceId: ?[]const u8 }) {
     return .{ .method = "CloseTerminal", .params = .{ .terminalId = terminal_id, .targetDeviceId = host } };
 }
+
+// ── Graff worktrees ──────────────────────────────────────────────────
+
+/// `GraffWorktreeAction`: "merge", "archive", "remove" or "discard" the
+/// chat's Graff worktree (`run_graff_worktree_action`, pickers.rs).
+pub fn graffWorktreeAction(chat_id: []const u8, action: []const u8, host: ?[]const u8) Request(struct { chatId: []const u8, action: []const u8, targetDeviceId: ?[]const u8 }) {
+    return .{ .method = "GraffWorktreeAction", .params = .{ .chatId = chat_id, .action = action, .targetDeviceId = host } };
+}

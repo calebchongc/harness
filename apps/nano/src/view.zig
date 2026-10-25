@@ -269,14 +269,18 @@ fn trailing(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (a.selected == null) return;
     const va = @import("view_actions.zig");
     const actions_w = va.controlWidth(c, a);
+    // The actions control, the row's 8-point gap, then the two toggles 4
+    // apart (`PANEL_TOGGLE_GAP`), 6 from the edge
+    // (`TITLEBAR_ACTION_EDGE_INSET`).
     const w: f32 = 28 * 2 + 4 + (if (actions_w > 0) actions_w + 8 else 0);
-    const bar = ui.div(c).fixed().offset(c.size.w - 6 - w, 4 + (34 - 28) / 2).row().gap(4).itemsCenter().layer(3);
+    const bar = ui.div(c).fixed().offset(c.size.w - 6 - w, 4 + (34 - 28) / 2).row().itemsCenter().layer(3);
     defer bar.end();
     if (actions_w > 0) {
         va.control(c, a, k);
-        _ = c.leaf(.{ .width = .{ .px = 4 } }, .none, null);
+        _ = c.leaf(.{ .width = .{ .px = 8 } }, .none, null);
     }
     if (kit.iconButton(c, k, .@"file-tree", .{ .size = 28, .on = a.panels.files_open })) @import("app_files.zig").toggle(a);
+    _ = c.leaf(.{ .width = .{ .px = 4 } }, .none, null);
     if (kit.iconButton(c, k, .@"sidebar-minimalistic", .{ .size = 28 })) @import("app_panels.zig").toggleHost(a);
 }
 

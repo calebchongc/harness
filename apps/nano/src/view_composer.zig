@@ -12,12 +12,14 @@ const icons = @import("icons.zig");
 const kit = @import("view_kit.zig");
 const rules = @import("rules.zig");
 const transcript_view = @import("view_transcript.zig");
+const footer_view = @import("view_session_footer.zig");
 const App = @import("app.zig").App;
 
-/// Docked under a chat's transcript.
+/// Docked under a chat's transcript: as wide as the conversation column
+/// setting, less its 16-point gutters only once the pane is narrower
+/// (shell.rs `composer_target_width`, less the composer's `px(SPACE_LG)`).
 pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const main_w = transcript_view.paneWidth(c, a);
-    const w = @min(transcript_view.columnWidth(main_w) + 32, main_w - 32);
+    const w = dockedWidth(transcript_view.paneWidth(c, a), transcript_view.column_w);
     const queue_view = @import("view_queue.zig");
     const queued = a.queue.items.len > 0;
     // 16 points of padding, over the window's 24-point status strip; the
@@ -39,13 +41,38 @@ pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
     const p = ui.div(c).column().offset(0, lift);
     defer p.end();
     pill(c, a, k, w, if (expanded) .expanded else .compact, 22);
+    // The session footer, in the slot the 40 points under the pill keep
+    // for it (`SESSION_FOOTER_HEIGHT`, 8 under the pill); drawn over that
+    // padding so the queue tray's tuck needn't move it.
+    const pill_h: f32 = if (!expanded) 49 else if (a.view.composer_anchor) |r| r.h else 49;
+    const f = ui.div(c).row().absolute().offset(0, pill_h + footer_view.gap);
+    defer f.end();
+    footer_view.footer(c, a, k, w);
+}
+
+/// `composer_target_width` less the composer's own 16-point sides: the
+/// conversation width `column` while the pane has room, else the pane
+/// less 32.
+pub fn dockedWidth(pane_w: f32, column: f32) f32 {
+    return @max(@min(column + 32, pane_w) - 32, 0);
+}
+
+test "the docked composer is the conversation's width until the pane is narrower (composer_width_shares_the_maximum_only_in_established_threads)" {
+    for ([_][2]f32{ .{ 560, 560 }, .{ 736, 736 }, .{ 1200, 1200 } }) |case| {
+        try std.testing.expectEqual(case[1], dockedWidth(1600, case[0]));
+        try std.testing.expectEqual(@as(f32, 468), dockedWidth(500, case[0]));
+        try std.testing.expectEqual(@as(f32, 0), dockedWidth(0, case[0]));
+    }
 }
 
 pub const Shape = enum { compact, expanded };
 
 pub fn pill(c: *ui.Context, a: *App, k: theme.Colors, w: f32, shape: Shape, radius: f32) void {
-    const p = kit.shadowLg(ui.div(c).w(w).bg(k.composer).border(k.border).borderW(1).rounded(radius));
-    const box = if (shape == .compact) p.row().h(49).px(8).itemsCenter() else p.column();
+    // `border_1` takes its point from inside the box in GPUI: the pill is
+    // 49 tall compact (`COMPACT_TOTAL_HEIGHT`), 76 + 42 + 2 expanded
+    // (`COMPOSER_MIN_HEIGHT`), its controls a point in from each edge.
+    const p = kit.shadowLg(ui.div(c).w(w).bg(k.composer).border(k.border).borderW(1).rounded(radius).p(1));
+    const box = if (shape == .compact) p.row().h(49).px(8 + 1).itemsCenter() else p.column();
     defer box.end();
     if (c.rects.get(c.node(box.index).id)) |r| a.view.composer_anchor = r;
     if (shape == .compact) {
@@ -60,7 +87,9 @@ pub fn pill(c: *ui.Context, a: *App, k: theme.Colors, w: f32, shape: Shape, radi
         const area = ui.div(c).row().wFull();
         defer area.end();
         _ = c.leaf(.{ .width = .{ .px = 0 }, .height = .{ .px = 76 } }, .none, null);
-        const inner = ui.div(c).column().grow().w(0).px(16).pt(16).pb(4);
+        // `pt(16)`, less the point and a half GPUI's input draws its first
+        // line above nano's (measured: parity/scenes/settings-*.json).
+        const inner = ui.div(c).column().grow().w(0).px(16).pt(16 - 1.5).pb(4 + 1.5);
         defer inner.end();
         input(c, a, k, .expanded);
     }
@@ -92,7 +121,8 @@ fn attachButtons(c: *ui.Context, a: *App, k: theme.Colors) void {
 }
 
 fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
-    const box = if (shape == .compact) ui.div(c).row().grow().w(0).px(8).itemsCenter() else ui.div(c).column().wFull();
+    // Compact, GPUI's line sits half a point lower than nano's centred one.
+    const box = if (shape == .compact) ui.div(c).row().grow().w(0).px(8).pt(1).itemsCenter() else ui.div(c).column().wFull();
     defer box.end();
     const placeholder = if (a.engine.state != .connected)
         "Waiting for the engine…"
