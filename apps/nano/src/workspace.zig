@@ -61,6 +61,11 @@ pub const Session = struct {
 pub const Device = struct {
     id: []const u8,
     name: []const u8,
+    platform: []const u8 = "",
+    version: ?[]const u8 = null,
+    /// When it was last heard from, and when it was added; 0 for never.
+    last_seen_ms: i64 = 0,
+    created_ms: i64 = 0,
 };
 
 /// A list replaced whole by each item, its strings in an arena of its own.
@@ -128,7 +133,14 @@ fn ms(a: Allocator, o: json.ObjectMap, k: []const u8) i64 {
 
 fn parseDevice(a: Allocator, o: json.ObjectMap) ?Device {
     const id = str(a, o, "id") orelse return null;
-    return .{ .id = id, .name = str(a, o, "name") orelse "Unknown device" };
+    return .{
+        .id = id,
+        .name = str(a, o, "name") orelse "Unknown device",
+        .platform = str(a, o, "platform") orelse "",
+        .version = str(a, o, "version"),
+        .last_seen_ms = ms(a, o, "lastSeenAt"),
+        .created_ms = ms(a, o, "createdAt"),
+    };
 }
 
 pub fn str(a: Allocator, o: json.ObjectMap, k: []const u8) ?[]const u8 {

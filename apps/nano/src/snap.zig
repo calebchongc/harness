@@ -134,7 +134,7 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
     a.account.scope = .local;
     const device = first(scene, "chats", "deviceId") orelse first(scene, "spaces", "deviceId") orelse "local";
     a.device_id = try gpa.dupe(u8, device);
-    const devices = try json.parseFromSliceLeaky(json.Value, arena, try std.fmt.allocPrint(arena, "[{{\"id\":\"{s}\",\"name\":\"Studio\"}}]", .{device}), .{});
+    const devices = try json.parseFromSliceLeaky(json.Value, arena, try std.fmt.allocPrint(arena, "[{{\"id\":\"{s}\",\"name\":\"Studio\",\"platform\":\"macos\",\"lastSeenAt\":null}}]", .{device}), .{});
     try a.devices.replace(devices);
     if (str(scene, "selectedSpace") orelse first(scene, "spaces", "id")) |sp| a.space = try gpa.dupe(u8, sp);
     if (str(scene, "selectedChat")) |id| {

@@ -26,7 +26,11 @@ pub fn build(b: *std.Build) void {
         \\
     );
     const fonts = b.createModule(.{ .root_source_file = fonts_root });
+    // Harness's version, as the GPUI app has it: the workspace's.
+    const info = b.addOptions();
+    info.addOption([]const u8, "version", workspaceVersion(b));
     const imports: []const std.Build.Module.Import = &.{
+        .{ .name = "build_info", .module = info.createModule() },
         .{ .name = "nanoui", .module = nanoui },
         .{ .name = "http_zig", .module = http_zig },
         .{ .name = "fonts", .module = fonts },
@@ -80,4 +84,20 @@ pub fn build(b: *std.Build) void {
     const write_vectors = b.addRunArtifact(vectors);
     write_vectors.addArg(b.pathJoin(&.{ protocol, "requests.json" }));
     b.step("vectors", "Write protocol/desktop/requests.json").dependOn(&write_vectors.step);
+}
+
+/// `version` under `[workspace.package]` in the repository's Cargo.toml.
+fn workspaceVersion(b: *std.Build) []const u8 {
+    const path = b.root.joinString(b.allocator, "../../Cargo.toml") catch return "0.0.0";
+    const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(1 << 20)) catch return "0.0.0";
+    const section = std.mem.indexOf(u8, text, "[workspace.package]") orelse return "0.0.0";
+    var lines = std.mem.splitScalar(u8, text[section..], '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \r");
+        if (!std.mem.startsWith(u8, t, "version")) continue;
+        const q = std.mem.indexOfScalar(u8, t, '"') orelse continue;
+        const end = std.mem.indexOfScalarPos(u8, t, q + 1, '"') orelse continue;
+        return t[q + 1 .. end];
+    }
+    return "0.0.0";
 }

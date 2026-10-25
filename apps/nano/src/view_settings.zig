@@ -18,7 +18,7 @@ const phi: f32 = 1.618;
 
 /// Text at `size` on GPUI's line height, exactly: rounded to the point,
 /// 21.03 became 22 and a card's rows slipped 1.5 points a row.
-fn st(c: *ui.Context, size: f32, base: ui.TextStyle) ui.TextStyle {
+pub fn st(c: *ui.Context, size: f32, base: ui.TextStyle) ui.TextStyle {
     _ = c;
     var s = base;
     s.size = size;
@@ -63,7 +63,7 @@ fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
 }
 
 /// Space above the next box (the GPUI kit's `mt`).
-fn space(c: *ui.Context, h: f32) void {
+pub fn space(c: *ui.Context, h: f32) void {
     _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = h } }, .none, null);
 }
 
@@ -153,6 +153,7 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         .notifications => notifications(c, a, k),
         .files => files(c, a, k),
         .archived => archived(c, a, k),
+        .devices => @import("view_settings_devices.zig").page(c, a, k),
         else => |s| {
             header(c, k, s.label(), null);
             subtitle(c, k, "This section isn't in Harness Nano yet: open it in Harness.", false);
@@ -163,14 +164,14 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
 // The kit (settings/widgets.rs).
 
 /// The page column's inside width, this frame.
-var inner_w: f32 = 720;
+pub var inner_w: f32 = 720;
 
 /// A card row's words: the row less its insets, tile, gaps and switch.
 fn wordsWidth(trailing: f32) f32 {
     return @max(inner_w - 2 - 2 * 20 - 36 - 14 - 14 - trailing, 80);
 }
 
-fn header(c: *ui.Context, k: theme.Colors, title: []const u8, count: ?usize) void {
+pub fn header(c: *ui.Context, k: theme.Colors, title: []const u8, count: ?usize) void {
     const h = ui.div(c).row().gap(10).itemsEnd();
     defer h.end();
     ui.text(c, title, st(c, 16, .{ .weight = .semibold, .color = k.text }));
@@ -179,27 +180,27 @@ fn header(c: *ui.Context, k: theme.Colors, title: []const u8, count: ?usize) voi
 
 /// `page_subtitle`. Pages that cap it (`max_w(512).line_height(20)`) pass
 /// `capped`; the others run it the column's width on GPUI's line height.
-fn subtitle(c: *ui.Context, k: theme.Colors, copy: []const u8, capped: bool) void {
+pub fn subtitle(c: *ui.Context, k: theme.Colors, copy: []const u8, capped: bool) void {
     space(c, 4);
     const s = ui.div(c).column().w(if (capped) @min(inner_w, 512) else inner_w);
     defer s.end();
     ui.text(c, copy, .{ .size = 13, .line_height = if (capped) 20 else 13 * phi, .wrap = true, .color = k.muted });
 }
 
-fn fieldLabel(c: *ui.Context, k: theme.Colors, label: []const u8) void {
+pub fn fieldLabel(c: *ui.Context, k: theme.Colors, label: []const u8) void {
     ui.text(c, label, st(c, 13, .{ .weight = .medium, .color = k.text }));
 }
 
 /// `section_card`: 24 points down, rounded 12, a hairline edge. In GPUI a
 /// border insets what's inside it; here it's drawn over the box, so the
 /// box pads by its width.
-fn card(c: *ui.Context, k: theme.Colors) ui.Div {
+pub fn card(c: *ui.Context, k: theme.Colors) ui.Div {
     space(c, 24);
     return ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(k.shell).clip();
 }
 
 /// `card_row`: 20 by 14 inside, a line above all but the first.
-fn row(c: *ui.Context, k: theme.Colors, first: bool, dim: bool) ui.Div {
+pub fn row(c: *ui.Context, k: theme.Colors, first: bool, dim: bool) ui.Div {
     if (!first) _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.border }, .none, null);
     var r = ui.div(c).row().wFull().px(20).py(14).gap(14).itemsCenter().hover(k.ink(0.015));
     if (dim) r = r.opacity(0.55);
@@ -207,14 +208,14 @@ fn row(c: *ui.Context, k: theme.Colors, first: bool, dim: bool) ui.Div {
 }
 
 /// `row_tile`: a 36-point tile around a 16-point icon.
-fn tile(c: *ui.Context, k: theme.Colors, icon: icons.Name) void {
+pub fn tile(c: *ui.Context, k: theme.Colors, icon: icons.Name) void {
     const t = ui.div(c).row().size(36, 36).center().rounded(10).border(k.border).borderW(1).bg(k.ink(0.03));
     defer t.end();
     icons.icon(c, icon, 16, k.muted, 0);
 }
 
 /// The title and the quiet line under it.
-fn words(c: *ui.Context, k: theme.Colors, title: []const u8, meta: []const u8, trailing: f32) void {
+pub fn words(c: *ui.Context, k: theme.Colors, title: []const u8, meta: []const u8, trailing: f32) void {
     const w = ui.div(c).column().w(wordsWidth(trailing)).gap(1);
     defer w.end();
     ui.text(c, title, st(c, 13, .{ .weight = .medium, .color = k.text }));
@@ -222,7 +223,7 @@ fn words(c: *ui.Context, k: theme.Colors, title: []const u8, meta: []const u8, t
 }
 
 /// `toggle_switch` in its 40-point target: true when clicked.
-fn toggle(c: *ui.Context, k: theme.Colors, on: bool, enabled: bool) bool {
+pub fn toggle(c: *ui.Context, k: theme.Colors, on: bool, enabled: bool) bool {
     const target = ui.div(c).row().size(40, 40).center();
     defer target.end();
     const track = ui.div(c).row().w(32).h(18).roundedFull().bg(if (on) k.text else k.ink(0.15)).pl(if (on) 16 else 2).itemsCenter();
@@ -245,7 +246,7 @@ fn switchRow(c: *ui.Context, a: *App, k: theme.Colors, comptime flag: settings.F
 }
 
 /// `btn_ghost`: muted text, a wash under the pointer.
-fn ghost(c: *ui.Context, k: theme.Colors, label: []const u8) bool {
+pub fn ghost(c: *ui.Context, k: theme.Colors, label: []const u8) bool {
     const b = ui.div(c).row().px(12).py(6).rounded(8).hover(k.ink(0.06));
     defer b.end();
     ui.text(c, label, st(c, 13, .{ .color = if (b.hovered()) k.text else k.muted }));
