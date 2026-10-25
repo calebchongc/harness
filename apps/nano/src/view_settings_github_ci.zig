@@ -589,12 +589,14 @@ fn budgetRow(c: *ui.Context, a: *App, k: theme.Colors, inst: *const runners.Inst
         };
     }
     if (in) |i| {
-        const f = ui.div(c).row().w(112).px(9).py(5).gap(4).itemsCenter().rounded(6).border(if (i.problem != null) k.danger.alpha(0.5) else k.border).borderW(1).bg(k.ink(0.03));
+        const f = ui.div(c).row().w(112).px(9).py(3).gap(4).itemsCenter().rounded(6).border(if (i.problem != null) k.danger.alpha(0.5) else k.border).borderW(1).bg(k.ink(0.03));
         defer f.end();
         ui.text(c, "$", set.st(c, 12.5, .{ .color = k.muted }));
         const fw = ui.div(c).row().grow().w(0);
         defer fw.end();
-        const res = ui.textField(c, i.buf, .{ .placeholder = "Amount", .width = .fill, .bare = true, .size = 12.5 });
+        // A ComposerInput: its own 14-point text on a 22.75-point line
+        // (less the 2 points a bare field keeps above and below).
+        const res = ui.textField(c, i.buf, .{ .placeholder = "Amount", .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 14, .line_height = 22.75 });
         if (res.changed) i.problem = null;
         if (res.submitted) saveBudget(a, id, b);
     }
@@ -649,7 +651,8 @@ fn repoRow(c: *ui.Context, a: *App, k: theme.Colors, inst: *const runners.Instal
     defer r.end();
     const w = rowInner() - trigger_w - 14 - 40;
     {
-        const t = ui.div(c).row().w(w).gap(8).itemsCenter();
+        // `flex_1`: the rest of the row, whatever the size label measures.
+        const t = ui.div(c).row().grow().w(0).gap(8).itemsCenter();
         defer t.end();
         const badge_w: f32 = if (repo.private) 8 + 2 * 9 + c.text.width("Private", .{ .size = 10.5 }) else 0;
         title(c, k, name, w - badge_w);

@@ -137,7 +137,7 @@ pub fn why(e: []const u8) []const u8 {
 
 /// An engine to ask (the GPUI app's `engine()`): connected, with a client.
 pub fn engineUp(a: *App) bool {
-    return a.engine.state == .connected and a.engine.client != null;
+    return a.engine.up();
 }
 
 pub fn target(a: *App) ?[]const u8 {

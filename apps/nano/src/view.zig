@@ -222,8 +222,12 @@ fn keys(c: *ui.Context, a: *App) void {
     // arrows and Return.
     const chat_menu = @import("view_chat_menu.zig");
     const header_menus = @import("view_sidebar_menus.zig");
-    // Settings › Accounts' sign-in dialog or device list takes Escape first.
-    if (a.view.settings_open) @import("view_settings_accounts.zig").escape(c, a);
+    // Settings › Accounts' sign-in dialog or device list, or Archived's
+    // Delete all, takes Escape first.
+    if (a.view.settings_open) {
+        @import("view_settings_accounts.zig").escape(c, a);
+        _ = @import("view_settings_archived.zig").escape(c, a);
+    }
     if (chat_menu.anyDialog(a)) {
         if (c.shortcut(.{ .key = S.escape })) chat_menu.dismiss(a);
     } else if (header_menus.anyOpen(a)) header_menus.keys(c, a) else if (!a.view.palette.open) {

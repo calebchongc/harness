@@ -155,7 +155,11 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
     switch (a.settings.section) {
         .notifications => notifications(c, a, k),
         .files => files(c, a, k),
-        .archived => archived(c, a, k),
+        .archived => {
+            const archived = @import("view_settings_archived.zig");
+            archived.page(c, a, k);
+            archived.dialog(c, a, k);
+        },
         .devices => @import("view_settings_devices.zig").page(c, a, k),
         .shortcuts => @import("view_settings_shortcuts.zig").page(c, a, k),
         .appearance => @import("view_settings_appearance.zig").page(c, a, k),
@@ -324,82 +328,6 @@ pub fn projectParent(path: []const u8) ?[]const u8 {
     if (t.len == 0) return null;
     const at = std.mem.lastIndexOfScalar(u8, t, '/') orelse return null;
     return if (at == 0) "/" else t[0..at];
-}
-
-fn archived(c: *ui.Context, a: *App, k: theme.Colors) void {
-    var count: usize = 0;
-    for (a.chats.items) |ch| if (ch.archived) {
-        count += 1;
-    };
-    header(c, k, "Archived sessions", if (count > 0) count else null);
-    subtitle(c, k, "Hidden from the sidebar until you unarchive or delete them. Unarchiving puts a session back on its device.", false);
-    {
-        const cd = card(c, k);
-        defer cd.end();
-        const r = row(c, k, true, false);
-        defer r.end();
-        {
-            const w = ui.div(c).column().w(@max(inner_w - 2 - 2 * 20 - 14 - 40, 80)).gap(4);
-            defer w.end();
-            ui.text(c, "Archive sessions when closing tabs or panes", st(c, 13, .{ .weight = .medium, .color = k.text }));
-            ui.text(c, "Closing a session tab or pane with ⌘W or its ✕ button archives it if idle, unless it is still open in another tab or pane in this app. ⌥⌘W always closes without archiving. Running sessions and sessions waiting for input remain in the sidebar. Closing the app or a window does not archive sessions.", st(c, 12, .{ .wrap = true, .color = k.muted }));
-        }
-        if (toggle(c, k, a.settings.get(.archive_sessions_on_close), true)) {
-            a.settings.toggle(.archive_sessions_on_close);
-            a.redraw();
-        }
-    }
-    if (count == 0) {
-        space(c, 96);
-        const e = ui.div(c).column().wFull().itemsCenter();
-        defer e.end();
-        icons.icon(c, .@"archive-minimalistic", 28, k.muted.alpha(0.2), 0);
-        space(c, 12);
-        const t = ui.div(c).row();
-        {
-            defer t.end();
-            ui.text(c, "Nothing archived", st(c, 14, .{ .color = k.muted.alpha(0.5) }));
-        }
-        space(c, 4);
-        const s = ui.div(c).row();
-        defer s.end();
-        ui.text(c, "Right-click a session in the sidebar to archive it.", st(c, 12, .{ .color = k.muted.alpha(0.4) }));
-        return;
-    }
-    space(c, 24);
-    const list = ui.div(c).column().wFull().gap(2);
-    defer list.end();
-    for (a.chats.items) |ch| if (ch.archived) {
-        ui.key(c, ch.id);
-        const r = ui.div(c).row().wFull().px(12).py(8).gap(12).itemsCenter().rounded(8).hover(k.ink(0.03));
-        defer r.end();
-        const hot = r.hovered();
-        {
-            const t = ui.div(c).row().size(32, 32).center().rounded(6).border(k.border).borderW(1);
-            defer t.end();
-            icons.icon(c, .@"archive-minimalistic", 16, k.muted.alpha(0.6), 0);
-        }
-        {
-            const w = ui.div(c).column().grow().w(0);
-            defer w.end();
-            {
-                const top = ui.div(c).row().gap(8).itemsCenter();
-                defer top.end();
-                kit.ellipsisText(c, ch.title orelse "Untitled session", st(c, 13, .{ .weight = .medium, .color = k.text }), 420);
-                const ago = @import("rules.zig").relativeTime(c.alloc().alloc(u8, 16) catch &.{}, a.nowMs(), ch.last_message_ms);
-                ui.text(c, ago, st(c, 11, .{ .color = k.muted.alpha(0.5) }));
-            }
-            space(c, 2);
-            const meta = ui.div(c).row().gap(6).itemsCenter();
-            defer meta.end();
-            ui.text(c, a.deviceName(ch.device_id), st(c, 11, .{ .color = k.muted.alpha(0.55) }));
-        }
-        const u = ui.div(c).row().px(11).py(5).gap(6).itemsCenter().rounded(6).border(k.border).borderW(1).opacity(if (hot) 1 else 0).hover(k.raised);
-        defer u.end();
-        icons.icon(c, .@"archive-up-minimalistic", 14, k.muted, 0);
-        ui.text(c, "Unarchive", st(c, 12, .{ .color = k.muted }));
-        if (hot and u.clicked()) a.setArchived(ch.id, false);
-    };
 }
 
 const testing = std.testing;

@@ -253,19 +253,19 @@ fn startRename(a: *App, ch: workspace.Chat) void {
 
 /// The scrim a dialog sits on, centring it. Keyed: its field keeps the
 /// focus when a menu drawn before it goes.
-fn scrim(c: *ui.Context, k: theme.Colors) ui.Div {
+pub fn scrim(c: *ui.Context, k: theme.Colors) ui.Div {
     ui.key(c, "dialog-scrim");
     return ui.div(c).fixed().offset(0, 0).size(c.size.w, c.size.h).layer(6).bg(.{ .a = if (k.dark) 0.35 else 0.32 }).center();
 }
 
 /// The dialog card (`dialog_card`): 360 wide, 20 in (and its border),
 /// rounded 16.
-fn dialog(c: *ui.Context, k: theme.Colors) ui.Div {
+pub fn dialog(c: *ui.Context, k: theme.Colors) ui.Div {
     return kit.shadowLg(ui.div(c).w(360).p(21).column().rounded(16).bg(k.composer)
         .border(if (k.dark) ui.Color{ .r = 1, .g = 1, .b = 1, .a = 0.10 } else ui.Color{ .a = 0.135 }).borderW(1));
 }
 
-fn buttons(c: *ui.Context, k: theme.Colors, confirm: []const u8, danger: bool) enum { none, cancel, confirm } {
+pub fn buttons(c: *ui.Context, k: theme.Colors, confirm: []const u8, danger: bool) enum { none, cancel, confirm } {
     _ = c.leaf(.{ .height = .{ .px = 16 } }, .none, null);
     const r = ui.div(c).row().wFull().gap(8).justifyEnd();
     defer r.end();

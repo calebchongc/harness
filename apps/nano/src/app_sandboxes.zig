@@ -37,7 +37,7 @@ pub const State = struct {
 };
 
 fn engineUp(a: *App) bool {
-    return a.engine.state == .connected and a.engine.client != null;
+    return a.engine.up();
 }
 
 /// The list, when there is one to show (signed in, and offered here).

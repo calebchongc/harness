@@ -39,7 +39,8 @@ fn tabList(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (tabs.len > 1) {
         const h = ui.div(c).row().px(4).pb(2);
         defer h.end();
-        ui.text(c, c.print("Tabs · {d}", .{tabs.len}), .{ .size = 11, .color = k.muted.alpha(0.8) });
+        // GPUI's line: 11 × φ, to the device pixel.
+        ui.text(c, c.print("Tabs · {d}", .{tabs.len}), .{ .size = 11, .line_height = 18, .color = k.muted.alpha(0.8) });
     }
     var close: ?usize = null;
     var show: ?usize = null;
@@ -222,8 +223,11 @@ fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
     }
     // Show › Archived off: no shelf.
     if (archived == 0 or !a.settings.get(.sidebar_show_archived)) return;
-    _ = c.leaf(.{ .height = .{ .px = 8 } }, .none, null);
+    // 6 under the list above: its 4, and the gap.
+    _ = c.leaf(.{ .height = .{ .px = 4 } }, .none, null);
     if (section(c, k, "Archived", archived, &a.view.archived_open)) {
+        // SIDEBAR_DISCLOSURE_BODY_INSET: 4 under the header, the list's 2 twice.
+        _ = c.leaf(.{ .height = .{ .px = 0 } }, .none, null);
         var shown: usize = 0;
         for (a.chats.items) |ch| if (ch.archived and listed(a, ch)) {
             if (shown == a.view.archived_limit) break;
@@ -231,10 +235,14 @@ fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
             shown += 1;
         };
         if (archived > shown) {
-            const more = ui.div(c).row().wFull().h(29).px(8).itemsCenter().rounded(8).hover(k.hover);
+            // A row's height (36, or a compact row's 29), 2 under the last
+            // row; 25 more at a time.
+            const more = ui.div(c).row().wFull().h(if (a.settings.get(.sidebar_compact)) 29 else 36).px(8).gap(10).itemsCenter().rounded(6).hover(k.hover);
             defer more.end();
             if (more.clicked()) a.view.archived_limit += 25;
-            ui.text(c, c.print("Show {d} more", .{archived - shown}), .{ .size = 12, .color = k.muted });
+            const color = if (more.hovered()) k.text else k.muted.alpha(0.55);
+            icons.icon(c, .plus, 14, color, 0);
+            ui.text(c, c.print("Show {d} more", .{@min(archived - shown, 25)}), .{ .size = 13, .line_height = 13 * 1.618, .color = color });
         }
     }
 }

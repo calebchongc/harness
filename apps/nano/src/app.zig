@@ -88,12 +88,15 @@ pub const View = struct {
     agents: @import("view_settings_agents.zig").Page = .{},
     /// Settings › Accounts, kept between visits.
     accounts: @import("view_settings_accounts.zig").Page = .{},
+    /// Settings › Archived sessions' Unarchive and Delete all.
+    archived: @import("view_settings_archived.zig").Page = .{},
 
     pub fn deinit(v: *View, gpa: Allocator) void {
         v.github_ci.deinit(gpa);
         v.palette.deinit(gpa);
         v.agents.deinit(gpa);
         v.accounts.deinit(gpa);
+        v.archived.deinit(gpa);
         v.shortcut_notice.deinit(gpa);
         v.drag.deinit(gpa);
         v.chat_menu.id.deinit(gpa);
@@ -426,6 +429,8 @@ pub const App = struct {
     /// Streams to open again, now that it's time; the seconds until the next.
     pub fn tick(a: *App, now: f64) ?f32 {
         a.now = now;
+        // A scene's answers, a frame after their calls.
+        if (a.engine.pump()) a.redraw();
         question.syncWizard(a);
         var next: ?f64 = question.tick(a, now);
         if (queue_mod.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;

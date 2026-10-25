@@ -138,6 +138,15 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
     a.device_id = try gpa.dupe(u8, device);
     const devices = try json.parseFromSliceLeaky(json.Value, arena, try std.fmt.allocPrint(arena, "[{{\"id\":\"{s}\",\"name\":\"Studio\",\"platform\":\"macos\",\"lastSeenAt\":null}}]", .{device}), .{});
     try a.devices.replace(devices);
+    // More devices, after this one.
+    if (scene.get("devices")) |v| if (v == .array and v.array.items.len > 0) {
+        var all = devices.array;
+        try all.appendSlice(v.array.items);
+        try a.devices.replace(.{ .array = all });
+    };
+    // The engine's replies, by method, as the GPUI renderer's fake engine
+    // answers them.
+    if (scene.get("replies")) |v| a.engine.scene = try json.parseFromSlice(json.Value, gpa, try json.Stringify.valueAlloc(arena, v, .{}), .{});
     // Settings › Accounts' replies in place of the engine's, as the GPUI
     // renderer's `SCENE_ACCOUNTS`.
     const accounts_page = @import("view_settings_accounts.zig");
@@ -161,7 +170,7 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
         .theme = theme.ui(dark),
     });
     defer t.deinit();
-    t.settle(1);
+    settleScene(&t, &a);
     var buf: [4096]u8 = undefined;
     try shot(&t, try std.fmt.bufPrint(&buf, "{s}/{s}.png", .{ out, name }));
     const steps = if (scene.get("steps")) |v| (if (v == .array) v.array.items else &.{}) else &.{};
@@ -192,9 +201,17 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
         } else if (std.mem.eql(u8, do, "wait")) {
             t.advance((num(o, "ms") orelse 0) / 1000);
         } else return fail(n, "no such step: {s}", .{do});
-        t.settle(1);
+        settleScene(&t, &a);
         try shot(&t, try std.fmt.bufPrint(&buf, "{s}/{s}-{d:0>2}.png", .{ out, name, n }));
     }
+}
+
+/// Settled, with the scene's answers to the calls drawing made delivered
+/// (and theirs), as the GPUI renderer runs until parked.
+fn settleScene(t: *ui.Tester, a: *App) void {
+    t.settle(1);
+    var rounds: usize = 0;
+    while (a.engine.queued.items.len > 0 and rounds < 16) : (rounds += 1) t.settle(1);
 }
 
 fn shot(t: *ui.Tester, path: []const u8) !void {

@@ -30,6 +30,7 @@ test {
     _ = @import("view_settings_mcp.zig");
     _ = @import("runners.zig");
     _ = @import("view_settings_github_ci.zig");
+    _ = @import("view_settings_archived.zig");
     _ = @import("agents.zig");
     _ = @import("view_settings_agents.zig");
     _ = @import("accounts.zig");
@@ -62,4 +63,5 @@ test {
     _ = @import("tests_ui_change_requests.zig");
     _ = @import("palette.zig");
     _ = @import("tests_ui_palette.zig");
+    _ = @import("tests_ui_archived.zig");
 }

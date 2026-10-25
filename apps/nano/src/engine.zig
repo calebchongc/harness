@@ -34,6 +34,15 @@ pub const Engine = struct {
     live: std.atomic.Value(?*ws.Client) = .init(null),
     thread: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    /// A headless scene's made-up replies, by method (snap.zig; the GPUI
+    /// renderer's `replies`): calls are answered from them, a frame later.
+    scene: ?std.json.Parsed(std.json.Value) = null,
+    /// Those answers, waiting for `pump`.
+    queued: std.ArrayList([]u8) = .empty,
+    /// The calls a scene answered, as sent, and how many of each method's
+    /// `$seq` replies are used.
+    sent: std.ArrayList([]u8) = .empty,
+    seq_used: std.StringHashMapUnmanaged(usize) = .empty,
 
     pub fn init(gpa: Allocator, io: std.Io, port: u16) Engine {
         return .{ .gpa = gpa, .io = io, .port = port, .mux = .{ .gpa = gpa } };
@@ -55,12 +64,24 @@ pub const Engine = struct {
         if (e.live.load(.acquire)) |c| c.shutdown();
         if (e.thread) |t| t.join();
         if (e.live.load(.acquire)) |c| c.deinit(e.gpa);
+        if (e.scene) |*sc| sc.deinit();
+        for (e.queued.items) |q| e.gpa.free(q);
+        e.queued.deinit(e.gpa);
+        for (e.sent.items) |q| e.gpa.free(q);
+        e.sent.deinit(e.gpa);
+        e.seq_used.deinit(e.gpa);
         e.mux.deinit();
     }
 
     /// Calls `method`; `handler` hears the reply (or each stream item). The
     /// id cancels a stream. Without a connection it fails at once.
+    /// Connected to an engine, or answering from a scene.
+    pub fn up(e: *const Engine) bool {
+        return e.state == .connected and (e.client != null or e.scene != null);
+    }
+
     pub fn call(e: *Engine, method: []const u8, params: anytype, handler: rpc.Handler) ?u64 {
+        if (e.scene != null) return e.sceneCall(method, params, handler);
         const c = if (e.state == .connected) e.client else null;
         if (c == null) {
             handler.func(handler.ctx, 0, .{ .err = "not connected" });
@@ -74,6 +95,54 @@ pub const Engine = struct {
             return null;
         };
         return req.id;
+    }
+
+    /// A call a scene answers: its reply (under `$items`, each item and the
+    /// end; `$err`, that error; `$seq`, the next of several, the last kept)
+    /// queued as the engine would send it; else "isn't in this scene".
+    fn sceneCall(e: *Engine, method: []const u8, params: anytype, handler: rpc.Handler) ?u64 {
+        const req = e.mux.call(method, params, handler) catch return null;
+        e.sent.append(e.gpa, req.frame) catch e.gpa.free(req.frame);
+        const replies = e.scene.?.value;
+        const entry = if (replies == .object) replies.object.getEntry(method) else null;
+        var reply = if (entry) |en| en.value_ptr.* else null;
+        if (reply) |r| if (r == .object) if (r.object.get("$seq")) |list| if (list == .array and list.array.items.len > 0) {
+            // Keyed by the scene's own name for it, which outlives the call.
+            const used = e.seq_used.getOrPut(e.gpa, entry.?.key_ptr.*) catch null;
+            const n = if (used) |u| (if (u.found_existing) u.value_ptr.* else 0) else 0;
+            if (used) |u| u.value_ptr.* = n + 1;
+            reply = list.array.items[@min(n, list.array.items.len - 1)];
+        };
+        const Frame = struct { id: u64, ok: ?std.json.Value = null, item: ?std.json.Value = null, err: ?[]const u8 = null, done: ?bool = null };
+        var frames: std.ArrayList(Frame) = .empty;
+        defer frames.deinit(e.gpa);
+        if (reply) |r| {
+            const items = if (r == .object) r.object.get("$items") else null;
+            const failure = if (r == .object) r.object.get("$err") else null;
+            if (failure) |why| {
+                frames.append(e.gpa, .{ .id = req.id, .err = if (why == .string) why.string else "error" }) catch {};
+            } else if (items) |list| {
+                if (list == .array) for (list.array.items) |it| frames.append(e.gpa, .{ .id = req.id, .item = it }) catch {};
+                frames.append(e.gpa, .{ .id = req.id, .done = true }) catch {};
+            } else frames.append(e.gpa, .{ .id = req.id, .ok = r }) catch {};
+        } else frames.append(e.gpa, .{ .id = req.id, .err = "isn't in this scene" }) catch {};
+        for (frames.items) |f| {
+            const text = std.json.Stringify.valueAlloc(e.gpa, f, .{ .emit_null_optional_fields = false }) catch continue;
+            e.queued.append(e.gpa, text) catch e.gpa.free(text);
+        }
+        return req.id;
+    }
+
+    /// Delivers a scene's queued answers; true when there were any.
+    pub fn pump(e: *Engine) bool {
+        if (e.queued.items.len == 0) return false;
+        const batch = e.queued.toOwnedSlice(e.gpa) catch return false;
+        defer e.gpa.free(batch);
+        for (batch) |q| {
+            defer e.gpa.free(q);
+            e.mux.dispatch(q) catch {};
+        }
+        return true;
     }
 
     pub fn cancel(e: *Engine, id: u64) void {

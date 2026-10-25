@@ -125,7 +125,7 @@ fn current(slot: *?u64, id: u64) bool {
 /// An engine to ask: connected, with a socket (the GPUI app's `engine()`;
 /// the parity renderer is "connected" with none).
 fn live(a: *const App) bool {
-    return a.engine.state == .connected and a.engine.client != null;
+    return a.engine.up();
 }
 
 /// Sends `method`, remembering its id in `slot`.

@@ -61,6 +61,9 @@ pub const Mcp = struct {
     /// The server an action is running for; "" for Check all.
     busy: ?std.ArrayList(u8) = null,
     open: std.StringHashMapUnmanaged(void) = .empty,
+    /// The project (its space id) the last load was for (`McpTarget`);
+    /// none for every project, as before the engine was up.
+    target: std.ArrayList(u8) = .empty,
 
     pub fn init(gpa: Allocator) Mcp {
         return .{ .servers = .init(gpa) };
@@ -73,6 +76,7 @@ pub const Mcp = struct {
         if (m.busy) |*b| b.deinit(gpa);
         m.closeAll(gpa);
         m.open.deinit(gpa);
+        m.target.deinit(gpa);
     }
 
     fn closeAll(m: *Mcp, gpa: Allocator) void {
@@ -100,14 +104,24 @@ fn stateColor(k: theme.Colors, s: []const u8) ui.Color {
     return k.warning;
 }
 
-/// The project the sidebar is filtered to, which the list is for
-/// (`McpTarget`); none for every project.
+/// The project the list is for: the one picked for new chats when it was
+/// loaded (`McpTarget`, `selected_space_row`); none for every project.
 fn project(a: *const App) ?workspace.Space {
-    return a.findSpace(a.view.filter);
+    return a.findSpace(if (a.mcp.target.items.len > 0) a.mcp.target.items else null);
+}
+
+/// A different project lists different servers.
+fn retargeted(a: *const App) bool {
+    return !std.mem.eql(u8, a.mcp.target.items, a.space orelse "");
 }
 
 fn load(a: *App) void {
     a.mcp.phase = .loading;
+    // Without the engine there's no list, and the target stays as it was.
+    if (a.engine.up()) {
+        a.mcp.target.clearRetainingCapacity();
+        a.mcp.target.appendSlice(a.gpa, a.space orelse "") catch {};
+    }
     if (project(a)) |p| {
         a.call("ListMcpServers", .{ .cwd = p.path }, .of(App, a, onList));
     } else a.call("ListMcpServers", .{}, .of(App, a, onList));
@@ -206,7 +220,7 @@ fn asJson(ar: Allocator, s: Server) !json.Value {
 const phi: f32 = 1.618;
 
 pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
-    if (a.mcp.phase == .idle) load(a);
+    if (a.mcp.phase == .idle or (a.mcp.phase != .loading and a.engine.up() and retargeted(a))) load(a);
     const m = &a.mcp;
     {
         const h = ui.div(c).row().wFull().itemsCenter();

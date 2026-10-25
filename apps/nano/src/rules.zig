@@ -47,6 +47,42 @@ pub fn parseTime(s: []const u8) ?i64 {
     return ((days * 24 + h) * 60 + mi - offset_min) * 60_000 + sec * 1000 + ms;
 }
 
+/// A chat's folder as a session row names it (`project_label`): its last
+/// part, or "No project" for none or the home folder.
+pub fn projectLabel(cwd: ?[]const u8) []const u8 {
+    const t = std.mem.trim(u8, cwd orelse "", " \t\n\r");
+    if (t.len == 0 or std.mem.eql(u8, t, "~") or std.mem.eql(u8, t, "~/")) return "No project";
+    const bare = std.mem.trimEnd(u8, t, "/\\");
+    const at = std.mem.lastIndexOfAny(u8, bare, "/\\");
+    const name = if (at) |i| bare[i + 1 ..] else bare;
+    return if (name.len == 0) t else name;
+}
+
+/// The row's "project · branch" (`chat_location`): either part may be
+/// missing; null when both are.
+pub fn chatLocation(buf: []u8, cwd: ?[]const u8, branch: ?[]const u8) ?[]const u8 {
+    const folder = std.mem.trim(u8, cwd orelse "", " \t\n\r");
+    const project: ?[]const u8 = if (folder.len > 0) projectLabel(folder) else null;
+    const b = std.mem.trim(u8, branch orelse "", " \t\n\r");
+    const reference: ?[]const u8 = if (b.len > 0) b else null;
+    if (project) |pr| {
+        if (reference) |r| return std.fmt.bufPrint(buf, "{s} \u{00B7} {s}", .{ pr, r }) catch pr;
+        return pr;
+    }
+    return reference;
+}
+
+test "a chat's location joins project and branch" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("soccertcg \u{00B7} harness/rebalance", chatLocation(&buf, "/home/w/dev/soccertcg", "harness/rebalance").?);
+    try std.testing.expectEqualStrings("soccertcg", chatLocation(&buf, "/home/w/dev/soccertcg", null).?);
+    try std.testing.expectEqualStrings("main", chatLocation(&buf, null, "main").?);
+    try std.testing.expect(chatLocation(&buf, null, "   ") == null);
+    try std.testing.expect(chatLocation(&buf, null, null) == null);
+    try std.testing.expectEqualStrings("No project", projectLabel("~/"));
+    try std.testing.expectEqualStrings("app", projectLabel("/work/app/"));
+}
+
 /// How long ago, as a session row reads it: "now", "5m", "2h", "3d", "2w",
 /// "4mo", "1y" (`relative_time`).
 pub fn relativeTime(buf: []u8, now_ms: i64, then_ms: i64) []const u8 {
