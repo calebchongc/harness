@@ -101,8 +101,10 @@ def main() -> None:
 
     fork = os.environ.get("NANOUI_FORK")
     run(["zig", "build", *([f"--fork={fork}"] if fork else [])], cwd=NANO)
-    run([GPUI_BIN, *scenes, "--out", out / "gpui"])
     for scene in scenes:
+        # One process a scene: the renderer keeps one settings file for its
+        # run, so a later scene would open Settings where the last one left it.
+        run([GPUI_BIN, scene, "--out", out / "gpui"])
         run([SNAP_BIN, scene, out / "nano"])
 
     budget = json.loads(BUDGET.read_text()) if BUDGET.exists() else {}
