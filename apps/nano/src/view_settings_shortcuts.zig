@@ -36,10 +36,11 @@ pub fn capture(c: *ui.Context, a: *App) void {
     _ = c.shortcut(s);
     var shown: [64]u8 = undefined;
     if (shortcuts.reserved(combo)) return refuse(a, c.print("{s} is reserved for the composer.", .{shortcuts.display(&shown, combo)}));
-    for (shortcuts.all, 0..) |other, j| if (j != ix and std.mem.eql(u8, a.settings.combo(other), combo)) {
+    // One past the page's shortcuts: the Appshots page's.
+    for (shortcuts.all ++ [_]shortcuts.Shortcut{shortcuts.appshot}, 0..) |other, j| if (j != ix and std.mem.eql(u8, a.settings.combo(other), combo)) {
         return refuse(a, c.print("{s} is already assigned to {s}.", .{ shortcuts.display(&shown, combo), other.title }));
     };
-    a.settings.setCombo(shortcuts.all[ix], combo);
+    a.settings.setCombo(if (ix == shortcuts.all.len) shortcuts.appshot else shortcuts.all[ix], combo);
     a.view.recording = null;
     a.view.shortcut_notice.clearRetainingCapacity();
 }

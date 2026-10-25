@@ -157,6 +157,7 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         .shortcuts => @import("view_settings_shortcuts.zig").page(c, a, k),
         .appearance => @import("view_settings_appearance.zig").page(c, a, k),
         .mcp => @import("view_settings_mcp.zig").page(c, a, k),
+        .appshots => @import("view_settings_appshots.zig").page(c, a, k),
         else => |s| {
             header(c, k, s.label(), null);
             subtitle(c, k, "This section isn't in Harness Nano yet: open it in Harness.", false);

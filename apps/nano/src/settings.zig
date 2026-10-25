@@ -104,6 +104,9 @@ pub const Prefs = struct {
     sidebar_show_branch: bool = true,
     sidebar_show_project_label: bool = true,
     sidebar_show_archived: bool = true,
+    // Settings › Appshots.
+    appshots_enabled: bool = false,
+    appshot_sound_enabled: bool = true,
 };
 
 /// One of `Prefs`'s switches.
@@ -128,6 +131,8 @@ pub const Flag = enum {
     sidebar_show_branch,
     sidebar_show_project_label,
     sidebar_show_archived,
+    appshots_enabled,
+    appshot_sound_enabled,
 };
 
 /// How the sidebar groups sessions (`SidebarOrganization`), as saved.
@@ -294,7 +299,7 @@ pub const Store = struct {
         const a = arena.allocator();
         var obj: json.ObjectMap = .empty;
         // What this app doesn't show (an Appshot's key) as the file had it.
-        obj.put(a, "captureAppshot", .{ .string = s.keymap.get("captureAppshot") orelse "ctrl-alt-space" }) catch return;
+        obj.put(a, "captureAppshot", .{ .string = s.combo(shortcuts.appshot) }) catch return;
         var jump: json.Array = .init(a);
         for (shortcuts.all) |sc| {
             if (sc.slot != null) {

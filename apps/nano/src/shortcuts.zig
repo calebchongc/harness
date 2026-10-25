@@ -38,6 +38,10 @@ pub const Shortcut = struct {
 
 const jump_description = "Open the session at this place in the sidebar list.";
 
+/// The Appshot capture's, recorded on the Appshots page (Control-Option-Space
+/// on the Mac, `ShortcutId::CaptureAppshot`).
+pub const appshot: Shortcut = .{ .key = "captureAppshot", .group = .sessions, .title = "Capture Appshot", .description = "", .default = "ctrl-alt-space" };
+
 /// In the page's order (`ShortcutId::ALL`, Appshots' left out: it has a
 /// page of its own).
 pub const all = [_]Shortcut{
