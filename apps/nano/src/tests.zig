@@ -55,4 +55,6 @@ test {
     _ = @import("view_session_footer.zig");
     _ = @import("view_composer.zig");
     _ = @import("tests_ui_footer.zig");
+    _ = @import("view_rail.zig");
+    _ = @import("tests_ui_rail.zig");
 }

@@ -437,10 +437,15 @@ fn pasteBody(c: *ui.Context, a: *App, k: theme.Colors, f: *Flow) void {
     set.space(c, 12);
     var submitted = false;
     {
-        const fr = ui.div(c).row().wFull().px(13).py(9).rounded(8).border(k.ink(0.08)).borderW(1).bg(k.ink(0.04));
+        // `dialog_field` in the mono face: its input's own 22.75-point
+        // line; 2 of the 9 above and below are the bare field's.
+        const fr = ui.div(c).row().wFull().px(13).py(7).rounded(8).border(k.ink(0.08)).borderW(1).bg(k.ink(0.04));
         defer fr.end();
         const at = c.nodes.items.len;
-        const r = ui.textField(c, &s.code, .{ .placeholder = "Paste the authorization code", .width = .fill, .bare = true, .size = 13 });
+        var opts: ui.TextFieldOptions = .{ .placeholder = "Paste the authorization code", .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 13, .line_height = 22.75 };
+        // Mono, with a nanoui whose fields have the face.
+        if (comptime @hasField(ui.TextFieldOptions, "mono")) @field(opts, "mono") = true;
+        const r = ui.textField(c, &s.code, opts);
         if (s.focus_code) {
             c.focus = c.node(@intCast(at)).id;
             c.changed = true;

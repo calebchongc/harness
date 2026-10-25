@@ -42,6 +42,13 @@ pub fn markdown(c: *ui.Context, colors: theme.Colors, src: []const u8) void {
 fn rich(c: *ui.Context, in: md.Inline, style: ui.TextStyle) void {
     var st = style;
     if (st.color == null) st.color = k.text;
+    // Inline code at the text's own size, as `render.rs` sets it (nanoui's
+    // `mono_scale`, justrach/nanoui mono-scale; 90% before).
+    if (comptime @hasField(ui.TextStyle, "mono_scale")) st.mono_scale = 1;
+    // Its wash 2 points past its glyphs, 2 in from the line's box, 4.5
+    // round (`INLINE_CODE_PAD_X`, `INLINE_CODE_INSET_Y`,
+    // `INLINE_CODE_RADIUS`; nanoui's `span_box`).
+    if (comptime @hasField(ui.TextStyle, "span_box")) st.span_box = .{ .pad_x = 2, .inset_y = 2, .radius = 4.5 };
     ui.richText(c, in.text, in.spans, st);
 }
 
@@ -115,12 +122,11 @@ fn codeBlock(c: *ui.Context, lang: []const u8, src: []const u8) void {
         if (kit.iconButton(c, k, .copy, .{ .size = 22, .radius = 5, .icon = 12 })) c.clipboard.write(c.clipboard.ctx, src);
     }
     _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.border }, .none, null);
-    const s = k.syntax;
-    const pal: highlight.Palette = .{ .comment = s[0], .keyword = s[1], .string = s[2], .number = s[3], .type = s[4], .call = s[5] };
+    const pal = k.syntax;
     const lines = ui.div(c).column().wFull().px(12).py(10).gap(0);
     defer lines.end();
     const st = kit.style(c, 12.5, 18, .{ .mono = true, .wrap = true, .color = k.text });
-    var in_block = false;
+    var in_block: highlight.State = .{};
     var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, src, "\n"), '\n');
     while (it.next()) |l| {
         const spans = highlight.line(c.alloc(), l, lang, pal, &in_block);

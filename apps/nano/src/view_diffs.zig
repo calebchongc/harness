@@ -122,12 +122,12 @@ fn fileBlock(c: *ui.Context, a: *App, k: theme.Colors, f: *const diff.File, firs
         const hr = ui.div(c).row().wFull().h(28).px(12).itemsCenter().bg(k.accent.alpha(if (k.dark) 0.08 else 0.07));
         ui.text(c, h.header, .{ .size = 11, .mono = true, .color = k.faint });
         hr.end();
-        var in_block = false;
+        var in_block: highlight.State = .{};
         for (h.lines) |l| line(c, k, l, gutter, lang, &in_block);
     }
 }
 
-fn line(c: *ui.Context, k: theme.Colors, l: diff.Line, gutter: f32, lang: []const u8, in_block: *bool) void {
+fn line(c: *ui.Context, k: theme.Colors, l: diff.Line, gutter: f32, lang: []const u8, in_block: *highlight.State) void {
     const tint: ?ui.Color = switch (l.kind) {
         .add => k.diff_add,
         .del => k.diff_del,
@@ -162,8 +162,7 @@ fn line(c: *ui.Context, k: theme.Colors, l: diff.Line, gutter: f32, lang: []cons
     const code = ui.div(c).row().grow().w(0).h(21).pl(12).itemsCenter().clip();
     defer code.end();
     if (l.kind == .meta) return ui.text(c, l.text, .{ .size = 10.5, .italic = true, .color = k.faint });
-    const s = k.syntax;
-    const pal: highlight.Palette = .{ .comment = s[0], .keyword = s[1], .string = s[2], .number = s[3], .type = s[4], .call = s[5] };
+    const pal = k.syntax;
     ui.richText(c, if (l.text.len == 0) " " else l.text, highlight.line(c.alloc(), l.text, lang, pal, in_block), kit.style(c, 12, 21, .{ .mono = true, .color = k.text }));
 }
 

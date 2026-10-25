@@ -50,7 +50,8 @@ pub const Colors = struct {
     /// Changed lines in a diff.
     diff_add: Color,
     diff_del: Color,
-    syntax: [6]Color,
+    /// Codegraff's twelve syntax roles and the GPUI palette's Markdown six.
+    syntax: @import("highlight.zig").Palette,
 
     /// White at `a` in dark, black at `a` in light.
     pub fn ink(k: Colors, a: f32) Color {
@@ -101,7 +102,7 @@ pub fn colors(dark: bool) Colors {
             .on_solid = black,
             .diff_add = .hex(0x7fa86b),
             .diff_del = .hex(0xd2674f),
-            .syntax = .{ .hex(0x5c564b), .hex(0xe8a33d), .hex(0x7fa86b), .hex(0xd9a441), .hex(0xedeae2), .hex(0xe8a33d) },
+            .syntax = syntax(.{ 0x5c564b, 0xe8a33d, 0x7fa86b, 0xd9a441, 0xedeae2, 0xe8a33d, 0xedeae2, 0xedeae2, 0x9a9384, 0xd2674f, 0xd9a441, 0xd2674f }, .{ 0x8f96ed, 0x1eb787, 0xe679b4, 0xdba924, 0xe679b4, 0x8f96ed }),
         };
     }
     const accent = Color.hex(0xc77d20);
@@ -136,7 +137,36 @@ pub fn colors(dark: bool) Colors {
         .on_solid = white,
         .diff_add = .hex(0x5c7e47),
         .diff_del = .hex(0xb14228),
-        .syntax = .{ .hex(0xa8a090), .hex(0xc77d20), .hex(0x5c7e47), .hex(0x9a6e1b), .hex(0x1a1813), .hex(0xc77d20) },
+        .syntax = syntax(.{ 0xa8a090, 0xc77d20, 0x5c7e47, 0x9a6e1b, 0x1a1813, 0xc77d20, 0x1a1813, 0x1a1813, 0x6b6557, 0xb14228, 0x9a6e1b, 0xb14228 }, .{ 0x5754b4, 0x0f5b41, 0x8d2f58, 0x7c451e, 0x8d2f58, 0x5754b4 }),
+    };
+}
+
+/// builtins.rs's `syntax` seeds (comment, keyword, string, number, type,
+/// function, property, variable, punctuation, tag, attribute, invalid),
+/// then `SyntaxPalette::dark`/`light`'s Markdown hues (heading, raw, link,
+/// reference, emphasis, strong), their oklch through `git_graph_tone`.
+fn syntax(comptime roles: [12]u24, comptime markup: [6]u24) @import("highlight.zig").Palette {
+    const r = roles;
+    const m = markup;
+    return .{
+        .comment = .hex(r[0]),
+        .keyword = .hex(r[1]),
+        .string = .hex(r[2]),
+        .number = .hex(r[3]),
+        .type = .hex(r[4]),
+        .function = .hex(r[5]),
+        .property = .hex(r[6]),
+        .variable = .hex(r[7]),
+        .punctuation = .hex(r[8]),
+        .tag = .hex(r[9]),
+        .attribute = .hex(r[10]),
+        .invalid = .hex(r[11]),
+        .markup_heading = .hex(m[0]),
+        .markup_raw = .hex(m[1]),
+        .markup_link = .hex(m[2]),
+        .markup_reference = .hex(m[3]),
+        .markup_emphasis = .hex(m[4]),
+        .markup_strong = .hex(m[5]),
     };
 }
 

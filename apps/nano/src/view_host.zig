@@ -92,11 +92,10 @@ fn file(c: *ui.Context, a: *App, k: theme.Colors, path: []const u8) void {
 
 /// Code with its line numbers, coloured as the language reads.
 pub fn code(c: *ui.Context, k: theme.Colors, text: []const u8, lang: []const u8) void {
-    const s = k.syntax;
-    const pal: highlight.Palette = .{ .comment = s[0], .keyword = s[1], .string = s[2], .number = s[3], .type = s[4], .call = s[5] };
+    const pal = k.syntax;
     const st = kit.style(c, 12.5, 19, .{ .mono = true, .color = k.text });
     const num = kit.style(c, 11, 19, .{ .mono = true, .color = k.faint });
-    var in_block = false;
+    var in_block: highlight.State = .{};
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
     while (it.next()) |l| {
@@ -113,9 +112,13 @@ pub fn code(c: *ui.Context, k: theme.Colors, text: []const u8, lang: []const u8)
     }
 }
 
-/// The language a path's extension names, for colouring.
+/// The language a path names, for colouring (`language_for_path`): a
+/// Dockerfile's, a Makefile's, Cargo.lock's, else its extension's.
 pub fn langOf(path: []const u8) []const u8 {
-    const ext = std.fs.path.extension(path);
+    const name = std.fs.path.basename(path);
+    const named = [_][2][]const u8{ .{ "dockerfile", "dockerfile" }, .{ "containerfile", "dockerfile" }, .{ "makefile", "make" }, .{ "gnumakefile", "make" }, .{ "cargo.lock", "toml" } };
+    for (named) |n| if (std.ascii.eqlIgnoreCase(name, n[0])) return n[1];
+    const ext = std.fs.path.extension(name);
     return if (ext.len > 1) ext[1..] else "";
 }
 

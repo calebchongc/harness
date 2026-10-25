@@ -49,6 +49,9 @@ pub fn view(a: *App, c: *ui.Context) void {
     // Text breaks into lines where the GPUI app breaks it, with a nanoui
     // that has its rule (justrach/nanoui gpui-wrap).
     if (comptime @hasField(@TypeOf(c.text.*), "wrap_rule")) c.text.wrap_rule = .glyph_positions;
+    // A line taller than its font's centres its glyphs as GPUI's
+    // `ShapedLine::paint` does (justrach/nanoui baseline_rule).
+    if (comptime @hasField(@TypeOf(c.text.*), "baseline_rule")) c.text.baseline_rule = .glyph_box;
     keys(c, a);
     @import("view_drag.zig").update(c, a);
     a.syncPeers();
@@ -187,7 +190,7 @@ fn neighbor(c: *ui.Context, a: *App, k: theme.Colors, ix: usize, chat_id: ?[]con
     const body = ui.div(c).column().grow().wFull().opacity(0.8);
     defer body.end();
     if (chat_id) |id| {
-        if (a.peer(id)) |p| transcript_view.entries(c, a, k, &p.transcript, w, p.watch != null, 8);
+        if (a.peer(id)) |p| _ = transcript_view.entries(c, a, k, &p.transcript, w, p.watch != null, 8);
         return false;
     }
     const empty = ui.div(c).column().grow().wFull().px(16).gap(4).center();

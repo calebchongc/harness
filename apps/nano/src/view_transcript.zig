@@ -53,18 +53,28 @@ pub fn paneHeight(c: *ui.Context, a: *const App) ?f32 {
     return (c.size.h - sidebar.titlebar_h) * s.shares.items[s.focus] - 1;
 }
 
+/// The open chat's transcript, and over its left edge the prompt rail
+/// (`render_rail`, view_rail.zig): the column it is in is the rail's.
 pub fn transcript(c: *ui.Context, a: *App, k: theme.Colors) void {
-    entries(c, a, k, &a.transcript, paneWidth(c, a), a.w_doc.id != null, 64 - sidebar.titlebar_h);
+    const rail = @import("view_rail.zig");
+    rail.step(c, &a.view.rail);
+    const drawn = entries(c, a, k, &a.transcript, paneWidth(c, a), a.w_doc.id != null, 64 - sidebar.titlebar_h);
+    rail.rail(c, k, &a.view.rail, &a.transcript, drawn.ticks, drawn.box, mainWidth(c, a));
 }
+
+/// What a transcript drew: its scroll box, and its prompts' rows as last
+/// laid out.
+pub const Drawn = struct { box: u64 = 0, ticks: []const @import("view_rail.zig").Tick = &.{} };
 
 /// A transcript `w` wide: the open chat's, or a split pane's neighbor's.
 /// The first row sits `top` points down; rows settle at the bottom, over
 /// the composer, until they fill it.
-pub fn entries(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f32, loading: bool, top: f32) void {
+pub fn entries(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f32, loading: bool, top: f32) Drawn {
     const frame = ui.div(c).column().grow().wFull().h(0);
     defer frame.end();
-    rows(c, a, k, t, w, loading, top);
+    const drawn = rows(c, a, k, t, w, loading, top);
     topFade(c, k);
+    return drawn;
 }
 
 /// `TRANSCRIPT_FADE_BAND`: rows scrolled up fade out over the 24 points
@@ -79,7 +89,7 @@ fn topFade(c: *ui.Context, k: theme.Colors) void {
     }
 }
 
-fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f32, loading: bool, top: f32) void {
+fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f32, loading: bool, top: f32) Drawn {
     const col = columnWidth(w);
     // The last row clears the status strip over the composer and the fade
     // band above it (`bottom_clearance + TRANSCRIPT_FADE_BAND + 8`); the
@@ -87,8 +97,12 @@ fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f3
     // while it scrolls, as GPUI's overlay rail.
     var st: ui.Style = .{ .grow = 1, .width = .fill, .padding = .{ .top = top, .bottom = 24 + 24 + 8 }, .align_items = .center, .justify = .end, .follow_end = true };
     if (@hasField(ui.Style, "scrollbar")) st.scrollbar = .{ .overlay = k.faint.alpha(0.5) };
-    ui.scroll(c, st);
+    st.scroll = true;
+    st.direction = .column;
+    const scroll = c.open(st, null);
     defer ui.end(c);
+    var drawn: Drawn = .{ .box = c.node(scroll).id };
+    var ticks: std.ArrayList(@import("view_rail.zig").Tick) = .empty;
     const body = ui.div(c).column().w(col);
     defer body.end();
     const entries_ = t.entries.items;
@@ -100,7 +114,7 @@ fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f3
         const e = ui.div(c).row().wFull().pt(40).justifyCenter();
         defer e.end();
         ui.text(c, if (loading) "Loading…" else "Nothing here yet.", .{ .size = 13, .color = k.faint });
-        return;
+        return drawn;
     }
     for (entries_, 0..) |*e, i| {
         ui.key(c, c.print("entry-{s}", .{e.id}));
@@ -108,14 +122,21 @@ fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f3
         if (i > 0) _ = c.leaf(.{ .height = .{ .px = 16 } }, .none, null);
         const at: At = .{ .chat_id = chat_id, .entries = entries_, .index = i, .col = col };
         switch (e.role) {
-            .user => user(c, k, e, col),
+            .user => {
+                // Its row starts where the turn's gap does (`top_gap_for`).
+                const r = user(c, k, e, col);
+                ticks.append(c.alloc(), .{ .entry = i, .top = if (r) |x| x.y - (if (i > 0) @as(f32, 16) else 0) else null }) catch {};
+            },
             .assistant => assistant(c, a, k, e, at),
             .system => system(c, a, k, e, at),
         }
     }
+    drawn.ticks = ticks.items;
+    return drawn;
 }
 
-fn user(c: *ui.Context, k: theme.Colors, e: *const tr.Entry, col: f32) void {
+/// A prompt's bubble; where it was last laid out.
+fn user(c: *ui.Context, k: theme.Colors, e: *const tr.Entry, col: f32) ?ui.Rect {
     const wrap = ui.div(c).column().wFull().itemsEnd();
     defer wrap.end();
     const hovered = wrap.hovered();
@@ -130,6 +151,7 @@ fn user(c: *ui.Context, k: theme.Colors, e: *const tr.Entry, col: f32) void {
         };
     }
     lane(c, k, e, hovered, true);
+    return c.rects.get(c.node(wrap.index).id);
 }
 
 /// Under a message: 32 points held for its copy button, shown on hover.

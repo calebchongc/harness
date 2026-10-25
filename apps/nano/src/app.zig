@@ -75,6 +75,8 @@ pub const View = struct {
     /// drawn, for keeping them when it moves.
     focus_composer: bool = false,
     composer_id: u64 = 0,
+    /// The prompt rail's hover and glide (view_rail.zig).
+    rail: @import("view_rail.zig").State = .{},
     /// Tool groups opened or closed by hand, by "<entry>/<first part>".
     groups: std.StringHashMapUnmanaged(bool) = .empty,
     /// Settings › GitHub CI, kept between visits.
