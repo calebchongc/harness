@@ -10,7 +10,87 @@ const icons = @import("icons.zig");
 const set = @import("view_settings.zig");
 const account = @import("app_account.zig");
 const workspace = @import("workspace.zig");
+const rpc = @import("rpc.zig");
+const dialogs = @import("view_chat_menu.zig");
 const App = @import("app.zig").App;
+const Allocator = std.mem.Allocator;
+
+const phi: f32 = 1.618;
+
+/// What the page keeps between frames.
+pub const Page = struct {
+    /// The device being renamed, and its name as typed.
+    rename: std.ArrayList(u8) = .empty,
+    renaming: bool = false,
+    name: ui.TextBuffer = .{},
+    focus_name: bool = false,
+    /// The device whose id chip says "Copied", until `copied_until`.
+    copied: std.ArrayList(u8) = .empty,
+    copied_until: f64 = 0,
+    /// The device whose Remove asks for a second click.
+    confirm_remove: std.ArrayList(u8) = .empty,
+    /// The strip under the version; a click clears it.
+    failure: std.ArrayList(u8) = .empty,
+
+    pub fn deinit(p: *Page, gpa: Allocator) void {
+        p.rename.deinit(gpa);
+        p.copied.deinit(gpa);
+        p.confirm_remove.deinit(gpa);
+        p.failure.deinit(gpa);
+    }
+};
+
+fn setTo(gpa: Allocator, list: *std.ArrayList(u8), s: []const u8) void {
+    list.clearRetainingCapacity();
+    list.appendSlice(gpa, s) catch {};
+}
+
+fn openRename(a: *App, d: workspace.Device) void {
+    const p = &a.view.devices;
+    setTo(a.gpa, &p.rename, d.id);
+    p.renaming = true;
+    p.name.set(d.name);
+    p.focus_name = true;
+}
+
+fn submitRename(a: *App) void {
+    const p = &a.view.devices;
+    p.renaming = false;
+    const name = std.mem.trim(u8, p.name.text(), " \t\r\n");
+    if (name.len == 0) return;
+    a.call("Mutate", .{ .op = "renameDevice", .deviceId = p.rename.items, .name = name }, .of(App, a, onRenamed));
+}
+
+fn onRenamed(a: *App, _: u64, r: rpc.Reply) void {
+    if (r == .err) fail(a, "Rename failed: {s}", .{r.err});
+    a.redraw();
+}
+
+/// An offline device off the list (a finished cloud sandbox, a computer
+/// that's gone); it comes back if that device starts Harness again.
+fn forget(a: *App, id: []const u8) void {
+    a.call("Mutate", .{ .op = "forgetDevice", .deviceId = id }, .of(App, a, onForgotten));
+    a.view.devices.confirm_remove.clearRetainingCapacity();
+}
+
+fn onForgotten(a: *App, _: u64, r: rpc.Reply) void {
+    if (r == .err) fail(a, "Couldn't remove the device: {s}", .{r.err});
+    a.redraw();
+}
+
+fn fail(a: *App, comptime fmt: []const u8, args: anytype) void {
+    const p = &a.view.devices;
+    p.failure.clearRetainingCapacity();
+    p.failure.print(a.gpa, fmt, args) catch {};
+}
+
+/// Escape closes the Rename dialog; false when it wasn't open.
+pub fn escape(c: *ui.Context, a: *App) bool {
+    const p = &a.view.devices;
+    if (!p.renaming or !c.shortcut(.{ .key = ui.Shortcut.escape })) return false;
+    p.renaming = false;
+    return true;
+}
 
 /// Seen this recently, a device is online (`DEVICE_ONLINE_WINDOW_SECS`).
 const online_window_ms: i64 = 70 * 1000;
@@ -74,6 +154,14 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         set.tile(c, k, .refresh);
         set.words(c, k, c.print("Harness v{s}", .{@import("build_info").version}), "This build doesn't update itself. Install the latest release to update.", 0);
     }
+    const p = &a.view.devices;
+    if (p.failure.items.len > 0) {
+        if (@import("view_settings_accounts_rows.zig").errorStrip(c, k, p.failure.items, false)) p.failure.clearRetainingCapacity();
+    }
+    if (p.copied.items.len > 0) {
+        if (c.time >= p.copied_until) p.copied.clearRetainingCapacity() else c.frameIn(@floatCast(p.copied_until - c.time));
+    }
+    defer renameDialog(c, a, k);
     const card = set.card(c, k);
     defer card.end();
     if (devices.len == 0) {
@@ -94,13 +182,18 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
             const w = ui.div(c).column().grow().w(0).gap(1);
             defer w.end();
             ui.text(c, d.name, set.st(c, 13, .{ .weight = .medium, .color = k.text }));
-            meta(c, k, d, on, now);
+            meta(c, a, k, d, on, now);
         }
         if (local) ui.text(c, if (a.account.scope == .local) "Local only" else "This device", .{ .size = 10.5, .line_height = 10.5 * 1.618, .color = k.muted });
-        if (action(c, k, .pen, "Rename")) a.setNotice("Renaming a device isn't in Harness Nano yet: use Harness.");
+        if (action(c, k, .pen, "Rename", false)) openRename(a, d);
         // Only offline devices, never this one: the engine refuses an online
-        // one, which would vanish until it restarted.
-        if (!on and !local) if (action(c, k, null, "Remove")) a.setNotice("Removing a device isn't in Harness Nano yet: use Harness.");
+        // one, which would vanish until it restarted. A second click removes.
+        if (!on and !local) {
+            const confirming = std.mem.eql(u8, p.confirm_remove.items, d.id);
+            if (action(c, k, null, if (confirming) "Remove?" else "Remove", confirming)) {
+                if (confirming) forget(a, d.id) else setTo(a.gpa, &p.confirm_remove, d.id);
+            }
+        }
     }
 }
 
@@ -117,7 +210,7 @@ fn presenceTile(c: *ui.Context, k: theme.Colors, icon: icons.Name, on: bool) voi
 
 /// platform · version · last seen (offline) · added · id, quiet, joined by
 /// dots fainter still (`meta_line`).
-fn meta(c: *ui.Context, k: theme.Colors, d: workspace.Device, on: bool, now: i64) void {
+fn meta(c: *ui.Context, a: *App, k: theme.Colors, d: workspace.Device, on: bool, now: i64) void {
     const line = ui.div(c).row().gap(8).itemsCenter();
     defer line.end();
     const st = set.st(c, 12, .{ .color = k.muted.alpha(0.65) });
@@ -144,18 +237,61 @@ fn meta(c: *ui.Context, k: theme.Colors, d: workspace.Device, on: bool, now: i64
         ui.text(c, c.print("Added {s}", .{lastSeen(&buf, d.created_ms, now)}), st);
     }
     Frag.sep(c, k, &first);
+    // The id chip: a click copies the whole id, and it says so a moment.
+    const p = &a.view.devices;
+    const copied = std.mem.eql(u8, p.copied.items, d.id);
+    const chip = ui.div(c).row();
+    defer chip.end();
     var idb: [64]u8 = undefined;
-    ui.text(c, c.print("{s}", .{shortId(&idb, d.id)}), .{ .size = 10.5, .line_height = 12 * 1.618, .mono = true, .color = k.muted.alpha(0.5) });
+    const color = if (copied) k.success_muted.alpha(0.9) else if (chip.hovered()) k.muted else k.muted.alpha(0.5);
+    ui.text(c, if (copied) "Copied" else c.print("{s}", .{shortId(&idb, d.id)}), .{ .size = 10.5, .line_height = 12 * 1.618, .mono = true, .color = color });
+    if (chip.clicked()) {
+        c.clipboard.write(c.clipboard.ctx, d.id);
+        setTo(a.gpa, &p.copied, d.id);
+        p.copied_until = c.time + 1.5;
+        c.frameIn(1.5);
+    }
 }
 
-/// `ghost_action` at 70%, full under the pointer.
-fn action(c: *ui.Context, k: theme.Colors, icon: ?icons.Name, label: []const u8) bool {
+/// "Rename device": the name in a field, Cancel and Rename.
+fn renameDialog(c: *ui.Context, a: *App, k: theme.Colors) void {
+    const p = &a.view.devices;
+    if (!p.renaming) return;
+    const back = dialogs.scrim(c, k);
+    defer back.end();
+    const card = dialogs.dialog(c, k);
+    defer card.end();
+    ui.text(c, "Rename device", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    _ = c.leaf(.{ .height = .{ .px = 12 } }, .none, null);
+    var submit = false;
+    {
+        const f = ui.div(c).row().wFull().px(13).py(9).rounded(8).border(k.ink(0.08)).borderW(1).bg(k.ink(0.04));
+        defer f.end();
+        const at = c.nodes.items.len;
+        const r = ui.textField(c, &p.name, .{ .placeholder = "Device name", .width = .fill, .bare = true, .size = 14 });
+        if (p.focus_name) {
+            c.focus = c.node(@intCast(at)).id;
+            c.changed = true;
+            p.focus_name = false;
+        }
+        submit = r.submitted;
+    }
+    switch (dialogs.buttons(c, k, "Rename", false)) {
+        .none => if (submit) submitRename(a),
+        .cancel => p.renaming = false,
+        .confirm => submitRename(a),
+    }
+}
+
+/// `ghost_action` at 70%, full under the pointer; red and full when it
+/// asks to be sure.
+fn action(c: *ui.Context, k: theme.Colors, icon: ?icons.Name, label: []const u8, asking: bool) bool {
     var b = ui.div(c).row().px(10).py(6).gap(6).itemsCenter().rounded(8).hover(k.ink(0.06));
     const hot = b.hovered();
-    b = b.opacity(if (hot) 1 else 0.7);
+    b = b.opacity(if (hot or asking) 1 else 0.7);
     defer b.end();
     if (icon) |i| icons.icon(c, i, 14, k.muted, 0);
-    ui.text(c, label, set.st(c, 12, .{ .color = if (hot) k.text else k.muted }));
+    ui.text(c, label, set.st(c, 12, .{ .color = if (hot) k.text else if (asking) k.danger else k.muted }));
     return b.clicked();
 }
 

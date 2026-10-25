@@ -28,6 +28,8 @@ pub const Colors = struct {
     danger_muted: Color,
     warning: Color,
     success: Color,
+    /// `success.mix(text, 0.25)`.
+    success_muted: Color,
     border: Color,
     border_strong: Color,
     /// element_hover: a control under the pointer.
@@ -88,6 +90,7 @@ pub fn colors(dark: bool) Colors {
             .danger_muted = .hex(0xda8c78),
             .warning = .hex(0xd9a441),
             .success = .hex(0x7fa86b),
+            .success_muted = .hex(0x9ab889),
             .border = white.alpha(0.10),
             .border_strong = white.alpha(0.18),
             .hover = white.alpha(0.11),
@@ -123,6 +126,7 @@ pub fn colors(dark: bool) Colors {
         .danger_muted = .hex(0x873622),
         .warning = .hex(0x9a6e1b),
         .success = .hex(0x5c7e47),
+        .success_muted = .hex(0x4c643a),
         .border = black.alpha(0.12),
         .border_strong = black.alpha(0.22),
         .hover = black.alpha(0.06),

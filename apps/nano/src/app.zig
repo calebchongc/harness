@@ -90,6 +90,8 @@ pub const View = struct {
     accounts: @import("view_settings_accounts.zig").Page = .{},
     /// Settings › Archived sessions' Unarchive and Delete all.
     archived: @import("view_settings_archived.zig").Page = .{},
+    /// Settings › Devices' Rename, Remove and copied id.
+    devices: @import("view_settings_devices.zig").Page = .{},
 
     pub fn deinit(v: *View, gpa: Allocator) void {
         v.github_ci.deinit(gpa);
@@ -97,6 +99,7 @@ pub const View = struct {
         v.agents.deinit(gpa);
         v.accounts.deinit(gpa);
         v.archived.deinit(gpa);
+        v.devices.deinit(gpa);
         v.shortcut_notice.deinit(gpa);
         v.drag.deinit(gpa);
         v.chat_menu.id.deinit(gpa);
