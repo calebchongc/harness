@@ -4220,6 +4220,7 @@ impl Shell {
                 // The project was just picked above.
                 target: None,
                 input: None,
+                git: None,
             }),
             cx,
         );
@@ -16343,19 +16344,76 @@ mod exit_regressions {
         });
         window
             .update(cx, |shell, window, cx| {
+                use crate::pickers::{CanvasDraft, CanvasGit, CheckoutKind, CheckoutPlan};
+                shell.state.update(cx, |state, cx| {
+                    state.local_device_id = Some("local".into());
+                    state.apply_spaces(vec![harness_proto::Space {
+                        id: "repo".into(),
+                        device_id: "local".into(),
+                        path: "/repo".into(),
+                        name: None,
+                        git_detected: true,
+                        git_checked_at: None,
+                        checkout_id: None,
+                        created_at: Utc::now(),
+                    }]);
+                    state.select_space(Some("repo".into()), cx);
+                });
+                shell.adopt_canvas_draft(
+                    Some(CanvasDraft {
+                        git: Some(CanvasGit {
+                            branch: Some("previous-feature".into()),
+                            checkout: CheckoutKind::Local,
+                        }),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                let plan = |shell: &Shell, cx: &App| {
+                    shell.composer.read(cx).pickers().read(cx).checkout_plan()
+                };
+                let original = CheckoutPlan::CurrentCheckout {
+                    branch: Some("previous-feature".into()),
+                };
+                let fresh = CheckoutPlan::NewWorktree { base: None };
                 let text = |shell: &Shell, cx: &App| shell.composer.read(cx).canvas_input(cx).text;
                 shell
                     .composer
                     .update(cx, |composer, cx| composer.prefill("unsent idea".into(), cx));
                 assert_eq!(text(shell, cx), "unsent idea");
+                assert_eq!(plan(shell, cx), original);
                 shell.split_chat(SplitAxis::Horizontal, window, cx);
                 assert_eq!(text(shell, cx), "", "a ⌘D pane opened with the draft (#28)");
+                assert_eq!(
+                    plan(shell, cx),
+                    fresh,
+                    "⌘D must not share the source checkout"
+                );
                 shell.focus_chat_pane(0, window, cx);
                 assert_eq!(text(shell, cx), "unsent idea", "the draft stays in its pane");
+                assert_eq!(plan(shell, cx), original, "parked Git picks stay with their pane");
                 shell.new_chat_tab(None, window, cx);
                 assert_eq!(text(shell, cx), "", "a ⌘T tab opened with the draft (#28)");
+                assert_eq!(
+                    plan(shell, cx),
+                    fresh,
+                    "⌘T must not share the source checkout"
+                );
+                shell.new_chat_tab(None, window, cx);
+                assert_eq!(
+                    plan(shell, cx),
+                    fresh,
+                    "successive new chats remain isolated"
+                );
                 shell.switch_chat_tab(0, window, cx);
                 assert_eq!(text(shell, cx), "unsent idea", "the draft stays in its tab");
+                assert_eq!(plan(shell, cx), original);
+                shell.open_new_session(cx);
+                assert_eq!(
+                    plan(shell, cx),
+                    fresh,
+                    "in-place new chat resets an already-empty canvas too"
+                );
             })
             .unwrap();
     }
@@ -16464,6 +16522,7 @@ mod exit_regressions {
                         reasoning: Some(ReasoningLevel::Low),
                         target: None,
                         input: None,
+                        git: None,
                     }),
                     cx,
                 );

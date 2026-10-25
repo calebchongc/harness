@@ -2183,10 +2183,17 @@ impl Harness for AcpHarness {
             .flatten()
             .filter(|name| harness_proto::graff_worktree::valid_name(name));
         if let Some(name) = &graff_worktree {
-            launch_args.extend(["-w".to_owned(), name.clone()]);
+            let (program, _) = self.resolve_program(true).await?;
+            let spec = request
+                .worktree
+                .as_ref()
+                .expect("named worktree has a spec");
             // "Send now" and other follow-ups rebuild the request from the
-            // chat row, already re-homed into the tree (codegraff#1693).
+            // re-homed row. Normalize before creation too, never nest a tree
+            // inside the chat's existing tree (codegraff#1693).
             request.cwd = harness_proto::graff_worktree::launch_root(&request.cwd).to_owned();
+            graff_worktree::ensure_worktree(&program, &request.cwd, name, &spec.base).await?;
+            launch_args.extend(["-w".to_owned(), name.clone()]);
         }
         let (scratch, mut child, stderr_tail) = self
             .spawn_agent(Some(&request.cwd), true, &launch_args)

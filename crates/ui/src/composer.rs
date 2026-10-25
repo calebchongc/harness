@@ -9010,16 +9010,11 @@ impl Composer {
                             // instead of failing the run.
                             chat_branch = base.clone();
                             if let Some(repo_path) = &space_path {
-                                // A remote repo's branch list loads over the
-                                // relay — on a bad link it may never arrive
-                                // and the picker has no base. That must NOT
-                                // silently drop the isolation the user picked
-                                // (2026-08-19: "New worktree" ran in the main
-                                // checkout): default to HEAD, which git — any
-                                // host version — resolves as the repo's
-                                // current checkout state.
-                                let base =
-                                    base.clone().unwrap_or_else(|| "HEAD".to_string());
+                                // Refs may still be loading over the relay.
+                                // An empty base asks the host to resolve the
+                                // repository default, not the shared folder's
+                                // current (possibly unrelated PR) branch.
+                                let base = base.clone().unwrap_or_default();
                                 run_worktree = Some(harness_proto::WorktreeSpec {
                                     repo_path: repo_path.clone(),
                                     base,
