@@ -392,8 +392,10 @@ pub fn badge(c: *ui.Context, k: theme.Colors, label: []const u8) void {
 }
 
 /// `action_button`: a bordered ghost action with its icon.
+/// A `button`'s width: 11 in each side (10 and its border), the glyph, the
+/// gap and the words.
 fn buttonW(c: *ui.Context, label: []const u8) f32 {
-    return 2 * 11 + 2 + 14 + 6 + c.text.width(label, .{ .size = 12 });
+    return 2 * 11 + 14 + 6 + c.text.width(label, .{ .size = 12 });
 }
 
 fn button(c: *ui.Context, k: theme.Colors, icon: icons.Name, label: []const u8, busy: bool) bool {

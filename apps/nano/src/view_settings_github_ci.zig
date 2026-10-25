@@ -688,7 +688,9 @@ fn sizeMenu(c: *ui.Context, a: *App, k: theme.Colors, inst: *const runners.Insta
     }
     const w: f32 = 260;
     const x = rules.snapToWindow(at.x + at.w - w, w, c.size.w, 8);
-    const y = at.y + at.h + 6;
+    // Hung from the trigger's padding box, inside its border: 6 under
+    // that, 4.5 under the border's outer edge as drawn.
+    const y = at.y + at.h + 4.5;
     const m = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(4 + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer m.end();
