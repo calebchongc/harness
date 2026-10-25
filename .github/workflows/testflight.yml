@@ -225,6 +225,17 @@ jobs:
             -authenticationKeyIssuerID "$AC_API_ISSUER_ID" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
+      # Crash and hang reports (Settings → Crash reports on the phone, Xcode's
+      # Organizer) carry code addresses only. These turn them into function
+      # names: scripts/symbolicate-metrickit.py <report.json> <dSYMs folder>.
+      - name: Keep the build's debug symbols
+        if: inputs.ci_certificates != 'list'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsyms-build-${{ env.BUILD_NUMBER }}
+          path: ${{ runner.temp }}/Harness.xcarchive/dSYMs
+          retention-days: 90
+
       - name: Upload to TestFlight
         if: inputs.ci_certificates != 'list'
         run: |

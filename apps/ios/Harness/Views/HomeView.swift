@@ -27,6 +27,8 @@ struct HomeView: View {
     /// What the "+" picker chose; acted on once it has closed.
     @State private var pendingNewSession: NewSessionTarget?
     @State private var showSettings = false
+    /// Screenshot rig (`-sheet crashreports`): Settings opens on Crash reports.
+    @State private var settingsOnCrashReports = false
     @State private var showProfile = false
     /// A session whose Delete is waiting on its confirmation.
     @State private var pendingDelete: Chat?
@@ -492,7 +494,7 @@ struct HomeView: View {
             }
         }
         .sheet(isPresented: $showSettings) {
-            SettingsView()
+            SettingsView(openCrashReports: settingsOnCrashReports)
         }
         .sheet(isPresented: $showProfile) {
             ProfileView()
@@ -550,7 +552,8 @@ struct HomeView: View {
             if model.launchSheet == "newspace" {
                 model.launchSheet = nil
                 showNewSpace = true
-            } else if model.launchSheet == "settings" {
+            } else if model.launchSheet == "settings" || model.launchSheet == "crashreports" {
+                settingsOnCrashReports = model.launchSheet == "crashreports"
                 model.launchSheet = nil
                 showSettings = true
             } else if model.launchSheet == "profile" {
