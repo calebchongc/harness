@@ -165,3 +165,14 @@ pub fn ui(dark: bool) nanoui.ui.Theme {
     t.mono_font = "Geist Mono";
     return t;
 }
+
+var fonts_registered = false;
+
+/// Geist and Geist Mono from the GPUI app's own files, before any window:
+/// most Macs don't have them installed, and a missing family falls back
+/// to the system's font, wider and lighter.
+pub fn registerFonts() void {
+    if (fonts_registered) return;
+    fonts_registered = true;
+    for (@import("fonts").all) |f| _ = @import("nanoui").ui.registerFont(f);
+}

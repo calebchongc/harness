@@ -9,11 +9,13 @@ const Engine = @import("engine.zig").Engine;
 const theme = @import("theme.zig");
 
 pub fn main(init: std.process.Init) !void {
+    theme.registerFonts();
     const app = try nanoui.App.create(init, .{ .name = "Harness" });
     defer app.destroy();
     var a: App = .init(init.gpa, init.io, Engine.portFrom(init.environ_map));
     defer a.deinit();
     a.new_harness = try init.gpa.dupe(u8, init.environ_map.get("HARNESS_NANO_HARNESS") orelse "graff");
+    a.settings = .open(init.gpa, init.io, init.environ_map);
     a.window = try app.newWindow(.{
         .title = "Harness",
         .width = 1200,

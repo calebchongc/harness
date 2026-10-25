@@ -25,7 +25,7 @@ pub fn columnWidth(w: f32) f32 {
 
 /// The chat column's width: the window less the sidebar and the panels.
 pub fn mainWidth(c: *ui.Context, a: *const App) f32 {
-    var w = c.size.w - (if (a.view.sidebar_open) sidebar.width + 1 else 0);
+    var w = c.size.w - (if (a.view.sidebar_open) sidebar.width else 0);
     if (a.selected != null and a.panels.host_open) w -= @import("view_host.zig").width + 1;
     if (a.selected != null and a.panels.files_open) w -= @import("view_files.zig").width + 1;
     return @max(w, 300);

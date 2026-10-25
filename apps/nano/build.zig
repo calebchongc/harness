@@ -7,9 +7,29 @@ pub fn build(b: *std.Build) void {
     // HTTPS with ALPN h2 for what the app asks the network itself (releases,
     // the edge); the engine's own socket is a local WebSocket (src/ws.zig).
     const http_zig = b.dependency("http_zig", .{ .target = target, .optimize = optimize }).module("http_zig");
+    // The GPUI app's own fonts (crates/ui/assets/fonts), the same files,
+    // in a module that embeds them: Geist isn't installed on most Macs.
+    const font_files = b.addWriteFiles();
+    _ = font_files.addCopyDirectory(b.path("../../crates/ui/assets/fonts"), "fonts", .{ .include_extensions = &.{".ttf"} });
+    const fonts_root = font_files.add("fonts.zig",
+        \\//! Geist and Geist Mono, as the GPUI app bundles them.
+        \\pub const all = [_][]const u8{
+        \\    @embedFile("fonts/Geist.ttf"),
+        \\    @embedFile("fonts/Geist-Medium.ttf"),
+        \\    @embedFile("fonts/Geist-SemiBold.ttf"),
+        \\    @embedFile("fonts/Geist-Bold.ttf"),
+        \\    @embedFile("fonts/GeistMono.ttf"),
+        \\    @embedFile("fonts/GeistMono-Medium.ttf"),
+        \\    @embedFile("fonts/GeistMono-SemiBold.ttf"),
+        \\    @embedFile("fonts/GeistMono-Bold.ttf"),
+        \\};
+        \\
+    );
+    const fonts = b.createModule(.{ .root_source_file = fonts_root });
     const imports: []const std.Build.Module.Import = &.{
         .{ .name = "nanoui", .module = nanoui },
         .{ .name = "http_zig", .module = http_zig },
+        .{ .name = "fonts", .module = fonts },
     };
 
     const exe = b.addExecutable(.{ .name = "harness-nano", .root_module = b.createModule(.{
@@ -44,6 +64,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = imports,
     }) });
+    b.installArtifact(snap);
     const run_snap = b.addRunArtifact(snap);
     run_snap.addPassthruArgs();
     b.step("snap", "Draw a scene offscreen to PNGs").dependOn(&run_snap.step);

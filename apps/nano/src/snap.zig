@@ -16,6 +16,13 @@
 //!                {"snap": "name"}]}
 //!
 //! Without a `snap` step it saves the last frame as `final.png`.
+//!
+//! A scene with a `name` is the GPUI renderer's instead
+//! (crates/ui/examples/ui-scenes.rs): the same state set up as it sets it
+//! up, the same steps (`{"do": "click", "x", "y"}`, `hover`, `key` with
+//! `keys`, `type` with `text`, `scroll` with `dy`, `wait` with `ms`), and
+//! the same files, `<name>.png` then `<name>-NN.png` after each step, so
+//! apps/nano/parity/check.py can set the two side by side.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -24,6 +31,7 @@ const theme = @import("theme.zig");
 const json = std.json;
 
 pub fn main(init: std.process.Init) !void {
+    theme.registerFonts();
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 3) {
@@ -37,6 +45,7 @@ pub fn main(init: std.process.Init) !void {
     const scene = parsed.value.object;
     const out = args[2];
     try std.Io.Dir.cwd().createDirPath(init.io, out);
+    if (str(scene, "name")) |name| return parity(init, scene, name, out);
 
     var a: App = .init(gpa, init.io, 1);
     defer a.deinit();
@@ -104,6 +113,90 @@ pub fn main(init: std.process.Init) !void {
         settle(&t, &a, transcripts, init.arena.allocator());
     }
     if (snaps == 0) try save(&t, out, 0, "final");
+}
+
+/// A GPUI renderer's scene, drawn as that renderer draws it.
+fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: []const u8) !void {
+    const gpa = init.gpa;
+    const arena = init.arena.allocator();
+    var a: App = .init(gpa, init.io, 1);
+    defer a.deinit();
+    a.new_harness = try gpa.dupe(u8, "graff");
+    const dark = !std.mem.eql(u8, str(scene, "appearance") orelse "dark", "light");
+    a.dark = dark;
+    inline for (.{ .{ "spaces", &a.spaces }, .{ "chats", &a.chats }, .{ "sessions", &a.sessions } }) |l| {
+        if (scene.get(l[0])) |v| try l[1].replace(v);
+    }
+    @import("workspace.zig").sortChats(a.chats.items);
+    // As the GPUI renderer has it: connected, a local workspace, and this
+    // device "Studio", the first chat's (or space's).
+    a.engine.state = .connected;
+    a.account.scope = .local;
+    const device = first(scene, "chats", "deviceId") orelse first(scene, "spaces", "deviceId") orelse "local";
+    a.device_id = try gpa.dupe(u8, device);
+    const devices = try json.parseFromSliceLeaky(json.Value, arena, try std.fmt.allocPrint(arena, "[{{\"id\":\"{s}\",\"name\":\"Studio\"}}]", .{device}), .{});
+    try a.devices.replace(devices);
+    if (str(scene, "selectedSpace") orelse first(scene, "spaces", "id")) |sp| a.space = try gpa.dupe(u8, sp);
+    if (str(scene, "selectedChat")) |id| {
+        a.openChat(id, null);
+        if (scene.get("transcript")) |v| a.transcript.apply(reset(arena, v) orelse return error.OutOfMemory) catch {};
+    }
+
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&a, @import("view.zig").view), .{
+        .width = num(scene, "width") orelse 1200,
+        .height = num(scene, "height") orelse 780,
+        .scale = 2,
+        .dark = dark,
+        .theme = theme.ui(dark),
+    });
+    defer t.deinit();
+    t.settle(1);
+    var buf: [4096]u8 = undefined;
+    try shot(&t, try std.fmt.bufPrint(&buf, "{s}/{s}.png", .{ out, name }));
+    const steps = if (scene.get("steps")) |v| (if (v == .array) v.array.items else &.{}) else &.{};
+    for (steps, 1..) |step, n| {
+        if (step != .object) continue;
+        const o = step.object;
+        const do = str(o, "do") orelse "";
+        const x = num(o, "x") orelse 0;
+        const y = num(o, "y") orelse 0;
+        if (std.mem.eql(u8, do, "click")) {
+            t.click(x, y);
+        } else if (std.mem.eql(u8, do, "hover")) {
+            t.moveTo(x, y);
+        } else if (std.mem.eql(u8, do, "key")) {
+            const keys = str(o, "keys") orelse "";
+            _ = t.shortcut(parseShortcut(keys) orelse return fail(n, "no such shortcut: {s}", .{keys}));
+        } else if (std.mem.eql(u8, do, "type")) {
+            // A key at a time, as the input system hands them over.
+            const s = str(o, "text") orelse "";
+            var i: usize = 0;
+            while (i < s.len) {
+                const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+                t.textOps(&.{.{ .insert = s[i..@min(s.len, i + len)] }});
+                i += len;
+            }
+        } else if (std.mem.eql(u8, do, "scroll")) {
+            t.scroll(x, y, num(o, "dy") orelse 0);
+        } else if (std.mem.eql(u8, do, "wait")) {
+            t.advance((num(o, "ms") orelse 0) / 1000);
+        } else return fail(n, "no such step: {s}", .{do});
+        t.settle(1);
+        try shot(&t, try std.fmt.bufPrint(&buf, "{s}/{s}-{d:0>2}.png", .{ out, name, n }));
+    }
+}
+
+fn shot(t: *ui.Tester, path: []const u8) !void {
+    try t.screenshot(path);
+    std.debug.print("{s}\n", .{path});
+}
+
+/// `key` of the first item of the array `list`.
+fn first(o: json.ObjectMap, list: []const u8, key: []const u8) ?[]const u8 {
+    const v = o.get(list) orelse return null;
+    if (v != .array or v.array.items.len == 0 or v.array.items[0] != .object) return null;
+    return str(v.array.items[0].object, key);
 }
 
 /// Runs frames until the view is still, giving every chat on screen (the

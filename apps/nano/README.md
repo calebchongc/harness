@@ -117,3 +117,14 @@ made-up scene (no window on screen, no engine) and saves a PNG for each
 and transcripts to show, and steps that press shortcuts, click, type and
 check what's drawn (`expect`, `expectNot` fail the run). The format is at
 the top of `src/snap.zig`; `scenes/` has examples.
+
+## Checking it against the GPUI app
+
+`python3 parity/check.py` draws every scene in `parity/scenes` in both apps
+offscreen, the GPUI app through `crates/ui/examples/ui-scenes.rs` (built
+once; the script never builds it) and nano through `harness-nano-snap`,
+and compares them frame by frame. It writes gpui | nano | difference
+images and fails when a frame is further from the GPUI app than its
+budget in `parity/budget.json`; `--update` records new numbers. The budget
+was taken with nanoui's `feat/glyph-dilation` (justrach/nanoui#21):
+`NANOUI_FORK=~/nanoui-svg python3 parity/check.py` until that merges.

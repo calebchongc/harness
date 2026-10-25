@@ -12,6 +12,7 @@ const kit = @import("view_kit.zig");
 const sidebar = @import("view_sidebar.zig");
 const transcript_view = @import("view_transcript.zig");
 const tabs = @import("tabs.zig");
+const settings_view = @import("view_settings.zig");
 const App = @import("app.zig").App;
 
 /// Where the title bar's buttons start: right of the traffic lights.
@@ -31,15 +32,23 @@ pub fn view(a: *App, c: *ui.Context) void {
     {
         const root = ui.div(c).row().sizeFull().bg(k.shell);
         defer root.end();
-        if (a.view.sidebar_open) {
+        if (a.view.settings_open) {
+            settings_view.nav(c, a, k);
+            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.border }, .none, null);
+        } else if (a.view.sidebar_open) {
             sidebar.sidebar(c, a, k);
             _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.border }, .none, null);
         }
         const main = ui.div(c).row().grow().w(0).hFull();
         defer main.end();
-        {
+        column: {
             const chat = ui.div(c).column().grow().w(0).hFull().clip();
             defer chat.end();
+            if (a.view.settings_open) {
+                _ = c.leaf(.{ .width = .fill, .height = .{ .px = sidebar.titlebar_h } }, .none, null);
+                settings_view.page(c, a, k);
+                break :column;
+            }
             header(c, a, k);
             if (a.tabs.layout()) |s| if (!s.zoomed) {
                 panes(c, a, k, s);
@@ -170,6 +179,7 @@ fn neighbor(c: *ui.Context, a: *App, k: theme.Colors, ix: usize, chat_id: ?[]con
 fn keys(c: *ui.Context, a: *App) void {
     const S = ui.Shortcut;
     if (c.shortcut(.{ .key = 'b', .cmd = true })) a.view.sidebar_open = !a.view.sidebar_open;
+    if (c.shortcut(.{ .key = ',', .cmd = true })) settings_view.open(a);
     if (a.selected != null and c.shortcut(.{ .key = 'e', .cmd = true })) @import("app_files.zig").toggle(a);
     if (a.selected != null and c.shortcut(.{ .key = 'r', .cmd = true })) @import("app_panels.zig").toggleHost(a);
     if (c.shortcut(.{ .key = 't', .cmd = true }) or c.shortcut(.{ .key = 'n', .cmd = true })) a.newTab();
@@ -227,7 +237,7 @@ fn trailing(c: *ui.Context, a: *App, k: theme.Colors) void {
 /// The chat's identity in the title bar's row: its agent's mark, its title,
 /// and "project @ device" (`shell/tabs.rs`).
 fn header(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const side: f32 = if (a.view.sidebar_open) sidebar.width + 1 else 0;
+    const side: f32 = if (a.view.sidebar_open) sidebar.width else 0;
     // Clear of the title bar's buttons, and 16 points into the main column.
     const left = @max(side + 16, cluster_x + cluster_w + 12 + 32) - side;
     const bar = ui.div(c).row().wFull().h(sidebar.titlebar_h).pt(4).pl(left).pr(6).gap(6).itemsCenter().clip();

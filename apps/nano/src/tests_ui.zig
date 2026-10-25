@@ -17,6 +17,7 @@ const Harness = struct {
     t: ui.Tester,
 
     fn init(h: *Harness) !void {
+        @import("theme.zig").registerFonts();
         h.a = .init(testing.allocator, testing.io, 1);
         h.a.dark = true;
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, chats, .{});

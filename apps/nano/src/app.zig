@@ -43,6 +43,9 @@ pub const View = struct {
     account_anchor: ?nanoui.ui.Rect = null,
     /// The account menu's height as last drawn, to keep it in the window.
     account_h: ?f32 = null,
+    /// The Settings page is open, in the sidebar's place; its search.
+    settings_open: bool = false,
+    settings_search: nanoui.ui.TextBuffer = .{},
     space_anchor: ?nanoui.ui.Rect = null,
     chip_anchor: ?nanoui.ui.Rect = null,
     composer_anchor: ?nanoui.ui.Rect = null,
@@ -171,6 +174,8 @@ pub const App = struct {
     /// Each chat's unsent prompt by its id, and "" the new chat's while a
     /// chat shows (app_drafts.zig).
     drafts: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// The settings shared with the GPUI app (`ui-settings.json`).
+    settings: @import("settings.zig").Store,
     /// The workspace's scope, the Harness account and the Codegraff
     /// sign-in, for the account badge's menu (app_account.zig).
     account: account.Account = .{},
@@ -193,6 +198,7 @@ pub const App = struct {
             .panels = .init(gpa),
             .actions = .init(gpa),
             .tabs = .init(gpa),
+            .settings = .{ .gpa = gpa, .io = io },
             .transcript = .{ .gpa = gpa },
             .harnesses = .init(gpa),
             .models = .init(gpa),
@@ -220,6 +226,7 @@ pub const App = struct {
         a.peers.deinit(a.gpa);
         drafts.deinit(a);
         a.account.deinit(a.gpa);
+        a.settings.deinit();
         a.view.deinit(a.gpa);
         question.deinit(a);
         queue_mod.deinit(a);

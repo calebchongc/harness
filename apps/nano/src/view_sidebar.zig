@@ -17,7 +17,8 @@ pub const width: f32 = 256;
 pub const titlebar_h: f32 = 38;
 
 pub fn sidebar(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const side = ui.div(c).column().w(width).hFull().bg(k.sidebar).pt(titlebar_h);
+    // The edge after it is inside its width, as the GPUI app's.
+    const side = ui.div(c).column().w(width - 1).hFull().bg(k.sidebar).pt(titlebar_h);
     defer side.end();
     tabList(c, a, k);
     filterRow(c, a, k);

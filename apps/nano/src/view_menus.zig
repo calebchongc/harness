@@ -84,14 +84,15 @@ fn accountMenu(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
     const h = a.view.account_h orelse 150;
     const x = @min(r.x + r.w + 6, c.size.w - 8 - w);
     const y = @max(8, @min(r.y, c.size.h - 8 - h));
-    const card = ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(card_inset).gap(2)
+    // The inset, and the 1-point border GPUI insets by too.
+    const card = ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(card_inset + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12).shadowLg();
     defer card.end();
     if (c.rects.get(c.node(card.index).id)) |cr| a.view.account_h = cr.h;
     {
         const id = ui.div(c).row().wFull().px(8).pt(6).pb(4);
         defer id.end();
-        @import("view_kit.zig").ellipsisText(c, m.identity, kit.style(c, 11, 11 * phi, .{ .color = k.muted }), w - 2 * card_inset - 16 - 2);
+        @import("view_kit.zig").ellipsisText(c, m.identity, .{ .size = 11, .line_height = 11 * phi, .color = k.muted }, w - 2 * card_inset - 16 - 2);
     }
     switch (m.codegraff) {
         .account => |who| if (menuRow(c, k, .global, k.accent, c.print("Codegraff · {s}", .{who}), 1)) {
@@ -116,10 +117,7 @@ fn accountMenu(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
         }
         separator(c, a, w);
     }
-    if (menuRow(c, k, .@"settings-minimalistic", k.muted, "Settings", 1)) {
-        a.view.account_menu = false;
-        a.setNotice("Settings aren't in Harness Nano yet.");
-    }
+    if (menuRow(c, k, .@"settings-minimalistic", k.muted, "Settings", 1)) @import("view_settings.zig").open(a);
 }
 
 /// GPUI's line height, as a multiple of the text's size.
@@ -138,7 +136,7 @@ fn menuRow(c: *ui.Context, k: theme.Colors, icon: icons.Name, tint: ui.Color, la
     icons.icon(c, icon, 16, tint, 0);
     const t = ui.div(c).row().grow().w(0).clip();
     defer t.end();
-    ui.text(c, label, kit.style(c, 13, 13 * phi, .{ .color = if (hot) k.text else k.text.alpha(0.9) }));
+    ui.text(c, label, .{ .size = 13, .line_height = 13 * phi, .color = if (hot) k.text else k.text.alpha(0.9) });
     return row.clicked();
 }
 
