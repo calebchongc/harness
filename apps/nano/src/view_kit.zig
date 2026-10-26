@@ -127,7 +127,7 @@ pub fn kbdHint(c: *ui.Context, k: theme.Colors, label: []const u8) void {
     const b = ui.div(c).row().px(5).py(1).rounded(5).bg(k.ink(0.05)).itemsCenter();
     defer b.end();
     // In the frame's memory: the text is drawn after the caller returns.
-    glyphText(c, c.alloc().dupe(u8, label) catch return, .{ .size = 10, .line_height = 16, .mono = true, .color = k.muted });
+    ui.text(c, c.alloc().dupe(u8, label) catch return, .{ .size = 10, .line_height = 16, .mono = true, .color = k.muted });
 }
 
 /// `s` with its key glyphs (⌘, ⇧, ↵, ↑…), which Geist hasn't, in the

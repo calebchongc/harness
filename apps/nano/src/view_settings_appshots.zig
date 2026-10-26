@@ -122,14 +122,15 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         {
             const d = destination(a);
             var segs_w: f32 = 2 * 6;
-            inline for (comptime std.enums.values(Destination)) |opt| segs_w += 22 + c.text.width(opt.label(), .{ .size = 11 });
+            inline for (comptime std.enums.values(Destination)) |opt| segs_w += 22 + @ceil(c.text.width(opt.label(), .{ .size = 11 }));
             const r = row(c, k, false, "Destination", d.description(), segs_w);
             defer r.end();
             const segs = ui.div(c).row().gap(6).itemsCenter();
             defer segs.end();
             inline for (comptime std.enums.values(Destination)) |opt| {
                 const lit = d == opt;
-                var b = ui.div(c).row().px(10).py(7).rounded(7).borderW(1).border(if (lit) k.text.alpha(0.24) else k.border);
+                // 10 by 7 inside the border, as GPUI's.
+                var b = ui.div(c).row().px(11).py(8).rounded(7).borderW(1).border(if (lit) k.text.alpha(0.24) else k.border);
                 if (lit) b = b.bg(k.ink(0.09));
                 defer b.end();
                 ui.text(c, opt.label(), .{ .size = 11, .line_height = 11 * 1.618, .color = if (lit) k.text else k.muted });
@@ -228,9 +229,10 @@ fn chipW(c: *ui.Context, a: *const App) f32 {
     return @max(96, 2 * 13 + 2 + c.text.width(shown, .{ .size = 12, .mono = true })) + reset;
 }
 
-/// `badge`: a hairline pill.
+/// `badge`: a hairline pill, 8 by 2 inside its border (which GPUI's box
+/// holds, and nanoui draws over: 9 by 3 here).
 pub fn badge(c: *ui.Context, k: theme.Colors, label: []const u8) void {
-    const b = ui.div(c).row().px(8).py(2).roundedFull().border(k.border).borderW(1);
+    const b = ui.div(c).row().px(9).py(3).roundedFull().border(k.border).borderW(1);
     defer b.end();
     ui.text(c, label, set.st(c, 10.5, .{ .color = k.muted }));
 }
