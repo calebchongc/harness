@@ -4044,9 +4044,24 @@ impl ComposerInput {
                         wrap_reference_chips(&mut line, &chips, (width - indent).max(px(20.0)));
                     }
                     let row_bottom = row_top + f32::from(line.size(self.line_height).height);
-                    if !text.trim().is_empty() {
-                        let top = ink_extent.map_or(row_top, |(top, _)| top);
-                        ink_extent = Some((top, row_bottom));
+                    // A logical line can end in soft-wrapped whitespace
+                    // rows. Count ink per visual row, not the whole line.
+                    let mut row_start = 0;
+                    for (row_ix, row_end) in line
+                        .wrap_boundaries()
+                        .iter()
+                        .map(|boundary| {
+                            line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index
+                        })
+                        .chain(std::iter::once(line.len()))
+                        .enumerate()
+                    {
+                        if !text[row_start..row_end].trim().is_empty() {
+                            let ink_top = row_top + row_ix as f32 * f32::from(self.line_height);
+                            let top = ink_extent.map_or(ink_top, |(top, _)| top);
+                            ink_extent = Some((top, ink_top + f32::from(self.line_height)));
+                        }
+                        row_start = row_end;
                     }
                     row_top = row_bottom;
                     lines.push(line);
@@ -9010,16 +9025,11 @@ impl Composer {
                             // instead of failing the run.
                             chat_branch = base.clone();
                             if let Some(repo_path) = &space_path {
-                                // A remote repo's branch list loads over the
-                                // relay — on a bad link it may never arrive
-                                // and the picker has no base. That must NOT
-                                // silently drop the isolation the user picked
-                                // (2026-08-19: "New worktree" ran in the main
-                                // checkout): default to HEAD, which git — any
-                                // host version — resolves as the repo's
-                                // current checkout state.
-                                let base =
-                                    base.clone().unwrap_or_else(|| "HEAD".to_string());
+                                // Refs may still be loading over the relay.
+                                // An empty base asks the host to resolve the
+                                // repository default, not the shared folder's
+                                // current (possibly unrelated PR) branch.
+                                let base = base.clone().unwrap_or_default();
                                 run_worktree = Some(harness_proto::WorktreeSpec {
                                     repo_path: repo_path.clone(),
                                     base,
@@ -11423,6 +11433,10 @@ fn dictation_unavailable_message(
 }
 
 #[cfg(test)]
+#[path = "composer/fade_tests.rs"]
+mod fade_tests;
+
+#[cfg(test)]
 #[path = "composer/prompt_history_tests.rs"]
 mod prompt_history_tests;
 
@@ -11434,7 +11448,7 @@ mod question_recovery_tests;
 mod tests {
     use super::*;
 
-    fn composer_focus_window(
+    pub(super) fn composer_focus_window(
         cx: &mut gpui::TestAppContext,
     ) -> (tempfile::TempDir, gpui::WindowHandle<Composer>) {
         let dir = composer_test_init(cx);
@@ -17797,6 +17811,20 @@ impl Composer {
     /// Put `draft` in the input with the caret at its end.
     pub fn fixture_set_draft(&mut self, draft: &str, cx: &mut Context<Self>) {
         self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        cx.notify();
+    }
+
+    /// Reveal the last written grapheme without discarding trailing whitespace.
+    pub fn fixture_set_draft_at_last_glyph(&mut self, draft: &str, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_text(draft, cx);
+            let last = draft
+                .trim_end()
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(0, |(at, _)| at);
+            input.move_to(last, cx);
+        });
         cx.notify();
     }
 

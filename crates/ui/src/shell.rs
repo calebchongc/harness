@@ -339,12 +339,8 @@ fn composer_target_width(panel_width: f32, content_width: f32, docked: bool) -> 
     (content_width + 2.0 * Theme::SPACE_LG).min(panel_width)
 }
 
-fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f32 {
-    if is_chat_route && has_selected_chat {
-        1.0
-    } else {
-        0.0
-    }
+fn titlebar_new_session_alpha(is_chat_route: bool) -> f32 {
+    if is_chat_route { 1.0 } else { 0.0 }
 }
 
 /// Open the session at `slot` (zero-based) of the sidebar's active list. One
@@ -381,27 +377,46 @@ pub fn titlebar_spacer_width(is_macos: bool, fullscreen: bool, container_pad: f3
     (titlebar_cluster_start(fullscreen) - container_pad).max(0.0)
 }
 
-/// Within-group rhythm for Back/Forward.
+/// Minimum spacing between adjacent top-left titlebar controls.
 pub const TITLEBAR_CONTROL_GAP: f32 = 2.0;
-/// Structural separation between titlebar groups: sidebar, navigation,
-/// transcript identity, and trailing actions.
-pub const TITLEBAR_GROUP_GAP: f32 = Theme::SPACE_SM;
+/// The sidebar/navigation boundary uses the same spacing as every icon pair.
+pub const TITLEBAR_GROUP_GAP: f32 = TITLEBAR_CONTROL_GAP;
 /// Breathing room between the navigation cluster and transcript identity.
 pub const TITLEBAR_IDENTITY_GAP: f32 = Theme::SPACE_MD;
 /// A 28px action centered in the 38px titlebar with its 2px downward optical
 /// shift lands 6px from the top; use the same inset at the trailing edge.
 pub const TITLEBAR_ACTION_EDGE_INSET: f32 = 6.0;
-/// Width of the persistent top-left button cluster itself: a 24px sidebar
-/// trigger, an 8px group gap, then two 24px history buttons on a 2px rhythm.
+/// Minimum width of the persistent top-left cluster: three 24px controls
+/// with a 2px gap between each pair.
 pub const CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 3.0 + TITLEBAR_GROUP_GAP + TITLEBAR_CONTROL_GAP;
-/// Extra width consumed when the collapsed-sidebar New Session action joins
-/// the left controls as its own group.
-pub const TITLEBAR_ACTION_SLOT_WIDTH: f32 = TITLEBAR_GROUP_GAP + 24.0;
+/// Extra width for each trailing action in the left controls. Use the
+/// within-group rhythm so both New Session and Update fit inside even the
+/// minimum-width sidebar, without hiding either on a new-session canvas.
+pub const TITLEBAR_ACTION_SLOT_WIDTH: f32 = TITLEBAR_CONTROL_GAP + 24.0;
 /// Horizontal inset owned by the titlebar control row itself. Keep this value
 /// paired with [`Self::titlebar_spacer`]: using a different number for the
 /// spacer shifts every control while leaving the declared cluster geometry
 /// unchanged.
 const TITLEBAR_CLUSTER_PAD: f32 = 10.0;
+
+/// Spread the available sidebar width across every icon pair equally, leaving
+/// only the row's normal inset after the last button. Collapse stays compact.
+/// Snap upward to a physical pixel before GPUI rounds each margin and gap;
+/// rounding the same fractional gap down four times leaves a trailing strip.
+fn distributed_titlebar_gap(
+    sidebar_width: f32,
+    cluster_start: f32,
+    buttons: usize,
+    scale_factor: f32,
+) -> f32 {
+    if buttons < 2 {
+        return TITLEBAR_CONTROL_GAP;
+    }
+    let gap = ((sidebar_width - TITLEBAR_CLUSTER_PAD - cluster_start - buttons as f32 * 24.0)
+        / (buttons - 1) as f32)
+        .max(TITLEBAR_CONTROL_GAP);
+    (gap * scale_factor).ceil() / scale_factor
+}
 
 /// Width of a row of `count` Linux caption buttons, drawn at the cluster's
 /// own 24px-button / 2px-gap rhythm.
@@ -4220,6 +4235,7 @@ impl Shell {
                 // The project was just picked above.
                 target: None,
                 input: None,
+                git: None,
             }),
             cx,
         );
@@ -6781,12 +6797,13 @@ impl Shell {
     /// The ONE top-left window-control cluster (sidebar toggle + back/forward —
     /// harness window-controls.tsx): rendered once, in a paint-only overlay layer
     /// pinned at the window's top-left, ABOVE the sidebar and headers. The
-    /// sidebar width animates *beneath* it, so the buttons keep their element
-    /// identity and never move or remount on collapse/expand; only the
-    /// fullscreen traffic-light inset tweens (the animated spacer). The
+    /// sidebar width animates *beneath* it. Buttons keep their identity while
+    /// the available width is distributed equally between them when Update
+    /// shows. Collapse returns them to the minimum spacing; the fullscreen
+    /// traffic-light inset also tweens (the animated spacer). The
     /// container has no id/listeners — everything between the buttons falls
     /// through to the titlebar drag strips below.
-    fn render_titlebar_cluster(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_titlebar_cluster(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // The arrows walk OPEN tabs, not route history: no archived chats,
         // no dead new-session canvases, and nothing while Settings shows.
@@ -6794,9 +6811,20 @@ impl Shell {
         let can_back = tab_arrows && self.chat_tab > 0;
         let can_forward = tab_arrows && self.chat_tab + 1 < self.chat_tabs.len();
         // The titlebar + shares Cmd+T's new-tab behavior in both sidebar states.
-        // Keep its existing visibility: show it only for an established session.
+        // Keep it on draft tabs too, so the update control never shifts when
+        // the first prompt turns the canvas into an established session.
         let plus_alpha = self.titlebar_plus_alpha(cx);
         let show_plus = plus_alpha > 0.01;
+        let control_gap = if self.titlebar_update_slot(cx) > 0.0 {
+            distributed_titlebar_gap(
+                self.sidebar_now(),
+                self.title_bar_content_start() - CLUSTER_BUTTONS_WIDTH - TITLEBAR_IDENTITY_GAP,
+                4 + usize::from(show_plus),
+                window.scale_factor(),
+            )
+        } else {
+            TITLEBAR_CONTROL_GAP
+        };
         let island_target = if matches!(self.route, Route::Chat)
             && self.state.read(cx).selected_chat.is_none()
             && self.settings.sidebar_collapsed
@@ -6869,11 +6897,11 @@ impl Shell {
             ))
             .child(
                 div()
-                    .ml(px(TITLEBAR_GROUP_GAP))
+                    .ml(px(control_gap))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(TITLEBAR_CONTROL_GAP))
+                    .gap(px(control_gap))
                     .child(nav_history_button(
                         "nav-back",
                         icons::ARROW_LEFT,
@@ -6903,7 +6931,7 @@ impl Shell {
             .children(show_plus.then(|| {
                 div()
                     .flex_none()
-                    .ml(px(TITLEBAR_GROUP_GAP))
+                    .ml(px(control_gap))
                     .opacity(plus_alpha)
                     .child(window_control_button(
                         "titlebar-new-session",
@@ -6912,17 +6940,13 @@ impl Shell {
                         cx.listener(|this, _, window, cx| this.new_chat_tab(None, window, cx)),
                     ))
             }))
-            .children(self.render_update_control(&theme, cx))
+            .children(self.render_update_control(&theme, control_gap, cx))
             .into_any_element()
     }
 
-    /// The titlebar opens a new tab regardless of sidebar state. It
-    /// is useful only while an existing session is selected.
-    pub(super) fn titlebar_plus_alpha(&self, cx: &App) -> f32 {
-        titlebar_new_session_alpha(
-            matches!(self.route, Route::Chat),
-            self.state.read(cx).selected_chat.is_some(),
-        )
+    /// The titlebar opens a new tab regardless of sidebar or draft state.
+    pub(super) fn titlebar_plus_alpha(&self, _cx: &App) -> f32 {
+        titlebar_new_session_alpha(matches!(self.route, Route::Chat))
     }
 
     /// Native Windows caption controls integrated into Harness's unified
@@ -12777,6 +12801,7 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_chat_pane_visibility(cx);
         {
             let transcript = &self.state.read(cx).transcript;
             crate::stall_watch::set_view(crate::stall_watch::View {
@@ -13570,7 +13595,7 @@ impl Render for Shell {
                             ),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
-                    .child(self.render_titlebar_cluster(cx))
+                    .child(self.render_titlebar_cluster(window, cx))
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
@@ -14580,10 +14605,10 @@ mod tests {
         assert_eq!(titlebar_cluster_start(false), 88.0);
         assert_eq!(titlebar_cluster_start(true), 12.0);
         assert_eq!(TITLEBAR_CONTROL_GAP, 2.0);
-        assert_eq!(TITLEBAR_GROUP_GAP, Theme::SPACE_SM);
+        assert_eq!(TITLEBAR_GROUP_GAP, TITLEBAR_CONTROL_GAP);
         assert_eq!(TITLEBAR_IDENTITY_GAP, Theme::SPACE_MD);
-        assert_eq!(CLUSTER_BUTTONS_WIDTH, 82.0);
-        assert_eq!(TITLEBAR_ACTION_SLOT_WIDTH, 32.0);
+        assert_eq!(CLUSTER_BUTTONS_WIDTH, 76.0);
+        assert_eq!(TITLEBAR_ACTION_SLOT_WIDTH, 26.0);
         assert_eq!(TITLEBAR_ACTION_EDGE_INSET, 6.0);
     }
 
@@ -14635,12 +14660,12 @@ mod tests {
 
     #[test]
     fn cluster_clearance_clears_the_overlay_buttons() {
-        // Linux: buttons at 10..92; a 16px-padded header needs 84 more px to
-        // put content at 92 + 8 breathing room.
-        assert_eq!(cluster_clearance(false, false, 0, 16.0), 84.0);
-        assert_eq!(cluster_clearance(false, false, 0, 10.0), 90.0);
+        // Linux: buttons at 10..86; a 16px-padded header needs 78 more px to
+        // put content at 86 + 8 breathing room.
+        assert_eq!(cluster_clearance(false, false, 0, 16.0), 78.0);
+        assert_eq!(cluster_clearance(false, false, 0, 10.0), 84.0);
         // Linux with a left-side close caption: everything shifts one slot.
-        assert_eq!(cluster_clearance(false, false, 1, 16.0), 84.0 + 26.0);
+        assert_eq!(cluster_clearance(false, false, 1, 16.0), 78.0 + 26.0);
         // macOS: buttons start at the 88px traffic-light cluster start.
         assert_eq!(
             cluster_clearance(true, false, 0, 16.0),
@@ -16343,19 +16368,80 @@ mod exit_regressions {
         });
         window
             .update(cx, |shell, window, cx| {
+                use crate::pickers::{CanvasDraft, CanvasGit, CheckoutKind, CheckoutPlan};
+                shell.state.update(cx, |state, cx| {
+                    state.local_device_id = Some("local".into());
+                    state.apply_spaces(vec![harness_proto::Space {
+                        id: "repo".into(),
+                        device_id: "local".into(),
+                        path: "/repo".into(),
+                        name: None,
+                        git_detected: true,
+                        git_checked_at: None,
+                        checkout_id: None,
+                        created_at: Utc::now(),
+                    }]);
+                    state.select_space(Some("repo".into()), cx);
+                });
+                shell.adopt_canvas_draft(
+                    Some(CanvasDraft {
+                        git: Some(CanvasGit {
+                            branch: Some("previous-feature".into()),
+                            checkout: CheckoutKind::Local,
+                        }),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                let plan = |shell: &Shell, cx: &App| {
+                    shell.composer.read(cx).pickers().read(cx).checkout_plan()
+                };
+                let original = CheckoutPlan::CurrentCheckout {
+                    branch: Some("previous-feature".into()),
+                };
+                let fresh = CheckoutPlan::NewWorktree { base: None };
                 let text = |shell: &Shell, cx: &App| shell.composer.read(cx).canvas_input(cx).text;
                 shell
                     .composer
                     .update(cx, |composer, cx| composer.prefill("unsent idea".into(), cx));
                 assert_eq!(text(shell, cx), "unsent idea");
+                assert_eq!(plan(shell, cx), original);
                 shell.split_chat(SplitAxis::Horizontal, window, cx);
                 assert_eq!(text(shell, cx), "", "a ⌘D pane opened with the draft (#28)");
+                assert_eq!(
+                    plan(shell, cx),
+                    fresh,
+                    "⌘D must not share the source checkout"
+                );
                 shell.focus_chat_pane(0, window, cx);
                 assert_eq!(text(shell, cx), "unsent idea", "the draft stays in its pane");
+                assert_eq!(
+                    plan(shell, cx),
+                    original,
+                    "parked Git picks stay with their pane"
+                );
                 shell.new_chat_tab(None, window, cx);
                 assert_eq!(text(shell, cx), "", "a ⌘T tab opened with the draft (#28)");
+                assert_eq!(
+                    plan(shell, cx),
+                    fresh,
+                    "⌘T must not share the source checkout"
+                );
+                shell.new_chat_tab(None, window, cx);
+                assert_eq!(
+                    plan(shell, cx),
+                    fresh,
+                    "successive new chats remain isolated"
+                );
                 shell.switch_chat_tab(0, window, cx);
                 assert_eq!(text(shell, cx), "unsent idea", "the draft stays in its tab");
+                assert_eq!(plan(shell, cx), original);
+                shell.open_new_session(cx);
+                assert_eq!(
+                    plan(shell, cx),
+                    fresh,
+                    "in-place new chat resets an already-empty canvas too"
+                );
             })
             .unwrap();
     }
@@ -16464,6 +16550,7 @@ mod exit_regressions {
                         reasoning: Some(ReasoningLevel::Low),
                         target: None,
                         input: None,
+                        git: None,
                     }),
                     cx,
                 );

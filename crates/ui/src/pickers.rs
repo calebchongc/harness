@@ -123,6 +123,14 @@ pub struct CanvasDraft {
     pub target: Option<CanvasTarget>,
     /// The canvas's unsent prompt and files. `None` leaves the composer's.
     pub input: Option<CanvasInput>,
+    /// Parked Git picks belong to this canvas, never to a fresh sibling.
+    pub git: Option<CanvasGit>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanvasGit {
+    pub branch: Option<String>,
+    pub checkout: CheckoutKind,
 }
 
 impl CanvasDraft {
@@ -131,6 +139,7 @@ impl CanvasDraft {
     pub fn fresh(&self) -> Self {
         Self {
             input: Some(CanvasInput::default()),
+            git: None,
             ..self.clone()
         }
     }
@@ -184,10 +193,21 @@ pub struct CanvasTarget {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CheckoutKind {
     /// The space's own folder — or the picked ref's existing worktree.
-    #[default]
     Local,
     /// A fresh isolated worktree created off the picked base ref on send.
+    #[default]
     NewWorktree,
+}
+
+impl CheckoutKind {
+    fn for_space(space: Option<&Space>) -> Self {
+        match space {
+            Some(space) if !space.git_detected => Self::Local,
+            // An unloaded project must not seed a shared-checkout draft that
+            // gets restored after the Git project arrives from the engine.
+            _ => Self::NewWorktree,
+        }
+    }
 }
 
 /// The resolved on-send checkout action (composer consumes this — see
@@ -201,8 +221,8 @@ pub enum CheckoutPlan {
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
     /// `CreateWorktree` off `base` on send (harness mints a `harness/<name>`
-    /// branch). `base: None` = refs never loaded — send falls back to the
-    /// space folder rather than failing.
+    /// branch). `base: None` = refs never loaded — the host resolves the
+    /// repository's default branch without dropping isolation.
     NewWorktree { base: Option<String> },
 }
 
@@ -825,6 +845,7 @@ pub struct Pickers {
     /// Space the branch draft/cache belong to (see the state observer).
     space_owner: Option<String>,
     device_owner: Option<String>,
+    git_owner: bool,
     target_generation: u64,
     menu_geometry: HashMap<PickerKind, popover::MenuGeometry>,
     model_trigger_bounds: Option<gpui::Bounds<gpui::Pixels>>,
@@ -972,6 +993,8 @@ impl Pickers {
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
+                this.config.branch = None;
+                this.config.checkout = CheckoutKind::for_space(state.read(cx).selected_space_row());
                 this.switch_error = None;
             }
             if this.creating_chat.as_ref().is_some_and(|(id, _)| {
@@ -983,30 +1006,7 @@ impl Pickers {
             }) {
                 this.creating_chat = None;
             }
-            // A space switch invalidates the branch draft + cache — the folder
-            // (and possibly the device) changed under them.
-            let space = state.read(cx).selected_space.clone();
-            let device = state.read(cx).effective_device_id();
-            if space != this.space_owner || device != this.device_owner {
-                this.space_owner = space;
-                this.device_owner = device;
-                this.target_generation = this.target_generation.wrapping_add(1);
-                this.setting_menu = None;
-                this.setting_bounds = None;
-                this.refs_task = None;
-                this.load_task = None;
-                this.config.branch = None;
-                this.config.checkout = CheckoutKind::default();
-                this.refs = Loadable::Idle;
-                this.refs_space = None;
-                // Catalogs are per-DEVICE (fetched from the space's host):
-                // a space switch may land on another device, so refetch.
-                this.harnesses = Loadable::Idle;
-                this.models.clear();
-                this.model_loads.clear();
-                this.model_refresh_errors.clear();
-                this.catalog_rev += 1;
-            }
+            this.sync_target(cx);
             cx.notify();
         });
         // A Settings → Agents toggle changed some device's enabled set:
@@ -1044,16 +1044,25 @@ impl Pickers {
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
         let device_owner = state.read(cx).effective_device_id();
+        let git_owner = state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| space.git_detected);
+        let checkout = CheckoutKind::for_space(state.read(cx).selected_space_row());
         Self {
             state,
             space_owner,
             device_owner,
+            git_owner,
             target_generation: 0,
             menu_geometry: HashMap::new(),
             model_trigger_bounds: None,
             open_model_width: None,
             open_model_height: model_menu_height(0),
-            config: DraftConfig::default(),
+            config: DraftConfig {
+                checkout,
+                ..DraftConfig::default()
+            },
             defaults,
             data_dir,
             draft_owner,
@@ -1107,6 +1116,39 @@ impl Pickers {
         }
     }
 
+    /// Invalidate the target before restoring its parked draft, so a deferred
+    /// state observer cannot erase the newly restored Git picks.
+    fn sync_target(&mut self, cx: &App) {
+        let state = self.state.read(cx);
+        let space = state.selected_space.clone();
+        let device = state.effective_device_id();
+        let git = state
+            .selected_space_row()
+            .is_some_and(|space| space.git_detected);
+        if space != self.space_owner || device != self.device_owner || git != self.git_owner {
+            self.space_owner = space;
+            self.device_owner = device;
+            self.git_owner = git;
+            self.target_generation = self.target_generation.wrapping_add(1);
+            self.setting_menu = None;
+            self.setting_bounds = None;
+            self.refs_task = None;
+            self.load_task = None;
+            self.switch_task = None;
+            self.switching = None;
+            self.switch_error = None;
+            self.config.branch = None;
+            self.config.checkout = CheckoutKind::for_space(state.selected_space_row());
+            self.refs = Loadable::Idle;
+            self.refs_space = None;
+            self.harnesses = Loadable::Idle;
+            self.models.clear();
+            self.model_loads.clear();
+            self.model_refresh_errors.clear();
+            self.catalog_rev += 1;
+        }
+    }
+
     /// Persist the sticky defaults (best-effort; picks are rare and tiny).
     fn save_defaults(&self) {
         if let Some(dir) = self.data_dir.as_deref()
@@ -1135,6 +1177,13 @@ impl Pickers {
                 device: state.selected_device.clone(),
             }),
             input: None,
+            git: state
+                .selected_space_row()
+                .filter(|space| space.git_detected)
+                .map(|_| CanvasGit {
+                    branch: self.config.branch.clone(),
+                    checkout: self.config.checkout,
+                }),
         }
     }
 
@@ -1158,6 +1207,8 @@ impl Pickers {
                 }
             });
         }
+        self.sync_target(cx);
+        let git = draft.as_ref().and_then(|draft| draft.git.clone());
         let offered = |harness: HarnessId| match self.harnesses.ready() {
             Some(list) => offered_harnesses(list).iter().any(|d| d.id == harness),
             None => true,
@@ -1169,6 +1220,12 @@ impl Pickers {
         self.config.harness = draft.harness;
         self.config.model = draft.model;
         self.config.reasoning = draft.reasoning;
+        let git = git.unwrap_or_else(|| CanvasGit {
+            branch: None,
+            checkout: CheckoutKind::for_space(self.state.read(cx).selected_space_row()),
+        });
+        self.config.branch = git.branch;
+        self.config.checkout = git.checkout;
         self.switch_error = None;
         cx.notify();
     }
@@ -2054,13 +2111,16 @@ impl Pickers {
         if self.state.read(cx).selected_chat_row().is_some() {
             return;
         }
-        if row.worktree_path.is_some() {
+        if self.config.checkout == CheckoutKind::NewWorktree {
+            // An isolated draft selects a base, never another session's tree.
+            self.config.branch = Some(row.name.clone());
+        } else if row.worktree_path.is_some() {
             // Reuse the ref's existing worktree ("Current worktree") — the
             // t3code `reuseExistingWorktree` path.
             self.config.branch = Some(row.name.clone());
             self.config.checkout = CheckoutKind::Local;
-        } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
-            // Base pick for a new worktree, or the already-current ref.
+        } else if row.current {
+            // The already-current ref in explicitly shared checkout mode.
             self.config.branch = Some(row.name.clone());
         } else {
             // Local mode + a plain non-current ref: CHECK OUT the space
@@ -2587,7 +2647,7 @@ impl Pickers {
             .read(cx)
             .selected_chat_row()
             .and_then(|c| c.branch.clone())
-            .or_else(|| self.config.branch.clone());
+            .or_else(|| self.effective_ref_name());
         let index = match selected {
             Some(name) => rows.iter().position(|r| r.name == name).unwrap_or(0),
             None => rows.iter().position(|r| r.current).unwrap_or(0),
@@ -2595,11 +2655,13 @@ impl Pickers {
         index.min(MAX_REF_ROWS.saturating_sub(1))
     }
 
-    /// The picked ref's row, else the repo's current branch's row.
+    /// The picked ref's row. Fresh isolated work starts from the repository's
+    /// default branch (ListRefs orders it first), not the shared checkout's PR.
     fn selected_ref(&self) -> Option<&RepoRef> {
         let refs = self.refs.ready()?;
         match self.config.branch.as_deref() {
             Some(name) => refs.iter().find(|r| r.name == name),
+            None if self.config.checkout == CheckoutKind::NewWorktree => refs.first(),
             None => refs.iter().find(|r| r.current),
         }
     }
@@ -7942,6 +8004,23 @@ mod tests {
             assert!(footer.right() <= usage.left(), "width={width}");
             assert!((f32::from(usage.right()) - width).abs() < 0.1);
         }
+        for selected in [None, Some("session")] {
+            fixture.update(cx, |fixture, cx| {
+                fixture.pickers.update(cx, |pickers, cx| {
+                    pickers.state.update(cx, |state, cx| {
+                        state.select_chat(selected.map(str::to_owned), cx);
+                    });
+                    pickers.adopt_canvas_draft(None, cx);
+                });
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear());
+            assert_eq!(
+                cx.debug_bounds("workspace-footer-pr").is_some(),
+                selected.is_some(),
+                "a fresh chat must not display the previous chat's cached PR"
+            );
+        }
     }
 
     #[gpui::test]
@@ -7997,6 +8076,63 @@ mod tests {
             2,
             "closing via the trigger returns to the composer"
         );
+    }
+
+    #[gpui::test]
+    fn startup_draft_does_not_restore_shared_checkout_after_projects_load(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        let startup = pickers.read_with(cx, |pickers, cx| pickers.canvas_draft(cx));
+        state.update(cx, |state, cx| {
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![Space {
+                id: "repo".into(),
+                device_id: "local".into(),
+                path: "/repo".into(),
+                name: None,
+                git_detected: true,
+                git_checked_at: None,
+                checkout_id: None,
+                created_at: chrono::Utc::now(),
+            }]);
+            state.select_space(Some("repo".into()), cx);
+        });
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            pickers.adopt_canvas_draft(Some(startup), cx);
+            // ListRefs puts the repository's default branch first, even when
+            // the shared folder is still checked out on a merged PR branch.
+            pickers.refs = Loadable::Ready(vec![
+                RepoRef {
+                    name: "main".into(),
+                    current: false,
+                    worktree_path: Some("/repo/main".into()),
+                },
+                RepoRef {
+                    name: "old-pr-branch".into(),
+                    current: true,
+                    worktree_path: None,
+                },
+            ]);
+            assert_eq!(
+                pickers.checkout_plan(),
+                CheckoutPlan::NewWorktree {
+                    base: Some("main".into())
+                }
+            );
+            assert_eq!(pickers.checkout_label(), "New worktree");
+            assert_eq!(pickers.ref_label().as_ref(), "From main");
+            assert_eq!(pickers.selected_ref_index(cx), 0);
+            pickers.pick_ref(pickers.refs.ready().unwrap()[0].clone(), cx);
+            assert_eq!(
+                pickers.checkout_plan(),
+                CheckoutPlan::NewWorktree {
+                    base: Some("main".into())
+                }
+            );
+        });
     }
 
     #[gpui::test]
@@ -9737,6 +9873,26 @@ impl Pickers {
 /// Catalog for the isolated native screenshot fixture; never used by the app.
 #[cfg(feature = "project-palette-fixture")]
 impl Pickers {
+    pub fn fixture_checkout_controls(&mut self, shared: bool, cx: &mut Context<Self>) {
+        self.refs_space = self.state.read(cx).selected_space.clone();
+        self.refs = Loadable::Ready(vec![
+            RepoRef {
+                name: "main".into(),
+                current: false,
+                worktree_path: None,
+            },
+            RepoRef {
+                name: "feature/other-task".into(),
+                current: true,
+                worktree_path: None,
+            },
+        ]);
+        if shared {
+            self.config.checkout = CheckoutKind::Local;
+        }
+        cx.notify();
+    }
+
     pub(crate) fn fixture_model_catalog(&mut self, cx: &mut Context<Self>) {
         if matches!(self.models.get(&HarnessId::Codex), Some(Loadable::Ready(_))) {
             return;
