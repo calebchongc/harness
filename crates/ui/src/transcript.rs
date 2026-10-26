@@ -54,6 +54,8 @@ use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
 use harness_syntax::LanguageId as Lang;
 
+mod cadence;
+
 #[cfg(test)]
 #[path = "transcript/bottom_flicker_tests.rs"]
 mod bottom_flicker_tests;
@@ -3704,6 +3706,7 @@ impl SavedViewportCache {
 
 pub struct Transcript {
     state: Entity<AppState>,
+    pane_cadence: cadence::PaneCadence,
     /// The reconnect generation the cards were last measured at (`reauth_recovery.rs`).
     reauth_generation: u64,
     list: ListState,
@@ -4064,7 +4067,9 @@ impl Transcript {
         chat_id: String,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(state, Some(chat_id), true, ListAlignment::Bottom, cx)
+        let mut this = Self::build(state, Some(chat_id), true, ListAlignment::Bottom, cx);
+        this.set_background_pane(true, cx);
+        this
     }
 
     /// Change only the feed/presentation role, not the chat or its interaction
@@ -4075,7 +4080,7 @@ impl Transcript {
     /// fills a `None` owner from `chat_id`). A promoted peer that kept its
     /// fixed owner would have its links rejected as a stale source once the
     /// primary moved to another chat (#456).
-    pub(crate) fn set_split_source(&mut self, peer: Option<String>) {
+    pub(crate) fn set_split_source(&mut self, peer: Option<String>, cx: &mut Context<Self>) {
         if let Some(link) = self.workspace_link.as_mut() {
             link.source_session = peer.clone();
         }
@@ -4087,6 +4092,7 @@ impl Transcript {
         }
         self.doc_override = peer;
         self.last_source = None;
+        self.set_background_pane(self.doc_override.is_some(), cx);
     }
 
     fn build(
@@ -4098,9 +4104,11 @@ impl Transcript {
     ) -> Self {
         // A split pane drawn from a cached frame keeps its selectable text
         // registered under this transcript; drop it with the transcript.
-        let selection_owner = cx.entity_id().as_u64();
+        let view = cx.entity_id();
+        let selection_owner = view.as_u64();
         cx.on_release(move |this: &mut Self, cx| {
             crate::markdown::render::release_selection_owner(selection_owner);
+            motion::set_background_notifier(view, None, cx);
             crate::image_media::release_media(this.diagrams.clear(), cx);
             this.release_diagram_zoom(cx);
         })
@@ -4126,7 +4134,7 @@ impl Transcript {
             })
             .ok();
         });
-        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.request_sync(cx));
         let text_changes = cx.subscribe(
             &state,
             |this: &mut Self, state, event: &crate::state::TranscriptTextChanged, cx| {
@@ -4135,7 +4143,7 @@ impl Transcript {
                     .as_deref()
                     .or_else(|| state.read(cx).selected_chat.as_deref());
                 if doc_id == Some(event.doc_id.as_str()) {
-                    this.sync(cx);
+                    this.request_sync(cx);
                 }
             },
         );
@@ -4151,6 +4159,7 @@ impl Transcript {
         let pinned = follow;
         let mut this = Self {
             state,
+            pane_cadence: cadence::PaneCadence::default(),
             reauth_generation: 0,
             list,
             rows: Vec::new(),
@@ -8526,8 +8535,8 @@ impl Transcript {
             .child(
                 canvas(
                     |_, _, _| (),
-                    move |_, _, window, _| {
-                        window.on_next_frame(move |_, cx| cx.notify(view));
+                    move |_, _, window, cx| {
+                        motion::request_view_frame(view, window, cx);
                     },
                 )
                 .absolute()
@@ -9108,8 +9117,8 @@ impl Transcript {
                     group.child(
                         canvas(
                             |_, _, _| (),
-                            move |_, _, window, _| {
-                                window.on_next_frame(move |_, cx| cx.notify(view));
+                            move |_, _, window, cx| {
+                                motion::request_view_frame(view, window, cx);
                             },
                         )
                         .absolute()
@@ -9417,8 +9426,8 @@ impl Transcript {
                 group.child(
                     canvas(
                         |_, _, _| (),
-                        move |_, _, window, _| {
-                            window.on_next_frame(move |_, cx| cx.notify(view));
+                        move |_, _, window, cx| {
+                            motion::request_view_frame(view, window, cx);
                         },
                     )
                     .absolute()
@@ -10819,6 +10828,7 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.pane_cadence.painted(cx.background_executor().now());
         if record_view_frame("transcript") {
             tracing::warn!(
                 distance = self.distance_from_bottom(),
@@ -10923,15 +10933,19 @@ impl Render for Transcript {
             && !self.own_turn_scheduled
         {
             self.own_turn_scheduled = true;
-            let entity = cx.weak_entity();
-            window.on_next_frame(move |_, cx| {
-                entity
-                    .update(cx, |this: &mut Transcript, cx| {
-                        this.own_turn_scheduled = false;
-                        this.step_own_turn(cx);
-                    })
-                    .ok();
-            });
+            if self.pane_cadence.background {
+                self.schedule_background_frame(cx);
+            } else {
+                let entity = cx.weak_entity();
+                window.on_next_frame(move |_, cx| {
+                    entity
+                        .update(cx, |this: &mut Transcript, cx| {
+                            this.own_turn_scheduled = false;
+                            this.step_own_turn(cx);
+                        })
+                        .ok();
+                });
+            }
         }
         // Spring driver: one on_next_frame callback at a time; each tick
         // notifies, which re-enters render and schedules the next frame until
@@ -10943,15 +10957,19 @@ impl Render for Transcript {
             && self.spring_should_run()
         {
             self.spring_scheduled = true;
-            let entity = cx.weak_entity();
-            window.on_next_frame(move |_, cx| {
-                entity
-                    .update(cx, |this: &mut Transcript, cx| {
-                        this.spring_scheduled = false;
-                        this.step_spring(cx);
-                    })
-                    .ok();
-            });
+            if self.pane_cadence.background {
+                self.schedule_background_frame(cx);
+            } else {
+                let entity = cx.weak_entity();
+                window.on_next_frame(move |_, cx| {
+                    entity
+                        .update(cx, |this: &mut Transcript, cx| {
+                            this.spring_scheduled = false;
+                            this.step_spring(cx);
+                        })
+                        .ok();
+                });
+            }
         }
         // Programmatic `scroll_to` does not invoke the list's user-scroll
         // handler. Refresh distance-derived state once layout has measured the

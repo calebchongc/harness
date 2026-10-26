@@ -12777,6 +12777,7 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_chat_pane_visibility(cx);
         {
             let transcript = &self.state.read(cx).transcript;
             crate::stall_watch::set_view(crate::stall_watch::View {

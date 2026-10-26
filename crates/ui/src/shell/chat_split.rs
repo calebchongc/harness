@@ -462,8 +462,8 @@ impl Shell {
         // selection, folds, and scroll animation belong to it, not a new view.
         let incoming = target.as_ref().and_then(|id| self.peer_chat_views.remove(id));
         if let Some(id) = selected.as_ref() {
-            self.transcript.update(cx, |transcript, _| {
-                transcript.set_split_source(Some(id.clone()));
+            self.transcript.update(cx, |transcript, cx| {
+                transcript.set_split_source(Some(id.clone()), cx);
             });
         }
         self.state.update(cx, |s, cx| s.select_split_chat(target.clone(), cx));
@@ -478,7 +478,9 @@ impl Shell {
             let events = cx.subscribe(&transcript, Self::on_transcript_event);
             PeerChatView { transcript, _events: events }
         });
-        incoming.transcript.update(cx, |transcript, _| transcript.set_split_source(None));
+        incoming
+            .transcript
+            .update(cx, |transcript, cx| transcript.set_split_source(None, cx));
         let outgoing = PeerChatView {
             transcript: std::mem::replace(&mut self.transcript, incoming.transcript),
             _events: std::mem::replace(&mut self._transcript_events, incoming._events),
@@ -725,6 +727,19 @@ impl Shell {
         }
     }
 
+    /// Hidden panes keep receiving engine data, but do no presentation work.
+    pub(super) fn sync_chat_pane_visibility(&self, cx: &mut Context<Self>) {
+        let visible =
+            self.chat_split_active() && self.chat_split.as_ref().is_some_and(|split| !split.zoomed);
+        for peer in self.peer_chat_views.values() {
+            if peer.transcript.read(cx).background_pane_visible() != visible {
+                peer.transcript.update(cx, |transcript, cx| {
+                    transcript.set_background_pane_visible(visible, cx);
+                });
+            }
+        }
+    }
+
     /// Reconcile peer transcript views and their doc watches with the split.
     pub(super) fn sync_chat_panes(&mut self, cx: &mut Context<Self>) {
         self.persist_chat_layout(cx);
@@ -765,6 +780,7 @@ impl Shell {
                 },
             );
         }
+        self.sync_chat_pane_visibility(cx);
     }
 
     /// The focused pane's share of the conversation column width (1 unless
