@@ -198,7 +198,11 @@ fn themeCard(c: *ui.Context, a: *App, k: theme.Colors) void {
         const v = themes.find(id);
         const open = a.view.theme_menu != null and a.view.theme_menu.? == t[2];
         const rect = picker(c, k, if (v) |x| x.colors else theme.builtin(t[2]), if (v) |x| x.name else id, open);
-        if (rect.clicked) a.view.theme_menu = if (open) null else t[2];
+        if (rect.clicked) {
+            a.view.theme_menu = if (open) null else t[2];
+            // A theme the GPUI app added since shows in the menu.
+            if (!open) if (a.settings.dataDir()) |dir| themes.loadLibrary(a.io, dir);
+        }
         if (open) a.view.theme_anchor = rect.at;
     }
     {

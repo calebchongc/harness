@@ -249,6 +249,11 @@ pub const Store = struct {
         } else s.write("accent", .{ .string = "themeDefault" });
     }
 
+    /// Harness's data folder, where the settings file is.
+    pub fn dataDir(s: *const Store) ?[]const u8 {
+        return std.fs.path.dirname(s.path orelse return null);
+    }
+
     /// The variant picked for the appearance (`themeSelection`), by id.
     pub fn themeId(s: *const Store, dark: bool) []const u8 {
         return s.text(if (dark) "themeSelection.dark" else "themeSelection.light") orelse

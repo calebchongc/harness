@@ -1,8 +1,11 @@
-//! The built-in themes, as the GPUI app offers them: the catalog the phones
+//! The themes, as the GPUI app offers them: the built-in catalog the phones
 //! bundle (apps/ios/Harness/Theme/themes.json, which crates/theme's
 //! `builtin_catalog_matches_ios_bundle` keeps in lockstep with the Rust
-//! registry), each variant made nano's `theme.Colors` as
-//! crates/ui/src/theme.rs derives its roles from the variant.
+//! registry), then the custom ones the theme library holds
+//! (`theme-library.json` in Harness's data folder, which either app's Add
+//! theme writes). Each variant is made nano's `theme.Colors` as
+//! crates/ui/src/theme.rs derives its roles, a custom one's words made
+//! readable as `harden_model_foreground` makes them.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const Color = nanoui.ui.Color;
@@ -17,13 +20,45 @@ pub const Variant = struct {
     colors: theme.Colors,
 };
 
-var loaded: ?[]const Variant = null;
+var builtins: ?[]const Variant = null;
+/// The built-ins, then the library's custom families, as last read.
+var everything: []const Variant = &.{};
+var custom_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
 
-/// Every variant, in the catalog's order (family by family).
+/// Every variant, built-ins first, each family's in its order.
 pub fn all() []const Variant {
-    if (loaded) |v| return v;
-    loaded = parse(std.heap.page_allocator, @import("themes_json").json) catch &.{};
-    return loaded.?;
+    if (builtins == null) {
+        builtins = parse(std.heap.page_allocator, @import("themes_json").json, true) catch &.{};
+        everything = builtins.?;
+    }
+    return everything;
+}
+
+/// Reads the theme library in `data_dir` again (`CustomThemeLibrary`):
+/// its entries' families join the built-ins. A missing or unreadable file
+/// leaves only the built-ins.
+pub fn loadLibrary(io: std.Io, data_dir: []const u8) void {
+    // The built-ins' own list: the combined one is the arena's, reset now.
+    _ = all();
+    const b = builtins.?;
+    _ = custom_arena.reset(.retain_capacity);
+    const a = custom_arena.allocator();
+    everything = b;
+    const path = std.fs.path.join(a, &.{ data_dir, "theme-library.json" }) catch return;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return;
+    const doc = json.parseFromSliceLeaky(json.Value, a, text, .{}) catch return;
+    if (doc != .object) return;
+    const entries = doc.object.get("entries") orelse return;
+    if (entries != .array) return;
+    var out: std.ArrayList(Variant) = .empty;
+    out.appendSlice(a, b) catch return;
+    for (entries.array.items) |e| {
+        if (e != .object) continue;
+        const family = e.object.get("family") orelse continue;
+        if (family != .object) continue;
+        appendFamily(a, &out, family.object, false) catch continue;
+    }
+    everything = out.items;
 }
 
 pub fn find(id: []const u8) ?*const Variant {
@@ -31,11 +66,19 @@ pub fn find(id: []const u8) ?*const Variant {
     return null;
 }
 
-fn parse(gpa: std.mem.Allocator, text: []const u8) ![]const Variant {
+fn parse(gpa: std.mem.Allocator, text: []const u8, curated: bool) ![]const Variant {
     const doc = try json.parseFromSliceLeaky(json.Value, gpa, text, .{});
     var out: std.ArrayList(Variant) = .empty;
     const families = (doc.object.get("families") orelse return error.Catalog).array.items;
-    for (families) |f| for ((f.object.get("variants") orelse continue).array.items) |v| {
+    for (families) |f| if (f == .object) try appendFamily(gpa, &out, f.object, curated);
+    return out.items;
+}
+
+fn appendFamily(gpa: std.mem.Allocator, out: *std.ArrayList(Variant), f: json.ObjectMap, curated: bool) !void {
+    const variants = f.get("variants") orelse return;
+    if (variants != .array) return;
+    for (variants.array.items) |v| {
+        if (v != .object) continue;
         const o = v.object;
         const dark = std.mem.eql(u8, str(o, "appearance"), "dark");
         try out.append(gpa, .{
@@ -43,10 +86,9 @@ fn parse(gpa: std.mem.Allocator, text: []const u8) ![]const Variant {
             .family = str(o, "familyId"),
             .name = str(o, "name"),
             .dark = dark,
-            .colors = derive(o, dark) orelse continue,
+            .colors = derive(o, dark, curated) orelse continue,
         });
-    };
-    return out.items;
+    }
 }
 
 fn str(o: json.ObjectMap, key: []const u8) []const u8 {
@@ -81,7 +123,7 @@ pub fn over(base: Color, top: Color) Color {
 
 /// A variant's roles, as theme.rs's `apply_model` and the paint helpers
 /// derive them (`wash`, `user_bubble_bg`, the composer's flattened input).
-fn derive(o: json.ObjectMap, dark: bool) ?theme.Colors {
+fn derive(o: json.ObjectMap, dark: bool, curated: bool) ?theme.Colors {
     const cs = (o.get("colors") orelse return null).object;
     const acc = (o.get("accent") orelse return null).object;
     const term = (o.get("terminal") orelse return null).object;
@@ -98,7 +140,27 @@ fn derive(o: json.ObjectMap, dark: bool) ?theme.Colors {
     const wash: Color = if (dark) Color.hex(0xebebeb) else Color.hex(0x1a1a1a);
     const shell = col.get(cs, "shell");
     const background = col.get(cs, "background");
-    const muted = col.get(cs, "textMuted");
+    var text = col.get(cs, "text");
+    var muted = col.get(cs, "textMuted");
+    var on_solid = col.get(cs, "onSolid");
+    if (!curated) {
+        // An imported theme's words are made readable on every surface they
+        // sit on (`harden_model_foreground`, 4.5:1).
+        const mc = @import("model_color.zig");
+        const m8 = struct {
+            fn get(m: json.ObjectMap, key: []const u8) mc.Rgba {
+                const v = m.get(key) orelse return .{};
+                return if (v == .string) mc.Rgba.parse(v.string) orelse .{} else .{};
+            }
+        };
+        const grounds = [_]mc.Rgba{ m8.get(cs, "background"), m8.get(cs, "shell"), m8.get(cs, "raised"), m8.get(cs, "card"), m8.get(cs, "dialog"), m8.get(cs, "overlay"), m8.get(cs, "input") };
+        const safe_text = mc.harden(m8.get(cs, "text"), &grounds, 4.5, null);
+        const safe_muted = mc.harden(m8.get(cs, "textMuted"), &grounds, 4.5, safe_text);
+        const safe_on = mc.harden(m8.get(cs, "onSolid"), &.{m8.get(cs, "solid")}, 4.5, safe_text);
+        text = safe_text.color();
+        muted = safe_muted.color();
+        on_solid = safe_on.color();
+    }
     var glyph: [3]Color = .{ .{}, .{}, .{} };
     if (acc.get("glyph")) |g| if (g == .array) for (g.array.items[0..@min(3, g.array.items.len)], 0..) |c, i| {
         glyph[i] = if (c == .string) hex(c.string) orelse .{} else .{};
@@ -116,7 +178,7 @@ fn derive(o: json.ObjectMap, dark: bool) ?theme.Colors {
         .shell = shell,
         .sidebar = over(shell, wash.alpha(0.05)),
         .raised = col.get(cs, "raised"),
-        .text = col.get(cs, "text"),
+        .text = text,
         .muted = muted,
         .faint = col.get(cs, "textFaint"),
         .subline = over(shell, muted.alpha(0.5)),
@@ -139,7 +201,7 @@ fn derive(o: json.ObjectMap, dark: bool) ?theme.Colors {
         .tone = if (dark) white else black,
         .ansi = ansi,
         .solid = col.get(cs, "solid"),
-        .on_solid = col.get(cs, "onSolid"),
+        .on_solid = on_solid,
         .diff_add = col.get(cs, "diffAdd"),
         .diff_del = col.get(cs, "diffDelete"),
         .syntax = .{
@@ -207,4 +269,52 @@ test "every built-in variant is offered, Codegraff among them" {
     };
     try testing.expect(light >= 10);
     try testing.expectEqualStrings("Codegraff Dark", find("codegraff-dark").?.name);
+}
+
+test "a custom theme from the library joins the built-ins, its words made readable" {
+    // A made-up family: Codegraff Dark's roles, renamed, with grey text on
+    // its near-black grounds that wouldn't read.
+    const doc = try json.parseFromSlice(json.Value, testing.allocator, @import("themes_json").json, .{});
+    defer doc.deinit();
+    var v: json.Value = .null;
+    for (doc.value.object.get("families").?.array.items) |f| for (f.object.get("variants").?.array.items) |x|
+        if (std.mem.eql(u8, x.object.get("id").?.string, "codegraff-dark")) {
+            v = x;
+        };
+    const variant = try std.json.Stringify.valueAlloc(testing.allocator, v, .{});
+    defer testing.allocator.free(variant);
+    var edited: std.ArrayList(u8) = .empty;
+    defer edited.deinit(testing.allocator);
+    try edited.appendSlice(testing.allocator, variant);
+    for ([_][2][]const u8{
+        .{ "\"id\":\"codegraff-dark\"", "\"id\":\"custom-dim-dark\"" },
+        .{ "\"name\":\"Codegraff Dark\"", "\"name\":\"Dim Dark\"" },
+        .{ "\"text\":\"#edeae2\"", "\"text\":\"#3a3a3a\"" },
+    }) |r| {
+        const at = std.mem.indexOf(u8, edited.items, r[0]) orelse return error.NoField;
+        try edited.replaceRange(testing.allocator, at, r[0].len, r[1]);
+    }
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try aw.writer.print("{{\"entries\":[{{\"id\":\"custom-dim\",\"family\":{{\"id\":\"custom-dim\",\"name\":\"Dim\",\"variants\":[{s}]}}}}]}}", .{edited.items});
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "theme-library.json", .data = aw.written() });
+    const dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(dir);
+    defer loadLibrary(testing.io, "/nonexistent");
+
+    loadLibrary(testing.io, dir);
+    const dim = find("custom-dim-dark") orelse return error.Missing;
+    try testing.expectEqualStrings("Dim Dark", dim.name);
+    try testing.expect(dim.dark);
+    // After every built-in.
+    try testing.expectEqualStrings("custom-dim-dark", all()[all().len - 1].id);
+    // Its #3a3a3a text was lifted to read at 4.5:1 on its grounds.
+    const mc = @import("model_color.zig");
+    const text8: mc.Rgba = .{ .r = @intFromFloat(@round(dim.colors.text.r * 255)), .g = @intFromFloat(@round(dim.colors.text.g * 255)), .b = @intFromFloat(@round(dim.colors.text.b * 255)) };
+    try testing.expect(text8.contrast(mc.Rgba.parse("#16140f").?) >= 4.5);
+    // A library gone, only the built-ins.
+    loadLibrary(testing.io, "/nonexistent");
+    try testing.expect(find("custom-dim-dark") == null);
 }

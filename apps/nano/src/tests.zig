@@ -67,4 +67,5 @@ test {
     _ = @import("tests_ui_devices.zig");
     _ = @import("tests_ui_hover.zig");
     _ = @import("themes.zig");
+    _ = @import("model_color.zig");
 }
