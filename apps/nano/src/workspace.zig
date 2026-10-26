@@ -133,14 +133,15 @@ pub const Harness = struct {
     /// Offered for new chats: enabled, or (from an engine that doesn't say)
     /// installed and one of graff, Codex, Claude Code.
     offered: bool,
+    /// Its reasoning ladder, for a model that lists none (`trait_ladder`).
+    levels: []const []const u8 = &.{},
 };
 
 /// A model an agent offers (`Model`, crates/proto/src/agent.rs).
 pub const Model = struct {
     id: []const u8,
     label: []const u8,
-    /// Its levels; a chat without one picked shows "medium" when offered,
-    /// else the first.
+    /// Its levels; a chat without one picked shows `rules.defaultReasoning`.
     reasoning_default: ?[]const u8 = null,
     levels: []const []const u8 = &.{},
 };
@@ -250,19 +251,23 @@ fn parseHarness(a: Allocator, o: json.ObjectMap) ?Harness {
     const installed = if (o.get("installed")) |v| v == .bool and v.bool else false;
     const offered = if (o.get("enabled")) |v| v == .bool and v.bool else installed and
         (std.mem.eql(u8, id, "graff") or std.mem.eql(u8, id, "codex") or std.mem.eql(u8, id, "claude-code"));
-    return .{ .id = id, .name = str(a, o, "name") orelse id, .offered = offered };
+    return .{ .id = id, .name = str(a, o, "name") orelse id, .offered = offered, .levels = stringList(a, o, "reasoningLevels") };
 }
 
 fn parseModel(a: Allocator, o: json.ObjectMap) ?Model {
     const id = str(a, o, "id") orelse return null;
-    var default: ?[]const u8 = null;
-    var levels: std.ArrayList([]const u8) = .empty;
-    if (o.get("reasoningLevels")) |v| if (v == .array) for (v.array.items) |l| if (l == .string) {
-        const level = a.dupe(u8, l.string) catch continue;
-        levels.append(a, level) catch continue;
-        if (default == null or std.mem.eql(u8, level, "medium")) default = level;
+    const levels = stringList(a, o, "reasoningLevels");
+    return .{ .id = id, .label = str(a, o, "label") orelse id, .reasoning_default = rules.defaultReasoning(levels), .levels = levels };
+}
+
+/// The strings of the array `key`, owned.
+fn stringList(a: Allocator, o: json.ObjectMap, key: []const u8) []const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    if (o.get(key)) |v| if (v == .array) for (v.array.items) |l| if (l == .string) {
+        const item = a.dupe(u8, l.string) catch continue;
+        list.append(a, item) catch continue;
     };
-    return .{ .id = id, .label = str(a, o, "label") orelse id, .reasoning_default = default, .levels = levels.items };
+    return list.items;
 }
 
 fn parseSession(a: Allocator, o: json.ObjectMap) ?Session {

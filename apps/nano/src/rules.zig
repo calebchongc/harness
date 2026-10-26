@@ -47,6 +47,21 @@ pub fn parseTime(s: []const u8) ?i64 {
     return ((days * 24 + h) * 60 + mi - offset_min) * 60_000 + sec * 1000 + ms;
 }
 
+/// A ladder's default level (`default_reasoning`): High when offered, else
+/// Medium, else the first; none for an empty ladder.
+pub fn defaultReasoning(levels: []const []const u8) ?[]const u8 {
+    for (levels) |l| if (std.mem.eql(u8, l, "high")) return l;
+    for (levels) |l| if (std.mem.eql(u8, l, "medium")) return l;
+    return if (levels.len > 0) levels[0] else null;
+}
+
+test "a ladder's default level is High, else Medium, else its first" {
+    try std.testing.expectEqualStrings("high", defaultReasoning(&.{ "low", "medium", "high", "xhigh" }).?);
+    try std.testing.expectEqualStrings("medium", defaultReasoning(&.{ "minimal", "medium" }).?);
+    try std.testing.expectEqualStrings("low", defaultReasoning(&.{ "low", "max" }).?);
+    try std.testing.expect(defaultReasoning(&.{}) == null);
+}
+
 /// A chat's folder as a session row names it (`project_label`): its last
 /// part, or "No project" for none or the home folder.
 pub fn projectLabel(cwd: ?[]const u8) []const u8 {

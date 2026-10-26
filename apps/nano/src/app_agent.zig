@@ -3,6 +3,7 @@
 //! whole by `SetChatConfig` when picked, as the GPUI pickers do), and the
 //! models the engine lists for that agent.
 const std = @import("std");
+const rules = @import("rules.zig");
 const rpc = @import("rpc.zig");
 const requests = @import("requests.zig");
 const workspace = @import("workspace.zig");
@@ -21,8 +22,9 @@ pub fn target(a: *const App) Target {
     if (a.selected) |id| if (a.findChat(id)) |ch| {
         t = .{ .harness = ch.harness orelse "graff", .model = ch.model, .reasoning = ch.reasoning };
     };
-    if (t.reasoning == null) if (modelOf(a, t.model)) |m| {
-        t.reasoning = m.reasoning_default;
+    // The model's ladder, else its agent's (`trait_ladder`), at its default.
+    if (t.reasoning == null) if (modelOf(a, t.model) != null) {
+        t.reasoning = rules.defaultReasoning(ladder(a, t.harness, t.model));
     };
     return t;
 }
@@ -43,7 +45,16 @@ pub fn modelLabel(a: *const App, id: ?[]const u8) []const u8 {
 }
 
 pub fn levelsOf(a: *const App, id: ?[]const u8) []const []const u8 {
-    return if (modelOf(a, id)) |m| m.levels else &.{};
+    return ladder(a, target(a).harness, id);
+}
+
+/// The model's levels, else (it lists none) its agent's; none before the
+/// model is known (`trait_ladder`).
+fn ladder(a: *const App, harness: []const u8, model: ?[]const u8) []const []const u8 {
+    const m = modelOf(a, model) orelse return &.{};
+    if (m.levels.len > 0) return m.levels;
+    for (a.harnesses.items) |h| if (std.mem.eql(u8, h.id, harness)) return h.levels;
+    return &.{};
 }
 
 pub fn harnessName(a: *const App, id: []const u8) []const u8 {
