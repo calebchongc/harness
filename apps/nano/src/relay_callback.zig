@@ -320,7 +320,9 @@ test "a busy port falls back to pasting" {
 test "let go before the browser comes, the port is freed" {
     const port = try freePort();
     var probe: Probe = .{};
-    const cap = start(testing.allocator, testing.io, port, "/auth/callback", .{ .ctx = &probe, .func = Probe.landed }) orelse return error.PortBusy;
+    // The listener's thread frees the capture after it frees the port,
+    // which can be after this test returns: an allocator that outlives it.
+    const cap = start(std.heap.smp_allocator, testing.io, port, "/auth/callback", .{ .ctx = &probe, .func = Probe.landed }) orelse return error.PortBusy;
     cap.cancel();
     // Within a poll interval or so, the port binds again.
     const addr = try net.IpAddress.parseIp4("127.0.0.1", port);
