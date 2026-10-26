@@ -202,7 +202,7 @@ pub fn controls(c: *ui.Context, a: *App, k: theme.Colors) void {
             defer t.end();
             ui.key(c, "sidebar-search-field");
             const at = c.nodes.items.len;
-            const res = ui.textField(c, &s.query, .{ .placeholder = "Search session names…", .placeholder_color = k.muted, .width = .fill, .bare = true, .size = 14, .line_height = 22.75 });
+            const res = ui.textField(c, &s.query, .{ .placeholder = "Search session names…", .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 14, .line_height = 22.75 });
             if (s.focus) {
                 c.focus = c.node(@intCast(at)).id;
                 c.changed = true;

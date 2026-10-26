@@ -326,7 +326,7 @@ fn header(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
         const placeholder = if (splits) "Search open panes, commands and chats…" else "Search commands and chats…";
         ui.key(c, "command-palette-search");
         const at = c.nodes.items.len;
-        const res = ui.textField(c, &p.query, .{ .placeholder = placeholder, .placeholder_color = k.muted, .width = .fill, .bare = true, .size = 14, .line_height = 22.75 });
+        const res = ui.textField(c, &p.query, .{ .placeholder = placeholder, .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 14, .line_height = 22.75 });
         const id = c.node(@intCast(at)).id;
         // A modal search: the keys stay in it.
         if (p.focus or c.focus != id) {

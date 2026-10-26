@@ -255,6 +255,24 @@ fn switchRow(c: *ui.Context, a: *App, k: theme.Colors, comptime flag: settings.F
     }
 }
 
+/// A row whose switch is the bare `toggle_switch` at its edge, with no
+/// 40-point target around it (Settings › Files').
+fn bareSwitchRow(c: *ui.Context, a: *App, k: theme.Colors, comptime flag: settings.Flag, icon: icons.Name, title: []const u8, meta: []const u8, first: bool) void {
+    ui.key(c, @tagName(flag));
+    const r = row(c, k, first, false);
+    defer r.end();
+    tile(c, k, icon);
+    words(c, k, title, meta, 32);
+    const on = a.settings.get(flag);
+    const track = ui.div(c).row().w(32).h(18).roundedFull().bg(if (on) k.text else k.ink(0.15)).pl(if (on) 16 else 2).itemsCenter();
+    defer track.end();
+    _ = c.leaf(.{ .width = .{ .px = 14 }, .height = .{ .px = 14 }, .radius = 7, .background = if (on) k.on_solid else k.ink(0.7) }, .none, null);
+    if (track.clicked()) {
+        a.settings.toggle(flag);
+        a.redraw();
+    }
+}
+
 /// `btn_ghost`: muted text, a wash under the pointer.
 pub fn ghost(c: *ui.Context, k: theme.Colors, label: []const u8) bool {
     const b = ui.div(c).row().px(12).py(6).rounded(8).hover(k.ink(0.06));
@@ -291,13 +309,14 @@ fn files(c: *ui.Context, a: *App, k: theme.Colors) void {
     subtitle(c, k, "Control how workspace files are displayed and saved while you edit.", true);
     const cd = card(c, k);
     defer cd.end();
-    switchRow(c, a, k, .files_autosave_enabled, .folder, "Autosave", "Save edited workspace files to disk automatically.", true, true);
-    switchRow(c, a, k, .files_word_wrap, .list, "Word wrap", "Wrap long lines in every workspace file.", true, true);
-    switchRow(c, a, k, .files_show_all, .eye, "Show all files", "Include hidden and ignored files in every file tree.", false, true);
+    bareSwitchRow(c, a, k, .files_autosave_enabled, .folder, "Autosave", "Save edited workspace files to disk automatically.", true);
+    bareSwitchRow(c, a, k, .files_word_wrap, .list, "Word wrap", "Wrap long lines in every workspace file.", true);
+    bareSwitchRow(c, a, k, .files_show_all, .eye, "Show all files", "Include hidden and ignored files in every file tree.", false);
     const r = row(c, k, false, false);
     defer r.end();
     tile(c, k, .folder);
-    words(c, k, "New project starting folder", c.print("Automatic · {s}", .{startingFolder(a) orelse "Home"}), 60);
+    // Edit's own width: 12 a side and its words.
+    words(c, k, "New project starting folder", c.print("Automatic · {s}", .{startingFolder(a) orelse "Home"}), 24 + @ceil(c.text.width("Edit", .{ .size = 13 })));
     if (ghost(c, k, "Edit")) a.setNotice("Choosing a starting folder isn't in Harness Nano yet: use Harness.");
 }
 
