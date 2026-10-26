@@ -269,7 +269,7 @@ pub fn dialog(c: *ui.Context, a: *App, k: theme.Colors) void {
     defer back.end();
     const card = dialogs.dialog(c, k);
     defer card.end();
-    ui.text(c, "Delete all archived sessions?", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    ui.text(c, "Delete all archived sessions?", .{ .size = 15, .line_height = kit.measured(15 * phi), .weight = .semibold, .color = k.text });
     _ = c.leaf(.{ .height = .{ .px = 6 } }, .none, null);
     // Drawn after this returns: the words live as long as the frame.
     ui.text(c, deleteAllBody(c.alloc().alloc(u8, 128) catch &.{}, ids.len), .{ .size = 13, .line_height = 19, .wrap = true, .color = k.muted });

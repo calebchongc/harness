@@ -686,7 +686,8 @@ fn sizeMenu(c: *ui.Context, a: *App, k: theme.Colors, inst: *const runners.Insta
         if (kit.pressedOutside(c, at)) return closeSizeMenu(a);
     }
     const w: f32 = 260;
-    const x = rules.snapToWindow(at.x + at.w - w, w, c.size.w, 8);
+    // Its right edge at the trigger's padding box's, inside its border.
+    const x = rules.snapToWindow(at.x + at.w - 1 - w, w, c.size.w, 8);
     // Hung from the trigger's padding box, inside its border: 6 under
     // that, 4.5 under the border's outer edge as drawn.
     const y = at.y + at.h + 4.5;

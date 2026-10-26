@@ -30,6 +30,12 @@ pub fn view(a: *App, c: *ui.Context) void {
     if (a.tick(c.time)) |wait| c.frameIn(wait);
     c.title_bar_height = sidebar.titlebar_h;
     @import("view_kit.zig").beginFrame(c);
+    // Box edges on the device's pixels, a half toward zero, as GPUI's
+    // taffy.rs puts them; text keeps the line heights nano gives it.
+    if (comptime @hasField(ui.Context, "pixel_snap_text")) {
+        c.pixel_snap = true;
+        c.pixel_snap_text = false;
+    }
     // Hover as GPUI's: none after the keyboard until the pointer moves.
     if (comptime @hasField(ui.Context, "keyboard_hides_hover")) c.keyboard_hides_hover = true;
     // A live snapshot asking for Settings (nanoui's NANOUI_LIVE_SNAPSHOT,
@@ -52,6 +58,8 @@ pub fn view(a: *App, c: *ui.Context) void {
     // Text breaks into lines where the GPUI app breaks it, with a nanoui
     // that has its rule (justrach/nanoui gpui-wrap).
     if (comptime @hasField(@TypeOf(c.text.*), "wrap_rule")) c.text.wrap_rule = .glyph_positions;
+    // Glyphs land on the device's pixels as GPUI's `paint_glyph` puts them.
+    if (comptime @hasField(@TypeOf(c.text.*), "glyph_snap")) c.text.glyph_snap = .half_toward_zero;
     // A line taller than its font's centres its glyphs as GPUI's
     // `ShapedLine::paint` does (justrach/nanoui baseline_rule).
     if (comptime @hasField(@TypeOf(c.text.*), "baseline_rule")) c.text.baseline_rule = .glyph_box;

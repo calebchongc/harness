@@ -306,7 +306,15 @@ fn motionCard(c: *ui.Context, a: *App, k: theme.Colors) void {
             "Animations play even if the system asks for less motion."
         else
             "Following the system, which currently allows motion.";
-        words(c, k, "Reduce motion", copy, 10 + 140);
+        // The choices' width: 10 before them, each 10 in a side (its
+        // border with them), its words (laid out to the whole point), 6
+        // between.
+        var seg_w: f32 = 10 + 2 * 6;
+        inline for (.{ .{ "System", "system" }, .{ "On", "on" }, .{ "Off", "off" } }) |o| {
+            const selected = std.mem.eql(u8, value, o[1]);
+            seg_w += 2 * 10 + @ceil(c.text.width(o[0], .{ .size = 11, .weight = if (selected) .medium else .regular }));
+        }
+        words(c, k, "Reduce motion", copy, seg_w);
         ui.spacer(c);
         const seg = ui.div(c).row().pl(10).gap(6);
         defer seg.end();

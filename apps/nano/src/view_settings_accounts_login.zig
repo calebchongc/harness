@@ -396,7 +396,7 @@ pub fn dialog(c: *ui.Context, a: *App, k: theme.Colors) void {
         .border(if (k.dark) ui.Color{ .r = 1, .g = 1, .b = 1, .a = 0.10 } else ui.Color{ .a = 0.135 }).borderW(1));
     defer card.end();
     var tb: [64]u8 = undefined;
-    ui.text(c, c.print("{s}", .{accounts.loginTitle(&tb, f.harness, f.provider, f.reauthenticate)}), .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    ui.text(c, c.print("{s}", .{accounts.loginTitle(&tb, f.harness, f.provider, f.reauthenticate)}), .{ .size = 15, .line_height = kit.measured(15 * phi), .weight = .semibold, .color = k.text });
     if (a.view.accounts.target) |t| body(c, k, c.print("Signing in on {s}", .{deviceName(a, t)}));
     switch (f.stage) {
         .starting => {

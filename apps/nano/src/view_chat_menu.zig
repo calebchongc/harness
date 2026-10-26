@@ -271,12 +271,12 @@ pub fn buttons(c: *ui.Context, k: theme.Colors, confirm: []const u8, danger: boo
     {
         const b = ui.div(c).row().px(12).py(6).rounded(8).hover(k.ink(0.06));
         defer b.end();
-        ui.text(c, "Cancel", .{ .size = 13, .line_height = 13 * phi, .color = if (b.hovered()) k.text else k.muted });
+        ui.text(c, "Cancel", .{ .size = 13, .line_height = kit.measured(13 * phi), .color = if (b.hovered()) k.text else k.muted });
         if (b.clicked()) out = .cancel;
     }
     const b = ui.div(c).row().px(12).py(6).rounded(8).bg(if (danger) k.danger else k.solid);
     defer b.end();
-    ui.text(c, confirm, .{ .size = 13, .line_height = 13 * phi, .weight = .medium, .color = if (danger) ui.Color.white else k.on_solid });
+    ui.text(c, confirm, .{ .size = 13, .line_height = kit.measured(13 * phi), .weight = .medium, .color = if (danger) ui.Color.white else k.on_solid });
     if (b.clicked()) out = .confirm;
     return out;
 }
@@ -288,7 +288,7 @@ fn renameDialog(c: *ui.Context, a: *App, k: theme.Colors) void {
     const card = dialog(c, k);
     defer card.end();
     const space = a.view.dialogs.space;
-    ui.text(c, if (space) "Rename project" else "Rename session", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    ui.text(c, if (space) "Rename project" else "Rename session", .{ .size = 15, .line_height = kit.measured(15 * phi), .weight = .semibold, .color = k.text });
     _ = c.leaf(.{ .height = .{ .px = 12 } }, .none, null);
     var submit = false;
     {
@@ -330,7 +330,7 @@ fn deleteDialog(c: *ui.Context, a: *App, k: theme.Colors) void {
     const card = dialog(c, k);
     defer card.end();
     const title = if (a.findChat(id)) |ch| (ch.title orelse "New session") else "New session";
-    ui.text(c, "Delete session?", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    ui.text(c, "Delete session?", .{ .size = 15, .line_height = kit.measured(15 * phi), .weight = .semibold, .color = k.text });
     _ = c.leaf(.{ .height = .{ .px = 6 } }, .none, null);
     ui.text(c, c.print("\u{201C}{s}\u{201D} will be permanently deleted. This can\u{2019}t be undone.", .{firstLine(title)}), .{ .size = 13, .line_height = 19, .wrap = true, .color = k.muted });
     const pressed = buttons(c, k, "Delete", true);
@@ -350,7 +350,7 @@ fn removeSpaceDialog(c: *ui.Context, a: *App, k: theme.Colors, id: []const u8) v
     const card = dialog(c, k);
     defer card.end();
     const space = a.findSpace(id);
-    ui.text(c, "Remove project?", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    ui.text(c, "Remove project?", .{ .size = 15, .line_height = kit.measured(15 * phi), .weight = .semibold, .color = k.text });
     _ = c.leaf(.{ .height = .{ .px = 6 } }, .none, null);
     ui.text(c, removeCopy(c, a, id, space), .{ .size = 13, .line_height = 19, .wrap = true, .color = k.muted });
     const pressed = buttons(c, k, "Remove", true);

@@ -8,6 +8,7 @@ const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const set = @import("view_settings.zig");
+const kit = @import("view_kit.zig");
 const account = @import("app_account.zig");
 const workspace = @import("workspace.zig");
 const rpc = @import("rpc.zig");
@@ -261,7 +262,7 @@ fn renameDialog(c: *ui.Context, a: *App, k: theme.Colors) void {
     defer back.end();
     const card = dialogs.dialog(c, k);
     defer card.end();
-    ui.text(c, "Rename device", .{ .size = 15, .line_height = 15 * phi, .weight = .semibold, .color = k.text });
+    ui.text(c, "Rename device", .{ .size = 15, .line_height = kit.measured(15 * phi), .weight = .semibold, .color = k.text });
     _ = c.leaf(.{ .height = .{ .px = 12 } }, .none, null);
     var submit = false;
     {

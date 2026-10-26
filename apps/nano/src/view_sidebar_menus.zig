@@ -485,10 +485,11 @@ pub fn choose(a: *App, ch: Choice) void {
 
 fn view(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
     const m = &a.view.menus;
-    // Right of the ⋯, 6 along, level with it (`anchored_menu_right`).
+    // Right of the ⋯, 6 along, level with it (`anchored_menu_right`),
+    // from inside the ⋯'s 1-point clear border, where GPUI hangs it.
     const w = sidebar.width - 2 * 8;
-    const x = rules.snapToWindow(r.x + r.w + 6, w, c.size.w, 8);
-    const y = @max(8, r.y);
+    const x = rules.snapToWindow(r.x + r.w - 1 + 6, w, c.size.w, 8);
+    const y = @max(8, r.y + 1);
     ui.key(c, "sidebar-view-menu");
     const card = card_(c, k, x, y, w);
     defer card.end();

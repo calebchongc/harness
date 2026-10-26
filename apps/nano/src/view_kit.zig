@@ -217,6 +217,14 @@ pub fn secondaryClicked(d: ui.Div) bool {
     return false;
 }
 
+/// A line's height as GPUI's layout measures it: up to the device pixel
+/// (a half point at 2x; taffy.rs rounds a measured size up). Where nano's
+/// boxes are centred on what text measures (a dialog in the window), the
+/// centre lands where GPUI's does.
+pub fn measured(line_height: f32) f32 {
+    return @ceil(line_height * 2 - 0.001) / 2;
+}
+
 /// The menu cards drawn (`noteCard`), last frame's and this one's, for
 /// `pressedOutside`.
 var cards: [2][16]ui.Rect = undefined;
