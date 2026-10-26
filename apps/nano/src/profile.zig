@@ -83,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
             return @as(f64, @floatFromInt(clock.now(i).toNanoseconds() - s)) / 1e6;
         }
     };
+    debug_frames = std.c.getenv(debug_frames_env) != null;
     std.debug.print("pid={d} phase=replay\n", .{std.c.getpid()});
     const first_at = frames[0].object.get("at").?.integer;
     var next: usize = 0;
@@ -120,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
                 draw.gpu_ms += timing.gpu_ms;
             }
             draw.frames += 1;
+            if (completed != null and debug_frames) std.debug.print("settled frame at {d:.0}ms animating={} frame_in={?d:.3}\n", .{ elapsed, t.ctx.animating, t.ctx.frame_in });
             if (t.ctx.animating) dirty = true else if (t.ctx.frame_in) |s| {
                 wake_at = elapsed + s * 1000;
             }
@@ -139,6 +141,10 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&path_buf, "{s}/nano-stats.json", .{out}), .data = stats });
     std.debug.print("{s}", .{stats});
 }
+
+/// NANO_PROFILE_FRAMES set: why each settled frame was drawn.
+const debug_frames_env = "NANO_PROFILE_FRAMES";
+var debug_frames = false;
 
 /// A nanoui with targets kept across frames (the fork's benchmark draw).
 const has_target = @hasField(ui.Tester, "renderer") and @hasDecl(@FieldType(ui.Tester, "renderer"), "drawTimed");
