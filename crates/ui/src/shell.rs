@@ -16415,7 +16415,11 @@ mod exit_regressions {
                 );
                 shell.focus_chat_pane(0, window, cx);
                 assert_eq!(text(shell, cx), "unsent idea", "the draft stays in its pane");
-                assert_eq!(plan(shell, cx), original, "parked Git picks stay with their pane");
+                assert_eq!(
+                    plan(shell, cx),
+                    original,
+                    "parked Git picks stay with their pane"
+                );
                 shell.new_chat_tab(None, window, cx);
                 assert_eq!(text(shell, cx), "", "a ⌘T tab opened with the draft (#28)");
                 assert_eq!(

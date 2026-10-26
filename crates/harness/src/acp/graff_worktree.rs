@@ -114,7 +114,7 @@ pub(super) async fn ensure_worktree(
     command
         .args(["worktree", "create", name, base])
         .current_dir(root)
-        .stdin(std::process::Stdio::null())
+        .stdin(crate::process::Stdio::null())
         .kill_on_drop(true);
     let output = tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
         .await
