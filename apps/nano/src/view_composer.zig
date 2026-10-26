@@ -28,6 +28,7 @@ pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
     defer outer.end();
     // Keyed: the tray coming and going must not change the input's id
     // (which would take its focus).
+    dictationStatus(c, a, k, w);
     ui.key(c, "queue-tray");
     _ = queue_view.tray(c, a, k, w);
     ui.key(c, "composer");
@@ -107,17 +108,51 @@ pub fn pill(c: *ui.Context, a: *App, k: theme.Colors, w: f32, shape: Shape, radi
     send(c, a, k);
 }
 
-/// Whether this device can dictate: the mic shows only then, as the GPUI
-/// app's does when it detects dictation, which macOS has.
-const dictation = @import("builtin").os.tag == .macos;
+const dictate = @import("app_dictation.zig");
 
 fn attachButtons(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (kit.iconButton(c, k, .paperclip, .{ .size = 28, .radius = 14, .icon = 18 }))
         a.setNotice("Attachments aren't in Harness Nano yet.");
-    if (!dictation) return;
+    // The mic shows where the device's Codex voice was found, and while a
+    // session is live.
+    if (!dictate.shown(a)) return;
     _ = c.leaf(.{ .width = .{ .px = 2 } }, .none, null);
-    if (kit.iconButton(c, k, .microphone, .{ .size = 28, .radius = 14, .icon = 17 }))
-        a.setNotice("Dictation isn't in Harness Nano yet.");
+    if (micButton(c, a, k)) dictate.toggle(a);
+}
+
+/// `render_dictation_button`: listening, a red wash as loud as the mic
+/// and a red mic; starting or finishing, a faint one.
+fn micButton(c: *ui.Context, a: *App, k: theme.Colors) bool {
+    const s = &a.dictation;
+    const listening = s.running != null and s.listening and !s.finishing;
+    const busy = s.running != null and !listening;
+    const level = std.math.clamp(s.level, 0, 1);
+    ui.key(c, "composer-dictate");
+    const base = ui.div(c).row().size(28, 28).center().roundedFull();
+    const b = if (listening) base.bg(k.danger.alpha(0.10 + 0.30 * level)) else kit.listenerHover(&a.view.hovers, base, k.ink(0.10)).div;
+    defer b.end();
+    icons.icon(c, .microphone, 17, if (listening) k.danger else if (busy) k.faint else k.muted, 0);
+    return b.clicked();
+}
+
+/// `render_dictation_status`: one quiet caption over the composer while
+/// dictating, as the queue's notice.
+pub fn dictationStatus(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
+    const s = &a.dictation;
+    if (s.running == null) return;
+    const dot = if (s.finishing or !s.listening) k.faint else k.danger;
+    const text = if (s.finishing)
+        "Finishing dictation…"
+    else if (!s.listening)
+        "Starting dictation…"
+    else if (s.partial.items.len == 0)
+        "Listening — click the mic to stop"
+    else
+        c.print("Listening — {s}", .{s.partial.items});
+    const row = ui.div(c).row().w(w).px(8).pt(6).gap(6).itemsCenter();
+    defer row.end();
+    _ = c.leaf(.{ .width = .{ .px = 5 }, .height = .{ .px = 5 }, .radius = 2.5, .background = dot }, .none, null);
+    kit.ellipsisText(c, text, .{ .size = 11, .line_height = 14, .color = k.faint }, w - 16 - 11);
 }
 
 fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
@@ -144,6 +179,7 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
     });
     // "Send messages with" (Settings › Shortcuts): Enter sends, or starts a
     // new line and ⌘↩ sends (`composerSendBehavior`).
+    a.view.composer_caret = r.caret;
     const on_enter = @import("view_settings_shortcuts.zig").sendsOnEnter(a);
     if (r.submitted) {
         if (on_enter) a.send() else {

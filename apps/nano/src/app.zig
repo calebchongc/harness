@@ -78,6 +78,8 @@ pub const View = struct {
     /// drawn, for keeping them when it moves.
     focus_composer: bool = false,
     composer_id: u64 = 0,
+    /// The composer's caret as of its last frame: where dictated words go.
+    composer_caret: usize = 0,
     /// The prompt rail's hover and glide (view_rail.zig).
     rail: @import("view_rail.zig").State = .{},
     /// Tool groups opened or closed by hand, by "<entry>/<first part>".
@@ -201,6 +203,12 @@ pub const App = struct {
     /// (`reap`).
     retired: std.ArrayList(Transcript) = .empty,
     retired_ids: std.ArrayList([]u8) = .empty,
+    /// The process's environment (main's), for what's started from here.
+    env: ?*const std.process.Environ.Map = null,
+    /// Drawn offscreen (a scene): no main run loop to post to.
+    offscreen: bool = false,
+    /// Dictation through the device's Codex voice.
+    dictation: @import("app_dictation.zig").State = .{},
     composer: nanoui.ui.TextBuffer = .{},
     /// The last error the engine gave, shown under the composer.
     notice: [200]u8 = undefined,
@@ -329,6 +337,7 @@ pub const App = struct {
         a.actions.deinit();
         a.transcript.deinit();
         a.reap();
+        a.dictation.deinit(a.gpa);
         a.retired.deinit(a.gpa);
         a.retired_ids.deinit(a.gpa);
         if (a.selected) |s| a.gpa.free(s);

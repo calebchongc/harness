@@ -21,6 +21,7 @@ pub fn main(init: std.process.Init) !void {
     defer a.deinit();
     a.new_harness = try init.gpa.dupe(u8, init.environ_map.get("HARNESS_NANO_HARNESS") orelse "graff");
     a.settings = .open(init.gpa, init.io, init.environ_map);
+    a.env = init.environ_map;
     // Panics, fatal signals and hangs leave their stacks in ~/.harness/logs.
     if (a.settings.dataDir()) |dir| crash_log.start(init.io, dir);
     // Custom themes either app added, for the pickers and a picked one.
@@ -43,6 +44,8 @@ pub fn main(init: std.process.Init) !void {
         .content = .{ .view = .init(&a, @import("view.zig").view) },
     });
     try a.start();
+    // Whether this device can dictate, found off the main thread.
+    @import("app_dictation.zig").probe(&a);
     // A chat to open at launch, for checks that render the window offscreen.
     if (init.environ_map.get("HARNESS_NANO_OPEN_CHAT")) |id| a.openChat(id, null);
     // Panels to open with it: "diffs", "files", or both.

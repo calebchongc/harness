@@ -130,6 +130,8 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
     try std.Io.Dir.cwd().createDirPath(init.io, data);
     a.settings.path = try std.fs.path.join(gpa, &.{ data, "ui-settings.json" });
     @import("themes.zig").loadLibrary(init.io, data);
+    a.env = init.environ_map;
+    @import("app_dictation.zig").probeNow(&a);
     const dark = !std.mem.eql(u8, str(scene, "appearance") orelse "dark", "light");
     a.dark = dark;
     // As the renderer sets it: the scene's appearance is the chosen one.

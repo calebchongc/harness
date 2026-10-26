@@ -71,5 +71,7 @@ test {
     _ = @import("theme_import.zig");
     _ = @import("theme_library.zig");
     _ = @import("crash_log.zig");
+    _ = @import("dictation.zig");
+    _ = @import("app_dictation.zig");
     _ = @import("view_settings_theme_import.zig");
 }
