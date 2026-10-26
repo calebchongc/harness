@@ -39,7 +39,7 @@ jobs:
   submit:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       # The iOS team's Admin key, the one testflight.yml uses.
       AC_API_KEY_P8: ${{ secrets.IOS_AC_API_KEY_P8 }}

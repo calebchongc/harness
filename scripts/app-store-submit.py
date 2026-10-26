@@ -157,12 +157,13 @@ def localizations(version_id):
 
 
 def screenshot_sets(localization_id):
+    """(set id, display type, screenshot ids) for each slot."""
     reply = api(
         "GET",
         f"/appStoreVersionLocalizations/{localization_id}/appScreenshotSets?include=appScreenshots&limit=50",
     )
     return [
-        (s["id"], s["attributes"]["screenshotDisplayType"], len(s["relationships"]["appScreenshots"]["data"]))
+        (s["id"], s["attributes"]["screenshotDisplayType"], [i["id"] for i in s["relationships"]["appScreenshots"]["data"]])
         for s in reply["data"]
     ]
 
@@ -178,8 +179,8 @@ def report(app, build, marketing, version):
         attributes = localization["attributes"]
         missing = [k for k in ("description", "keywords", "supportUrl") if not attributes.get(k)]
         print(f"  {attributes['locale']}: " + (f"missing {', '.join(missing)}" if missing else "text complete"))
-        for _, display, count in screenshot_sets(localization["id"]):
-            print(f"    {display}: {count} screenshots")
+        for _, display, shots in screenshot_sets(localization["id"]):
+            print(f"    {display}: {len(shots)} screenshots")
     try:
         detail = api("GET", f"/appStoreVersions/{version['id']}/appStoreReviewDetail")["data"]
         attributes = detail["attributes"] if detail else {}
@@ -208,12 +209,18 @@ def upload_watch_shots(version_id):
         print(f"No Watch screenshots in {WATCH_SHOTS.name}/; leaving the Watch slot as it is.")
         return
     for localization in localizations(version_id):
+        locale = localization["attributes"]["locale"]
         sets = screenshot_sets(localization["id"])
-        if any(display.startswith("APP_WATCH") and count for _, display, count in sets):
-            print(f"  {localization['attributes']['locale']}: Watch screenshots already there.")
+        if any(display.startswith("APP_WATCH") and len(ids) >= len(shots) for _, display, ids in sets):
+            print(f"  {locale}: Watch screenshots already there.")
             continue
-        set_id = next((sid for sid, display, _ in sets if display == WATCH_DISPLAY), None)
-        if set_id is None:
+        existing = next(((sid, ids) for sid, display, ids in sets if display == WATCH_DISPLAY), None)
+        if existing:
+            # A set an earlier run left part-way: start it again.
+            set_id, ids = existing
+            for screenshot_id in ids:
+                api("DELETE", f"/appScreenshots/{screenshot_id}")
+        else:
             set_id = api("POST", "/appScreenshotSets", {
                 "data": {
                     "type": "appScreenshotSets",
@@ -223,9 +230,9 @@ def upload_watch_shots(version_id):
                     }},
                 },
             })["data"]["id"]
-        for shot in shots:
-            upload_screenshot(set_id, shot)
-        print(f"  {localization['attributes']['locale']}: uploaded {len(shots)} Watch screenshots.")
+        uploaded = {upload_screenshot(set_id, shot): shot.name for shot in shots}
+        wait_for_processing(uploaded)
+        print(f"  {locale}: uploaded {len(shots)} Watch screenshots.")
 
 
 def upload_screenshot(set_id, path):
@@ -250,15 +257,26 @@ def upload_screenshot(set_id, path):
             "attributes": {"uploaded": True, "sourceFileChecksum": hashlib.md5(data).hexdigest()},
         },
     })
-    for _ in range(40):
-        state = api("GET", f"/appScreenshots/{reserved['id']}?fields[appScreenshots]=assetDeliveryState")
-        delivery = state["data"]["attributes"]["assetDeliveryState"]
-        if delivery["state"] == "COMPLETE":
+    return reserved["id"]
+
+
+def wait_for_processing(uploaded):
+    """Apple processes screenshots after upload; it can take minutes."""
+    pending = dict(uploaded)
+    deadline = time.time() + 600
+    while pending:
+        for screenshot_id, name in list(pending.items()):
+            reply = api("GET", f"/appScreenshots/{screenshot_id}?fields[appScreenshots]=assetDeliveryState")
+            delivery = reply["data"]["attributes"]["assetDeliveryState"]
+            if delivery["state"] == "COMPLETE":
+                del pending[screenshot_id]
+            elif delivery["state"] == "FAILED":
+                raise AppleError(f"{name} was refused: {delivery.get('errors')}")
+        if not pending:
             return
-        if delivery["state"] == "FAILED":
-            raise AppleError(f"{path.name} was refused: {delivery.get('errors')}")
-        time.sleep(3)
-    raise AppleError(f"{path.name} didn't finish processing.")
+        if time.time() > deadline:
+            raise AppleError(f"Still processing after ten minutes: {', '.join(sorted(pending.values()))}.")
+        time.sleep(10)
 
 
 def submit(app, build, marketing, release):
