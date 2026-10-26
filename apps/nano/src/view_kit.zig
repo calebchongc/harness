@@ -225,6 +225,20 @@ pub fn measured(line_height: f32) f32 {
     return @ceil(line_height * 2 - 0.001) / 2;
 }
 
+/// A box's height as last laid out, kept in `slot` for what's placed by it
+/// (a menu kept inside the window); when it changed, another frame, so the
+/// placement uses it now rather than at the next redraw.
+pub fn rememberHeight(c: *ui.Context, d: ui.Div, slot: *?f32) void {
+    const r = c.rects.get(c.node(d.index).id) orelse {
+        c.animating = true;
+        return;
+    };
+    if (slot.* == null or slot.*.? != r.h) {
+        slot.* = r.h;
+        c.animating = true;
+    }
+}
+
 /// The menu cards drawn (`noteCard`), last frame's and this one's, for
 /// `pressedOutside`.
 var cards: [2][16]ui.Rect = undefined;

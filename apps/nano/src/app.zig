@@ -376,13 +376,18 @@ pub const App = struct {
         if (a.window) |w| w.redraw();
     }
 
+    /// The agents and the new chat's agent's models, for the composer.
+    pub fn loadAgents(a: *App) void {
+        a.request(requests.none("ListHarnesses"), .of(App, a, onHarnesses));
+        a.ensureModels(a.target().harness);
+    }
+
     fn stateChanged(ctx: ?*anyopaque, s: engine_mod.State) void {
         const a: *App = @ptrCast(@alignCast(ctx.?));
         switch (s) {
             .connected => {
                 a.request(requests.none("EngineInfo"), .of(App, a, onEngineInfo));
-                a.request(requests.none("ListHarnesses"), .of(App, a, onHarnesses));
-                a.ensureModels(a.target().harness);
+                a.loadAgents();
                 a.request(requests.none("EngineReady"), .of(App, a, onNotice));
                 a.watchSidebar();
                 change_requests.reconcile(a);

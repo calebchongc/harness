@@ -146,7 +146,11 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
     };
     // The engine's replies, by method, as the GPUI renderer's fake engine
     // answers them.
-    if (scene.get("replies")) |v| a.engine.scene = try json.parseFromSlice(json.Value, gpa, try json.Stringify.valueAlloc(arena, v, .{}), .{});
+    if (scene.get("replies")) |v| {
+        a.engine.scene = try json.parseFromSlice(json.Value, gpa, try json.Stringify.valueAlloc(arena, v, .{}), .{});
+        // What the composer asks a live engine for, as the GPUI app's does.
+        a.loadAgents();
+    }
     // Settings › Accounts' replies in place of the engine's, as the GPUI
     // renderer's `SCENE_ACCOUNTS`.
     const accounts_page = @import("view_settings_accounts.zig");

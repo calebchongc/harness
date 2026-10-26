@@ -111,7 +111,7 @@ fn menu(c: *ui.Context, a: *App, k: theme.Colors) void {
     const card = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(5).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer card.end();
-    if (c.rects.get(c.node(card.index).id)) |r| a.view.chat_menu_h = r.h;
+    kit.rememberHeight(c, card, &a.view.chat_menu_h);
     switch (m.page) {
         .root => {
             const pinned = isPinned(a, ch.id);

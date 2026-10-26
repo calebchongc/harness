@@ -61,7 +61,7 @@ fn accountMenu(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
     const card = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(card_inset + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer card.end();
-    if (c.rects.get(c.node(card.index).id)) |cr| a.view.account_h = cr.h;
+    kit.rememberHeight(c, card, &a.view.account_h);
     {
         const id = ui.div(c).row().wFull().px(8).pt(6).pb(4);
         defer id.end();

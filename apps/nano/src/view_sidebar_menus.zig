@@ -331,7 +331,7 @@ fn spaceMenu(c: *ui.Context, a: *App, k: theme.Colors) void {
     const card = held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(7).column().p(inset + 1)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer card.end();
-    if (c.rects.get(c.node(card.index).id)) |r| m.ctx_h = r.h;
+    kit.rememberHeight(c, card, &m.ctx_h);
     const chat_menu = @import("view_chat_menu.zig");
     {
         ui.key(c, "space-menu-rename");
