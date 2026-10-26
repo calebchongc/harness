@@ -86,6 +86,16 @@ pub fn build(b: *std.Build) void {
     run_snap.addPassthruArgs();
     b.step("snap", "Draw a scene offscreen to PNGs").dependOn(&run_snap.step);
 
+    // `zig build profile -- replay.json out-dir`: the GPUI app's UI-only
+    // resource replay, for bench/resource.py to measure (src/profile.zig).
+    const profile = b.addExecutable(.{ .name = "harness-nano-profile", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/profile.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) });
+    b.installArtifact(profile);
+
     // `zig build vectors`: rewrite protocol/desktop/requests.json from the
     // request builders, after changing one on purpose.
     const vectors = b.addExecutable(.{ .name = "parity-vectors", .root_module = b.createModule(.{

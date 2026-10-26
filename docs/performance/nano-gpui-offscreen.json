@@ -1,0 +1,71 @@
+{
+ "schemaVersion": 1,
+ "date": "2026-10-26",
+ "kind": "UI-only offscreen replay, the GPUI app against harness-nano, same replay and sampler",
+ "conditions": {
+  "chip": "Apple M4 Pro",
+  "ramGiB": 48,
+  "os": "macOS 27.0.1",
+  "windowPoints": [
+   1320,
+   880
+  ],
+  "scale": 2,
+  "replay": "apps/nano/bench/make_replay.py (885 frames: a 40-section reply in 24-character appends every 20 ms)",
+  "order": [
+   "gpui",
+   "nano",
+   "nano",
+   "gpui"
+  ],
+  "method": "apps/nano/bench/resource.py: scripts/macos-resource-stat.c every 500 ms; the first 2 s of each phase left out; each binary saves complete.png at the settle, as the GPUI example does."
+ },
+ "binaries": {
+  "gpui": "crates/ui/examples/macos-resource-profile.rs (app-dev, mimalloc)",
+  "nano": "apps/nano/src/profile.zig (ReleaseFast, nanoui fork with the growing image atlas)"
+ },
+ "means": {
+  "gpui": {
+   "replay": {
+    "durationSeconds": 15.75,
+    "cpuPercent": 13.03,
+    "peakFootprintMiB": 177.95,
+    "endFootprintMiB": 177.95,
+    "peakRssMiB": 85.95,
+    "endRssMiB": 85.95,
+    "idleWakeupsPerSecond": 2.35
+   },
+   "settled": {
+    "durationSeconds": 12.23,
+    "cpuPercent": 0.34,
+    "peakFootprintMiB": 166.3,
+    "endFootprintMiB": 104.2,
+    "peakRssMiB": 124.3,
+    "endRssMiB": 124.3,
+    "idleWakeupsPerSecond": 2.75
+   },
+   "lifetimePeakFootprintMiB": 228.8
+  },
+  "nano": {
+   "replay": {
+    "durationSeconds": 15.54,
+    "cpuPercent": 7.18,
+    "peakFootprintMiB": 159.7,
+    "endFootprintMiB": 159.7,
+    "peakRssMiB": 35.75,
+    "endRssMiB": 35.75,
+    "idleWakeupsPerSecond": 2.0
+   },
+   "settled": {
+    "durationSeconds": 12.48,
+    "cpuPercent": 0.17,
+    "peakFootprintMiB": 178.8,
+    "endFootprintMiB": 59.55,
+    "peakRssMiB": 54.9,
+    "endRssMiB": 54.9,
+    "idleWakeupsPerSecond": 1.65
+   },
+   "lifetimePeakFootprintMiB": 215.3
+  }
+ }
+}

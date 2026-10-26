@@ -25,11 +25,15 @@ var builtins: ?[]const Variant = null;
 /// The built-ins, then the library's custom families, as last read.
 var everything: []const Variant = &.{};
 var custom_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+var builtin_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
 
 /// Every variant, built-ins first, each family's in its order.
 pub fn all() []const Variant {
     if (builtins == null) {
-        builtins = parse(std.heap.page_allocator, @import("themes_json").json, true) catch &.{};
+        // In an arena: straight from the page allocator, each of the
+        // catalog's thousands of strings and objects took a page of its own
+        // (87 MB for a 103 KB file).
+        builtins = parse(builtin_arena.allocator(), @import("themes_json").json, true) catch &.{};
         everything = builtins.?;
     }
     return everything;
