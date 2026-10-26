@@ -11,8 +11,8 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, Hsla, SharedString, Subscription, Task, Window,
-    div, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Entity, Focusable, Hsla, SharedString, Subscription, Task,
+    Window, div, prelude::*, px,
 };
 use std::time::Duration;
 
@@ -393,6 +393,8 @@ pub struct AccountsPage {
     copy_task: Option<Task<()>>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
+    /// The code field takes the keys on the paste step's first frame.
+    focus_code: bool,
     load_task: Option<Task<()>>,
     codegraff_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
@@ -438,6 +440,7 @@ impl AccountsPage {
             copy_task: None,
             error: None,
             code_input,
+            focus_code: false,
             load_task: None,
             codegraff_task: None,
             action_task: None,
@@ -1557,6 +1560,7 @@ impl AccountsPage {
                                 let relayed = start.mode == AgentLoginMode::RelayBrowser;
                                 page.code_input
                                     .update(cx, |input, cx| input.set_text("", cx));
+                                page.focus_code = true;
                                 page.login = Some(LoginFlow::PasteCode {
                                     harness,
                                     provider,
@@ -3027,6 +3031,11 @@ impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
+        if std::mem::take(&mut self.focus_code)
+            && matches!(self.login, Some(LoginFlow::PasteCode { .. }))
+        {
+            window.focus(&self.code_input.focus_handle(cx), cx);
+        }
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
         let refreshing = matches!(self.snapshot, Loadable::Loading);
         let account_count = self
