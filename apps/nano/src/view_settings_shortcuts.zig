@@ -142,7 +142,7 @@ fn sendCard(c: *ui.Context, a: *App, k: theme.Colors) void {
         const selected = on_enter == opt[2];
         var seg = ui.div(c).row().minW(72).px(12).py(6).rounded(7).justifyCenter();
         // The selected one's border is outside, as GPUI's: a point larger.
-        seg = if (selected) seg.bg(k.background).border(k.border.alpha(k.border.a * 0.8)).borderW(1).p(1).px(13).py(7) else seg;
+        seg = if (selected) seg.bg(k.background).border(k.border.alpha(0.8)).borderW(1).p(1).px(13).py(7) else seg;
         defer seg.end();
         const hot = seg.hovered();
         ui.text(c, opt[0], .{ .size = 12, .line_height = 12 * 1.618, .mono = true, .color = if (selected or hot) k.text else k.muted });

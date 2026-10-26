@@ -206,6 +206,10 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
             t.advance((num(o, "ms") orelse 0) / 1000);
         } else return fail(n, "no such step: {s}", .{do});
         settleScene(&t, &a);
+        // The GPUI renderer's step: 20 frames 15 ms apart and their
+        // drawing, about 0.36 s (a tooltip's 350 ms wait passes in it; a
+        // scrollbar's 1.66 s outlasts four).
+        if (!std.mem.eql(u8, do, "wait")) t.advance(0.36);
         try shot(&t, try std.fmt.bufPrint(&buf, "{s}/{s}-{d:0>2}.png", .{ out, name, n }));
     }
 }

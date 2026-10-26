@@ -39,7 +39,7 @@ pub fn iconButton(c: *ui.Context, k: theme.Colors, name: icons.Name, o: IconButt
     defer b.end();
     const clicked = b.clicked() and !o.disabled;
     const color = o.color orelse k.muted;
-    icons.icon(c, name, o.icon, if (o.disabled) color.alpha(color.a * 0.35) else color, 0);
+    icons.icon(c, name, o.icon, if (o.disabled) color.alpha(0.35) else color, 0);
     return clicked;
 }
 
@@ -65,7 +65,7 @@ pub fn fadeText(c: *ui.Context, s: []const u8, st: ui.TextStyle, max_w: f32) voi
         if (x0 >= max_w) break;
         const x1 = c.text.width(s[0 .. at + cp.len], st);
         const t = std.math.clamp((right - (x0 + x1) / 2) / band, 0, 1);
-        if (t < 1) spans.append(c.alloc(), .{ .start = @intCast(at), .end = @intCast(at + cp.len), .color = base.alpha(base.a * t) }) catch break;
+        if (t < 1) spans.append(c.alloc(), .{ .start = @intCast(at), .end = @intCast(at + cp.len), .color = base.alpha(t) }) catch break;
         at += cp.len;
         x0 = x1;
     }
@@ -215,6 +215,19 @@ pub fn dot(c: *ui.Context, size: f32, color: ui.Color) void {
 pub fn secondaryClicked(d: ui.Div) bool {
     if (comptime @hasDecl(ui.Div, "secondaryClicked")) return d.secondaryClicked();
     return false;
+}
+
+/// GPUI's `tab_index(0)` with `focus_visible`: a press focuses the box,
+/// and while it has the focus and the keyboard was used last, a ring of
+/// `width` in `color` (GPUI's `border_2().border_color(accent)`). True
+/// while it shows: GPUI's border grows the box, so the caller pads it by
+/// `width` more.
+pub fn focusRing(c: *ui.Context, d: ui.Div, color: ui.Color, width: f32) bool {
+    const it = c.interact(d.index, .{ .focusable = true });
+    const keyboard = if (comptime @hasField(ui.Context, "keyboard_modality")) c.keyboard_modality else false;
+    if (!it.focused or !keyboard) return false;
+    _ = d.border(color).borderW(width);
+    return true;
 }
 
 /// A line's height as GPUI's layout measures it: up to the device pixel

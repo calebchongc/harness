@@ -95,7 +95,7 @@ fn card(c: *ui.Context, a: *App, k: theme.Colors, chat_id: []const u8, tree: gra
     // `ml(4)`, then the card's left border and `pl(6)`.
     const outer = ui.div(c).row().pl(4).itemsCenter();
     defer outer.end();
-    _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = 20 }, .background = k.border.alpha(k.border.a * 0.6) }, .none, null);
+    _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = 20 }, .background = k.border.alpha(0.6) }, .none, null);
     const box = ui.div(c).row().pl(6).gap(2).itemsCenter();
     defer box.end();
     if (button(c, k, "Merge back", false, busy)) actions.run(a, chat_id, "merge");

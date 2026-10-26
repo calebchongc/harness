@@ -28,6 +28,8 @@ pub const Page = struct {
     queue: std.ArrayList([]u8) = .empty,
     deleting: bool = false,
     failed: usize = 0,
+    /// Delete all's focus ring, as last drawn (its width is the column's).
+    ring: f32 = 0,
 
     pub fn deinit(p: *Page, gpa: Allocator) void {
         if (p.busy) |b| gpa.free(b);
@@ -156,7 +158,7 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         const head = ui.div(c).row().wFull().gap(16).itemsEnd();
         defer head.end();
         const label = if (p.deleting) "Deleting…" else "Delete all";
-        const button_w: f32 = if (count > 0) 16 + deleteAllW(c, label) else 0;
+        const button_w: f32 = if (count > 0) 16 + deleteAllW(c, label) + 2 * p.ring else 0;
         {
             const col = ui.div(c).column().w(set.inner_w - button_w);
             defer col.end();
@@ -165,7 +167,14 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
             ui.text(c, "Hidden from the sidebar until you unarchive or delete them. Unarchiving puts a session back on its device.", .{ .size = 13, .line_height = 13 * phi, .wrap = true, .color = k.muted });
         }
         if (count > 0) {
-            var b = ui.div(c).row().px(12).py(6).gap(6).itemsCenter().rounded(8).bg(k.danger);
+            var b = ui.div(c).row().gap(6).itemsCenter().rounded(8).bg(k.danger);
+            // Focused from its click, it rings once keys are used.
+            const ring: f32 = if (kit.focusRing(c, b, k.accent, 2)) 2 else 0;
+            if (ring != p.ring) {
+                p.ring = ring;
+                c.animating = true;
+            }
+            b = b.px(12 + ring).py(6 + ring);
             // Half while deleting; 0.9 under the pointer.
             if (p.deleting) b = b.opacity(0.5) else if (b.hovered()) b = b.opacity(0.9);
             defer b.end();

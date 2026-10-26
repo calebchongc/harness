@@ -271,18 +271,18 @@ fn projects(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
                 m.ctx_at = c.input.mouse;
             }
             switch (row) {
-                .all => label(c, k, "All projects", it.hovered() or selected or i == m.active),
+                .all => labelWeight(c, k, "All projects", it.hovered() or selected or i == m.active, .medium),
                 .space => |id| if (a.findSpace(id)) |s| {
                     const tag = c.print("@ {s}", .{a.deviceName(s.device_id)});
-                    const tag_w = @min(c.text.width(tag, .{ .size = 10 }), (w - 2 * (inset + 1) - 16) / 2);
+                    const tag_w = @min(c.text.width(tag, .{ .size = 10, .weight = .medium }), (w - 2 * (inset + 1) - 16) / 2);
                     const off = !online(a, s.device_id, now);
                     const name_w = w - 2 * (inset + 1) - 16 - 10 - tag_w - (if (off) @as(f32, 22) else 0);
                     {
                         const t = ui.div(c).row().grow().w(0).clip();
                         defer t.end();
-                        kit.ellipsisText(c, s.name, .{ .size = 13, .line_height = 13 * phi, .color = if (it.hovered() or selected or i == m.active) k.text else k.text.alpha(0.9) }, name_w);
+                        kit.ellipsisText(c, s.name, .{ .size = 13, .line_height = 13 * phi, .weight = .medium, .color = if (it.hovered() or selected or i == m.active) k.text else k.text.alpha(0.9) }, name_w);
                     }
-                    kit.ellipsisText(c, tag, .{ .size = 10, .line_height = 10 * phi, .color = k.muted }, tag_w + 1);
+                    kit.ellipsisText(c, tag, .{ .size = 10, .line_height = 10 * phi, .weight = .medium, .color = k.muted }, tag_w + 1);
                     if (off) icons.icon(c, .@"wifi-off", 12, k.warning.alpha(0.8), 0);
                 },
                 .add => {},
@@ -293,7 +293,7 @@ fn projects(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
     {
         const d = ui.div(c).column().wFull().py(2);
         defer d.end();
-        _ = c.leaf(.{ .width = .{ .px = w - 2 }, .height = .{ .px = 1 }, .background = k.border.alpha(k.border.a * 0.6), .offset = .{ .x = -inset } }, .none, null);
+        _ = c.leaf(.{ .width = .{ .px = w - 2 }, .height = .{ .px = 1 }, .background = k.border.alpha(0.6), .offset = .{ .x = -inset } }, .none, null);
     }
     {
         ui.key(c, "spaces-menu-add");
@@ -301,7 +301,7 @@ fn projects(c: *ui.Context, a: *App, k: theme.Colors, r: ui.Rect) void {
         defer it.end();
         if (it.clicked()) picked = .add;
         icons.icon(c, .plus, 12, k.muted, 0);
-        label(c, k, "New project", it.hovered() or m.active == rows.len);
+        labelWeight(c, k, "New project", it.hovered() or m.active == rows.len, .medium);
     }
     if (picked) |p| activate(a, p);
 }
@@ -384,9 +384,15 @@ fn menuRow(c: *ui.Context, k: theme.Colors, selected: bool, highlighted: bool) u
 }
 
 fn label(c: *ui.Context, k: theme.Colors, text: []const u8, lit: bool) void {
+    labelWeight(c, k, text, lit, .regular);
+}
+
+/// The project menu's: it hangs from the filter, whose medium weight GPUI's
+/// rows inherit.
+fn labelWeight(c: *ui.Context, k: theme.Colors, text: []const u8, lit: bool, weight: @FieldType(ui.TextStyle, "weight")) void {
     const t = ui.div(c).row().grow().w(0).clip();
     defer t.end();
-    ui.text(c, text, .{ .size = 13, .line_height = 13 * phi, .color = if (lit) k.text else k.text.alpha(0.9) });
+    ui.text(c, text, .{ .size = 13, .line_height = 13 * phi, .weight = weight, .color = if (lit) k.text else k.text.alpha(0.9) });
 }
 
 // The view options.

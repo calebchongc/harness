@@ -725,7 +725,7 @@ fn footer(c: *ui.Context, a: *App, k: theme.Colors) void {
     const f = ui.div(c).row().wFull().p(8);
     defer f.end();
     var b = ui.div(c).row().size(21, 21).center().roundedFull();
-    b = if (a.view.account_menu) b.bg(k.hover) else b.hover(k.hover.alpha(k.hover.a * 0.8));
+    b = if (a.view.account_menu) b.bg(k.hover) else b.hover(k.hover.alpha(0.8));
     defer b.end();
     if (b.clicked()) {
         a.view.account_menu = !a.view.account_menu;
