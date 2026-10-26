@@ -105,7 +105,10 @@ def main() -> None:
         # One process a scene: the renderer keeps one settings file for its
         # run, so a later scene would open Settings where the last one left it.
         run([GPUI_BIN, scene, "--out", out / "gpui"])
-        run([SNAP_BIN, scene, out / "nano"])
+        # nano's clock is simulated: it replays how long each GPUI step took.
+        name = json.loads(pathlib.Path(scene).read_text()).get("name", "")
+        steps = out / "gpui" / f"{name}.steps.json"
+        run([SNAP_BIN, scene, out / "nano"], env={**os.environ, "NANO_GPUI_STEPS": str(steps)})
 
     budget = json.loads(BUDGET.read_text()) if BUDGET.exists() else {}
     failed = []

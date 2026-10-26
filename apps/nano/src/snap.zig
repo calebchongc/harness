@@ -174,13 +174,19 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
         .theme = theme.ui(dark),
     });
     defer t.deinit();
+    // How long the GPUI renderer's run of this scene really took to reach
+    // each frame (its steps.json, from NANO_GPUI_STEPS): the same moments
+    // drawn here, where time is simulated.
+    const timing = loadTiming(init, arena);
     settleScene(&t, &a);
+    if (timing.initial) |ms| catchUp(&t, 0, ms);
     var buf: [4096]u8 = undefined;
     try shot(&t, try std.fmt.bufPrint(&buf, "{s}/{s}.png", .{ out, name }));
     const steps = if (scene.get("steps")) |v| (if (v == .array) v.array.items else &.{}) else &.{};
     for (steps, 1..) |step, n| {
         if (step != .object) continue;
         const o = step.object;
+        const started = t.time;
         const do = str(o, "do") orelse "";
         const x = num(o, "x") orelse 0;
         const y = num(o, "y") orelse 0;
@@ -206,10 +212,13 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
             t.advance((num(o, "ms") orelse 0) / 1000);
         } else return fail(n, "no such step: {s}", .{do});
         settleScene(&t, &a);
-        // The GPUI renderer's step: 20 frames 15 ms apart and their
-        // drawing, about 0.36 s (a tooltip's 350 ms wait passes in it; a
-        // scrollbar's 1.66 s outlasts four).
-        if (!std.mem.eql(u8, do, "wait")) t.advance(0.36);
+        if (n - 1 < timing.steps.len) {
+            catchUp(&t, started, timing.steps[n - 1]);
+        } else if (!std.mem.eql(u8, do, "wait")) {
+            // Without its timings, the GPUI renderer's step as it mostly
+            // runs: 20 frames 15 ms apart and their drawing.
+            t.advance(0.36);
+        }
         try shot(&t, try std.fmt.bufPrint(&buf, "{s}/{s}-{d:0>2}.png", .{ out, name, n }));
     }
 }
@@ -220,6 +229,38 @@ fn settleScene(t: *ui.Tester, a: *App) void {
     t.settle(1);
     var rounds: usize = 0;
     while (a.engine.queued.items.len > 0 and rounds < 16) : (rounds += 1) t.settle(1);
+}
+
+const Timing = struct { initial: ?f64 = null, steps: []const f64 = &.{} };
+
+/// The GPUI renderer's steps.json: `initial_ms`, and each step's
+/// `elapsed_ms`.
+fn loadTiming(init: std.process.Init, arena: std.mem.Allocator) Timing {
+    const path = init.environ_map.get("NANO_GPUI_STEPS") orelse return .{};
+    const text = std.Io.Dir.cwd().readFileAlloc(init.io, path, arena, .limited(1 << 20)) catch return .{};
+    const v = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch return .{};
+    if (v != .object) return .{};
+    var out: Timing = .{ .initial = if (v.object.get("initial_ms")) |i| number(i) else null };
+    if (v.object.get("steps")) |list| if (list == .array) {
+        const times = arena.alloc(f64, list.array.items.len) catch return out;
+        for (list.array.items, times) |e, *ms| ms.* = if (e == .object) (if (e.object.get("elapsed_ms")) |x| number(x) orelse 0 else 0) else 0;
+        out.steps = times;
+    };
+    return out;
+}
+
+fn number(v: json.Value) ?f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => null,
+    };
+}
+
+/// Simulated time on to `ms` after `since`, if it isn't there yet.
+fn catchUp(t: *ui.Tester, since: f64, ms: f64) void {
+    const left = ms / 1000 - (t.time - since);
+    if (left > 0) t.advance(@floatCast(left));
 }
 
 fn shot(t: *ui.Tester, path: []const u8) !void {
