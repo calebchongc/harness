@@ -8,6 +8,7 @@ const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
+const themes = @import("themes.zig");
 const icons = @import("icons.zig");
 const set = @import("view_settings.zig");
 const App = @import("app.zig").App;
@@ -187,13 +188,18 @@ fn bar(c: *ui.Context, w: f32, color: Color) void {
 fn themeCard(c: *ui.Context, a: *App, k: theme.Colors) void {
     const cd = card(c, k);
     defer cd.end();
-    inline for (.{ .{ true, .sun, "Light theme", "Codegraff Light", false }, .{ false, .moon, "Dark theme", "Codegraff Dark", true } }, 0..) |t, i| {
+    inline for (.{ .{ .sun, "Light theme", false }, .{ .moon, "Dark theme", true } }, 0..) |t, i| {
         const r = set.row(c, k, i == 0, false);
         defer r.end();
-        set.tile(c, k, t[1]);
-        words(c, k, t[2], "Used whenever this appearance is active.", 218);
+        set.tile(c, k, t[0]);
+        words(c, k, t[1], "Used whenever this appearance is active.", 218);
         ui.spacer(c);
-        picker(c, k, theme.colors(t[4]), t[3]);
+        const id = a.settings.themeId(t[2]);
+        const v = themes.find(id);
+        const open = a.view.theme_menu != null and a.view.theme_menu.? == t[2];
+        const rect = picker(c, k, if (v) |x| x.colors else theme.builtin(t[2]), if (v) |x| x.name else id, open);
+        if (rect.clicked) a.view.theme_menu = if (open) null else t[2];
+        if (open) a.view.theme_anchor = rect.at;
     }
     {
         const r = set.row(c, k, false, false);
@@ -219,22 +225,81 @@ fn themeCard(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (b.clicked()) a.setNotice("Adding a theme isn't in Harness Nano yet: use Harness.");
 }
 
-/// The theme picker's closed state: the variant's swatch, its name, and
-/// the up-down arrow.
-fn picker(c: *ui.Context, k: theme.Colors, t: theme.Colors, name: []const u8) void {
-    const p = ui.div(c).row().w(218).h(34).px(11).gap(8).itemsCenter().rounded(8).border(k.border).borderW(1).bg(k.raised.alpha(0.42)).hover(k.raised);
+/// The theme picker's trigger: the variant's swatch, its name, and the
+/// up-down arrow (`render_theme_selector`).
+fn picker(c: *ui.Context, k: theme.Colors, t: theme.Colors, name: []const u8, open: bool) struct { clicked: bool, at: ?ui.Rect } {
+    var p = ui.div(c).row().w(218).h(34).px(11).gap(8).itemsCenter().rounded(8).border(if (open) k.border_strong else k.border).borderW(1).bg(k.raised.alpha(if (open) 0.75 else 0.42));
+    if (!open) p = p.hover(k.raised);
     defer p.end();
-    {
-        const sw = ui.div(c).row().size(30, 18).p(1).rounded(5).border(t.border).borderW(1).clip();
-        defer sw.end();
-        for ([_]Color{ t.shell, t.background, t.accent }) |col| _ = c.leaf(.{ .width = .{ .px = 28.0 / 3.0 }, .height = .fill, .background = col }, .none, null);
-    }
-    const n = ui.div(c).row().grow().w(0);
+    preview(c, k, t);
+    const n = ui.div(c).row().grow().w(0).clip();
     {
         defer n.end();
         ui.text(c, name, .{ .size = 12.5, .line_height = 12.5 * phi, .weight = .medium, .color = k.text });
     }
-    icons.icon(c, .@"sort-vertical", 14, k.muted.alpha(0.45), 0);
+    icons.icon(c, .@"sort-vertical", 14, k.muted.alpha(if (open) 0.9 else 0.45), 0);
+    return .{ .clicked = p.clicked(), .at = c.rects.get(c.node(p.index).id) };
+}
+
+/// `palette_preview`: the variant's shell, background and accent in a
+/// bordered 30 by 18 chip.
+fn preview(c: *ui.Context, k: theme.Colors, t: theme.Colors) void {
+    _ = k;
+    const sw = ui.div(c).row().size(30, 18).p(1).rounded(5).border(t.border).borderW(1).clip();
+    defer sw.end();
+    for ([_]Color{ t.shell, t.background, t.accent }) |col| _ = c.leaf(.{ .width = .{ .px = 28.0 / 3.0 }, .height = .fill, .background = col }, .none, null);
+}
+
+/// The open theme menu under its trigger: "Light themes" or "Dark themes",
+/// then every variant of that appearance; picking one applies it.
+pub fn themeMenu(c: *ui.Context, a: *App, k: theme.Colors) void {
+    const dark = a.view.theme_menu orelse return;
+    const at = a.view.theme_anchor orelse return;
+    const kit = @import("view_kit.zig");
+    if (kit.pressedOutside(c, at)) {
+        a.view.theme_menu = null;
+        return;
+    }
+    const w: f32 = 260;
+    const h = a.view.theme_menu_h orelse 300;
+    const rules = @import("rules.zig");
+    // Hung from the trigger's padding box, as GPUI's anchored menus are.
+    const x = rules.snapToWindow(at.x + 1, w, c.size.w, 8);
+    const y = rules.snapToWindow(at.y + at.h + 4.5, h, c.size.h, 8);
+    ui.key(c, "appearance-theme-menu");
+    const m = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(4 + 1).gap(2)
+        .bg(k.composer).border(k.border).borderW(1).rounded(12)));
+    defer m.end();
+    kit.rememberHeight(c, m, &a.view.theme_menu_h);
+    {
+        const hd = ui.div(c).row().wFull().px(8).pt(6).pb(4);
+        defer hd.end();
+        ui.text(c, if (dark) "D\u{200A}A\u{200A}R\u{200A}K\u{200A} \u{200A}T\u{200A}H\u{200A}E\u{200A}M\u{200A}E\u{200A}S" else "L\u{200A}I\u{200A}G\u{200A}H\u{200A}T\u{200A} \u{200A}T\u{200A}H\u{200A}E\u{200A}M\u{200A}E\u{200A}S", set.st(c, 10, .{ .weight = .medium, .color = k.muted }));
+    }
+    const picked = a.settings.themeId(dark);
+    for (themes.all()) |*v| if (v.dark == dark) {
+        ui.key(c, c.print("theme-{s}", .{v.id}));
+        const active = std.mem.eql(u8, v.id, picked);
+        const base = ui.div(c).row().wFull().px(8).py(6).gap(10).itemsCenter().rounded(7);
+        // `menu_row`'s hover is a listener's: a menu opening under a still
+        // pointer doesn't light the row there.
+        const lh = kit.listenerHover(&a.view.hovers, if (active) base.bg(k.selected) else base, k.selected);
+        const row = lh.div;
+        defer row.end();
+        const hot = lh.hovered;
+        preview(c, k, v.colors);
+        {
+            const n = ui.div(c).row().grow().w(0).clip();
+            defer n.end();
+            ui.text(c, v.name, set.st(c, 13, .{ .color = if (active or hot) k.text else k.text.alpha(0.9) }));
+        }
+        if (active) icons.icon(c, .check, 14, k.accent, 0);
+        if (row.clicked()) {
+            a.settings.setTheme(dark, v.id);
+            a.view.theme_menu = null;
+            a.redraw();
+        }
+    };
 }
 
 /// One accent: a 30-point chip over a 2-point underline in its colour when

@@ -249,6 +249,24 @@ pub const Store = struct {
         } else s.write("accent", .{ .string = "themeDefault" });
     }
 
+    /// The variant picked for the appearance (`themeSelection`), by id.
+    pub fn themeId(s: *const Store, dark: bool) []const u8 {
+        return s.text(if (dark) "themeSelection.dark" else "themeSelection.light") orelse
+            (if (dark) "codegraff-dark" else "codegraff-light");
+    }
+
+    /// Picks `id` for the appearance; the file keeps both, as the GPUI app
+    /// writes them (`{"light": …, "dark": …}`).
+    pub fn setTheme(s: *Store, dark: bool, id: []const u8) void {
+        s.remember(if (dark) "themeSelection.dark" else "themeSelection.light", .{ .string = id });
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        var obj: json.ObjectMap = .empty;
+        obj.put(arena.allocator(), "light", .{ .string = s.themeId(false) }) catch return;
+        obj.put(arena.allocator(), "dark", .{ .string = s.themeId(true) }) catch return;
+        s.write("themeSelection", .{ .object = obj });
+    }
+
     pub fn setText(s: *Store, key: []const u8, value: []const u8) void {
         s.remember(key, .{ .string = value });
         s.write(key, .{ .string = value });
@@ -400,6 +418,11 @@ pub const Store = struct {
             const a = s.doc_arena.?.allocator();
             s.pins = .empty;
             for (list.array.items) |v| if (v == .string) s.pins.append(a, a.dupe(u8, v.string) catch continue) catch {};
+        };
+        // `themeSelection`: {"light": id, "dark": id}, kept as two names.
+        if (o.get("themeSelection")) |v| if (v == .object) {
+            if (v.object.get("light")) |l| if (l == .string) s.remember("themeSelection.light", l);
+            if (v.object.get("dark")) |d| if (d == .string) s.remember("themeSelection.dark", d);
         };
         // `accent`: "themeDefault", or {"preset": name}, kept as its name.
         if (o.get("accent")) |v| switch (v) {

@@ -92,6 +92,11 @@ pub const View = struct {
     archived: @import("view_settings_archived.zig").Page = .{},
     /// Settings › Devices' Rename, Remove and copied id.
     devices: @import("view_settings_devices.zig").Page = .{},
+    /// Settings › Appearance's open theme menu (true: the dark one), its
+    /// trigger and its height as last drawn.
+    theme_menu: ?bool = null,
+    theme_anchor: ?nanoui.ui.Rect = null,
+    theme_menu_h: ?f32 = null,
     /// Boxes hovered as GPUI's `hover_listener` hovers them (kit.listenerHover).
     hovers: std.AutoHashMapUnmanaged(u64, bool) = .empty,
 
@@ -213,7 +218,7 @@ pub const App = struct {
     /// The project's actions, their editor, and the dock their runs show in.
     actions: @import("app_actions.zig").Actions,
     /// The terminal palette of the theme last drawn.
-    ansi: [16]nanoui.ui.Color = @import("theme.zig").colors(true).ansi,
+    ansi: [16]nanoui.ui.Color = @import("theme.zig").builtin(true).ansi,
     /// The surface pane and the file explorer beside the chat.
     panels: @import("app_panels.zig").Panels,
     /// The open chats, one per tab, and their split panes.

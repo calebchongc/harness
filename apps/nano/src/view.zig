@@ -21,6 +21,9 @@ const cluster_x: f32 = 88;
 const cluster_w: f32 = 24 * 3 + 8 + 2;
 
 pub fn view(a: *App, c: *ui.Context) void {
+    // The themes Settings › Appearance picked, for every palette drawn now.
+    theme.light_id = a.settings.themeId(false);
+    theme.dark_id = a.settings.themeId(true);
     const dark = a.dark orelse nanoui.isDark();
     c.theme = theme.ui(dark);
     // The accent Settings › Appearance chose, in place of the theme's.

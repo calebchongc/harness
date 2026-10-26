@@ -152,6 +152,8 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
     // The column's inside: wrapped text needs its width up front.
     const main_w = c.size.w - sidebar.width;
     inner_w = @min(main_w, 768) - 2 * 24;
+    // Appearance's theme menu doesn't outlive its page.
+    if (a.settings.section != .appearance) a.view.theme_menu = null;
     switch (a.settings.section) {
         .notifications => notifications(c, a, k),
         .files => files(c, a, k),
@@ -162,7 +164,11 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         },
         .devices => @import("view_settings_devices.zig").page(c, a, k),
         .shortcuts => @import("view_settings_shortcuts.zig").page(c, a, k),
-        .appearance => @import("view_settings_appearance.zig").page(c, a, k),
+        .appearance => {
+            const look = @import("view_settings_appearance.zig");
+            look.page(c, a, k);
+            look.themeMenu(c, a, k);
+        },
         .mcp => @import("view_settings_mcp.zig").page(c, a, k),
         .appshots => @import("view_settings_appshots.zig").page(c, a, k),
         .github_ci => @import("view_settings_github_ci.zig").page(c, a, k),

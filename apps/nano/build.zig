@@ -26,6 +26,16 @@ pub fn build(b: *std.Build) void {
         \\
     );
     const fonts = b.createModule(.{ .root_source_file = fonts_root });
+    // The built-in themes, the catalog the phones bundle (crates/theme keeps
+    // it in lockstep with the GPUI app's registry).
+    const theme_files = b.addWriteFiles();
+    _ = theme_files.addCopyFile(b.path("../ios/Harness/Theme/themes.json"), "themes.json");
+    const themes_root = theme_files.add("themes_json.zig",
+        \\//! The built-in theme catalog, as JSON.
+        \\pub const json = @embedFile("themes.json");
+        \\
+    );
+    const themes_json = b.createModule(.{ .root_source_file = themes_root });
     // Harness's version, as the GPUI app has it: the workspace's.
     const info = b.addOptions();
     info.addOption([]const u8, "version", workspaceVersion(b));
@@ -34,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "nanoui", .module = nanoui },
         .{ .name = "http_zig", .module = http_zig },
         .{ .name = "fonts", .module = fonts },
+        .{ .name = "themes_json", .module = themes_json },
     };
 
     const exe = b.addExecutable(.{ .name = "harness-nano", .root_module = b.createModule(.{

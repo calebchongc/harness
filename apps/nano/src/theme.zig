@@ -69,7 +69,19 @@ pub const Colors = struct {
 const white: Color = .{ .r = 1, .g = 1, .b = 1 };
 const black: Color = .{};
 
+/// The variants Settings › Appearance picked (`themeSelection`), by id.
+pub var light_id: []const u8 = "codegraff-light";
+pub var dark_id: []const u8 = "codegraff-dark";
+
+/// The picked variant's palette for the appearance (themes.zig), else
+/// Codegraff's.
 pub fn colors(dark: bool) Colors {
+    if (@import("themes.zig").find(if (dark) dark_id else light_id)) |v| if (v.dark == dark) return v.colors;
+    return builtin(dark);
+}
+
+/// Codegraff Dark and Codegraff Light, as the GPUI app resolves them.
+pub fn builtin(dark: bool) Colors {
     if (dark) {
         const accent = Color.hex(0xe8a33d);
         const muted = Color.hex(0x9a9384);

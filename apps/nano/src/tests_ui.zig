@@ -264,6 +264,37 @@ test "Settings › Appearance: Light switches the window, an accent recolours it
     try testing.expectEqual(@as(f32, 1008), @import("view_transcript.zig").column_w);
 }
 
+test "Settings › Appearance: the dark theme's picker lists the dark themes, and picking one repaints the window" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const theme = @import("theme.zig");
+    defer {
+        theme.light_id = "codegraff-light";
+        theme.dark_id = "codegraff-dark";
+    }
+    @import("view_settings.zig").open(&h.a);
+    h.a.settings.section = .appearance;
+    h.t.settle(1);
+    try h.t.clickText("Codegraff Dark");
+    h.t.settle(1);
+    try testing.expectEqual(@as(?bool, true), h.a.view.theme_menu);
+    try testing.expect(h.t.containsText("D\u{200A}A\u{200A}R\u{200A}K"));
+    try testing.expect(h.t.hasText("Dracula"));
+    // A light theme isn't among the dark ones.
+    try testing.expect(!h.t.hasText("Catppuccin Latte"));
+    try h.t.clickText("Dracula");
+    h.t.settle(1);
+    try testing.expect(h.a.view.theme_menu == null);
+    try testing.expectEqualStrings("dracula", h.a.settings.themeId(true));
+    try testing.expectEqualStrings("dracula", theme.dark_id);
+    const dracula = @import("themes.zig").find("dracula").?;
+    try testing.expectEqual(dracula.colors.shell, theme.colors(true).shell);
+    // The trigger names it now, and the light theme stays Codegraff's.
+    try testing.expect(h.t.hasText("Dracula"));
+    try testing.expectEqualStrings("codegraff-light", h.a.settings.themeId(false));
+}
+
 test "a session dragged from the sidebar onto the right target opens in a new pane to the right" {
     var h: Harness = undefined;
     try h.init();
