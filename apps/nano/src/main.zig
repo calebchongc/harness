@@ -7,9 +7,11 @@ const nanoui = @import("nanoui");
 const App = @import("app.zig").App;
 const Engine = @import("engine.zig").Engine;
 const theme = @import("theme.zig");
+const crash_log = @import("crash_log.zig");
 
-/// Warnings too, in every build: why a picture isn't drawn, say.
-pub const std_options: std.Options = .{ .log_level = .warn };
+/// Warnings too, in every build: why a picture isn't drawn, say. A fatal
+/// signal's stack trace in every build too, into the crash log.
+pub const std_options: std.Options = .{ .log_level = .warn, .enable_segfault_handler = true };
 
 pub fn main(init: std.process.Init) !void {
     theme.registerFonts();
@@ -19,6 +21,8 @@ pub fn main(init: std.process.Init) !void {
     defer a.deinit();
     a.new_harness = try init.gpa.dupe(u8, init.environ_map.get("HARNESS_NANO_HARNESS") orelse "graff");
     a.settings = .open(init.gpa, init.io, init.environ_map);
+    // Panics, fatal signals and hangs leave their stacks in ~/.harness/logs.
+    if (a.settings.dataDir()) |dir| crash_log.start(init.io, dir);
     // Custom themes either app added, for the pickers and a picked one.
     if (a.settings.dataDir()) |dir| @import("themes.zig").loadLibrary(init.io, dir);
     a.view.setFilter(init.gpa, a.settings.spaceFilter());
@@ -47,6 +51,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.indexOf(u8, list, "diffs") != null) a.panels.tabs.append(a.gpa, .{ .kind = .diffs }) catch {};
         a.panels.host_open = a.panels.tabs.items.len > 0;
     }
+    // Proves the crash log: a hang of 5 seconds, or a panic, once the
+    // window is up.
+    if (init.environ_map.get("HARNESS_NANO_CRASH_TEST")) |what| crash_log.selfTest(what);
     a.release.done = .{ .ctx = &a, .func = App.releaseCame };
     a.release.start();
     try app.run();
