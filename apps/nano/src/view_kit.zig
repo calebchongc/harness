@@ -124,7 +124,10 @@ pub fn highlightText(c: *ui.Context, k: theme.Colors, s: []const u8, st: ui.Text
 /// A muted key-cap inside a row or header (`popover::kbd_hint`): 5 across,
 /// 1 down, rounded 5, on ink(0.05), 10-point mono.
 pub fn kbdHint(c: *ui.Context, k: theme.Colors, label: []const u8) void {
-    const b = ui.div(c).row().px(5).py(1).rounded(5).bg(k.ink(0.05)).itemsCenter();
+    // Its words as GPUI measures them: a mono run's whole-point width
+    // carries a float's excess, which rounding up makes a point more.
+    const tw = c.text.width(label, .{ .size = 10, .mono = true });
+    const b = ui.div(c).row().w(10 + @floor(tw + 1)).px(5).py(1).rounded(5).bg(k.ink(0.05)).itemsCenter();
     defer b.end();
     // In the frame's memory: the text is drawn after the caller returns.
     ui.text(c, c.alloc().dupe(u8, label) catch return, .{ .size = 10, .line_height = 16, .mono = true, .color = k.muted });

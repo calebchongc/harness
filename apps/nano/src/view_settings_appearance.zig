@@ -274,7 +274,8 @@ fn windowCard(c: *ui.Context, a: *App, k: theme.Colors) void {
     const r = set.row(c, k, false, false);
     defer r.end();
     set.tile(c, k, .@"file-image");
-    words(c, k, "New thread composer background", "Add an image behind the composer on empty new threads.", 100);
+    // Choose image's own width: 10 before it, 10 a side, its words.
+    words(c, k, "New thread composer background", "Add an image behind the composer on empty new threads.", 10 + 2 * 10 + @ceil(c.text.width("Choose image", .{ .size = 11.5 })));
     ui.spacer(c);
     const act = ui.div(c).row().pl(10).gap(6);
     defer act.end();
@@ -349,15 +350,18 @@ fn fonts(c: *ui.Context, a: *App, k: theme.Colors) void {
         const r = ui.div(c).row().wFull().gap(24).itemsCenter();
         defer r.end();
         {
-            // Less the spacer's gap too: the pair sits at the row's end.
-            const l = ui.div(c).column().w(set.inner_w - 24 - 24 - 220 - 8 - 128).gap(4);
+            // `flex_1`: the row less the pair and the gap; the words at
+            // most 520 wide.
+            const lw = set.inner_w - 24 - 220 - 8 - 128;
+            const l = ui.div(c).column().w(lw).gap(4);
             defer l.end();
             set.fieldLabel(c, k, f[0]);
+            const dw = ui.div(c).column().w(@min(lw, 520));
+            defer dw.end();
             ui.text(c, f[1], .{ .size = 12, .line_height = 18, .wrap = true, .color = k.muted });
         }
         const family = a.settings.text(f[2]) orelse f[3];
         const size = a.settings.number(f[4]) orelse f[5];
-        ui.spacer(c);
         const pair = ui.div(c).row().gap(8);
         defer pair.end();
         if (dropdown(c, k, 220, familyLabel(family))) a.setNotice("Choosing a font isn't in Harness Nano yet: use Harness.");

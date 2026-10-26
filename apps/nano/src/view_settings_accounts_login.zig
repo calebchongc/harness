@@ -377,9 +377,13 @@ fn urlField(c: *ui.Context, a: *App, k: theme.Colors, url: []const u8) void {
     const label: []const u8 = if (s.copied_until != null) "Copied" else "Copy";
     const r = ui.div(c).row().w(inner).pl(11).pr(5).py(5).gap(8).itemsCenter().rounded(8).border(k.border).borderW(1).bg(k.ink(0.03));
     defer r.end();
-    const copy_w = 24 + c.text.width(label, .{ .size = 13 });
-    kit.ellipsisText(c, url, st(c, 12, .{ .mono = true, .color = k.text }), inner - 2 - 10 - 4 - 8 - copy_w);
-    ui.spacer(c);
+    const copy_w = 24 + @ceil(c.text.width(label, .{ .size = 13 }));
+    {
+        // `flex_1().truncate()`: the rest of the row, whatever Copy takes.
+        const t = ui.div(c).row().grow().w(0).clip();
+        defer t.end();
+        kit.ellipsisText(c, url, st(c, 12, .{ .mono = true, .color = k.text }), inner - 2 - 10 - 4 - 8 - copy_w);
+    }
     if (ghostButton(c, k, label, 3)) {
         c.clipboard.write(c.clipboard.ctx, url);
         s.copied_until = c.time + copied_s;
@@ -437,14 +441,12 @@ fn pasteBody(c: *ui.Context, a: *App, k: theme.Colors, f: *Flow) void {
     set.space(c, 12);
     var submitted = false;
     {
-        // `dialog_field` in the mono face: its input's own 22.75-point
-        // line; 2 of the 9 above and below are the bare field's.
+        // `dialog_field`: its input's own 22.75-point line; 2 of the 9
+        // above and below are the bare field's.
         const fr = ui.div(c).row().wFull().px(13).py(7).rounded(8).border(k.ink(0.08)).borderW(1).bg(k.ink(0.04));
         defer fr.end();
         const at = c.nodes.items.len;
-        var opts: ui.TextFieldOptions = .{ .placeholder = "Paste the authorization code", .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 13, .line_height = 22.75 };
-        // Mono, with a nanoui whose fields have the face.
-        if (comptime @hasField(ui.TextFieldOptions, "mono")) @field(opts, "mono") = true;
+        const opts: ui.TextFieldOptions = .{ .placeholder = "Paste the authorization code", .placeholder_color = k.faint, .width = .fill, .bare = true, .size = 14, .line_height = kit.measured(22.75) };
         const r = ui.textField(c, &s.code, opts);
         if (s.focus_code) {
             c.focus = c.node(@intCast(at)).id;
