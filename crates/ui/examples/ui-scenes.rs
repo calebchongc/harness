@@ -299,10 +299,15 @@ fn main() -> anyhow::Result<()> {
             println!("{}", path.display());
             Ok(())
         };
+        let opened = Instant::now();
         settle(40);
+        // The real time each frame took to reach, so a renderer on a
+        // simulated clock (harness-nano's) can draw the same moment.
+        let initial_ms = opened.elapsed().as_secs_f64() * 1000.0;
         save(&out.join(format!("{}.png", scene.name)))?;
         let mut log = Vec::new();
         for (i, step) in scene.steps.iter().enumerate() {
+            let started = Instant::now();
             // Through the untyped handle: the Shell isn't held while the
             // event reaches it.
             app.update(|cx| {
@@ -315,16 +320,22 @@ fn main() -> anyhow::Result<()> {
             } else {
                 settle(20)
             };
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             let png = format!("{}-{:02}.png", scene.name, i + 1);
             save(&out.join(&png))?;
-            log.push(serde_json::json!({ "step": step, "frame": png, "frame_ms": ms }));
+            log.push(serde_json::json!({
+                "step": step,
+                "frame": png,
+                "frame_ms": ms,
+                "elapsed_ms": elapsed_ms,
+            }));
         }
-        if !log.is_empty() {
-            std::fs::write(
-                out.join(format!("{}.steps.json", scene.name)),
-                serde_json::to_vec_pretty(&log)?,
-            )?;
-        }
+        std::fs::write(
+            out.join(format!("{}.steps.json", scene.name)),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({ "initial_ms": initial_ms, "steps": log }),
+            )?,
+        )?;
         app.update(|cx| {
             window
                 .update(cx, |_, window, _| window.remove_window())
