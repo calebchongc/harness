@@ -103,6 +103,10 @@ pub const View = struct {
     theme_review: std.ArrayList(u8) = .empty,
     theme_review_open: bool = false,
     library_error: std.ArrayList(u8) = .empty,
+    /// An entry's action, and a library read the picker asked for, done at
+    /// the next frame's start (`settleFrame`).
+    theme_pending: ?@import("app_theme_library.zig").Pending = null,
+    theme_reload: bool = false,
     /// Boxes hovered as GPUI's `hover_listener` hovers them (kit.listenerHover).
     hovers: std.AutoHashMapUnmanaged(u64, bool) = .empty,
 
@@ -192,6 +196,11 @@ pub const App = struct {
     selected: ?[]u8 = null,
     space: ?[]u8 = null,
     transcript: Transcript,
+    /// What `select` let go of: the frame that let go may have drawn it
+    /// already, and lays it out after. Freed at the next frame's start
+    /// (`reap`).
+    retired: std.ArrayList(Transcript) = .empty,
+    retired_ids: std.ArrayList([]u8) = .empty,
     composer: nanoui.ui.TextBuffer = .{},
     /// The last error the engine gave, shown under the composer.
     notice: [200]u8 = undefined,
@@ -319,6 +328,9 @@ pub const App = struct {
         a.panels.deinit();
         a.actions.deinit();
         a.transcript.deinit();
+        a.reap();
+        a.retired.deinit(a.gpa);
+        a.retired_ids.deinit(a.gpa);
         if (a.selected) |s| a.gpa.free(s);
         if (a.space) |s| a.gpa.free(s);
         if (a.device_id) |d| a.gpa.free(d);
@@ -847,10 +859,14 @@ pub const App = struct {
         a.view.focus_composer = true;
         if (a.w_doc.id) |id| a.engine.cancel(id);
         a.w_doc = .{};
-        a.transcript.clear();
+        // Not freed now: this frame may have drawn it (a split dropped
+        // last, the palette's pick), and its layout still reads it.
+        if (a.retired.append(a.gpa, a.transcript)) |_| {
+            a.transcript = .{ .gpa = a.gpa };
+        } else |_| a.transcript.clear();
         a.notice_len = 0;
         queue_mod.stop(a);
-        if (a.selected) |s| a.gpa.free(s);
+        if (a.selected) |s| a.retired_ids.append(a.gpa, s) catch a.gpa.free(s);
         a.selected = if (chat_id) |c| a.gpa.dupe(u8, c) catch null else null;
         if (space_id) |s| {
             if (a.space) |old| a.gpa.free(old);
@@ -868,6 +884,15 @@ pub const App = struct {
 
     /// Opened, a chat is seen (`mark_chat_seen`): here at once, its
     /// Done giving way to its time, then on the host; only when unseen.
+    /// At a frame's start, before anything is drawn: what `select` let go
+    /// of, freed.
+    pub fn reap(a: *App) void {
+        for (a.retired.items) |*t| t.deinit();
+        a.retired.clearRetainingCapacity();
+        for (a.retired_ids.items) |s| a.gpa.free(s);
+        a.retired_ids.clearRetainingCapacity();
+    }
+
     pub fn markSeen(a: *App, id: []const u8) void {
         for (a.chats.items) |*ch| if (std.mem.eql(u8, ch.id, id)) {
             if (!workspace.unseen(ch.*)) return;

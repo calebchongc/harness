@@ -35,6 +35,9 @@ pub const Import = struct {
     selected: std.StringHashMapUnmanaged(void) = .empty,
     review: ?[]const u8 = null,
     err: std.ArrayList(u8) = .empty,
+    /// What was clicked, done at the next frame's start (`settleFrame`):
+    /// each frees or remakes what this frame drew.
+    pending: enum { none, close, primary, browse } = .none,
 };
 
 pub fn open(a: *App) void {
@@ -165,7 +168,7 @@ pub fn dialog(c: *ui.Context, a: *App, k: theme.Colors) void {
     defer card.end();
     // `on_mouse_down_out`.
     if (kit.pressedOutside(c, c.rects.get(c.node(card.index).id))) return close(a);
-    if (c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true })) analyzeOrFinish(a, d);
+    if (c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true })) d.pending = .primary;
     var act: enum { none, close, browse, primary } = .none;
     {
         const h = ui.div(c).row().wFull().px(20).pt(18).pb(16).gap(16);
@@ -211,7 +214,7 @@ pub fn dialog(c: *ui.Context, a: *App, k: theme.Colors) void {
                     d.review = null;
                     d.err.clearRetainingCapacity();
                 };
-                if (res.submitted) analyzeOrFinish(a, d);
+                if (res.submitted) d.pending = .primary;
             }
             if (compactAction(c, a, k, "Browse…", .{ .h = 36, .px = 12 })) act = .browse;
         }
@@ -259,6 +262,30 @@ pub fn dialog(c: *ui.Context, a: *App, k: theme.Colors) void {
         if (b.clicked() and (d.compilation == null or ready)) act = .primary;
     }
     switch (act) {
+        .none => {},
+        .close => d.pending = .close,
+        .primary => d.pending = .primary,
+        .browse => d.pending = .browse,
+    }
+    if (d.pending != .none) c.animating = true;
+}
+
+/// At a frame's start, before anything is drawn: what last frame's clicks
+/// asked of the dialog and the library, done now that nothing drawn reads
+/// what they free.
+pub fn settleFrame(a: *App) void {
+    if (a.view.theme_reload) {
+        a.view.theme_reload = false;
+        if (a.settings.dataDir()) |dir| themes.loadLibrary(a.io, dir);
+    }
+    if (a.view.theme_pending) |p| {
+        a.view.theme_pending = null;
+        ops.run(a, p);
+    }
+    const d = a.view.theme_import orelse return;
+    const pending = d.pending;
+    d.pending = .none;
+    switch (pending) {
         .none => {},
         .close => close(a),
         .primary => analyzeOrFinish(a, d),
@@ -513,7 +540,10 @@ pub fn libraryRows(c: *ui.Context, a: *App, k: theme.Colors) void {
             if (entry(c, a, k, e)) |kind| pending = .of(kind, e.id);
         };
     }
-    if (pending) |p| ops.run(a, p);
+    if (pending) |p| {
+        a.view.theme_pending = p;
+        c.animating = true;
+    }
 }
 
 fn entry(c: *ui.Context, a: *App, k: theme.Colors, e: library.Entry) ?ops.Kind {

@@ -20,7 +20,8 @@
 //! A scene with a `name` is the GPUI renderer's instead
 //! (crates/ui/examples/ui-scenes.rs): the same state set up as it sets it
 //! up, the same steps (`{"do": "click", "x", "y"}`, `hover`, `key` with
-//! `keys`, `type` with `text`, `scroll` with `dy`, `wait` with `ms`), and
+//! `keys`, `type` with `text`, `scroll` with `dy`, `wait` with `ms`; and,
+//! nano's alone, `drag` from x, y to `x2`, `y2`), and
 //! the same files, `<name>.png` then `<name>-NN.png` after each step, so
 //! apps/nano/parity/check.py can set the two side by side.
 const std = @import("std");
@@ -213,6 +214,20 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
                 t.textOps(&.{.{ .insert = s[i..@min(s.len, i + len)] }});
                 i += len;
             }
+        } else if (std.mem.eql(u8, do, "drag")) {
+            // Pressed at x, y, carried to x2, y2 a frame at a time, let go.
+            const x2 = num(o, "x2") orelse x;
+            const y2 = num(o, "y2") orelse y;
+            t.moveTo(x, y);
+            t.ctx.pointerDown();
+            t.frame();
+            for (1..9) |i| {
+                const f: f32 = @as(f32, @floatFromInt(i)) / 8;
+                t.ctx.input.mouse = .{ .x = x + (x2 - x) * f, .y = y + (y2 - y) * f };
+                t.frame();
+            }
+            t.ctx.pointerUp();
+            t.frame();
         } else if (std.mem.eql(u8, do, "scroll")) {
             t.scroll(x, y, num(o, "dy") orelse 0);
         } else if (std.mem.eql(u8, do, "wait")) {

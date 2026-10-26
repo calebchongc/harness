@@ -66,6 +66,9 @@ pub fn view(a: *App, c: *ui.Context) void {
     // A line taller than its font's centres its glyphs as GPUI's
     // `ShapedLine::paint` does (justrach/nanoui baseline_rule).
     if (comptime @hasField(@TypeOf(c.text.*), "baseline_rule")) c.text.baseline_rule = .glyph_box;
+    // Last frame's let-go transcript, now nothing drawn reads it.
+    a.reap();
+    @import("view_settings_theme_import.zig").settleFrame(a);
     keys(c, a);
     @import("view_drag.zig").update(c, a);
     a.syncPeers();

@@ -26,6 +26,10 @@ pub const Drag = struct {
     active: bool = false,
     /// Where it would land in the sidebar, as of this frame.
     target: ?pins.Target = null,
+    /// Let go on a target: done at the next frame's start (`update`).
+    drop: ?Drop = null,
+
+    pub const Drop = union(enum) { split: tabs.Axis, sidebar: pins.Target };
 
     pub fn deinit(d: *Drag, gpa: std.mem.Allocator) void {
         d.id.deinit(gpa);
@@ -87,9 +91,23 @@ pub fn dragging(a: *const App) bool {
     return a.view.drag.active;
 }
 
-/// Early each frame: a press becomes a drag once it has moved far enough.
+/// Early each frame: last frame's drop done, before anything is drawn (a
+/// split opens a chat, and the transcript drawn with the release would be
+/// freed under the frame still laying it out); and a press becomes a drag
+/// once it has moved far enough.
 pub fn update(c: *ui.Context, a: *App) void {
     const d = &a.view.drag;
+    if (d.drop) |drop| {
+        d.drop = null;
+        const id = a.gpa.dupe(u8, d.id.items) catch "";
+        defer if (id.len > 0) a.gpa.free(id);
+        d.id.clearRetainingCapacity();
+        if (id.len > 0) switch (drop) {
+            .split => |axis| a.splitOpening(axis, id),
+            .sidebar => |t| dropInSidebar(a, a.gpa, id, t),
+        };
+        return;
+    }
     if (d.id.items.len == 0) return;
     if (!d.active and c.input.down) {
         const dx = c.input.mouse.x - d.origin.x;
@@ -173,14 +191,12 @@ pub fn overlay(c: *ui.Context, a: *App, k: theme.Colors) void {
         c.cursor = .hand;
         return;
     }
-    // Released.
-    const id = a.gpa.dupe(u8, d.id.items) catch "";
-    defer if (id.len > 0) a.gpa.free(id);
-    d.id.clearRetainingCapacity();
+    // Released: what it was let go on is done next frame, before anything
+    // is drawn; drawn now, this frame's text must outlive it.
     d.active = false;
-    if (over) |z| return a.splitOpening(z.axis, id);
-    if (d.target) |t| dropInSidebar(a, a.gpa, id, t);
+    d.drop = if (over) |z| .{ .split = z.axis } else if (d.target) |t| .{ .sidebar = t } else null;
     d.target = null;
+    if (d.drop == null) d.id.clearRetainingCapacity() else c.animating = true;
 }
 
 /// The dragged row, raised, in the sidebar's column at the pointer's

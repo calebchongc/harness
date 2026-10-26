@@ -203,7 +203,7 @@ fn themeCard(c: *ui.Context, a: *App, k: theme.Colors) void {
         if (rect.clicked) {
             a.view.theme_menu = if (open) null else t[2];
             // A theme the GPUI app added since shows in the menu.
-            if (!open) if (a.settings.dataDir()) |dir| themes.loadLibrary(a.io, dir);
+            if (!open) a.view.theme_reload = true;
         }
         if (open) a.view.theme_anchor = rect.at;
     }

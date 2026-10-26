@@ -321,6 +321,48 @@ test "a session dragged from the sidebar onto the right target opens in a new pa
     try testing.expectEqualStrings("a", s.panes.items[0].?);
 }
 
+test "the open session dragged onto its own right target: a split with it and a new chat, nothing lost" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    // Alpha, the open one, is the row above Beta's (the newest first).
+    const beta = h.t.findText("Beta") orelse return error.NoRow;
+    h.t.moveTo(beta.x + 4, beta.y + 4 - @import("view_sidebar.zig").row_slot);
+    h.t.ctx.pointerDown();
+    h.t.frame();
+    h.t.ctx.input.mouse = .{ .x = 900, .y = 300 };
+    h.t.frame();
+    h.t.ctx.input.mouse = .{ .x = 1100, .y = 400 };
+    h.t.frame();
+    try testing.expectEqualStrings("a", h.a.view.drag.id.items);
+    try testing.expect(h.t.hasText("Open to the right ◨"));
+    h.t.ctx.pointerUp();
+    h.t.frame();
+    // The release frame's transcript was drawn with Alpha's; opening the
+    // split there freed it under the frame's layout (a segfault with a long
+    // one). It waits for the next frame's start.
+    try testing.expect(h.a.tabs.layout() == null);
+    h.t.frame();
+    try testing.expect(h.a.tabs.layout() != null);
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText("Open to the right ◨"));
+    try testing.expectEqualStrings("a", h.a.selected.?);
+}
+
+test "a chat let go of mid-frame keeps its transcript until the next frame starts" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    try h.a.transcript.entries.append(testing.allocator, .{ .id = try testing.allocator.dupe(u8, "e1"), .role = .user, .status = .complete });
+    h.a.select("b", null);
+    // Drawn this frame, laid out after: still there.
+    try testing.expectEqual(@as(usize, 1), h.a.retired.items.len);
+    try testing.expectEqual(@as(usize, 1), h.a.retired.items[0].entries.items.len);
+    try testing.expectEqual(@as(usize, 0), h.a.transcript.entries.items.len);
+    h.t.frame();
+    try testing.expectEqual(@as(usize, 0), h.a.retired.items.len);
+}
+
 test "a drag released off the targets does nothing, and isn't a click" {
     var h: Harness = undefined;
     try h.init();
