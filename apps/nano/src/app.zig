@@ -97,6 +97,12 @@ pub const View = struct {
     theme_menu: ?bool = null,
     theme_anchor: ?nanoui.ui.Rect = null,
     theme_menu_h: ?f32 = null,
+    /// Appearance's "Add a theme" dialog, the entry "Theme mapping" shows,
+    /// and what the library's last action said.
+    theme_import: ?*@import("view_settings_theme_import.zig").Import = null,
+    theme_review: std.ArrayList(u8) = .empty,
+    theme_review_open: bool = false,
+    library_error: std.ArrayList(u8) = .empty,
     /// Boxes hovered as GPUI's `hover_listener` hovers them (kit.listenerHover).
     hovers: std.AutoHashMapUnmanaged(u64, bool) = .empty,
 
@@ -108,6 +114,13 @@ pub const View = struct {
         v.archived.deinit(gpa);
         v.devices.deinit(gpa);
         v.hovers.deinit(gpa);
+        v.theme_review.deinit(gpa);
+        v.library_error.deinit(gpa);
+        if (v.theme_import) |d| {
+            d.arena.deinit();
+            d.err.deinit(gpa);
+            gpa.destroy(d);
+        }
         v.shortcut_notice.deinit(gpa);
         v.drag.deinit(gpa);
         v.chat_menu.id.deinit(gpa);

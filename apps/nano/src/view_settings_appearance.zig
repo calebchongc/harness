@@ -11,6 +11,7 @@ const theme = @import("theme.zig");
 const themes = @import("themes.zig");
 const icons = @import("icons.zig");
 const set = @import("view_settings.zig");
+const import_view = @import("view_settings_theme_import.zig");
 const App = @import("app.zig").App;
 const Color = ui.Color;
 
@@ -82,6 +83,7 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
     caption(c, k, "Motion");
     motionCard(c, a, k);
     fonts(c, a, k);
+    import_view.warning(c, a, k);
 }
 
 /// The row's words, less the room a spacer's extra gap takes.
@@ -157,10 +159,10 @@ pub fn setMode(a: *App, m: Mode) void {
     };
 }
 
-const Corners = enum { all, left, right };
+pub const Corners = enum { all, left, right };
 
 /// A window in little: a sidebar of four bars and a pane of four lines.
-fn miniature(c: *ui.Context, t: theme.Colors, w: f32, corners: Corners) void {
+pub fn miniature(c: *ui.Context, t: theme.Colors, w: f32, corners: Corners) void {
     _ = corners;
     const line = t.text.alpha(0.22);
     const strong = t.text.alpha(0.34);
@@ -218,15 +220,18 @@ fn themeCard(c: *ui.Context, a: *App, k: theme.Colors) void {
         if (swatch(c, k, null, chosen == null)) a.settings.setAccent(null);
         for (presets) |p| if (swatch(c, k, p, chosen != null and std.mem.eql(u8, chosen.?.name, p.name))) a.settings.setAccent(p.name);
     }
-    const r = set.row(c, k, false, false);
-    defer r.end();
-    set.tile(c, k, .@"folder-with-files");
-    words(c, k, "Theme library", "Import or link custom themes.", 92);
-    ui.spacer(c);
-    const b = ui.div(c).row().px(12).py(6).rounded(8).bg(k.solid);
-    defer b.end();
-    ui.text(c, "Add theme", .{ .size = 13, .line_height = 13 * phi, .weight = .medium, .color = k.on_solid });
-    if (b.clicked()) a.setNotice("Adding a theme isn't in Harness Nano yet: use Harness.");
+    {
+        const r = set.row(c, k, false, false);
+        defer r.end();
+        set.tile(c, k, .@"folder-with-files");
+        words(c, k, "Theme library", "Import or link custom themes.", 92);
+        ui.spacer(c);
+        const b = ui.div(c).row().px(12).py(6).rounded(8).bg(k.solid);
+        defer b.end();
+        ui.text(c, "Add theme", .{ .size = 13, .line_height = 13 * phi, .weight = .medium, .color = k.on_solid });
+        if (b.clicked()) import_view.open(a);
+    }
+    import_view.libraryRows(c, a, k);
 }
 
 /// The theme picker's trigger: the variant's swatch, its name, and the
@@ -247,7 +252,7 @@ fn picker(c: *ui.Context, k: theme.Colors, t: theme.Colors, name: []const u8, op
 
 /// `palette_preview`: the variant's shell, background and accent in a
 /// bordered 30 by 18 chip.
-fn preview(c: *ui.Context, k: theme.Colors, t: theme.Colors) void {
+pub fn preview(c: *ui.Context, k: theme.Colors, t: theme.Colors) void {
     _ = k;
     const sw = ui.div(c).row().size(30, 18).p(1).rounded(5).border(t.border).borderW(1).clip();
     defer sw.end();

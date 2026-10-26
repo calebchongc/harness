@@ -11,6 +11,7 @@ const nanoui = @import("nanoui");
 const Color = nanoui.ui.Color;
 const theme = @import("theme.zig");
 const json = std.json;
+const theme_library = @import("theme_library.zig");
 
 pub const Variant = struct {
     id: []const u8,
@@ -44,21 +45,32 @@ pub fn loadLibrary(io: std.Io, data_dir: []const u8) void {
     _ = custom_arena.reset(.retain_capacity);
     const a = custom_arena.allocator();
     everything = b;
-    const path = std.fs.path.join(a, &.{ data_dir, "theme-library.json" }) catch return;
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return;
-    const doc = json.parseFromSliceLeaky(json.Value, a, text, .{}) catch return;
-    if (doc != .object) return;
-    const entries = doc.object.get("entries") orelse return;
-    if (entries != .array) return;
+    library = .{};
+    load_warning = null;
+    library = theme_library.load(a, io, data_dir) catch {
+        load_warning = a.dupe(u8, theme_library.last_error) catch null;
+        return;
+    };
     var out: std.ArrayList(Variant) = .empty;
     out.appendSlice(a, b) catch return;
-    for (entries.array.items) |e| {
+    for (library.entries.items) |e| {
         if (e != .object) continue;
         const family = e.object.get("family") orelse continue;
         if (family != .object) continue;
         appendFamily(a, &out, family.object, false) catch continue;
     }
     everything = out.items;
+}
+
+/// The library as last read: its entries, in the arena `loadLibrary` resets.
+pub var library: theme_library.Library = .{};
+/// Why it couldn't be read (`load_warning`), until the next read.
+pub var load_warning: ?[]const u8 = null;
+
+/// A library or import variant's colours, made readable as an imported
+/// theme's are.
+pub fn colorsOf(o: json.ObjectMap) ?theme.Colors {
+    return derive(o, std.mem.eql(u8, str(o, "appearance"), "dark"), false);
 }
 
 pub fn find(id: []const u8) ?*const Variant {

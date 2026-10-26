@@ -102,6 +102,10 @@ def main() -> None:
     fork = os.environ.get("NANOUI_FORK")
     run(["zig", "build", *([f"--fork={fork}"] if fork else [])], cwd=NANO)
     for scene in scenes:
+        # Files a scene reads (a theme to import, say), made up, where it says.
+        for path, text in json.loads(pathlib.Path(scene).read_text()).get("files", {}).items():
+            pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(path).write_text(text)
         # One process a scene: the renderer keeps one settings file for its
         # run, so a later scene would open Settings where the last one left it.
         run([GPUI_BIN, scene, "--out", out / "gpui"])

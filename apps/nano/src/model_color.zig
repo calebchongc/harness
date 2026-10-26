@@ -73,6 +73,69 @@ pub const Rgba = struct {
     pub fn bestOn(c: Rgba) Rgba {
         return if (white.contrast(c) >= black.contrast(c)) white else black;
     }
+
+    pub fn withAlpha(c: Rgba, alpha: f32) Rgba {
+        var out = c;
+        out.a = @intFromFloat(@round(std.math.clamp(alpha, 0, 1) * 255));
+        return out;
+    }
+
+    /// Toward black or white, a twentieth at a time, until `minimum`
+    /// contrast on `background` (`ensure_contrast`); else that extreme.
+    pub fn ensureContrast(c: Rgba, background: Rgba, minimum: f32) Rgba {
+        if (c.contrast(background) >= minimum) return c;
+        const target = if (black.contrast(background) >= white.contrast(background)) black else white;
+        var step: usize = 1;
+        while (step <= 20) : (step += 1) {
+            const candidate = c.mix(target, @as(f32, @floatFromInt(step)) / 20);
+            if (candidate.contrast(background) >= minimum) return candidate;
+        }
+        return target;
+    }
+
+    pub fn eql(a: Rgba, b: Rgba) bool {
+        return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+    }
+
+    /// "#rrggbb", or "#rrggbbaa" when translucent (`Display`).
+    pub fn hex(c: Rgba, buf: *[9]u8) []const u8 {
+        return (if (c.a == 255)
+            std.fmt.bufPrint(buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ c.r, c.g, c.b })
+        else
+            std.fmt.bufPrint(buf, "#{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ c.r, c.g, c.b, c.a })) catch unreachable;
+    }
+
+    /// A CSS hex colour: #rgb, #rgba, #rrggbb or #rrggbbaa, spaces around
+    /// it allowed (`FromStr`).
+    pub fn css(text: []const u8) ?Rgba {
+        const t = std.mem.trim(u8, text, " \t\n\r");
+        if (t.len == 0 or t[0] != '#') return null;
+        const v = t[1..];
+        const nib = struct {
+            fn f(ch: u8) ?u8 {
+                return switch (ch) {
+                    '0'...'9' => ch - '0',
+                    'a'...'f' => ch - 'a' + 10,
+                    'A'...'F' => ch - 'A' + 10,
+                    else => null,
+                };
+            }
+            fn pair(s: []const u8) ?u8 {
+                return ((f(s[0]) orelse return null) << 4) | (f(s[1]) orelse return null);
+            }
+            fn one(ch: u8) ?u8 {
+                const n = f(ch) orelse return null;
+                return (n << 4) | n;
+            }
+        };
+        return switch (v.len) {
+            3 => .{ .r = nib.one(v[0]) orelse return null, .g = nib.one(v[1]) orelse return null, .b = nib.one(v[2]) orelse return null },
+            4 => .{ .r = nib.one(v[0]) orelse return null, .g = nib.one(v[1]) orelse return null, .b = nib.one(v[2]) orelse return null, .a = nib.one(v[3]) orelse return null },
+            6 => .{ .r = nib.pair(v[0..2]) orelse return null, .g = nib.pair(v[2..4]) orelse return null, .b = nib.pair(v[4..6]) orelse return null },
+            8 => .{ .r = nib.pair(v[0..2]) orelse return null, .g = nib.pair(v[2..4]) orelse return null, .b = nib.pair(v[4..6]) orelse return null, .a = nib.pair(v[6..8]) orelse return null },
+            else => null,
+        };
+    }
 };
 
 /// `harden_model_foreground`: `color` toward the preferred target, then

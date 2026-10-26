@@ -168,6 +168,9 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
             const look = @import("view_settings_appearance.zig");
             look.page(c, a, k);
             look.themeMenu(c, a, k);
+            const library = @import("view_settings_theme_import.zig");
+            library.dialog(c, a, k);
+            library.reviewDialog(c, a, k);
         },
         .mcp => @import("view_settings_mcp.zig").page(c, a, k),
         .appshots => @import("view_settings_appshots.zig").page(c, a, k),

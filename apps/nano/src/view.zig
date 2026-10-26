@@ -242,6 +242,7 @@ fn keys(c: *ui.Context, a: *App) void {
         @import("view_settings_accounts.zig").escape(c, a);
         _ = @import("view_settings_archived.zig").escape(c, a);
         _ = @import("view_settings_devices.zig").escape(c, a);
+        @import("view_settings_theme_import.zig").escape(c, a);
     }
     if (chat_menu.anyDialog(a)) {
         if (c.shortcut(.{ .key = S.escape })) chat_menu.dismiss(a);

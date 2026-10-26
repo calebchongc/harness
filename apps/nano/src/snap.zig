@@ -122,6 +122,13 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
     var a: App = .init(gpa, init.io, 1);
     defer a.deinit();
     a.new_harness = try gpa.dupe(u8, "graff");
+    // A data folder of its own, empty, as the renderer's temporary one: what
+    // a scene saves (a theme it imports) goes there, never in ~/.harness.
+    const data = try std.fs.path.join(arena, &.{ out, try std.fmt.allocPrint(arena, "data-{s}", .{name}) });
+    std.Io.Dir.cwd().deleteTree(init.io, data) catch {};
+    try std.Io.Dir.cwd().createDirPath(init.io, data);
+    a.settings.path = try std.fs.path.join(gpa, &.{ data, "ui-settings.json" });
+    @import("themes.zig").loadLibrary(init.io, data);
     const dark = !std.mem.eql(u8, str(scene, "appearance") orelse "dark", "light");
     a.dark = dark;
     // As the renderer sets it: the scene's appearance is the chosen one.
