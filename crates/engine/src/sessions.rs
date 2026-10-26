@@ -719,12 +719,32 @@ impl SessionsEngine {
 
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
-        // An imported chat's first graff turn carries the earlier transcript
-        // as read-only context; read the doc before the new user row lands.
-        let seed_entries = crate::external_history::continues_in_graff(chat_id)
-            .then(|| handle.doc().read_entries())
-            .and_then(Result::ok);
+        // A different checkout cannot resume the old native session. Carry
+        // the transcript read-only rather than silently dropping its context.
+        let moved_checkout = self
+            .inner
+            .workspace()
+            .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
+            .is_some_and(|chat| {
+                chat.source_context
+                    .as_ref()
+                    .is_some_and(|source| !same_dir(&source.cwd, &request.cwd))
+                    || chat
+                        .harness_session_cwd
+                        .as_deref()
+                        .is_some_and(|cwd| !cwd.is_empty() && !same_dir(cwd, &request.cwd))
+            });
+        let imported = crate::external_history::continues_in_graff(chat_id);
         let user_id = message_id.unwrap_or_else(new_id);
+        let seed_entries = (imported || moved_checkout)
+            .then(|| handle.doc().read_entries())
+            .and_then(Result::ok)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.id != user_id)
+                    .collect::<Vec<_>>()
+            });
         self.inner.journal.record_pending_turn_origin(chat_id, &user_id, request.turn_origin, false);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
         self.inner.journal.record_confirmed_turn_origin(chat_id, &user_id, request.turn_origin);
@@ -748,8 +768,11 @@ impl SessionsEngine {
             && let Some(entries) = seed_entries
             && !entries.is_empty()
         {
-            request.prompt =
-                crate::external_history::seed_prompt(chat_id, &entries, &request.prompt);
+            request.prompt = if imported {
+                crate::external_history::seed_prompt(chat_id, &entries, &request.prompt)
+            } else {
+                crate::external_history::seed_checkout_prompt(&entries, &request.prompt)
+            };
         }
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
 
