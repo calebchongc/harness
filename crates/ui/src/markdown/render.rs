@@ -1834,8 +1834,8 @@ fn register_selection_listeners(
     }
     {
         let key = key.clone();
-        window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, _cx| {
-            if phase != DispatchPhase::Bubble {
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, _cx| {
+            if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                 return;
             }
             if let Some(_text) = super::selection::end_drag(&key) {

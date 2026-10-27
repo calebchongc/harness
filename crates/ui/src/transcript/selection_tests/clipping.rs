@@ -514,6 +514,209 @@ fn collapsed_prompt_selection_survives_other_cached_pane_repaints(cx: &mut gpui:
     }
 }
 
+#[gpui::test]
+fn selection_ignores_secondary_button_releases_during_a_primary_drag(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    with_transcript(
+        cx,
+        "A short synthetic prompt.",
+        "Reply alpha beta gamma.",
+        |_, _, cx| {
+            let (key, text, layout) = entry("Reply alpha");
+            for button in [MouseButton::Right, MouseButton::Middle] {
+                cx.simulate_event(gpui::MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: at(&layout, 0),
+                    click_count: 1,
+                    ..Default::default()
+                });
+                cx.simulate_event(MouseMoveEvent {
+                    position: at(&layout, 5),
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                });
+                assert_eq!(selection::selected_text().as_deref(), Some(&text[..5]));
+                cx.simulate_event(gpui::MouseDownEvent {
+                    button,
+                    position: at(&layout, 5),
+                    click_count: 1,
+                    ..Default::default()
+                });
+                cx.simulate_event(MouseUpEvent {
+                    button,
+                    position: at(&layout, 5),
+                    ..Default::default()
+                });
+                assert!(
+                    selection::is_dragging(),
+                    "{button:?} release must not end a primary drag"
+                );
+                cx.simulate_event(MouseMoveEvent {
+                    position: at(&layout, text.len()),
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                });
+                assert_eq!(selection::selected_text().as_deref(), Some(text.as_str()));
+                cx.simulate_event(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: at(&layout, text.len()),
+                    ..Default::default()
+                });
+                assert!(!selection::is_dragging());
+                selection::clear_if_owner(&key);
+            }
+        },
+    );
+}
+
+#[gpui::test]
+fn selection_keeps_original_link_offsets_through_ellipsis_and_resize(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    let prompt = "Hidden prompt text. ".repeat(100);
+    let reply = format!(
+        "Prefix https://example.invalid/{} suffix",
+        "synthetic-long-segment/".repeat(30)
+    );
+    with_transcript(cx, &prompt, &reply, |transcript, _, cx| {
+        transcript.update(cx, |this, cx| {
+            this.set_workspace_link_handler(render::LinkUi {
+                source_session: Some("clipping-fixture".into()),
+                handler: Rc::new(|_, _, _| render::LinkOutcome::Internal),
+            });
+            cx.notify();
+        });
+        for width in [900.0, 320.0, 600.0, 900.0] {
+            cx.simulate_resize(size(px(width), px(800.0)));
+            draw(&transcript, cx);
+            let (key, original, layout) = entry("Prefix https://example.invalid/");
+            let (_, _, offsets) = render::selection_test_snapshot(&key);
+            assert!(
+                offsets
+                    .as_ref()
+                    .is_some_and(|offsets| !offsets.omissions.is_empty())
+            );
+            let displayed = layout.text();
+            assert!(displayed.contains('…'));
+            assert_eq!(original, reply);
+            for (start, end) in [(0, displayed.len()), (displayed.len(), 0)] {
+                drag(cx, &key, 1, at(&layout, start), at(&layout, end), &original);
+            }
+            drag(cx, &key, 3, at(&layout, 2), at(&layout, 2), &original);
+            let suffix = displayed.find("suffix").unwrap() + 2;
+            drag(
+                cx,
+                &key,
+                2,
+                at(&layout, suffix),
+                at(&layout, suffix),
+                "suffix",
+            );
+        }
+    });
+}
+
+struct HorizontalSelectionClip {
+    width: f32,
+}
+
+impl Render for HorizontalSelectionClip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        div()
+            .size_full()
+            .text_size(px(14.0))
+            .line_height(px(22.0))
+            .child(render::selection_owner_reset(cx.entity_id().as_u64()))
+            .child(div().h(px(40.0)))
+            .child(
+                div()
+                    .ml(px(40.0))
+                    .w(px(self.width))
+                    .h(px(44.0))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .ml(px(20.0))
+                            .w(px(120.0))
+                            .h(px(44.0))
+                            .overflow_hidden()
+                            .child(div().relative().left(px(-70.0)).w(px(400.0)).child(
+                                render::selectable_autolinked_text(
+                                    "horizontal-clip".into(),
+                                    "prefixprefix visibleword suffixsuffix".into(),
+                                    gpui::font(theme.font_sans.clone()),
+                                    theme.text,
+                                    None,
+                                    &theme,
+                                ),
+                            )),
+                    ),
+            )
+            .child(render::selection_owner_end())
+    }
+}
+
+#[gpui::test]
+fn selection_respects_nested_horizontal_masks_and_zero_width_clips(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    cx.update(|cx| cx.set_global(Theme::dark()));
+    let (host, cx) = cx.add_window_view(|_, _| HorizontalSelectionClip { width: 120.0 });
+    cx.simulate_resize(size(px(500.0), px(300.0)));
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    let (key, text, layout) = entry("prefixprefix visibleword");
+    let ix = text.find("visibleword").unwrap() + 2;
+    let visible = at(&layout, ix);
+    assert!(visible.x >= px(60.0) && visible.x < px(160.0));
+    for count in [2, 3] {
+        drag(
+            cx,
+            &key,
+            count,
+            visible,
+            visible,
+            if count == 2 { "visibleword" } else { &text },
+        );
+    }
+    for width in [120.0, 0.0, 120.0] {
+        host.update(cx, |host, cx| {
+            host.width = width;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        for x in [40.0, 59.9, 160.0, 160.1, 200.0] {
+            for count in [1, 2, 3] {
+                let position = point(px(x), px(48.0));
+                cx.simulate_event(gpui::MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: count,
+                    ..Default::default()
+                });
+                assert!(
+                    !selection::is_dragging(),
+                    "clip width {width}, hidden x={x}, count={count}"
+                );
+                assert!(selection::selected_text().is_none());
+                cx.simulate_event(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+}
+
 struct ClipHost {
     height: f32,
     offset: f32,

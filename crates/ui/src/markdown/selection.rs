@@ -338,36 +338,48 @@ fn join_spans(spans: &[Span]) -> String {
 }
 
 /// Word range around `ix` for double-click selection: an alphanumeric/`_`
-/// run, or the single non-space char under the cursor, or empty at spaces.
+/// run, or one non-space grapheme, or empty at spaces. Never split combining
+/// marks or multi-codepoint emoji from the character they belong to.
 pub fn word_range(text: &str, ix: usize) -> Range<usize> {
-    let mut ix = ix.min(text.len());
-    // Snap into a char boundary (mouse indices should already be on one;
-    // defensive against mid-char byte offsets).
-    while ix > 0 && !text.is_char_boundary(ix) {
-        ix -= 1;
-    }
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let before = text[..ix].chars().next_back();
-    let at = text[ix..].chars().next();
-    // Off a word boundary entirely: select the single char (or nothing).
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let ix = ix.min(text.len());
+    // Mouse indices and defensive mid-byte offsets both snap to the start of
+    // the containing grapheme, not merely to a UTF-8 character boundary.
+    let ix = if ix < text.len() {
+        text.grapheme_indices(true)
+            .take_while(|(start, _)| *start <= ix)
+            .last()
+            .map_or(0, |(start, _)| start)
+    } else {
+        ix
+    };
+    let is_word = |grapheme: &str| {
+        grapheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    };
+    let before = text[..ix].graphemes(true).next_back();
+    let at = text[ix..].graphemes(true).next();
     if !at.is_some_and(is_word) && !before.is_some_and(is_word) {
         return match at {
-            Some(c) if !c.is_whitespace() => ix..ix + c.len_utf8(),
+            Some(grapheme) if !grapheme.chars().all(char::is_whitespace) => ix..ix + grapheme.len(),
             _ => ix..ix,
         };
     }
     let start = text[..ix]
-        .char_indices()
+        .grapheme_indices(true)
         .rev()
-        .take_while(|(_, c)| is_word(*c))
+        .take_while(|(_, grapheme)| is_word(grapheme))
         .last()
         .map(|(i, _)| i)
         .unwrap_or(ix);
     let end = text[ix..]
-        .char_indices()
-        .take_while(|(_, c)| is_word(*c))
+        .grapheme_indices(true)
+        .take_while(|(_, grapheme)| is_word(grapheme))
         .last()
-        .map(|(i, c)| ix + i + c.len_utf8())
+        .map(|(i, grapheme)| ix + i + grapheme.len())
         .unwrap_or(ix);
     start..end
 }
@@ -538,6 +550,68 @@ mod tests {
         assert_eq!(selected_text().as_deref(), Some("paragraph"));
         assert!(update_drag(&elems(), (0, 6)));
         assert_eq!(end_drag("p1"), None);
+    }
+
+    #[test]
+    fn word_ranges_preserve_grapheme_boundaries_for_mixed_text_and_arbitrary_offsets() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let pieces = ["", "a", "_", " ", "é", "e\u{301}", "👩‍💻", "👍🏽", "."];
+        for left in pieces {
+            for middle in pieces {
+                for right in pieces {
+                    let text = format!("{left}{middle}{right}");
+                    let boundaries = text
+                        .grapheme_indices(true)
+                        .map(|(ix, _)| ix)
+                        .chain(std::iter::once(text.len()))
+                        .collect::<Vec<_>>();
+                    for ix in (0..=text.len() + 3).chain(std::iter::once(usize::MAX)) {
+                        let range = word_range(&text, ix);
+                        assert!(
+                            range.start <= range.end && range.end <= text.len(),
+                            "{text:?}: {ix} -> {range:?}"
+                        );
+                        assert!(
+                            text.get(range.clone()).is_some(),
+                            "range must be UTF-8 safe"
+                        );
+                        assert!(
+                            boundaries.contains(&range.start) && boundaries.contains(&range.end),
+                            "selection split a grapheme in {text:?}: {ix} -> {range:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_ranges_keep_decomposed_letters_and_marks_together() {
+        for word in ["cafe\u{301}", "nai\u{308}ve", "foo_e\u{301}_bar"] {
+            let text = format!("[{word}]");
+            for ix in 1..1 + word.len() {
+                assert_eq!(
+                    &text[word_range(&text, ix)],
+                    word,
+                    "word={word:?}, byte={ix}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn word_ranges_select_complete_emoji_graphemes() {
+        for emoji in ["👩‍💻", "👍🏽", "🇸🇬", "✈️"] {
+            let text = format!(" {emoji} ");
+            for ix in 1..1 + emoji.len() {
+                assert_eq!(
+                    &text[word_range(&text, ix)],
+                    emoji,
+                    "emoji={emoji:?}, byte={ix}"
+                );
+            }
+        }
     }
 
     #[test]
