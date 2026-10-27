@@ -61,7 +61,7 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// The stable per-chat tree name Harness asks Graff for.
+/// Legacy name, retained for compatibility with existing checkouts.
 pub fn name_for_chat(chat_id: &str) -> String {
     let short: String = chat_id
         .chars()
@@ -73,6 +73,23 @@ pub fn name_for_chat(chat_id: &str) -> String {
         "harness-chat".into()
     } else {
         format!("harness-{short}")
+    }
+}
+
+/// A new tree is named for the task, with a short chat id only to distinguish
+/// independent conversations doing the same work. Existing trees keep their name.
+pub fn name_for_task(chat_id: &str, task: &str) -> String {
+    let short: String = chat_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let slug = crate::worktree_name::task_slug(task);
+    if short.is_empty() {
+        slug
+    } else {
+        format!("{slug}-{short}")
     }
 }
 
@@ -106,6 +123,19 @@ mod tests {
         assert_eq!(
             launch_root("/repo/.graff/worktrees/bad name"),
             "/repo/.graff/worktrees/bad name"
+        );
+    }
+
+    #[test]
+    fn new_chat_names_describe_the_task_without_product_branding() {
+        let name = name_for_task("chat-graff-tree", "Fix login redirect after sign-in");
+        assert_eq!(name, "fix-login-redirect-after-sign-in-chatgrafftre");
+        assert!(valid_name(&name));
+        assert!(valid_name(&name_for_task("---", "***")));
+        assert!(valid_name(&name_for_task("chat", &"x".repeat(100))));
+        assert_ne!(
+            name_for_task("chat-one", "Fix login"),
+            name_for_task("chat-two", "Fix login")
         );
     }
 

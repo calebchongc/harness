@@ -6,7 +6,7 @@
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
 //! created under `~/.harness/worktrees/<repoName>/<worktreeName>` (NOT the data
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `harness/<name>` branch. `HARNESS_WORKTREES_DIR`
+//! matching task-derived `task/<name>` branch. `HARNESS_WORKTREES_DIR`
 //! override the root.
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
@@ -56,15 +56,6 @@ const FILE_INDEX_MAX_ENTRIES: usize = 250_000;
 const RANK_BUFFER: usize = 1_024;
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
-
-const ADJECTIVES: &[&str] = &[
-    "swift", "calm", "bright", "bold", "keen", "brave", "clever", "lucky", "quiet", "warm", "cool",
-    "sharp", "gentle", "vivid", "amber", "cobalt",
-];
-const NOUNS: &[&str] = &[
-    "otter", "harbor", "falcon", "cedar", "meadow", "harness", "delta", "ember", "lynx", "maple",
-    "onyx", "quartz", "raven", "summit", "willow", "aspen",
-];
 
 /// Canonical identity shared by every chat operating in this exact worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1178,13 +1169,25 @@ impl Repos {
 
     // ── worktrees ───────────────────────────────────────────────────────────
 
-    /// `git worktree add` an isolated checkout under
-    /// `{worktrees_root}/<repoName>/<generatedName>`, on a fresh `harness/<name>`
-    /// branch off `branch`.
+    /// Create a worktree before a task is available (the legacy RPC path).
+    /// Session runs use `create_worktree_for_task` so their branches describe work.
     pub async fn create_worktree(
         &self,
         repo_path: &Path,
         branch: &str,
+    ) -> Result<Worktree, EngineError> {
+        self.create_worktree_for_task(repo_path, branch, "changes")
+            .await
+    }
+
+    /// `git worktree add` an isolated checkout named for the first task request,
+    /// on a fresh `task/<slug>` branch off `branch`. Repeated tasks get a numeric
+    /// suffix rather than an unrelated random label.
+    pub async fn create_worktree_for_task(
+        &self,
+        repo_path: &Path,
+        branch: &str,
+        task: &str,
     ) -> Result<Worktree, EngineError> {
         let repo_name = repo_path
             .file_name()
@@ -1192,27 +1195,22 @@ impl Repos {
             .unwrap_or_else(|| "repo".to_string());
         let base = self.inner.worktrees_root.join(&repo_name);
         std::fs::create_dir_all(&base)?;
-        // Auto-generate a name colliding with neither an existing dir nor branch.
+        // Never reuse another task's folder or branch.
         let existing: HashSet<String> = self
             .branches(repo_path)
             .await
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let slug = harness_proto::worktree_name::task_slug(task);
         let mut name = None;
-        for attempt in 0..50u64 {
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as u64)
-                .unwrap_or(attempt)
-                .wrapping_add(attempt.wrapping_mul(0x9E37_79B9));
-            let candidate = format!(
-                "{}-{}",
-                ADJECTIVES[(seed % ADJECTIVES.len() as u64) as usize],
-                NOUNS[((seed / 31) % NOUNS.len() as u64) as usize]
-            );
-            if !base.join(&candidate).exists() && !own_branch_taken(&existing, &candidate)
-            {
+        for attempt in 1..=1_000 {
+            let candidate = if attempt == 1 {
+                slug.clone()
+            } else {
+                format!("{slug}-{attempt}")
+            };
+            if !base.join(&candidate).exists() && !own_branch_taken(&existing, &candidate) {
                 name = Some(candidate);
                 break;
             }
@@ -1236,6 +1234,18 @@ impl Repos {
         // `.agents/linked` + `.agents/prepare` before any agent starts in it.
         crate::agents_prepare::prepare_worktree(repo_path, &path).await;
         let checkout = self.checkout_identity(&path).await?;
+        // Ownership is local metadata, not a brand in the Git branch name.
+        // A user's unrelated task/* branch must never become ours by prefix.
+        self.git(
+            &[
+                "config",
+                "--local",
+                &format!("branch.{branch_name}.harness-worktree"),
+                &checkout.git_dir.to_string_lossy(),
+            ],
+            Some(&path),
+        )
+        .await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
             path: path.to_string_lossy().to_string(),
@@ -1259,10 +1269,10 @@ impl Repos {
         .is_ok()
     }
 
-    /// Rename a harness-created worktree branch after its chat's generated title
+    /// Rename a newly created worktree branch after its chat's generated title
     /// (port of harness's `renameWorktreeBranch`). Guards:
     /// - respect an external checkout/rename: only act while the worktree is still
-    ///   on `expected_branch` AND that branch is the original `harness/<folderName>`;
+    ///   on `expected_branch` AND that branch is the original managed branch;
     /// - a title-slug collision gets a stable 6-hex suffix (hash of the worktree
     ///   path); a collision on THAT too fails.
     ///
@@ -1279,7 +1289,12 @@ impl Repos {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if current != expected_branch || !is_original_own_branch(expected_branch, &folder) {
+        if current != expected_branch
+            || !is_original_own_branch(expected_branch, &folder)
+            || !self
+                .manages_worktree_branch(worktree_path, expected_branch)
+                .await
+        {
             return Ok(current);
         }
         let preferred = worktree_branch_from_title(title);
@@ -1307,9 +1322,30 @@ impl Repos {
         self.current_branch(worktree_path).await
     }
 
+    async fn manages_worktree_branch(&self, path: &Path, branch: &str) -> bool {
+        if branch.starts_with(LEGACY_BRANCH_PREFIX) {
+            return true;
+        }
+        let Ok(checkout) = self.checkout_identity(path).await else {
+            return false;
+        };
+        self.git(
+            &[
+                "config",
+                "--local",
+                "--get",
+                &format!("branch.{branch}.harness-worktree"),
+            ],
+            Some(path),
+        )
+        .await
+        .is_ok_and(|owner| owner.trim() == checkout.git_dir.to_string_lossy())
+    }
+
     /// Best-effort worktree removal (if it still exists), then prune stale refs.
-    /// Deletes the worktree's branch ONLY when harness created it (`harness/…`) — the
-    /// user may have checked out their own branch inside the worktree.
+    /// New task branches need a matching local ownership record; a user's branch
+    /// is never ours just because it has a task/ prefix. Legacy branches retain
+    /// their existing recognition.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,
@@ -1320,6 +1356,7 @@ impl Repos {
         } else {
             String::new()
         };
+        let managed = self.manages_worktree_branch(worktree_path, &branch).await;
         if worktree_path.exists() {
             let removed = self
                 .git(
@@ -1338,7 +1375,7 @@ impl Repos {
             }
         }
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if is_own_branch(&branch) {
+        if managed {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
         Ok(())
@@ -2243,11 +2280,9 @@ fn rank_file_matches(
         .collect()
 }
 
-/// Turn a generated chat title into the semantic portion of a Harness branch
-/// (port of harness's `worktreeBranchFromTitle`). Harness NFKD-normalizes accented
-/// letters first; native keeps it ASCII-only (generated titles are Title Case
-/// English), so non-ASCII characters collapse into the `-` separator.
-pub const OWN_BRANCH_PREFIX: &str = "harness/";
+/// Neutral namespace for new task branches. Legacy names remain recognized;
+/// a new branch's prefix alone does not establish ownership for cleanup.
+pub const OWN_BRANCH_PREFIX: &str = "task/";
 const LEGACY_BRANCH_PREFIX: &str = "harness/";
 
 pub fn is_own_branch(branch: &str) -> bool {
@@ -2268,20 +2303,7 @@ fn is_original_own_branch(branch: &str, folder: &str) -> bool {
 }
 
 pub fn worktree_branch_from_title(title: &str) -> String {
-    let mut slug = String::new();
-    for c in title.trim().chars() {
-        if matches!(c, '\'' | '"' | '`') {
-            continue; // dropped entirely (cafe's → cafes), not a separator
-        }
-        if c.is_ascii_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
-        } else if !slug.is_empty() && !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    slug.truncate(48);
-    let slug = slug.trim_matches('-');
-    own_branch(if slug.is_empty() { "update" } else { slug })
+    own_branch(&harness_proto::worktree_name::task_slug(title))
 }
 
 fn bounded_field(value: &str, max_chars: usize) -> String {

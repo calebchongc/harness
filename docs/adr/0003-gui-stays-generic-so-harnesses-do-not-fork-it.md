@@ -33,4 +33,4 @@ The GUI is the shared product. A person's harness is not a fork of it.
 - Built-in agents and a custom binary share one settings page and one launch probe.
 - The shell cannot grow a per-harness special case without an adapter change in this repo. That is intentional: the special case belongs next to the other adapters, not in a fork.
 - Existing installs keep updating because the binary and installer paths did not move.
-- Saved theme ids `harness-dark` / `harness-light` still resolve. New worktree branches use `harness/`; branches already named `harness/` are still treated as ours so old checkouts are not orphaned.
+- Saved theme ids `harness-dark` / `harness-light` still resolve. New host worktree branches use task-derived `task/<description>` names; Graff-owned trees also use task-derived names, with a short chat-id suffix for uniqueness. Ownership of new host branches is recorded in local Git configuration, not inferred from the neutral prefix. Existing `harness/` branches and recorded Graff tree paths remain usable without a naming migration.
