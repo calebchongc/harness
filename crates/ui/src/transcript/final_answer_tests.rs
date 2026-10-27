@@ -177,6 +177,15 @@ fn final_answer_keeps_compact_history_accessible_without_a_duplicate_label() {
     );
     assert!(markers[0].compact_fold.is_none());
     assert!(!markers[0].final_answer.as_ref().unwrap().show_label);
+    let detailed = self::rows(&entry, false);
+    for (from, to) in [(&detailed, &rows), (&rows, &detailed)] {
+        let answer_ix = from.iter().position(|r| r.final_answer.is_some()).unwrap();
+        let (changed, _) = diff_rows(from, to).unwrap();
+        assert!(
+            changed.contains(&answer_ix),
+            "switching Compact mode must remeasure the changed answer heading"
+        );
+    }
     assert!(rows.iter().any(|r| r.compact_fold.is_some()));
     assert!(rows.iter().any(|r| matches!(
         r.kind,

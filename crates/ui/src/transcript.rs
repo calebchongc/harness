@@ -2271,9 +2271,10 @@ pub fn rows_for_entry(
                 .duration_ms
                 .filter(|&ms| ms > 0)
                 .map(|ms| (ms / 1000).max(1));
-            // Timing can arrive after the text: invalidate the cached layout,
-            // while preserving the first markdown block's identity.
+            // Timing can arrive after the text, and Compact changes the
+            // heading's height. Invalidate both without changing the block id.
             row.version ^= fnv1a(&worked_secs.unwrap_or(0).to_le_bytes());
+            row.version ^= u64::from(show_label) << 61;
             row.final_answer = Some(FinalAnswer {
                 worked_secs,
                 show_label,
