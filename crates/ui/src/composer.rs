@@ -624,10 +624,13 @@ pub fn send_mode_behind_pending(mode: SendButtonMode, pending_prompt: bool) -> S
     }
 }
 
-/// Queue rows are represented by the queue panel until the host promotes them
-/// into the transcript. They must never publish (or refresh) a local echo.
-fn should_publish_optimistic_echo(queue: bool) -> bool {
-    !queue
+/// Queue rows stay in the queue panel until promotion, except for Steer, which
+/// publishes a normal pending user row while the host handles the action.
+fn should_publish_optimistic_echo(
+    queue: bool,
+    follow_up: Option<follow_up::FollowUpAction>,
+) -> bool {
+    !queue || follow_up == Some(follow_up::FollowUpAction::Steer)
 }
 
 fn begin_interrupt(pending: &mut HashSet<String>, chat_id: &str) -> bool {
@@ -8964,7 +8967,7 @@ impl Composer {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
-            if should_publish_optimistic_echo(queue) {
+            if should_publish_optimistic_echo(queue, follow_up) {
                 s.push_echo(&chat_id, echo);
                 // Working overlay until the host executes the queued command —
                 // without it a remote send flashed Completed (and could ring
@@ -8978,10 +8981,9 @@ impl Composer {
         self.drafts.remove(&self.current_key);
         self.failure = None;
         self.sending = true;
-        // A queued row is represented by the queue panel, not the transcript.
-        // Claiming an own-turn anchor for it here would replace the live
-        // turn's runway with an id that has no transcript row yet.
-        if should_publish_optimistic_echo(queue) {
+        // Ordinary queued rows are represented by the queue panel. Steer has
+        // a pending transcript echo, so its Sent event can anchor immediately.
+        if should_publish_optimistic_echo(queue, follow_up) {
             cx.emit(ComposerEvent::Sent {
                 chat_id: chat_id.clone(),
                 message_id: message_id.clone(),
@@ -9105,11 +9107,9 @@ impl Composer {
                         &appshots::with_appshots(&text, &staged_appshots, &appshot_paths),
                         &attachment_paths,
                     );
-                    // A normal send already has an optimistic echo: refresh it
-                    // in place with the uploaded refs so its thumbnails never
-                    // flicker. A queued message has no transcript echo at all;
-                    // its queue row is the only representation until dispatch.
-                    if should_publish_optimistic_echo(queue) {
+                    // Refresh an existing send/Steer echo in place with the
+                    // uploaded refs so its thumbnails never flicker.
+                    if should_publish_optimistic_echo(queue, follow_up) {
                         let refreshed = SessionMessageEntry {
                             id: message_id.clone(),
                             role: harness_doc::MessageRole::User,
@@ -9286,6 +9286,19 @@ impl Composer {
                     let queue_id = queue_id.to_string();
                     let mut follow_up_warning = None;
                     if let Some(action) = follow_up {
+                        if action == follow_up::FollowUpAction::Steer {
+                            this.update(cx, |composer, cx| {
+                                composer.state.update(cx, |state, cx| {
+                                    state.rekey_echo(&chat_id, &message_id, &queue_id);
+                                    cx.notify();
+                                });
+                                cx.emit(ComposerEvent::Sent {
+                                    chat_id: chat_id.clone(),
+                                    message_id: queue_id.clone(),
+                                });
+                            })
+                            .ok();
+                        }
                         let method = match action {
                             follow_up::FollowUpAction::Queue => unreachable!("Queue needs no promotion"),
                             follow_up::FollowUpAction::Steer => methods::STEER_QUEUED_MESSAGE_NOW,
@@ -9462,7 +9475,9 @@ impl Composer {
                 composer
                     .state
                     .update(cx, |s, _| s.end_upload_progress());
-                if let Ok((Some(message_id), _)) = &result {
+                if let Ok((Some(message_id), _)) = &result
+                    && follow_up != Some(follow_up::FollowUpAction::Steer)
+                {
                     cx.emit(ComposerEvent::Queued {
                         chat_id: err_chat_id.clone(),
                         message_id: message_id.clone(),
@@ -9474,10 +9489,23 @@ impl Composer {
                     {
                         composer.state.update(cx, |state, cx| {
                             state.end_pending_send(&err_chat_id, message_id);
+                            if follow_up == Some(follow_up::FollowUpAction::Steer)
+                                && warning.is_some()
+                            {
+                                state.remove_echo(&err_chat_id, message_id);
+                            }
                             if state.selected_chat.as_deref() == Some(err_chat_id.as_str()) {
                                 state.refresh_selected_queue(cx);
                             }
                         });
+                        if follow_up == Some(follow_up::FollowUpAction::Steer)
+                            && warning.is_some()
+                        {
+                            cx.emit(ComposerEvent::Queued {
+                                chat_id: err_chat_id.clone(),
+                                message_id: message_id.clone(),
+                            });
+                        }
                         if let Some(warning) = warning {
                             composer.failure = Some(warning.clone().into());
                             composer.failure_key = Some(err_chat_id.clone());
@@ -17660,8 +17688,12 @@ mod tests {
 
     #[test]
     fn queued_submit_does_not_publish_an_optimistic_transcript_echo() {
-        assert!(should_publish_optimistic_echo(false));
-        assert!(!should_publish_optimistic_echo(true));
+        assert!(should_publish_optimistic_echo(false, None));
+        assert!(!should_publish_optimistic_echo(true, None));
+        assert!(should_publish_optimistic_echo(
+            true,
+            Some(follow_up::FollowUpAction::Steer)
+        ));
     }
 
     #[test]

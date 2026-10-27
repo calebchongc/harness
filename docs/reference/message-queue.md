@@ -83,11 +83,19 @@ while removal is pending. Command+Return on iOS activates the queue head. A
 blocked shortcut target is never skipped and an empty modified submit never
 stops the agent.
 
-Queued submissions do not create optimistic transcript bubbles. Desktop retains
-the active reply's scroll runway and anchors a locally queued message only when
-its stable ID appears in the transcript. Attachment paths remain separate from
-editable text and are expanded at dispatch; legacy expanded rows are recognized
-to avoid duplicate trailers. Queue attachments use committed host uploads.
+Queue submissions stay in the queue and do not create transcript bubbles. Steer
+appears immediately at the conversation tail as a pending user message. If a
+tool result is still in flight, it can finish above the pending message before
+the host accepts the steer. Steering a queued row removes it from the queue and
+shows the same pending message. The host writes the user message before the
+continued assistant response, so the pending bubble becomes the confirmed
+message in place and the continuation follows it. Failed enqueue restores the
+composer draft; failed promotion removes the pending bubble and leaves the row
+recoverable in the queue. Desktop retains the active reply's scroll runway and
+anchors queued messages only when their stable IDs appear in the transcript.
+Attachment paths remain separate from editable text and are expanded at
+dispatch; legacy expanded rows are recognized to avoid duplicate trailers.
+Queue attachments use committed host uploads.
 
 Support is negotiated through `EngineInfo` and device-registry capabilities:
 `message-queue-v1`, `message-queue-actions-v1`, `message-queue-attachments-v1`,

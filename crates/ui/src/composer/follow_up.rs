@@ -203,8 +203,14 @@ mod tests {
         let captured = events.clone();
         let _subscription = cx.update(|cx| {
             cx.subscribe(&composer, move |_, event: &ComposerEvent, _| {
-                if let ComposerEvent::Queued { message_id, .. } = event {
-                    captured.borrow_mut().push(message_id.clone());
+                match event {
+                    ComposerEvent::Sent { message_id, .. } => {
+                        captured.borrow_mut().push(("sent", message_id.clone()));
+                    }
+                    ComposerEvent::Queued { message_id, .. } => {
+                        captured.borrow_mut().push(("queued", message_id.clone()));
+                    }
+                    _ => {}
                 }
             })
         });
@@ -228,12 +234,44 @@ mod tests {
         let queued = receive_request(cx, &runtime, &mut requests, "queue message");
         assert_eq!(queued.method.as_deref(), Some(methods::QUEUE_MESSAGE));
         assert_eq!(queued.params["holdForTurnEnd"], true);
+        // The shortcut always steers, independently of the saved button policy.
+        let is_steer = behavior == FollowUpBehavior::Steer || shortcut;
+        let provisional_id = if is_steer {
+            let provisional_id = state.read_with(cx, |state, _| {
+                let echo = state.pending_echoes().first();
+                assert!(echo.is_some(), "Steer should echo before QueueMessage is acknowledged");
+                echo.unwrap().id.clone()
+            });
+            assert_eq!(
+                state.read_with(cx, |state, _| state.pending_echoes()[0].parts[0].clone()),
+                harness_doc::MessagePart::Text {
+                    id: "t0".into(),
+                    text: "Keep the current turn".into(),
+                }
+            );
+            assert_eq!(&*events.borrow(), &[("sent", provisional_id.clone())]);
+            Some(provisional_id)
+        } else {
+            assert!(state.read_with(cx, |state, _| state.pending_echoes().is_empty()));
+            None
+        };
         reply(
             &replies,
             &queued,
             serde_json::json!({ "id": "stable-row-id" }),
         );
         let promoted = receive_request(cx, &runtime, &mut requests, "follow-up action");
+        if is_steer {
+            assert_eq!(
+                state.read_with(cx, |state, _| state.pending_echoes()[0].id.clone()),
+                "stable-row-id".to_string(),
+                "queue ack should rekey the pending echo before Steer RPC"
+            );
+        }
+        assert!(!state.read_with(cx, |state, _| state.message_is_in_transcript(
+            "steer-chat",
+            "missing-id"
+        )));
         assert_eq!(
             promoted.method.as_deref(),
             Some(methods::STEER_QUEUED_MESSAGE_NOW)
@@ -287,7 +325,29 @@ mod tests {
                 assert_eq!(state.read(cx).queue[0].id, "stable-row-id");
             }
         });
-        assert_eq!(&*events.borrow(), &["stable-row-id"]);
+        if is_steer {
+            state.read_with(cx, |state, _| {
+                if promotion_succeeds {
+                    assert_eq!(state.pending_echoes()[0].id, "stable-row-id");
+                } else {
+                    assert!(state.pending_echoes().is_empty());
+                }
+            });
+        }
+        if let Some(provisional_id) = provisional_id {
+            let expected = if promotion_succeeds {
+                vec![("sent", provisional_id), ("sent", "stable-row-id".into())]
+            } else {
+                vec![
+                    ("sent", provisional_id),
+                    ("sent", "stable-row-id".into()),
+                    ("queued", "stable-row-id".into()),
+                ]
+            };
+            assert_eq!(&*events.borrow(), &expected);
+        } else {
+            assert_eq!(&*events.borrow(), &[("queued", "stable-row-id".into())]);
+        }
         cx.update(|cx| {
             assert_eq!(
                 crate::settings::with_current(cx, |settings| settings.follow_up_behavior),

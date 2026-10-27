@@ -174,10 +174,38 @@ fn queue_drag_offsets(ix: usize, from: usize, prev_over: usize, over: usize) -> 
     }
 }
 
+fn visible_move_target(
+    queue: &[QueuedMessage],
+    visible: &[(usize, QueuedMessage)],
+    id: &str,
+    to_visible: usize,
+) -> Option<(usize, usize)> {
+    let from = queue.iter().position(|item| item.id == id)?;
+    if visible
+        .iter()
+        .position(|(_, item)| item.id == id)
+        .is_some_and(|position| position == to_visible)
+    {
+        return Some((from, from));
+    }
+    let remaining: Vec<_> = visible
+        .iter()
+        .filter(|(_, item)| item.id != id)
+        .map(|(index, _)| index.saturating_sub(usize::from(from < *index)))
+        .collect();
+    let target = remaining
+        .get(to_visible)
+        .copied()
+        .or_else(|| remaining.last().map(|index| index + 1))
+        .unwrap_or(queue.len().saturating_sub(1));
+    Some((from, target))
+}
+
 /// A queue row being dragged (gpui drag-and-drop). Scoped to its chat so a
 /// drag can't land in a queue it didn't come from.
 pub struct QueueDragPayload {
     chat: String,
+    id: String,
     from: usize,
 }
 
@@ -308,6 +336,19 @@ fn visible_queue_rows(offset: f32, height: f32, count: usize) -> std::ops::Range
     first.min(count)..last.min(count)
 }
 
+fn visible_queue_items(
+    state: &crate::state::AppState,
+    chat_id: &str,
+) -> Vec<(usize, QueuedMessage)> {
+    state
+        .queue
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !state.message_is_in_transcript(chat_id, &item.id))
+        .map(|(index, item)| (index, item.clone()))
+        .collect()
+}
+
 impl Composer {
     /// The queue panel, or `None` when nothing is waiting. Like the composer,
     /// it is one frosted surface; rows use spacing and hover wash rather than
@@ -332,13 +373,17 @@ impl Composer {
                 .is_some_and(|engine| engine.engine_info().supports(capability));
             let host_supports_actions = state.chat_host_supports(&chat_id, capability);
             (
-                state.queue.clone(),
+                visible_queue_items(state, &chat_id),
                 chat_id,
                 host_supports_actions,
                 local_supports_actions && host_supports_actions,
             )
         };
-        self.prepare_queue_previews(&items, window, cx);
+        let preview_items = items
+            .iter()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        self.prepare_queue_previews(&preview_items, window, cx);
         if items.is_empty() {
             return None;
         }
@@ -356,7 +401,7 @@ impl Composer {
         let rows = queue_rows(
             &self.queue_scroll,
             window.viewport_size().height * 0.3,
-            items.iter().enumerate().map(|(ix, item)| {
+            items.iter().enumerate().map(|(ix, (_, item))| {
                 self.queue_row(
                     &chat_id,
                     ix,
@@ -414,7 +459,14 @@ impl Composer {
                         .map(|d| d.over)
                         .unwrap_or(payload.from);
                     this.queue_drag = None;
-                    this.move_queued(payload.from, to, cx);
+                    let target = {
+                        let state = this.state.read(cx);
+                        let visible = visible_queue_items(state, &drop_chat);
+                        visible_move_target(&state.queue, &visible, &payload.id, to)
+                    };
+                    if let Some((from, to)) = target {
+                        this.move_queued(from, to, cx);
+                    }
                 },
             ))
             .on_mouse_up_out(
@@ -619,6 +671,7 @@ impl Composer {
                 el.on_drag(
                     QueueDragPayload {
                         chat: drag_chat,
+                        id: item.id.clone(),
                         from: ix,
                     },
                     move |_payload, _point, _, cx| {
@@ -1349,6 +1402,9 @@ impl Composer {
             let Some(item) = state.queue.iter().find(|item| item.id == id) else {
                 return;
             };
+            if state.message_is_in_transcript(chat_id, &item.id) {
+                return;
+            }
             let queue_capability = harness_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1;
             let local_supports_actions = state
                 .engine()
@@ -1401,7 +1457,13 @@ impl Composer {
             let Some(chat_id) = state.selected_chat.as_deref() else {
                 return false;
             };
-            let Some(item) = latest_queued_message(&state.queue) else {
+            let available = state
+                .queue
+                .iter()
+                .filter(|item| !state.message_is_in_transcript(chat_id, &item.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let Some(item) = latest_queued_message(&available) else {
                 return false;
             };
             (
@@ -1935,11 +1997,46 @@ impl Composer {
                 .map(str::to_owned)
         })
         .flatten();
+        let steer_echo = (method == methods::STEER_QUEUED_MESSAGE_NOW)
+            .then(|| {
+                let id = pending_message.as_deref()?;
+                let state = self.state.read(cx);
+                if state.message_is_in_transcript(&chat_id, id) {
+                    return None;
+                }
+                let item = state.queue.iter().find(|item| item.id == id)?;
+                Some((id.to_owned(), item.text.clone()))
+            })
+            .flatten();
         if let Some(id) = &pending_message {
             self.state.update(cx, |state, cx| {
+                if let Some((echo_id, text)) = &steer_echo {
+                    state.push_echo(
+                        &chat_id,
+                        harness_doc::SessionMessageEntry {
+                            id: echo_id.clone(),
+                            role: harness_doc::MessageRole::User,
+                            parts: vec![harness_doc::MessagePart::Text {
+                                id: "t0".into(),
+                                text: text.clone(),
+                            }],
+                            created_at: chrono::Utc::now().timestamp_millis(),
+                            device_id: "local".into(),
+                            status: None,
+                            continuation_of: None,
+                            duration_ms: None,
+                        },
+                    );
+                }
                 state.begin_pending_send(&chat_id, id, chrono::Utc::now());
                 cx.notify();
             });
+            if steer_echo.is_some() {
+                cx.emit(crate::composer::ComposerEvent::Sent {
+                    chat_id: chat_id.clone(),
+                    message_id: id.clone(),
+                });
+            }
         }
         let mut params = params;
         if let Some(object) = params.as_object_mut() {
@@ -1976,8 +2073,17 @@ impl Composer {
                     this.update(cx, |composer, cx| {
                         if let Some(id) = &pending_message {
                             composer.state.update(cx, |state, cx| {
+                                if steer_echo.is_some() {
+                                    state.remove_echo(&chat_id, id);
+                                }
                                 state.end_pending_send(&chat_id, id);
                                 cx.notify();
+                            });
+                        }
+                        if let Some((id, _)) = &steer_echo {
+                            cx.emit(crate::composer::ComposerEvent::Queued {
+                                chat_id: chat_id.clone(),
+                                message_id: id.clone(),
                             });
                         }
                         composer
@@ -1991,8 +2097,17 @@ impl Composer {
                     this.update(cx, |composer, cx| {
                         if let Some(id) = &pending_message {
                             composer.state.update(cx, |state, cx| {
+                                if steer_echo.is_some() {
+                                    state.remove_echo(&chat_id, id);
+                                }
                                 state.end_pending_send(&chat_id, id);
                                 cx.notify();
+                            });
+                        }
+                        if let Some((id, _)) = &steer_echo {
+                            cx.emit(crate::composer::ComposerEvent::Queued {
+                                chat_id: chat_id.clone(),
+                                message_id: id.clone(),
                             });
                         }
                         composer.failure = Some(failure.into());
@@ -2014,10 +2129,11 @@ mod tests {
     use harness_rpc::methods;
 
     use super::{
-        PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action,
+        PANEL_PAD_TOP, QueuePrimaryAction, QueuedMessage, ROW_SLOT, available_queue_primary_action,
         latest_queued_message, one_line, queue_action_needs_host, queue_drag_offsets,
         queue_drop_index, queue_latest_shortcut_visible, queue_message_is_text_only,
-        queue_mutation_acknowledged, queue_steer_available, queue_visible_text, visible_queue_rows,
+        queue_mutation_acknowledged, queue_steer_available, queue_visible_text,
+        visible_move_target, visible_queue_rows,
     };
 
     #[test]
@@ -2063,6 +2179,71 @@ mod tests {
         assert_eq!(latest_queued_message(&items).unwrap().id, "older");
         items.pop();
         assert!(latest_queued_message(&items).is_none());
+    }
+
+    #[test]
+    fn hidden_head_row_keeps_latest_shortcut_and_drag_indices_dense() {
+        let queue = vec![
+            QueuedMessage::new("hidden", "steering", "host"),
+            QueuedMessage::new("middle", "second", "host"),
+            QueuedMessage::new("latest", "third", "host"),
+        ];
+        let visible = vec![(1, queue[1].clone()), (2, queue[2].clone())];
+        assert!(queue_latest_shortcut_visible(1, visible.len(), true, true));
+        assert_eq!(
+            visible_move_target(&queue, &visible, "middle", 0),
+            Some((1, 1)),
+            "dropping on its own visible slot does not cross the hidden head"
+        );
+        assert_eq!(
+            visible_move_target(&queue, &visible, "latest", 0),
+            Some((2, 1)),
+            "visual slot zero maps before the visible middle row after removal"
+        );
+        assert_eq!(
+            visible_move_target(&queue, &visible, "middle", visible.len()),
+            Some((1, 2)),
+            "the visible end slot maps after the last visible row"
+        );
+
+        let without_hidden = vec![
+            QueuedMessage::new("first", "first", "host"),
+            QueuedMessage::new("second", "second", "host"),
+            QueuedMessage::new("third", "third", "host"),
+        ];
+        let visible = without_hidden
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, item)| (index, item))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_move_target(&without_hidden, &visible, "first", 2),
+            Some((0, 2)),
+            "a downward drag keeps the original final index when nothing is hidden"
+        );
+
+        let hidden_middle = vec![
+            QueuedMessage::new("first", "first", "host"),
+            QueuedMessage::new("hidden", "steering", "host"),
+            QueuedMessage::new("second", "second", "host"),
+            QueuedMessage::new("third", "third", "host"),
+        ];
+        let visible = vec![
+            (0, hidden_middle[0].clone()),
+            (2, hidden_middle[2].clone()),
+            (3, hidden_middle[3].clone()),
+        ];
+        assert_eq!(
+            visible_move_target(&hidden_middle, &visible, "first", 2),
+            Some((0, 3)),
+            "a downward drag lands after the last visible row"
+        );
+        assert_eq!(
+            visible_move_target(&hidden_middle, &visible, "third", 0),
+            Some((3, 0)),
+            "an upward drag lands before the first visible row"
+        );
     }
 
     #[test]
@@ -2371,5 +2552,160 @@ mod appshot_edit_tests {
             assert_eq!(composer.staged_appshots()[1].id, "during-save");
             assert!(composer.editing_queued.is_none());
         });
+    }
+}
+
+#[cfg(test)]
+mod steer_delivery_tests {
+    use super::*;
+    use gpui::AppContext as _;
+    use harness_rpc::{ClientFrame, ServerFrame};
+
+    #[derive(Clone, Copy)]
+    enum ReplyKind {
+        Accepted,
+        Rejected,
+        Error,
+    }
+
+    fn next_request(
+        cx: &mut gpui::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        requests: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> ClientFrame {
+        cx.run_until_parked();
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        serde_json::from_str(&requests.try_recv().expect("expected RPC request")).unwrap()
+    }
+
+    fn answer(
+        replies: &tokio::sync::mpsc::Sender<String>,
+        request: &ClientFrame,
+        kind: ReplyKind,
+    ) {
+        let frame = match kind {
+            ReplyKind::Accepted => ServerFrame {
+                id: request.id,
+                ok: Some(serde_json::json!({ "sent": true })),
+                ..Default::default()
+            },
+            ReplyKind::Rejected => ServerFrame {
+                id: request.id,
+                ok: Some(serde_json::json!({ "sent": false })),
+                ..Default::default()
+            },
+            ReplyKind::Error => ServerFrame {
+                id: request.id,
+                err: Some("host unavailable".into()),
+                ..Default::default()
+            },
+        };
+        replies.try_send(serde_json::to_string(&frame).unwrap()).unwrap();
+    }
+
+    fn run_row_steer(cx: &mut gpui::TestAppContext, kind: ReplyKind) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(32);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(32);
+        let state = cx.new(|_| crate::state::AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(
+                crate::state::EngineHandle::from_test_client_with_capabilities(
+                    harness_rpc::RpcClient::new(out, inbound),
+                    vec![harness_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1.into()],
+                ),
+            );
+            state.chats = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "steer-chat",
+                    "deviceId": "local",
+                    "archived": false,
+                    "cwd": "/repo",
+                    "createdAt": chrono::Utc::now(),
+                    "config": { "harness": "codex", "sandbox": "workspace-write" }
+                }))
+                .unwrap(),
+            ];
+            state.local_device_id = Some("local".into());
+            state.selected_chat = Some("steer-chat".into());
+            state.queue = vec![QueuedMessage::new(
+                "queued-id",
+                "Review the latest tool result",
+                "local",
+            )];
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        cx.run_until_parked();
+        while let Ok(raw) = requests.try_recv() {
+            let request: ClientFrame = serde_json::from_str(&raw).unwrap();
+            answer(&replies, &request, ReplyKind::Accepted);
+        }
+        cx.run_until_parked();
+        while let Ok(raw) = requests.try_recv() {
+            let request: ClientFrame = serde_json::from_str(&raw).unwrap();
+            answer(&replies, &request, ReplyKind::Accepted);
+        }
+        cx.run_until_parked();
+        composer.update(cx, |composer, cx| {
+            composer.pickers().update(cx, |pickers, cx| {
+                pickers.seed_step_boundary_steering_for_test(cx)
+            });
+            composer.steer_queued_now("queued-id".into(), cx);
+        });
+        let steer = next_request(cx, &runtime, &mut requests);
+        assert_eq!(
+            steer.method.as_deref(),
+            Some(methods::STEER_QUEUED_MESSAGE_NOW)
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.pending_echoes()[0].parts[0].clone()),
+            harness_doc::MessagePart::Text {
+                id: "t0".into(),
+                text: "Review the latest tool result".into(),
+            }
+        );
+        assert!(state.read_with(cx, |state, _| {
+            state.message_is_in_transcript("steer-chat", "queued-id")
+        }));
+        assert!(state.read_with(cx, |state, _| {
+            visible_queue_items(state, "steer-chat").is_empty()
+        }));
+        composer.update(cx, |composer, cx| {
+            composer.steer_queued_now("queued-id".into(), cx)
+        });
+        assert!(
+            requests.try_recv().is_err(),
+            "an in-flight row must not steer twice"
+        );
+        answer(&replies, &steer, kind);
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        match kind {
+            ReplyKind::Accepted => assert!(state.read_with(cx, |state, _| {
+                state.message_is_in_transcript("steer-chat", "queued-id")
+            })),
+            ReplyKind::Rejected | ReplyKind::Error => {
+                assert!(state.read_with(cx, |state, _| {
+                    !state.message_is_in_transcript("steer-chat", "queued-id")
+                }));
+                assert_eq!(state.read_with(cx, |state, _| {
+                    visible_queue_items(state, "steer-chat").len()
+                }), 1);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn queued_row_steer_echoes_before_reply_and_cleans_up_rejections_and_errors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        run_row_steer(cx, ReplyKind::Accepted);
+        run_row_steer(cx, ReplyKind::Rejected);
+        run_row_steer(cx, ReplyKind::Error);
     }
 }
