@@ -60,6 +60,9 @@ mod cadence;
 #[path = "transcript/bottom_flicker_tests.rs"]
 mod bottom_flicker_tests;
 #[cfg(test)]
+#[path = "transcript/final_answer_tests.rs"]
+mod final_answer_tests;
+#[cfg(test)]
 #[path = "transcript/mermaid_tests.rs"]
 mod mermaid_tests;
 #[cfg(test)]
@@ -1435,6 +1438,14 @@ fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
     devices
 }
 
+/// Decoration on the first block of a completed assistant's trailing answer.
+#[derive(Clone)]
+pub struct FinalAnswer {
+    pub worked_secs: Option<i64>,
+    /// Compact work already has a heading; keep only the answer's divider there.
+    pub show_label: bool,
+}
+
 /// A transcript row: stable id + content version (diff key) + block payload.
 #[derive(Clone)]
 pub struct Row {
@@ -1456,6 +1467,8 @@ pub struct Row {
     pub copy_text: Option<SharedString>,
     /// Hidden while the named compact-work fold is closed.
     pub compact_fold: Option<SharedString>,
+    /// A completion boundary, not a separate row: markdown ids and selection stay stable.
+    pub final_answer: Option<FinalAnswer>,
 }
 
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
@@ -1638,6 +1651,40 @@ pub fn user_resize_spec(height_delta: f32) -> motion::MotionSpec {
     motion::MotionSpec::new(user_resize_duration_ms(height_delta), curve)
 }
 
+/// Only a completed trailing reply is an answer, never narration before more
+/// work or an error. Media and blank text may follow or accompany that reply.
+fn final_answer_part(entry: &SessionMessageEntry) -> Option<&str> {
+    if entry.role != MessageRole::Assistant
+        || entry.status != Some(MessageStatus::Complete)
+        || entry.parts.iter().any(|part| {
+            matches!(
+                part,
+                MessagePart::Input {
+                    resolved: false,
+                    ..
+                } | MessagePart::Tool {
+                    resolved: false,
+                    ..
+                } | MessagePart::Tool {
+                    subagent_status: Some(SubagentStatus::Running),
+                    ..
+                }
+            )
+        })
+    {
+        return None;
+    }
+    let mut first = None;
+    for part in entry.parts.iter().rev() {
+        match part {
+            MessagePart::Text { id, text } if !text.trim().is_empty() => first = Some(id.as_str()),
+            MessagePart::Text { .. } | MessagePart::Image { .. } | MessagePart::Visual { .. } => {}
+            _ => break,
+        }
+    }
+    first
+}
+
 #[cfg(test)]
 thread_local! { static FORBID_ROW_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
@@ -1708,6 +1755,7 @@ pub fn rows_for_entry(
             timestamp: Some(entry.created_at),
             copy_text,
             compact_fold: None,
+            final_answer: None,
         }];
     }
 
@@ -1768,6 +1816,7 @@ pub fn rows_for_entry(
                 timestamp: None,
                 copy_text: None,
                 compact_fold: None,
+                final_answer: None,
             });
             *group_ix += 1;
         };
@@ -1919,6 +1968,7 @@ pub fn rows_for_entry(
                                 timestamp: None,
                                 copy_text: None,
                                 compact_fold: None,
+                                final_answer: None,
                                 kind: if streaming {
                                     RowKind::LiveMarkdown {
                                         tree: tree.clone(),
@@ -1947,6 +1997,7 @@ pub fn rows_for_entry(
                             timestamp: None,
                             copy_text: None,
                             compact_fold: None,
+                            final_answer: None,
                             kind: RowKind::Visual {
                                 title: title.clone(),
                                 script: script.clone(),
@@ -1970,6 +2021,7 @@ pub fn rows_for_entry(
                             timestamp: None,
                             copy_text: None,
                             compact_fold: None,
+                            final_answer: None,
                             kind: RowKind::GeneratedImage {
                                 owner: entry.device_id.clone(),
                                 path: path.clone(),
@@ -2004,6 +2056,7 @@ pub fn rows_for_entry(
                                 timestamp: None,
                                 copy_text: None,
                                 compact_fold: None,
+                                final_answer: None,
                                 kind: RowKind::Markdown {
                                     tree: tree.clone(),
                                     block_ix,
@@ -2046,6 +2099,7 @@ pub fn rows_for_entry(
                             timestamp: None,
                             copy_text: None,
                             compact_fold: None,
+                            final_answer: None,
                         });
                     }
                     MessagePart::Error {
@@ -2088,6 +2142,7 @@ pub fn rows_for_entry(
                             timestamp: None,
                             copy_text: None,
                             compact_fold: None,
+                            final_answer: None,
                         });
                     }
                     // Tools and thoughts are grouped by the outer arms;
@@ -2135,6 +2190,7 @@ pub fn rows_for_entry(
                 row.timestamp = None;
                 row.copy_text = None;
                 row.compact_fold = Some(work_id.clone());
+                row.final_answer = None;
             }
             let header = Row {
                 id: work_id,
@@ -2158,6 +2214,7 @@ pub fn rows_for_entry(
                 timestamp: None,
                 copy_text: None,
                 compact_fold: None,
+                final_answer: None,
             };
             after_work = pos + 1 + inner.len();
             for (i, row) in inner.into_iter().enumerate() {
@@ -2183,6 +2240,7 @@ pub fn rows_for_entry(
                     timestamp: None,
                     copy_text: None,
                     compact_fold: None,
+                    final_answer: None,
                 },
             );
         }
@@ -2196,6 +2254,32 @@ pub fn rows_for_entry(
     }
 
     rows.extend(viewed_image_rows(entry));
+
+    if let Some(part_id) = final_answer_part(entry) {
+        let answer_id = format!("{}#{part_id}.0", entry.id);
+        let show_label = !rows.iter().any(|row| {
+            matches!(
+                row.kind,
+                RowKind::ToolGroup {
+                    compact_shell: true,
+                    ..
+                }
+            )
+        });
+        if let Some(row) = rows.iter_mut().find(|row| row.id.as_ref() == answer_id) {
+            let worked_secs = entry
+                .duration_ms
+                .filter(|&ms| ms > 0)
+                .map(|ms| (ms / 1000).max(1));
+            // Timing can arrive after the text: invalidate the cached layout,
+            // while preserving the first markdown block's identity.
+            row.version ^= fnv1a(&worked_secs.unwrap_or(0).to_le_bytes());
+            row.final_answer = Some(FinalAnswer {
+                worked_secs,
+                show_label,
+            });
+        }
+    }
 
     if let Some(first) = rows.first_mut() {
         first.turn_start = true;
@@ -2247,6 +2331,7 @@ fn viewed_image_rows(entry: &SessionMessageEntry) -> Vec<Row> {
                 timestamp: None,
                 copy_text: None,
                 compact_fold: None,
+                final_answer: None,
                 kind: RowKind::GeneratedImage {
                     owner: entry.device_id.clone(),
                     path: path.clone(),
@@ -8349,6 +8434,38 @@ impl Transcript {
             RowKind::RestartNotice { message } => restart_notice_chip(message.clone(), &theme),
         };
 
+        let inner = if let Some(answer) = &row.final_answer {
+            let heading = div()
+                .w_full()
+                .border_b_1()
+                .border_color(theme.border)
+                .mb(px(Theme::SPACE_MD))
+                .when(answer.show_label, |el| {
+                    el.pt(px(Theme::SPACE_SM))
+                        .pb(px(Theme::SPACE_SM + Theme::SPACE_XS))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(13.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(
+                                    answer
+                                        .worked_secs
+                                        .map(worked_for_label)
+                                        .unwrap_or_else(|| "Final answer".into()),
+                                )),
+                        )
+                });
+            #[cfg(test)]
+            let heading = heading.debug_selector(|| "transcript-final-answer-heading".into());
+            div()
+                .w_full()
+                .child(heading)
+                .child(inner)
+                .into_any_element()
+        } else {
+            inner
+        };
+
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
         // entry's last row. Timestamp, copy action, and copied feedback only
         // flip visibility/content, so none of them shifts the virtualizer.
@@ -13108,6 +13225,7 @@ mod tests {
             timestamp: None,
             copy_text: None,
             compact_fold: None,
+            final_answer: None,
         }
     }
 
