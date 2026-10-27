@@ -635,3 +635,289 @@ async fn an_existing_local_branch_wins_over_remote_labels_and_tags() {
         current
     );
 }
+
+#[tokio::test]
+async fn sha256_repositories_keep_full_snapshot_bases_and_ownership() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("sha256-app");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "--object-format=sha256", "-b", "main"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let (old, current) = advance_main(&repo);
+    assert_eq!(old.len(), 64);
+    git(&repo, &["branch", &old, &current]);
+    git(&repo, &["tag", "main", &old]);
+    let repos =
+        Repos::with_worktrees_root(&tmp.path().join("data"), "test", tmp.path().join("trees"));
+    for (base, expected) in [(old.as_str(), &old), ("main", &current)] {
+        let tree = repos
+            .create_worktree_for_task(&repo, base, "Fix login")
+            .await
+            .unwrap();
+        let path = Path::new(&tree.path);
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), *expected);
+        assert!(tree.checkout_id.is_some());
+        repos.delete_worktree(&repo, path).await.unwrap();
+        assert!(!repos.branches(&repo).await.unwrap().contains(&tree.branch));
+    }
+    assert_eq!(
+        git(&repo, &["rev-parse", &format!("refs/heads/{old}")]),
+        current
+    );
+}
+
+#[tokio::test]
+async fn bare_repository_worktrees_support_descriptive_names_and_guarded_cleanup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (source, repos) = setup(tmp.path());
+    let expected = git(&source, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("sample.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--",
+            source.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    let tree = repos
+        .create_worktree_for_task(&bare, "main", "Fix login")
+        .await
+        .unwrap();
+    let path = Path::new(&tree.path);
+    assert_eq!(tree.branch, "task/fix-login");
+    assert_eq!(git(path, &["rev-parse", "HEAD"]), expected);
+    let renamed = repos
+        .rename_worktree_branch(path, &tree.branch, "Fix login callback")
+        .await
+        .unwrap();
+    assert_eq!(renamed, "task/fix-login-callback");
+    repos.delete_worktree(&bare, path).await.unwrap();
+    assert_eq!(repos.branches(&bare).await.unwrap(), ["main"]);
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), expected);
+}
+
+#[tokio::test]
+async fn moved_worktrees_keep_checkout_identity_without_triggering_another_title_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let tree = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    let moved = tmp.path().join("user-moved-checkout");
+    git(
+        &repo,
+        &["worktree", "move", &tree.path, moved.to_str().unwrap()],
+    );
+    let identity = repos.checkout_identity(&moved).await.unwrap();
+    assert_eq!(tree.checkout_id.as_deref(), Some(identity.id.as_str()));
+    let unchanged = repos
+        .rename_worktree_branch(&moved, &tree.branch, "Different task")
+        .await
+        .unwrap();
+    assert_eq!(unchanged, tree.branch);
+    repos.delete_worktree(&repo, &moved).await.unwrap();
+    assert!(!repos.branches(&repo).await.unwrap().contains(&tree.branch));
+    assert!(!moved.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn primary_linked_and_symlink_aliases_share_one_allocation_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let seed = repos
+        .create_worktree_for_task(&repo, "main", "Seed checkout")
+        .await
+        .unwrap();
+    let alias = tmp.path().join("project-alias");
+    std::os::unix::fs::symlink(&repo, &alias).unwrap();
+    let paths = [&repo, Path::new(&seed.path), &alias];
+    let managers: Vec<_> = (0..paths.len())
+        .map(|index| {
+            Repos::with_worktrees_root(
+                &tmp.path().join(format!("data-{index}")),
+                "test",
+                tmp.path().join(format!("trees-{index}")),
+            )
+        })
+        .collect();
+    let results = futures::future::join_all(
+        managers
+            .iter()
+            .zip(paths)
+            .map(|(manager, path)| manager.create_worktree_for_task(path, "main", "Fix login")),
+    )
+    .await;
+    let trees: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+    let unique: std::collections::HashSet<_> = trees.iter().map(|tree| &tree.branch).collect();
+    assert_eq!(unique.len(), paths.len());
+    for tree in trees {
+        let common = git(Path::new(&tree.path), &["rev-parse", "--git-common-dir"]);
+        assert_eq!(
+            Path::new(&tree.path).join(common).canonicalize().unwrap(),
+            repo.join(".git").canonicalize().unwrap()
+        );
+        repos
+            .delete_worktree(&repo, Path::new(&tree.path))
+            .await
+            .unwrap();
+    }
+    repos
+        .delete_worktree(&repo, Path::new(&seed.path))
+        .await
+        .unwrap();
+    assert_eq!(repos.branches(&repo).await.unwrap(), ["main"]);
+}
+
+#[tokio::test]
+async fn failed_ownership_recording_preserves_the_partial_checkout_and_allows_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let config_lock = repo.join(".git/config.lock");
+    std::fs::write(&config_lock, b"synthetic concurrent configuration writer\n").unwrap();
+    let result = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await;
+    let partial = tmp.path().join("trees/sample-app/fix-login");
+    assert!(result.is_err());
+    assert!(partial.join(".git").exists());
+    assert_eq!(
+        git(&partial, &["branch", "--show-current"]),
+        "task/fix-login"
+    );
+    assert_eq!(
+        std::fs::read(&config_lock).unwrap(),
+        b"synthetic concurrent configuration writer\n"
+    );
+    std::fs::remove_file(&config_lock).unwrap();
+    let retry = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(retry.branch, "task/fix-login-2");
+    repos.delete_worktree(&repo, &partial).await.unwrap();
+    assert!(
+        repos
+            .branches(&repo)
+            .await
+            .unwrap()
+            .contains(&"task/fix-login".to_string()),
+        "a failed ownership write cannot authorize deletion"
+    );
+    repos
+        .delete_worktree(&repo, Path::new(&retry.path))
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_prepare_script_does_not_hold_the_repository_allocation_lock() {
+    use std::time::Duration;
+    struct ReleaseFile(std::path::PathBuf);
+    impl Drop for ReleaseFile {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    std::fs::create_dir(repo.join(".agents")).unwrap();
+    std::fs::write(
+        repo.join(".agents/prepare"),
+        r#"#!/bin/sh
+if [ "$(git branch --show-current)" != "task/slow-setup" ]; then exit 0; fi
+common=$(git rev-parse --git-common-dir)
+printf ready > "$common/prepare-started"
+i=0
+while [ ! -f "$common/prepare-release" ] && [ "$i" -lt 1000 ]; do
+  sleep 0.02
+  i=$((i + 1))
+done
+[ -f "$common/prepare-release" ]
+"#,
+    )
+    .unwrap();
+    git(&repo, &["add", ".agents/prepare"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "synthetic gated setup",
+        ],
+    );
+    let release = ReleaseFile(repo.join(".git/prepare-release"));
+    let slow_repo = repo.clone();
+    let slow_manager = repos.clone();
+    let mut slow = tokio::spawn(async move {
+        slow_manager
+            .create_worktree_for_task(&slow_repo, "main", "Slow setup")
+            .await
+    });
+    let started = tokio::time::timeout(Duration::from_secs(10), async {
+        while !repo.join(".git/prepare-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let fast = if started {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                repos.create_worktree_for_task(&repo, "main", "Fast setup"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let slow_was_still_waiting = !slow.is_finished();
+    // Release and join the shell before any assertion can unwind the fixture.
+    drop(release);
+    let slow_tree = match tokio::time::timeout(Duration::from_secs(10), &mut slow).await {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => {
+            slow.abort();
+            let _ = slow.await;
+            panic!("slow setup did not exit after release");
+        }
+    };
+    assert!(started, "the setup barrier was never reached");
+    let fast_tree = fast
+        .unwrap()
+        .expect("another allocation waited for the prepare script")
+        .unwrap();
+    assert!(
+        slow_was_still_waiting,
+        "the first setup must remain gated while the second allocation completes"
+    );
+    assert_ne!(fast_tree.path, slow_tree.path);
+    for tree in [slow_tree, fast_tree] {
+        repos
+            .delete_worktree(&repo, Path::new(&tree.path))
+            .await
+            .unwrap();
+    }
+}
