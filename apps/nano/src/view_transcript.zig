@@ -14,6 +14,7 @@ const icons = @import("icons.zig");
 const file_icons = @import("file_icons.zig");
 const kit = @import("view_kit.zig");
 const tools = @import("tools.zig");
+const compact = @import("compact.zig");
 const tr = @import("transcript.zig");
 const sidebar = @import("view_sidebar.zig");
 const App = @import("app.zig").App;
@@ -200,42 +201,152 @@ fn assistant(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, at: A
     // Its parts 12 apart; the lane right under the last (the row's
     // `strip`, with no gap of its own).
     const parts_box = ui.div(c).column().wFull().gap(12);
-    const buf = c.alloc().alloc(tools.Run, e.parts.items.len) catch {
+    const answer: Answer = .{ .part = if (compact.finalAnswerPart(e)) |i| &e.parts.items[i] else null };
+    if (a.settings.get(.transcript_compact_mode))
+        compactParts(c, a, k, e, at, answer)
+    else
+        partRows(c, a, k, e, e.parts.items, at, last, answer);
+    if (e.status == .streaming and e.parts.items.len == 0) ui.text(c, "Working…", .{ .size = 12, .color = k.muted });
+    parts_box.end();
+    if (e.status != .streaming) lane(c, k, e, hovered, false);
+}
+
+/// The part a finished reply's answer starts at, which a divider heads,
+/// and whether the divider says how long the turn worked (compact mode's
+/// work line already does).
+const Answer = struct {
+    part: ?*const tr.Part,
+    label: bool = true,
+};
+
+/// Parts as rows: tool calls and reasoning folded into groups, the rest
+/// one row each. `auto` lets a streaming reply's tail group open itself.
+fn partRows(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, parts: []const tr.Part, at: At, auto: bool, answer: Answer) void {
+    const buf = c.alloc().alloc(tools.Run, parts.len) catch {
         ui.text(c, "Unable to render reply: out of memory", .{ .size = 12, .color = k.danger });
-        parts_box.end();
         return;
     };
-    const rs = tools.runs(buf, e.parts.items);
-    for (rs) |r| {
-        const p = &e.parts.items[r.start];
+    for (tools.runs(buf, parts)) |r| {
+        const p = &parts[r.start];
         ui.key(c, c.print("run-{s}-{s}", .{ e.id, p.id }));
         if (r.group) {
             // ACP often creates its answer placeholder before its first
             // text chunk. An empty placeholder must not hide live work.
-            const tail = e.status == .streaming and last and for (e.parts.items[r.end..]) |next| {
+            const tail = e.status == .streaming and auto and for (parts[r.end..]) |next| {
                 if (next.kind != .text or std.mem.trim(u8, next.text.items, " \t\r\n").len > 0) break false;
             } else true;
-            group(c, a, k, e, e.parts.items[r.start..r.end], tail, at.chat_id);
+            group(c, a, k, e, parts[r.start..r.end], tail, at.chat_id);
             continue;
         }
-        switch (p.kind) {
-            .text => @import("view_markdown.zig").withLinks(c, k, p.text.items, a, at.chat_id),
-            .tool => treeRow(c, a, k, e, p, true, at.chat_id),
-            .@"error" => errorPart(c, a, k, e, p, at),
-            .image => attachment(c, k, .document, p.text.items),
-            .visual => attachment(c, k, .widget, p.text.items),
-            .delegation => attachment(c, k, .widget, "Delegated to a subagent"),
-            .input => {
-                const q = if (p.questions.len > 0) p.questions[0] else null;
-                const label = if (q) |x| (if (x.question.len > 0) x.question else x.header) else "Question";
-                @import("view_question.zig").chip(c, k, label, p.resolved);
-            },
-            else => {},
+        part(c, a, k, e, p, at, answer);
+    }
+}
+
+fn part(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, p: *const tr.Part, at: At, answer: Answer) void {
+    switch (p.kind) {
+        .text => {
+            if (answer.part == p) {
+                const box = ui.div(c).column().wFull();
+                defer box.end();
+                answerHeading(c, k, e, answer.label);
+                @import("view_markdown.zig").withLinks(c, k, p.text.items, a, at.chat_id);
+            } else @import("view_markdown.zig").withLinks(c, k, p.text.items, a, at.chat_id);
+        },
+        .tool => treeRow(c, a, k, e, p, true, at.chat_id),
+        .@"error" => errorPart(c, a, k, e, p, at),
+        .image => attachment(c, k, .document, p.text.items),
+        .visual => attachment(c, k, .widget, p.text.items),
+        .delegation => attachment(c, k, .widget, "Delegated to a subagent"),
+        .input => {
+            const q = if (p.questions.len > 0) p.questions[0] else null;
+            const label = if (q) |x| (if (x.question.len > 0) x.question else x.header) else "Question";
+            @import("view_question.zig").chip(c, k, label, p.resolved);
+        },
+        else => {},
+    }
+}
+
+/// Above a finished reply's answer (GPUI's `final_answer` heading): a thin
+/// divider, 12 points over the answer, under a muted "Worked for …" (or
+/// "Final answer") unless compact mode's work line already says it.
+fn answerHeading(c: *ui.Context, k: theme.Colors, e: *const tr.Entry, label: bool) void {
+    const h = ui.div(c).column().wFull().pb(12);
+    defer h.end();
+    if (label) {
+        const l = ui.div(c).row().wFull().pt(8).pb(12);
+        defer l.end();
+        var buf: [48]u8 = undefined;
+        const text = if (compact.workedSecs(e)) |s| compact.workedFor(&buf, s) else "Final answer";
+        ui.text(c, c.print("{s}", .{text}), kit.style(c, 13, 18, .{ .color = k.muted }));
+    }
+    _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.border }, .none, null);
+}
+
+/// Compact mode (GPUI's `compact_shell`): the turn's thinking, tool calls
+/// and the narration between them under one closed line where the first
+/// of them was; it opens to the rows they'd be without compact mode, and
+/// never on its own. Saved views stay rows after it; questions, errors and
+/// the reply keep their places.
+fn compactParts(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, at: At, answer_in: Answer) void {
+    const items = e.parts.items;
+    const reply = compact.replyStart(items, e.status == .streaming);
+    var work: std.ArrayList(tr.Part) = .empty;
+    var views: std.ArrayList(tr.Part) = .empty;
+    var first: ?usize = null;
+    for (items, 0..) |*p, i| if (compact.isWork(i, p, reply)) {
+        if (first == null) first = i;
+        // Read-only copies: the rows draw from them this frame only.
+        (if (compact.isView(p)) &views else &work).append(c.alloc(), p.*) catch return;
+    };
+    var answer = answer_in;
+    answer.label = work.items.len == 0;
+    for (items, 0..) |*p, i| {
+        if (compact.isWork(i, p, reply)) {
+            if (i != first.?) continue;
+            if (work.items.len > 0) {
+                ui.key(c, c.print("work-{s}", .{e.id}));
+                workLine(c, a, k, e, work.items, at);
+            }
+            if (views.items.len > 0) partRows(c, a, k, e, views.items, at, false, answer);
+            continue;
+        }
+        ui.key(c, c.print("part-{s}-{s}", .{ e.id, p.id }));
+        part(c, a, k, e, p, at, answer);
+    }
+}
+
+/// The compact work line: a group's header that says what's running while
+/// the turn works, then "Worked for …" once it has.
+fn workLine(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, work: []const tr.Part, at: At) void {
+    const key = c.print("{s}#work", .{e.id});
+    const open = a.view.groupOpen(key, false);
+    const box = ui.div(c).column().wFull().gap(12);
+    defer box.end();
+    {
+        const h = kit.pressFeedback(ui.div(c).row().h(26).gap(6).pr(4).itemsCenter().rounded(4).control().hover(k.wash(0.04)));
+        defer h.end();
+        if (h.clicked()) a.view.toggleGroup(a.gpa, key, false);
+        const slot = ui.div(c).row().size(22, 18).center();
+        icons.icon(c, if (open) .@"alt-arrow-down" else .@"alt-arrow-right", 14, k.muted, 0);
+        slot.end();
+        const st = kit.style(c, 12, 18, .{ .color = if (h.hovered()) k.text else k.muted });
+        const settled = if (e.status != .streaming) compact.workedSecs(e) else null;
+        if (settled) |s| {
+            const lb = c.alloc().alloc(u8, 48) catch return;
+            ui.text(c, compact.workedFor(lb, s), st);
+        } else {
+            const lb = c.alloc().alloc(u8, 160) catch return;
+            const active = e.status == .streaming and for (work) |p| {
+                if (p.kind == .reasoning or (p.kind == .tool and !p.resolved)) break true;
+            } else false;
+            kit.activityText(c, k, tools.label(lb, work), st, active);
         }
     }
-    if (e.status == .streaming and e.parts.items.len == 0) ui.text(c, "Working…", .{ .size = 12, .color = k.muted });
-    parts_box.end();
-    if (e.status != .streaming) lane(c, k, e, hovered, false);
+    if (!open) return;
+    const reveal = ui.motion.frame(c, (ui.motion.MotionSpec{ .duration_ms = 140, .curve = ui.motion.Easing.css_ease_out }).animate(.{ .opacity = 0.65, .y = -2 }, .{ .opacity = 1, .y = 0 }));
+    const body = ui.div(c).column().wFull().gap(12).motion(reveal);
+    defer body.end();
+    partRows(c, a, k, e, work, at, false, .{ .part = null });
 }
 
 const row_h: f32 = 32;

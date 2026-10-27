@@ -8,6 +8,7 @@ test {
     _ = @import("app.zig");
     _ = @import("rules.zig");
     _ = @import("tools.zig");
+    _ = @import("compact.zig");
     _ = @import("diff.zig");
     _ = @import("wizard.zig");
     _ = @import("termlog.zig");
@@ -19,6 +20,7 @@ test {
     _ = @import("tests_ui.zig");
     _ = @import("tests_ui_picker.zig");
     _ = @import("tests_ui_history.zig");
+    _ = @import("tests_ui_compact.zig");
     _ = @import("tests_ui_caret.zig");
     _ = @import("app_drafts.zig");
     _ = @import("snap.zig");

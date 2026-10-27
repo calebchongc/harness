@@ -62,7 +62,7 @@ pub const Part = struct {
     questions: []const Question = &.{},
     arena: ?*std.heap.ArenaAllocator = null,
 
-    fn deinit(p: *Part, gpa: Allocator) void {
+    pub fn deinit(p: *Part, gpa: Allocator) void {
         gpa.free(p.id);
         gpa.free(p.path);
         gpa.free(p.output);
@@ -82,8 +82,10 @@ pub const Entry = struct {
     role: Role,
     status: EntryStatus,
     parts: std.ArrayList(Part) = .empty,
+    /// How long the turn worked (`durationMs`), once it has said.
+    duration_ms: ?i64 = null,
 
-    fn deinit(e: *Entry, gpa: Allocator) void {
+    pub fn deinit(e: *Entry, gpa: Allocator) void {
         gpa.free(e.id);
         for (e.parts.items) |*p| p.deinit(gpa);
         e.parts.deinit(gpa);
@@ -242,6 +244,9 @@ fn parseEntry(gpa: Allocator, v: json.Value) !Entry {
     const status = std.meta.stringToEnum(EntryStatus, string(o.get("status")) orelse "") orelse .complete;
     var e: Entry = .{ .id = try gpa.dupe(u8, string(o.get("id")) orelse return error.Desync), .role = role, .status = status };
     errdefer e.deinit(gpa);
+    if (o.get("durationMs")) |d| if (d == .integer) {
+        e.duration_ms = d.integer;
+    };
     for (array(o.get("parts"))) |p| if (p == .object) try e.parts.append(gpa, try parsePart(gpa, p.object));
     return e;
 }
