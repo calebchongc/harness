@@ -2028,7 +2028,7 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
-    /// The first ⌘W close is asking whether to archive (`archive_choice.rs`).
+    /// A ⌘W close is asking whether to archive (`archive_choice.rs`).
     archive_choice_prompt: bool,
     /// Global confirmation/error dialog for the Changes-pane trash action. The
     /// RPC task is retained separately so rerenders do not cancel it.
@@ -16007,7 +16007,7 @@ mod exit_regressions {
             )
         });
         let windows = |cx: &mut TestAppContext| cx.update(|cx| cx.windows().len());
-        // Already chosen, so ⌘W closes instead of asking first.
+        // A saved preference must not bypass the per-close question.
         cx.update(|cx| settings::set_archive_sessions_on_close(false, cx));
         // A fresh, unprompted chat (the new-session canvas): nothing closes.
         cx.update(|cx| crate::app_menus::close_tab_in(window, cx));
@@ -16045,7 +16045,10 @@ mod exit_regressions {
         cx.update(|cx| crate::app_menus::close_tab_in(window, cx));
         assert_eq!(windows(cx), 1);
         window
-            .update(cx, |shell, _, cx| {
+            .update(cx, |shell, window, cx| {
+                assert!(shell.archive_choice_prompt);
+                assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("chat"));
+                assert!(shell.choose_close_archiving(false, window, cx));
                 assert_eq!(shell.state.read(cx).selected_chat, None, "the chat closed");
             })
             .unwrap();
