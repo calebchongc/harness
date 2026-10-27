@@ -99,6 +99,7 @@ pub fn resolve_codex_executable() -> Option<PathBuf> {
 pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessError> {
     let exe = CodexHarness::new().resolve_executable()?;
     let mut cmd = Command::new(&exe);
+    crate::apply_run_environment(&mut cmd, None);
     crate::compose_child_path(&mut cmd, &exe);
     cmd.arg("login").env("CODEX_HOME", codex_home);
     Ok(cmd)
@@ -173,6 +174,7 @@ impl CodexHarness {
     async fn discover_skills(&self, cwd: Option<&std::path::Path>) -> Result<Value, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        crate::apply_run_environment(&mut cmd, None);
         cmd.arg("app-server");
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -232,6 +234,7 @@ impl CodexHarness {
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        crate::apply_run_environment(&mut cmd, None);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
@@ -698,6 +701,7 @@ impl CodexHarness {
             harness_proto::SandboxLevel::DangerFullAccess
         };
         let mut cmd = Command::new(&exe);
+        crate::apply_run_environment(&mut cmd, controls.origin.as_ref().filter(|_| !title_only));
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
         if !request.cwd.is_empty() {
