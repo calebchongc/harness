@@ -52,7 +52,7 @@ impl Shell {
         self.close_chat_view_with_archive(archive, window, cx)
     }
 
-    /// Escape: nothing closes and nothing is saved; the next ⌘W asks again.
+    /// Dismiss or Escape: nothing closes and nothing is saved; the next ⌘W asks again.
     pub(super) fn dismiss_archive_choice(&mut self, cx: &mut Context<Self>) -> bool {
         if !std::mem::take(&mut self.archive_choice_prompt) {
             return false;
@@ -73,7 +73,35 @@ impl Shell {
         let (close, close_only) = settings::close_shortcut_badges(cx);
         let (title, body) = archive_choice_copy(&close, &close_only);
         let card = popover::dialog_card(theme)
-            .child(popover::dialog_title(theme, &title))
+            .relative()
+            .debug_selector(|| "archive-choice-card".into())
+            .child(
+                div()
+                    .id("archive-choice-dismiss")
+                    .debug_selector(|| "archive-choice-dismiss".into())
+                    .absolute()
+                    .top(px(8.0))
+                    .right(px(8.0))
+                    .size(px(20.0))
+                    .rounded(px(5.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label("Dismiss close preference setup")
+                    .hover(|style| style.bg(theme.ink(0.08)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.dismiss_archive_choice(cx);
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::CLOSE)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .child(popover::dialog_title(theme, &title).mt(px(12.0)))
             .child(div().mt(px(6.0)).child(popover::dialog_body(theme, body)))
             .child(
                 div()
@@ -82,13 +110,6 @@ impl Shell {
                     .flex_row()
                     .justify_end()
                     .gap(px(8.0))
-                    .child(
-                        popover::btn_ghost(theme, "Cancel", "archive-choice-cancel")
-                            .id("archive-choice-cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.dismiss_archive_choice(cx);
-                            })),
-                    )
                     .child(
                         popover::btn_primary(theme, "Archive it")
                             .id("archive-choice-archive")

@@ -28,7 +28,7 @@ def check(directory):
         assert image.height == round(720 * scale), case["file"]
         samples = [
             image.getpixel((round(x * scale), round(y * scale)))
-            for x, y in [(563, 437.5), (658, 437.5)]
+            for x, y in [(563, 443.5), (658, 443.5)]
         ]
         if samples[0] != samples[1] or any(
             abs(actual - expected) > 1
@@ -36,7 +36,7 @@ def check(directory):
             for actual, expected in zip(sample, case["fill"])
         ):
             failures.append((case["file"], samples, case["fill"]))
-        crop = image.crop(tuple(round(n * scale) for n in (368, 230.5, 732.5, 490)))
+        crop = image.crop(tuple(round(n * scale) for n in (368, 224.5, 732.5, 496)))
         crop.thumbnail((550, 397))
         tile = Image.new("RGB", (560, 425), "#d0d0d0")
         tile.paste(crop, ((560 - crop.width) // 2, 25))

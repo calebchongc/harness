@@ -72,6 +72,55 @@ fn cmd_w_asks_and_escape_cancels(cx: &mut gpui::TestAppContext) {
     assert_eq!(chosen(cx), (false, false));
 }
 
+struct ArchiveChoiceHost {
+    shell: Entity<Shell>,
+    _updates: Subscription,
+}
+
+impl Render for ArchiveChoiceHost {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.shell.update(cx, |shell, cx| {
+            let theme = Theme::of(cx).clone();
+            shell
+                .render_archive_choice_dialog(window.viewport_size(), &theme, cx)
+                .unwrap_or_else(|| gpui::Empty.into_any_element())
+        })
+    }
+}
+
+#[gpui::test]
+fn top_right_dismiss_keeps_chat_open_and_saves_nothing(cx: &mut gpui::TestAppContext) {
+    let (dir, window) = fixture(cx, false, None);
+    press(cx, window, "mod-w");
+    let shell = window.root(cx).unwrap();
+    let (_host, visual) = cx.add_window_view(|_, cx| ArchiveChoiceHost {
+        _updates: cx.observe(&shell, |_, _, cx| cx.notify()),
+        shell,
+    });
+    visual.run_until_parked();
+    let dismiss = visual
+        .debug_bounds("archive-choice-dismiss")
+        .expect("the setup dialog has a dismiss control");
+    let card = visual.debug_bounds("archive-choice-card").unwrap();
+    let inset = px(9.0); // 8px inset inside the card's 1px border.
+    assert_eq!(dismiss.top(), card.top() + inset);
+    assert_eq!(dismiss.right(), card.right() - inset);
+    visual.simulate_click(dismiss.center(), gpui::Modifiers::none());
+    visual.run_until_parked();
+    assert_eq!(
+        prompt_and_selection(cx, window),
+        (false, Some("current".into()))
+    );
+    assert_eq!(chosen(cx), (false, false));
+    assert!(!settings::UiSettings::load(dir.path()).archive_on_close_chosen);
+    press(cx, window, "mod-w");
+    assert!(
+        prompt_and_selection(cx, window).0,
+        "dismiss did not choose a default"
+    );
+    press(cx, window, "escape");
+}
+
 #[gpui::test]
 fn close_buttons_never_ask(cx: &mut gpui::TestAppContext) {
     let (_dir, window) = fixture(cx, true, None);
