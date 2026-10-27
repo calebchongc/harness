@@ -328,6 +328,107 @@ async fn a_directory_collision_keeps_existing_bytes_and_uses_a_suffix() {
 }
 
 #[tokio::test]
+async fn a_locked_worktree_refuses_cleanup_without_discarding_its_branch_or_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("sample-app");
+    init_repo(&repo);
+    let repos = Repos::with_worktrees_root(
+        &tmp.path().join("data"),
+        "test",
+        tmp.path().join("worktrees"),
+    );
+    let tree = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    let path = Path::new(&tree.path);
+    std::fs::write(path.join("keep.txt"), b"worktree intentionally locked\n").unwrap();
+    git(
+        &repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "synthetic active task",
+            &tree.path,
+        ],
+    );
+    let result = repos.delete_worktree(&repo, path).await;
+    assert!(
+        result.is_err(),
+        "a lock must not be bypassed with extra force or recursive removal"
+    );
+    assert_eq!(
+        std::fs::read(path.join("keep.txt")).unwrap(),
+        b"worktree intentionally locked\n"
+    );
+    assert!(repos.branches(&repo).await.unwrap().contains(&tree.branch));
+    git(&repo, &["worktree", "unlock", &tree.path]);
+    // The failed removal must release both locks so an explicit later retry works.
+    repos.delete_worktree(&repo, path).await.unwrap();
+    assert!(!repos.branches(&repo).await.unwrap().contains(&tree.branch));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failing_checkout_hook_preserves_the_files_it_already_wrote() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("sample-app");
+    init_repo(&repo);
+    let hooks = tmp.path().join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'hook-created work\\n' > keep.txt\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &repo,
+        &[
+            "config",
+            "--local",
+            "core.hooksPath",
+            hooks.to_str().unwrap(),
+        ],
+    );
+    let root = tmp.path().join("worktrees");
+    let repos = Repos::with_worktrees_root(&tmp.path().join("data"), "test", root.clone());
+    let result = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await;
+    assert!(result.is_err());
+    let partial = root.join("sample-app/fix-login");
+    assert_eq!(
+        std::fs::read(partial.join("keep.txt")).unwrap(),
+        b"hook-created work\n"
+    );
+    assert!(partial.join(".git").is_file());
+    assert_eq!(
+        git(&partial, &["branch", "--show-current"]),
+        "task/fix-login"
+    );
+    // Once the hook is repaired, retry must not reuse or erase the partial checkout.
+    std::fs::remove_file(&hook).unwrap();
+    let retry = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(retry.branch, "task/fix-login-2");
+    repos.delete_worktree(&repo, &partial).await.unwrap();
+    // Failed creation never recorded ownership; cleanup cannot claim this branch.
+    assert!(
+        repos
+            .branches(&repo)
+            .await
+            .unwrap()
+            .contains(&"task/fix-login".to_string())
+    );
+}
+
+#[tokio::test]
 async fn an_invalid_base_does_not_leave_a_branch_or_checkout() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("sample-app");

@@ -142,6 +142,13 @@ type WorktreeMutationLocks =
     std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>;
 static WORKTREE_MUTATIONS: std::sync::OnceLock<WorktreeMutationLocks> = std::sync::OnceLock::new();
 
+struct WorktreeMutationGuard {
+    // Drop the OS lock before admitting another local waiter. The persistent
+    // file is only a rendezvous point: process exit releases the actual lock.
+    _file: std::fs::File,
+    _local: tokio::sync::OwnedMutexGuard<()>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WorktreeBranchOwner {
     git_dir: String,
@@ -1179,12 +1186,12 @@ impl Repos {
     // ── worktrees ───────────────────────────────────────────────────────────
 
     /// Serialize ref/config mutations for one repository, including independent
-    /// Repos handles and aliases of its primary or linked checkouts. Other
-    /// repositories do not wait on this lock.
+    /// Repos handles, processes, and aliases of its primary or linked checkouts.
+    /// Other repositories do not wait on this lock.
     async fn lock_worktree_mutations(
         &self,
         path: &Path,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, EngineError> {
+    ) -> Result<WorktreeMutationGuard, EngineError> {
         let common = self
             .git(&["rev-parse", "--git-common-dir"], Some(path))
             .await?;
@@ -1199,12 +1206,34 @@ impl Repos {
                 Some(lock) => lock,
                 None => {
                     let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(key, std::sync::Arc::downgrade(&lock));
+                    locks.insert(key.clone(), std::sync::Arc::downgrade(&lock));
                     lock
                 }
             }
         };
-        Ok(lock.lock_owned().await)
+        let local = lock.lock_owned().await;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(key.join("harness-worktree-mutations.lock"))?;
+        // A nonblocking OS lock keeps waiting cancellable without leaving a
+        // blocking task behind. Do not remove the file: replacing its inode
+        // would let another process bypass existing holders/waiters.
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+        Ok(WorktreeMutationGuard {
+            _file: file,
+            _local: local,
+        })
     }
 
     /// Create a worktree before a task is available (the legacy RPC path).
