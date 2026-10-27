@@ -90,7 +90,7 @@ impl Shell {
                             })),
                     )
                     .child(
-                        popover::btn_ghost(theme, "Archive it", "archive-choice-archive")
+                        popover::btn_primary(theme, "Archive it")
                             .id("archive-choice-archive")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.choose_close_archiving(true, window, cx);
