@@ -1257,6 +1257,7 @@ impl Repos {
         task: &str,
     ) -> Result<Worktree, EngineError> {
         let mutation = self.lock_worktree_mutations(repo_path).await?;
+        let base_ref = self.worktree_base_ref(repo_path, branch).await;
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1306,7 +1307,7 @@ impl Repos {
                     "-b",
                     &branch_name,
                     &path.to_string_lossy(),
-                    branch,
+                    &base_ref,
                 ],
                 Some(repo_path),
             )
@@ -1332,6 +1333,32 @@ impl Repos {
             name,
             checkout_id: Some(checkout.id),
         })
+    }
+
+    /// A branch picker supplies branch names, while recovery supplies a full
+    /// object id. Qualify branches so a same-named tag cannot make Git's DWIM
+    /// lookup fail, but retain remote refs (and their upstream setup behavior).
+    async fn worktree_base_ref(&self, path: &Path, base: &str) -> String {
+        if matches!(base.len(), 40 | 64) && base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            // `git worktree add -b` can prefer a branch named like an object id.
+            // Peeling forces object-expression resolution for recorded snapshots.
+            return format!("{base}^{{commit}}");
+        }
+        if !base.starts_with("refs/") {
+            for namespace in ["refs/heads", "refs/remotes"] {
+                let qualified = format!("{namespace}/{base}");
+                if self
+                    .git(&["show-ref", "--verify", "--quiet", &qualified], Some(path))
+                    .await
+                    .is_ok()
+                {
+                    return qualified;
+                }
+            }
+        }
+        // Explicit refs/tags, other revision expressions, and invalid inputs
+        // retain their existing Git interpretation and authoritative errors.
+        base.to_string()
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {

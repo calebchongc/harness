@@ -209,3 +209,203 @@ async fn detached_checkouts_are_not_retitled_or_used_to_delete_the_old_branch() 
             .contains(&"task/different-task".to_string())
     );
 }
+
+fn advance_main(repo: &Path) -> (String, String) {
+    let before = git(repo, &["rev-parse", "refs/heads/main"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "advance synthetic main",
+        ],
+    );
+    let after = git(repo, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(before, after);
+    (before, after)
+}
+
+#[tokio::test]
+async fn a_selected_local_base_is_not_shadowed_by_a_same_named_tag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let (old, current) = advance_main(&repo);
+    git(&repo, &["tag", "main", &old]);
+    let tree = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(
+        git(Path::new(&tree.path), &["rev-parse", "HEAD"]),
+        current,
+        "the selected branch, not the older tag, must supply the base"
+    );
+    assert_eq!(git(&repo, &["rev-parse", "refs/tags/main"]), old);
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), current);
+}
+
+#[tokio::test]
+async fn a_selected_remote_base_is_not_shadowed_by_a_same_named_tag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let (old, current) = advance_main(&repo);
+    git(&repo, &["remote", "add", "origin", repo.to_str().unwrap()]);
+    git(&repo, &["update-ref", "refs/remotes/origin/main", &current]);
+    git(&repo, &["tag", "origin/main", &old]);
+    let tree = repos
+        .create_worktree_for_task(&repo, "origin/main", "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(
+        git(Path::new(&tree.path), &["rev-parse", "HEAD"]),
+        current,
+        "the selected remote ref must supply the base"
+    );
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--get",
+                &format!("branch.{}.remote", tree.branch)
+            ]
+        ),
+        "origin"
+    );
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--get",
+                &format!("branch.{}.merge", tree.branch)
+            ]
+        ),
+        "refs/heads/main"
+    );
+    assert_eq!(git(&repo, &["rev-parse", "refs/tags/origin/main"]), old);
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/remotes/origin/main"]),
+        current
+    );
+}
+
+#[tokio::test]
+async fn explicit_tags_and_full_snapshot_ids_keep_their_exact_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let (old, current) = advance_main(&repo);
+    git(&repo, &["tag", "snapshot", &old]);
+    git(&repo, &["branch", "snapshot", &current]);
+    // Full object ids are used by independent recovery. Even a pathological
+    // local branch with the same spelling must not redirect that snapshot.
+    git(&repo, &["branch", &old, &current]);
+    let hash_named_branch = format!("refs/heads/{old}");
+    for (base, expected) in [
+        (old.as_str(), &old),
+        ("refs/tags/snapshot", &old),
+        ("refs/heads/snapshot", &current),
+        (hash_named_branch.as_str(), &current),
+    ] {
+        let tree = repos
+            .create_worktree_for_task(&repo, base, "Recover recorded snapshot")
+            .await
+            .unwrap();
+        let path = Path::new(&tree.path);
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), *expected);
+        repos.delete_worktree(&repo, path).await.unwrap();
+    }
+    assert_eq!(
+        git(&repo, &["rev-parse", &format!("refs/heads/{old}")]),
+        current
+    );
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), current);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn occupied_symlink_destinations_are_never_followed_or_replaced() {
+    for broken in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, repos) = setup(tmp.path());
+        let destination = tmp.path().join("trees/sample-app/fix-login");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let target = tmp.path().join("unrelated-folder");
+        if !broken {
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("keep.txt"), b"preserve symlink target\n").unwrap();
+        }
+        std::os::unix::fs::symlink(&target, &destination).unwrap();
+        let tree = repos
+            .create_worktree_for_task(&repo, "main", "Fix login")
+            .await
+            .unwrap();
+        assert_eq!(tree.branch, "task/fix-login-2");
+        assert_eq!(std::fs::read_link(&destination).unwrap(), target);
+        if broken {
+            assert!(!target.exists());
+        } else {
+            assert_eq!(
+                std::fs::read(target.join("keep.txt")).unwrap(),
+                b"preserve symlink target\n"
+            );
+            assert!(!target.join(".git").exists());
+        }
+        repos
+            .delete_worktree(&repo, Path::new(&tree.path))
+            .await
+            .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+}
+
+#[tokio::test]
+async fn exhausting_the_name_budget_preserves_existing_directories_and_allows_a_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let base = tmp.path().join("trees/sample-app");
+    std::fs::create_dir_all(&base).unwrap();
+    for index in 1..=1_000 {
+        let name = if index == 1 {
+            "fix-login".to_string()
+        } else {
+            format!("fix-login-{index}")
+        };
+        std::fs::create_dir(base.join(name)).unwrap();
+    }
+    std::fs::write(base.join("fix-login/keep.txt"), b"existing folder\n").unwrap();
+    let result = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1_000);
+    assert_eq!(
+        std::fs::read(base.join("fix-login/keep.txt")).unwrap(),
+        b"existing folder\n"
+    );
+    assert_eq!(repos.branches(&repo).await.unwrap(), ["main"]);
+    // Release only a known-empty synthetic directory, not any person's work.
+    std::fs::remove_dir(base.join("fix-login-1000")).unwrap();
+    let tree = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(tree.branch, "task/fix-login-1000");
+    repos
+        .delete_worktree(&repo, Path::new(&tree.path))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 999);
+}
