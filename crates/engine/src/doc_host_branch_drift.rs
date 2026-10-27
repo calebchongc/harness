@@ -544,6 +544,34 @@ impl DocHost {
             .and_then(|answer| answer.labels.first())
             .map(String::as_str)
             .unwrap_or(DONT_SEND);
+        // Typed text instead of a choice ("go on", or the next instruction)
+        // answers "How should it continue?" by continuing: on the branch the
+        // question showed, with the text sent after the held messages.
+        // Holding it and asking again looped for as long as the user typed.
+        let typed = !(choice.starts_with(CONTINUE)
+            || choice.starts_with(SWITCH_BACK)
+            || choice == INDEPENDENT
+            || choice == DONT_SEND);
+        let held = if typed {
+            let message_id = new_id();
+            handle.write_user_message(&message_id, choice, now_ms())?;
+            match held {
+                Some(mut held) => {
+                    held.request.prompt = format!("{}\n\n{choice}", held.request.prompt);
+                    held.message_id = Some(message_id);
+                    Some(held)
+                }
+                None => self
+                    .request_from_chat_row(chat_id, choice)
+                    .map(|request| HeldDispatch {
+                        harness: self.harness_for_request(chat_id, &request),
+                        request,
+                        message_id: Some(message_id),
+                    }),
+            }
+        } else {
+            held
+        };
         let Some(mut held) = held else {
             handle.doc.resolve_input(request_id)?;
             self.clear_branch_drift_held(handle, request_id)?;
@@ -553,6 +581,29 @@ impl DocHost {
                 SessionCommandStatus::Applied,
                 Some("nothing was waiting to send".into()),
             ));
+        };
+        let displayed_choice =
+            entries
+                .iter()
+                .find(|entry| entry.id == entry_id)
+                .and_then(|entry| {
+                    entry.parts.iter().find_map(|part| match part {
+                        MessagePart::Input {
+                            request_id: id,
+                            questions,
+                            ..
+                        } if id == request_id => questions
+                            .first()?
+                            .options
+                            .iter()
+                            .find(|option| option.starts_with(CONTINUE)),
+                        _ => None,
+                    })
+                });
+        let choice = if typed {
+            displayed_choice.map_or(choice, String::as_str)
+        } else {
+            choice
         };
         let independent = choice == INDEPENDENT;
         if independent || choice.starts_with(SWITCH_BACK) {
@@ -589,24 +640,6 @@ impl DocHost {
             self.save_snapshot(handle);
         }
         let continue_context = if let Some(accepted_branch) = choice.strip_prefix(CONTINUE) {
-            let displayed_choice =
-                entries
-                    .iter()
-                    .find(|entry| entry.id == entry_id)
-                    .and_then(|entry| {
-                        entry.parts.iter().find_map(|part| match part {
-                            MessagePart::Input {
-                                request_id: id,
-                                questions,
-                                ..
-                            } if id == request_id => questions
-                                .first()?
-                                .options
-                                .iter()
-                                .find(|option| option.starts_with(CONTINUE)),
-                            _ => None,
-                        })
-                    });
             let Some(current) = self.capture_source_context(&held.request.cwd).await else {
                 // No fresh observation means no consent. Leave the question
                 // and its durable request intact so the user can retry.
@@ -687,22 +720,7 @@ impl DocHost {
                     .append_error_part(&entry_id, &part_id, &err.to_string())?;
                 handle.publish_messages();
             }
-        } else if choice != DONT_SEND {
-            // Typed text instead of a choice: it is another message for this
-            // chat, not a decision. Hold it with the rest and ask again (or,
-            // if the checkout is back where it was, send them all).
-            let mut typed = held.request.clone();
-            typed.prompt = choice.to_string();
-            typed.attachments = Vec::new();
-            let harness = held.harness;
-            lock(&self.inner.branch_drift_holds)
-                .entry(chat_id.to_string())
-                .or_default()
-                .push(held);
-            self.dispatch_with_source_context(sessions, chat_id, harness, typed, Some(new_id()))
-                .await?;
-            return Ok((SessionCommandStatus::Applied, None));
-        } else {
+        } else if choice == DONT_SEND {
             // Not sent. Freeze the queue too, so the next row does not go
             // straight back into the same question; a new send thaws it.
             handle.queue_paused.store(true, Ordering::Release);
