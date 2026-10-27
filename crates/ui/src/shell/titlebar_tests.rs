@@ -241,6 +241,7 @@ fn titlebar_keeps_plus_and_update_inside_sidebar_across_first_prompt(
                         update_available: mode != "none",
                         checked_at: None,
                         error: None,
+                        host: None,
                     });
                 });
                 cx.notify();

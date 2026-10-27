@@ -1522,6 +1522,8 @@ fn forwardable(method: &str) -> bool {
             | methods::READ_ATTACHMENT_CHUNK
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
+            | methods::CHECK_FOR_UPDATES
+            | methods::QUEUE_UPDATE
             | methods::APPLY_UPDATE
     )
 }
@@ -2594,6 +2596,12 @@ impl RpcService for EngineRpc {
             methods::CHECK_FOR_UPDATES => {
                 self.updater()?.check_now();
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::QUEUE_UPDATE => {
+                self.updater()?
+                    .queue_update()
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&serde_json::json!({ "ok": true, "queued": true }))
             }
             methods::APPLY_UPDATE => {
                 let version = self
@@ -4143,6 +4151,27 @@ mod tests {
             MutateParams::SetAppearance { mode, light, dark }
                 if mode == "system" && light == "codegraff-light" && dark == "codegraff-dark"
         ));
+    }
+
+    #[test]
+    fn device_updates_route_to_the_requested_host() {
+        for method in [
+            methods::UPDATE_STATUS,
+            methods::CHECK_FOR_UPDATES,
+            methods::QUEUE_UPDATE,
+        ] {
+            assert!(
+                forwardable(method),
+                "{method} must not act on the viewer's device"
+            );
+        }
+        assert!(is_stream_method(methods::UPDATE_STATUS));
+        assert!(!is_stream_method(methods::CHECK_FOR_UPDATES));
+        assert!(!is_stream_method(methods::QUEUE_UPDATE));
+        assert_eq!(
+            forward_deadline(methods::QUEUE_UPDATE),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]

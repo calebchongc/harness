@@ -842,6 +842,7 @@ mod tests {
             update_available: available,
             checked_at: None,
             error: None,
+            host: None,
         }
     }
 

@@ -13686,6 +13686,7 @@ mod tests {
             update_available: true,
             checked_at: None,
             error: None,
+            host: None,
         };
         let available = status(Some("1.1.0"));
         assert!(should_auto_download(
@@ -18320,6 +18321,7 @@ impl Shell {
                 update_available: available,
                 checked_at: None,
                 error: None,
+                host: None,
             })
         });
         let staged = StagedUpdate {
