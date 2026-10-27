@@ -71,6 +71,10 @@ name = "transcript-mermaid-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "final-answer-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "restart-resume-fixture"
 required-features = ["appshots-fixture"]
 
