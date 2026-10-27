@@ -32,6 +32,8 @@ pub struct Span {
 struct MdSelection {
     /// Element that owns the drag (where the mouse went down).
     anchor_key: String,
+    /// Stable surface identity, retained when virtualization unmounts the anchor.
+    anchor_owner: Option<u64>,
     /// Byte offset of the anchor within its element.
     anchor_ix: usize,
     /// The immediate word/paragraph selected by a multi-click. Moving inside
@@ -92,6 +94,7 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
 pub fn begin(key: &str, ix: usize) {
     *state().lock().unwrap() = Some(MdSelection {
         anchor_key: key.to_string(),
+        anchor_owner: None,
         anchor_ix: ix,
         initial_span: None,
         dragging: true,
@@ -104,6 +107,7 @@ pub fn begin(key: &str, ix: usize) {
 pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
     *state().lock().unwrap() = Some(MdSelection {
         anchor_key: key.to_string(),
+        anchor_owner: None,
         anchor_ix: range.start,
         initial_span: Some(range.clone()),
         dragging: true,
@@ -129,6 +133,26 @@ pub(crate) fn anchor_key() -> Option<String> {
         .unwrap()
         .as_ref()
         .map(|s| s.anchor_key.clone())
+}
+
+/// Remember the surface that claimed this gesture independently of painted rows.
+pub(crate) fn set_anchor_owner(key: &str, owner: u64) {
+    if let Some(selection) = state()
+        .lock()
+        .unwrap()
+        .as_mut()
+        .filter(|selection| selection.dragging && selection.anchor_key == key)
+    {
+        selection.anchor_owner = Some(owner);
+    }
+}
+
+pub(crate) fn anchor_owner() -> Option<u64> {
+    state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|selection| selection.anchor_owner)
 }
 
 /// Whether a markdown selection drag is currently in flight.
@@ -358,6 +382,31 @@ mod tests {
             ("p2", "second"),
             ("p3", "third one"),
         ]
+    }
+
+    #[test]
+    fn selection_owner_is_bound_to_the_active_anchor_and_resets_for_new_gestures() {
+        let _state = test_state_lock();
+        begin("p1", 0);
+        assert_eq!(anchor_owner(), None);
+        set_anchor_owner("p1", 7);
+        set_anchor_owner("other", 9);
+        assert_eq!(anchor_owner(), Some(7));
+        update_drag(&elems(), (1, 6));
+        end_active_drag();
+        set_anchor_owner("p1", 9);
+        assert_eq!(anchor_owner(), Some(7));
+        begin_with_span("p2", "second", 0..6);
+        assert_eq!(anchor_owner(), None);
+        set_anchor_owner("p2", 0); // Non-transcript surfaces also have an owner.
+        assert_eq!(anchor_owner(), Some(0));
+        assert!(!clear_if_owner("p2")); // A live gesture is not a settled selection.
+        end_active_drag();
+        assert!(clear_if_owner("p2"));
+        assert_eq!(anchor_owner(), None);
+        begin("p3", 0);
+        assert_eq!(anchor_owner(), None);
+        end_active_drag();
     }
 
     #[test]

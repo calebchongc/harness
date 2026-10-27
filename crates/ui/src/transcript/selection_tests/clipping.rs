@@ -281,6 +281,239 @@ fn collapsed_prompt_selection_refreshes_after_expand_collapse_and_stream_repaint
     });
 }
 
+#[gpui::test]
+fn collapsed_prompt_selection_targets_the_actual_markdown_table_cell(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    let prompt = "Hidden prompt words that must not capture output selection.\n".repeat(40);
+    let reply = "| Left header | Middle header | Right header |\n| --- | --- | --- |\n| left alpha end | middle beta end | right gamma end |";
+    with_transcript(cx, &prompt, reply, |_, _, cx| {
+        for (needle, word) in [
+            ("left alpha", "alpha"),
+            ("middle beta", "beta"),
+            ("right gamma", "gamma"),
+        ] {
+            let (key, text, layout) = entry(needle);
+            let start = text.find(word).unwrap();
+            for count in [1, 2, 3] {
+                let from = if count == 1 { start } else { start + 1 };
+                let to = if count == 1 {
+                    start + word.len()
+                } else {
+                    start + 1
+                };
+                let expected = if count == 3 { &text } else { word };
+                drag(
+                    cx,
+                    &key,
+                    count,
+                    at(&layout, from),
+                    at(&layout, to),
+                    expected,
+                );
+            }
+        }
+    });
+}
+
+struct PagingSelectionHost {
+    tail: bool,
+}
+
+impl Render for PagingSelectionHost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        let rows = if self.tail {
+            [
+                ("paging-middle", "middle selectable"),
+                ("paging-last", "last selectable"),
+            ]
+        } else {
+            [
+                ("paging-first", "first selectable"),
+                ("paging-middle", "middle selectable"),
+            ]
+        };
+        div()
+            .size_full()
+            .text_size(px(14.0))
+            .line_height(px(22.0))
+            .child(render::selection_owner_reset(cx.entity_id().as_u64()))
+            .children(rows.into_iter().map(|(key, text)| {
+                render::selectable_autolinked_text(
+                    key.into(),
+                    text.into(),
+                    gpui::font(theme.font_sans.clone()),
+                    theme.text,
+                    None,
+                    &theme,
+                )
+            }))
+            .child(render::selection_owner_end())
+    }
+}
+
+#[gpui::test]
+fn clipped_selection_keeps_its_owner_when_the_anchor_is_virtualized(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    cx.update(|cx| cx.set_global(Theme::dark()));
+    let (host, cx) = cx.add_window_view(|_, _| PagingSelectionHost { tail: false });
+    cx.simulate_resize(size(px(500.0), px(300.0)));
+    for forward in [true, false] {
+        host.update(cx, |host, cx| {
+            host.tail = !forward;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let (anchor, text, layout) = entry(if forward {
+            "first selectable"
+        } else {
+            "last selectable"
+        });
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Left,
+            position: at(&layout, if forward { 0 } else { text.len() }),
+            click_count: 1,
+            ..Default::default()
+        });
+        let (_, middle, middle_layout) = entry("middle selectable");
+        cx.simulate_event(MouseMoveEvent {
+            position: at(&middle_layout, if forward { middle.len() } else { 0 }),
+            pressed_button: Some(MouseButton::Left),
+            ..Default::default()
+        });
+        assert!(
+            selection::selected_text()
+                .unwrap()
+                .contains("middle selectable")
+        );
+        host.update(cx, |host, cx| {
+            host.tail = forward;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        assert!(
+            !render::selection_test_entries()
+                .iter()
+                .any(|(key, _, _)| key == &anchor)
+        );
+        let (_, text, layout) = entry(if forward {
+            "last selectable"
+        } else {
+            "first selectable"
+        });
+        let head = at(&layout, if forward { text.len() } else { 0 });
+        assert!(
+            render::update_drag_at(head),
+            "selection must extend after its anchor unmounts"
+        );
+        let expected = "first selectable\nmiddle selectable\nlast selectable";
+        assert_eq!(selection::selected_text().as_deref(), Some(expected));
+        assert_eq!(selection::end_active_drag().as_deref(), Some(expected));
+        selection::clear_if_owner(&anchor);
+    }
+}
+
+#[gpui::test]
+fn collapsed_prompt_selection_survives_other_cached_pane_repaints(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    struct Split(Entity<Transcript>, Entity<Transcript>);
+    impl Render for Split {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let cached = || gpui::StyleRefinement::default().size_full();
+            div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .child(
+                    div()
+                        .w(px(450.0))
+                        .h_full()
+                        .child(self.0.clone().cached(cached())),
+                )
+                .child(
+                    div()
+                        .w(px(450.0))
+                        .h_full()
+                        .child(self.1.clone().cached(cached())),
+                )
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (left_state, right_state) = cx.update(|cx| {
+        gpui_base::init(cx);
+        cx.set_global(Theme::dark());
+        crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        (cx.new(|_| AppState::new()), cx.new(|_| AppState::new()))
+    });
+    let (split, cx) = cx.add_window_view(|_, cx| {
+        Split(
+            cx.new(|cx| Transcript::new(left_state.clone(), cx)),
+            cx.new(|cx| Transcript::new(right_state.clone(), cx)),
+        )
+    });
+    cx.simulate_resize(size(px(900.0), px(800.0)));
+    let (left, right) = split.read_with(cx, |split, _| (split.0.clone(), split.1.clone()));
+    for (state, side) in [(&left_state, "left"), (&right_state, "right")] {
+        state.update(cx, |state, _| {
+            state.selected_chat = Some(side.into());
+            state.transcript_replayed = true;
+            state.transcript = vec![
+                message(
+                    &format!("{side}-prompt"),
+                    MessageRole::User,
+                    &"Hidden prompt words. ".repeat(100),
+                ),
+                message(
+                    &format!("{side}-reply"),
+                    MessageRole::Assistant,
+                    &format!("{side} alpha beta reply"),
+                ),
+            ];
+            state.transcript_revision += 1;
+        });
+    }
+    for _ in 0..3 {
+        left.update(cx, |this, cx| this.sync(cx));
+        right.update(cx, |this, cx| this.sync(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+    }
+    for (changing, changed, untouched) in [
+        (&left_state, &left, "right alpha"),
+        (&right_state, &right, "left alpha"),
+    ] {
+        changing.update(cx, |state, _| {
+            state.transcript[1].parts = vec![MessagePart::Text {
+                id: "text".into(),
+                text: format!(
+                    "{} alpha beta reply with new streaming text",
+                    state.selected_chat.as_deref().unwrap()
+                ),
+            }];
+            state.transcript_revision += 1;
+        });
+        changed.update(cx, |this, cx| this.sync(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        }); // No global refresh: the other pane stays cached.
+        let (key, text, layout) = entry(untouched);
+        let ix = text.find("alpha").unwrap() + 1;
+        drag(cx, &key, 2, at(&layout, ix), at(&layout, ix), "alpha");
+    }
+}
+
 struct ClipHost {
     height: f32,
     offset: f32,

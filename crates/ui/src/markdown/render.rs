@@ -8,6 +8,10 @@
 //! chunk opacity veil over the text runs (see [`super::veil`]) — opacity only,
 //! zero translate, applied after layout-relevant properties are fixed.
 
+#[cfg(test)]
+#[path = "render/selection_geometry_tests.rs"]
+mod selection_geometry_tests;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -1611,6 +1615,9 @@ pub(crate) fn release_selection_owner(owner: u64) {
 
 /// The transcript the drag's anchor was painted by.
 fn anchor_owner(reg: &[RegEntry]) -> u64 {
+    if let Some(owner) = super::selection::anchor_owner() {
+        return owner;
+    }
     let anchor = super::selection::anchor_key().unwrap_or_default();
     reg.iter()
         .find(|e| *e.key == *anchor)
@@ -1647,13 +1654,14 @@ pub fn selection_surface_reset(prefix: String) -> impl IntoElement {
 
 /// `(element index, byte offset)` for a window position: the registered
 /// element whose vertical band contains it, else the nearest by vertical
-/// distance (a drag past the gutter or between blocks clamps sensibly).
+/// distance, then horizontal distance. Table cells can share a vertical band;
+/// the cell under the pointer must win over the first cell in document order.
 fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)> {
     REGISTRY.with(|r| {
         let reg = r.borrow();
         let anchor = super::selection::anchor_key().unwrap_or_default();
         let owner = anchor_owner(&reg);
-        let mut best: Option<(usize, f32)> = None;
+        let mut best: Option<(usize, (f32, f32))> = None;
         for (ei, entry) in reg.iter().enumerate() {
             // A drag stays in the pane it started in.
             if selection_scope(&entry.key) != selection_scope(&anchor) || entry.owner != owner {
@@ -1663,10 +1671,6 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
             if b.is_empty() {
                 continue;
             }
-            if position.y >= b.top() && position.y < b.bottom() {
-                best = Some((ei, 0.0));
-                break;
-            }
             let dy = if position.y < b.top() {
                 f32::from(b.top() - position.y)
             } else if position.y > b.bottom() {
@@ -1674,8 +1678,19 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
             } else {
                 0.0
             };
-            if best.is_none_or(|(_, d)| dy < d) {
-                best = Some((ei, dy));
+            let dx = if position.x < b.left() {
+                f32::from(b.left() - position.x)
+            } else if position.x > b.right() {
+                f32::from(position.x - b.right())
+            } else {
+                0.0
+            };
+            if best.is_none_or(|(_, distance)| (dy, dx) < distance) {
+                best = Some((ei, (dy, dx)));
+            }
+            if b.contains(&position) {
+                best = Some((ei, (0.0, 0.0)));
+                break;
             }
         }
         let (ei, _) = best?;
@@ -1718,6 +1733,7 @@ pub(crate) fn begin_drag_in_whitespace(owner: u64, position: gpui::Point<gpui::P
         // Preserve the layout's visual-line boundary, including soft wraps;
         // whitespace after a line is its END, not its final character.
         super::selection::begin(&entry.key, entry.index_for_position(position));
+        super::selection::set_anchor_owner(&entry.key, entry.owner);
         true
     })
 }
@@ -1773,6 +1789,7 @@ fn register_selection_listeners(
     {
         let (key, text, layout) = (key.clone(), text.clone(), layout.clone());
         let bounds = layout.bounds().intersect(&window.content_mask().bounds);
+        let owner = PAINT_OWNER.get();
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, _cx| {
             if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
                 return;
@@ -1793,6 +1810,7 @@ fn register_selection_listeners(
                     }
                     _ => super::selection::begin(&key, ix),
                 }
+                super::selection::set_anchor_owner(&key, owner);
                 window.refresh();
             } else if super::selection::clear_if_owner(&key) {
                 window.refresh();
