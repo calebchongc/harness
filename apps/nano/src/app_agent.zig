@@ -64,17 +64,19 @@ pub fn harnessName(a: *const App, id: []const u8) []const u8 {
 
 /// Lists `harness`'s models, unless they are listed already.
 pub fn ensureModels(a: *App, harness: []const u8) void {
-    if (std.mem.eql(u8, a.models_for, harness) or a.engine.state != .connected) return;
+    if (a.engine.state != .connected) return;
+    const picker = @import("model_picker.zig");
+    const cat = picker.ensureCatalog(a, harness, false) orelse return;
+    if (std.mem.eql(u8, a.models_for, harness)) return;
     const copy = a.gpa.dupe(u8, harness) catch return;
     a.gpa.free(a.models_for);
     a.models_for = copy;
-    a.models.replace(.{ .array = .init(a.gpa) }) catch {};
-    a.request(requests.listModels(harness), .of(App, a, App.onModels));
+    picker.copyModels(&a.models, cat.models.items) catch {};
 }
 
 pub fn togglePicker(a: *App) void {
     a.picker = if (a.picker == .none) .model else .none;
-    if (a.picker != .none) ensureModels(a, target(a).harness);
+    if (a.picker != .none) @import("view_picker.zig").opened(a);
     a.redraw();
 }
 

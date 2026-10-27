@@ -8,6 +8,7 @@ const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
+const file_icons = @import("file_icons.zig");
 const kit = @import("view_kit.zig");
 const tip_quick = @import("view_tooltip.zig").quick;
 const panels = @import("app_panels.zig");
@@ -17,7 +18,7 @@ const App = @import("app.zig").App;
 pub const width: f32 = 286;
 
 pub fn explorer(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const col = ui.div(c).column().w(width).hFull().bg(k.shell).clip();
+    const col = ui.div(c).column().w(width).hFull().bg(if (k.frosted) k.panel else k.shell).clip();
     defer col.end();
     _ = c.leaf(.{ .height = .{ .px = 38 } }, .none, null);
     toolbar(c, a, k);
@@ -78,7 +79,7 @@ fn row(c: *ui.Context, a: *App, k: theme.Colors, e: panels.Entry, depth: u32) vo
         defer slot.end();
         if (e.dir) icons.icon(c, if (a.panels.expanded.contains(e.path)) .@"alt-arrow-down" else .@"alt-arrow-right", 11, k.faint, 0);
     }
-    icons.icon(c, if (e.dir) .folder else .document, 14, k.muted, 0);
+    file_icons.icon(c, e.path, e.dir, k.dark, 14);
     const color = if (git) |g| gitColor(k, g) else if (selected) k.text else k.muted;
     kit.fadeText(c, e.name, .{ .size = 11.5, .color = color }, width - 8 - @as(f32, @floatFromInt(depth)) * 14 - 8 - 36);
 }
@@ -110,7 +111,7 @@ fn results(c: *ui.Context, a: *App, k: theme.Colors) void {
         if (r.clicked()) {
             if (e.dir) files.toggleDir(a, e.path) else files.openFile(a, e.path);
         }
-        icons.icon(c, if (e.dir) .folder else .document, 14, k.muted, 0);
+        file_icons.icon(c, e.path, e.dir, k.dark, 14);
         ui.text(c, e.name, .{ .size = 11.5, .color = k.text });
         kit.fadeText(c, std.fs.path.dirname(e.path) orelse "", .{ .size = 10.5, .color = k.faint }, width - 140);
     }

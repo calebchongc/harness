@@ -80,6 +80,7 @@ pub const Status = enum { idle, working, awaiting_input, errored };
 pub const Session = struct {
     chat_id: []const u8,
     status: Status,
+    started_ms: ?i64 = null,
     updated_ms: i64 = 0,
 };
 
@@ -141,6 +142,10 @@ pub const Harness = struct {
 pub const Model = struct {
     id: []const u8,
     label: []const u8,
+    /// The real catalog's inline attribution and model maker, as GPUI shows.
+    description: ?[]const u8 = null,
+    maker: ?[]const u8 = null,
+    billing: ?[]const u8 = null,
     /// Its levels; a chat without one picked shows `rules.defaultReasoning`.
     reasoning_default: ?[]const u8 = null,
     levels: []const []const u8 = &.{},
@@ -257,7 +262,15 @@ fn parseHarness(a: Allocator, o: json.ObjectMap) ?Harness {
 fn parseModel(a: Allocator, o: json.ObjectMap) ?Model {
     const id = str(a, o, "id") orelse return null;
     const levels = stringList(a, o, "reasoningLevels");
-    return .{ .id = id, .label = str(a, o, "label") orelse id, .reasoning_default = rules.defaultReasoning(levels), .levels = levels };
+    return .{
+        .id = id,
+        .label = str(a, o, "label") orelse id,
+        .description = str(a, o, "description"),
+        .maker = str(a, o, "maker"),
+        .billing = str(a, o, "billing"),
+        .reasoning_default = rules.defaultReasoning(levels),
+        .levels = levels,
+    };
 }
 
 /// The strings of the array `key`, owned.
@@ -272,9 +285,11 @@ fn stringList(a: Allocator, o: json.ObjectMap, key: []const u8) []const []const 
 
 fn parseSession(a: Allocator, o: json.ObjectMap) ?Session {
     const s = if (o.get("status")) |v| (if (v == .string) v.string else "") else "";
+    const started = ms(a, o, "startedAt");
     return .{
         .chat_id = str(a, o, "chatId") orelse return null,
         .updated_ms = ms(a, o, "updatedAt"),
+        .started_ms = if (started == 0) null else started,
         .status = if (std.mem.eql(u8, s, "working"))
             .working
         else if (std.mem.eql(u8, s, "awaitingInput"))

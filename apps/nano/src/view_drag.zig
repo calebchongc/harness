@@ -66,7 +66,7 @@ pub fn sidebarTarget(a: *const App) ?pins.Target {
 /// Elsewhere, nowhere (`SidebarSessionDrop`).
 fn targetAt(a: *const App, p: ui.Point, from_pins: bool, pin_count: usize) ?pins.Target {
     const v = &a.view;
-    if (!a.view.sidebar_open or a.view.settings_open or p.x >= sidebar.width) return null;
+    if (!a.view.sidebar_open or a.view.settings_open or p.x < 0 or p.x >= v.sidebar_width) return null;
     if (v.pin_header) |r| if (r.contains(p)) return .{ .pinned = 0 };
     if (v.pin_rows) |r| if (p.y >= r.y and p.y <= r.y + @max(r.h, sidebar.row_slot)) {
         if (pin_count == 0) return .{ .pinned = 0 };
@@ -170,7 +170,7 @@ pub fn overlay(c: *ui.Context, a: *App, k: theme.Colors) void {
         if (!c.input.down) d.id.clearRetainingCapacity();
         return;
     }
-    const x0: f32 = if (a.view.sidebar_open) sidebar.width else 0;
+    const x0 = a.view.sidebar_width;
     var buf: [2]Zone = undefined;
     const targets = if (a.view.settings_open) buf[0..0] else zones(a, x0, transcript_view.mainWidth(c, a), c.size.h, &buf);
     var over: ?Zone = null;

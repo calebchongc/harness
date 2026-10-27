@@ -142,13 +142,108 @@ fn pinned(pins: []const []const u8, id: []const u8) ?usize {
 /// A row's slot: its 29 points and the 2 between rows.
 pub const row_slot: f32 = 29 + 2;
 
+const Window = struct {
+    top: f32,
+    bottom: f32,
+    y: f32,
+    eager: bool = false,
+};
+
+// One leaf per omitted run, including its internal gaps only. The parent
+// supplies the boundary gaps just as it does for the original rows.
+const Rows = struct {
+    height: f32 = 0,
+    count: usize = 0,
+
+    fn include(self: *Rows, c: *ui.Context, window: *Window, height: f32) bool {
+        const visible = window.eager or (window.y + height >= window.top and window.y <= window.bottom);
+        window.y += height + 2;
+        if (visible) {
+            self.flush(c);
+        } else {
+            self.height += height + 2;
+            self.count += 1;
+        }
+        return visible;
+    }
+
+    fn flush(self: *Rows, c: *ui.Context) void {
+        if (self.count == 0) return;
+        _ = c.leaf(.{ .height = .{ .px = self.height - 2 } }, .none, null);
+        self.* = .{};
+    }
+};
+
+// The input offset may overshoot the end before layout clamps it. Bound
+// the build window against the complete content, not the previous frame's
+// rows; otherwise an immediate jump to the bottom can produce a blank frame.
+fn contentHeight(c: *ui.Context, a: *App, pins: []const []const u8) f32 {
+    var height: f32 = 4;
+    if (pins.len > 0) {
+        height += 30;
+        if (a.view.pinned_open) {
+            height += 6;
+            for (pins) |id| if (a.findChat(id)) |ch| {
+                height += rowHeight(a, ch) + 2;
+            };
+        }
+        if (a.settings.organization() == .in_one_list) height += 12;
+    }
+    var active: usize = 0;
+    var archived: usize = 0;
+    var archive_height: f32 = 0;
+    var keys: std.StringHashMapUnmanaged(void) = .empty;
+    const grouped = a.settings.organization() != .in_one_list;
+    for (a.chats.items) |ch| if (listed(a, ch)) {
+        if (ch.archived) {
+            if (archived < a.view.archived_limit) archive_height += rowHeight(a, ch) + 2;
+            archived += 1;
+        } else if (pinned(pins, ch.id) == null) {
+            active += 1;
+            if (grouped) {
+                const project = a.settings.organization() == .by_project;
+                const key = groupKey(c, ch, project);
+                const open = a.view.groupOpen(c.print("{s}:{s}", .{ if (project) "project" else "device", key }), true);
+                const entry = keys.getOrPut(c.alloc(), key) catch continue;
+                if (!entry.found_existing) height += if (open) @as(f32, 44) else 42;
+                if (open) height += rowHeight(a, ch) + 2;
+            } else if (a.view.sessions_open) height += rowHeight(a, ch) + 2;
+        }
+    };
+    if (!grouped) {
+        if (active > 0) {
+            height += 30 + (if (a.view.sessions_open) @as(f32, 2) else 0);
+        } else if (pins.len == 0) height += 8 + c.text.lineHeight(.{ .size = 12 });
+    }
+    if (archived > 0 and a.settings.get(.sidebar_show_archived)) {
+        height += 6 + 30;
+        if (a.view.archived_open) {
+            height += 2 + archive_height;
+            if (archived > a.view.archived_limit) height += (if (a.settings.get(.sidebar_compact)) @as(f32, 29) else 36) + 2;
+        }
+    }
+    return height + 6; // Bottom padding, less the trailing parent gap.
+}
+
 fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
     ui.scroll(c, .{ .grow = 1, .width = .fill, .padding = .{ .left = 8, .right = 8, .top = 4, .bottom = 8 }, .gap = 2 });
     defer ui.end(c);
+    const scroll = c.stack.items[c.stack.items.len - 1];
+    // Read the current offset on every rebuild: wheel input can change it
+    // between builds before layout. A window-height bound also covers the
+    // first layout and a resize without relying on stale viewport rectangles.
+    const offset = c.scroll.get(c.node(scroll).id) orelse 0;
+    var window: Window = .{ .top = @max(0, offset - 128), .bottom = offset + c.size.h + 128, .y = 4 };
     const drag = @import("view_drag.zig");
     const moving = drag.moving(a);
+    window.eager = moving != null;
     const target = drag.sidebarTarget(a);
     const pins = visiblePins(a, c.alloc());
+    if (!window.eager) {
+        const bounded = @min(offset, @max(0, contentHeight(c, a, pins) - c.size.h));
+        window.top = @max(0, bounded - 128);
+        window.bottom = bounded + c.size.h + 128;
+    }
     const source_pin = if (moving) |id| pinned(pins, id) else null;
     var active: usize = 0;
     var archived: usize = 0;
@@ -158,7 +253,10 @@ fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
     // Pinned, while there are pins or a session is being dragged.
     if (pins.len > 0 or moving != null) {
         a.view.pin_header = rectOf(c, sectionAt(c, k, "Pinned", pins.len, &a.view.pinned_open));
+        window.y += 30;
         if (a.view.pinned_open) {
+            window.y += 2;
+            var rows: Rows = .{};
             const body = ui.div(c).column().wFull().pt(2).pb(4).gap(2);
             defer body.end();
             a.view.pin_rows = rectOf(c, body);
@@ -180,38 +278,62 @@ fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
                     if (ix >= g) dy = row_slot;
                 }
                 const held = source_pin != null and source_pin.? == ix;
-                slotRow(c, a, k, ch, dy, held);
+                if (rows.include(c, &window, rowHeight(a, ch))) slotRow(c, a, k, ch, dy, held);
             }
+            rows.flush(c);
+            window.y += 4;
             // Room for the row coming in.
             if (gap_at != null) _ = c.leaf(.{ .height = .{ .px = row_slot - 2 } }, .none, null);
             if (pins.len == 0 and gap_at == null) _ = c.leaf(.{ .height = .{ .px = 0 } }, .none, null);
         } else a.view.pin_rows = null;
         // Groups bring their own 12 above them.
-        if (a.settings.organization() == .in_one_list) _ = c.leaf(.{ .height = .{ .px = 12 - 2 } }, .none, null);
+        if (a.settings.organization() == .in_one_list) {
+            _ = c.leaf(.{ .height = .{ .px = 12 - 2 } }, .none, null);
+            window.y += 12;
+        }
     } else {
         a.view.pin_header = null;
         a.view.pin_rows = null;
     }
     if (a.settings.organization() != .in_one_list) {
-        groups(c, a, k, pins, moving);
+        groups(c, a, k, pins, moving, &window);
     } else regular: {
-    a.view.sessions_header = rectOf(c, sectionAt(c, k, "Sessions", active, &a.view.sessions_open));
-    if (!a.view.sessions_open) {
-        a.view.session_rows = null;
-        break :regular;
-    }
+        // GPUI has no Sessions disclosure when the regular list is empty.
+        // A drag still needs that section as its drop target.
+        if (active == 0 and moving == null) {
+            a.view.sessions_header = null;
+            a.view.session_rows = null;
+            if (pins.len == 0) {
+                const empty = ui.div(c).row().px(8).pb(8);
+                defer empty.end();
+                ui.text(c, "No sessions yet", .{ .size = 12, .color = k.faint });
+                window.y += 8 + c.text.lineHeight(.{ .size = 12 });
+            }
+            break :regular;
+        }
+        a.view.sessions_header = rectOf(c, sectionAt(c, k, "Sessions", active, &a.view.sessions_open));
+        window.y += 30;
+        if (!a.view.sessions_open) {
+            a.view.session_rows = null;
+            break :regular;
+        }
         // SIDEBAR_DISCLOSURE_BODY_INSET: 4 under the header, the list's 2 twice.
         _ = c.leaf(.{ .height = .{ .px = 0 } }, .none, null);
         const body = ui.div(c).column().wFull().gap(2);
         defer body.end();
         a.view.session_rows = rectOf(c, body);
+        window.y += 2;
+        var rows: Rows = .{};
         const unpinning = source_pin != null and target != null and target.? == .regular;
         for (a.chats.items) |ch| if (!ch.archived and listed(a, ch) and pinned(pins, ch.id) == null) {
             const held = moving != null and std.mem.eql(u8, moving.?, ch.id);
             // Dragged to the pins, a session's row leaves the list.
             if (held and target != null and target.? == .pinned) continue;
-            slotRow(c, a, k, ch, 0, held);
+            if (rows.include(c, &window, rowHeight(a, ch))) slotRow(c, a, k, ch, 0, held);
         };
+        rows.flush(c);
+        // An empty body still has its outer gap.
+        if (active == 0) window.y += if (pins.len == 0) 12 + c.text.lineHeight(.{ .size = 12 }) + 2 else @as(f32, 2);
         if (unpinning) _ = c.leaf(.{ .height = .{ .px = row_slot - 2 } }, .none, null);
         if (active == 0 and moving != null) {
             // While a session is dragged, an empty list takes it back.
@@ -228,15 +350,19 @@ fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (archived == 0 or !a.settings.get(.sidebar_show_archived)) return;
     // 6 under the list above: its 4, and the gap.
     _ = c.leaf(.{ .height = .{ .px = 4 } }, .none, null);
+    window.y += 6 + 30;
     if (section(c, k, "Archived", archived, &a.view.archived_open)) {
         // SIDEBAR_DISCLOSURE_BODY_INSET: 4 under the header, the list's 2 twice.
         _ = c.leaf(.{ .height = .{ .px = 0 } }, .none, null);
+        window.y += 2;
+        var rows: Rows = .{};
         var shown: usize = 0;
         for (a.chats.items) |ch| if (ch.archived and listed(a, ch)) {
             if (shown == a.view.archived_limit) break;
-            sessionRow(c, a, k, ch);
+            if (rows.include(c, &window, rowHeight(a, ch))) sessionRow(c, a, k, ch);
             shown += 1;
         };
+        rows.flush(c);
         if (archived > shown) {
             // A row's height (36, or a compact row's 29), 2 under the last
             // row; 25 more at a time.
@@ -252,7 +378,7 @@ fn lists(c: *ui.Context, a: *App, k: theme.Colors) void {
 
 /// By project or by device (`sidebar_organization`): a disclosure for
 /// each, in the order their newest sessions come; this device's first.
-fn groups(c: *ui.Context, a: *App, k: theme.Colors, pins: []const []const u8, moving: ?[]const u8) void {
+fn groups(c: *ui.Context, a: *App, k: theme.Colors, pins: []const []const u8, moving: ?[]const u8, window: *Window) void {
     const by_project = a.settings.organization() == .by_project;
     const gpa = c.alloc();
     var keys: std.ArrayList([]const u8) = .empty;
@@ -269,17 +395,23 @@ fn groups(c: *ui.Context, a: *App, k: theme.Colors, pins: []const []const u8, mo
     };
     a.view.sessions_header = null;
     a.view.session_rows = null;
+    var omitted: Rows = .{};
     for (keys.items) |key| {
-        ui.key(c, c.print("group-{s}", .{key}));
-        // `SIDEBAR_SECTION_GAP` above each, past the list's 2 between them.
-        const box = ui.div(c).column().wFull().pt(12);
-        defer box.end();
         var count: usize = 0;
+        var height: f32 = 0;
         for (a.chats.items) |ch| if (!ch.archived and listed(a, ch) and pinned(pins, ch.id) == null and std.mem.eql(u8, groupKey(c, ch, by_project), key)) {
             count += 1;
+            height += rowHeight(a, ch) + 2;
         };
         const collapse = c.print("{s}:{s}", .{ if (by_project) "project" else "device", key });
         const open = a.view.groupOpen(collapse, true);
+        const extent: f32 = 12 + 28 + (if (open) 4 + @max(0, height - 2) else @as(f32, 0));
+        const start = window.y;
+        if (!omitted.include(c, window, extent)) continue;
+        ui.key(c, c.print("group-{s}", .{key}));
+        // Keep the existing group/body hierarchy and ID-based keys.
+        const box = ui.div(c).column().wFull().pt(12);
+        defer box.end();
         const label = if (by_project)
             (if (std.mem.startsWith(u8, key, "home:")) "~" else if (a.findSpace(key)) |sp| sp.name else "?")
         else
@@ -296,11 +428,16 @@ fn groups(c: *ui.Context, a: *App, k: theme.Colors, pins: []const []const u8, mo
         if (!open) continue;
         const body = ui.div(c).column().wFull().pt(4).gap(2);
         defer body.end();
+        var inside = window.*;
+        inside.y = start + 12 + 28 + 4;
+        var rows: Rows = .{};
         for (a.chats.items) |ch| if (!ch.archived and listed(a, ch) and pinned(pins, ch.id) == null and std.mem.eql(u8, groupKey(c, ch, by_project), key)) {
             const held = moving != null and std.mem.eql(u8, moving.?, ch.id);
-            slotRow(c, a, k, ch, 0, held);
+            if (rows.include(c, &inside, rowHeight(a, ch))) slotRow(c, a, k, ch, 0, held);
         };
+        rows.flush(c);
     }
+    omitted.flush(c);
 }
 
 /// A session's group: its project (or its device's home), or its device.

@@ -17,6 +17,9 @@ test {
     _ = @import("app_queue.zig");
     _ = @import("tabs.zig");
     _ = @import("tests_ui.zig");
+    _ = @import("tests_ui_picker.zig");
+    _ = @import("tests_ui_history.zig");
+    _ = @import("tests_ui_caret.zig");
     _ = @import("app_drafts.zig");
     _ = @import("snap.zig");
     _ = @import("app_account.zig");
@@ -47,8 +50,14 @@ test {
     _ = @import("pins.zig");
     _ = @import("view_chat_menu.zig");
     _ = @import("icons.zig");
+    _ = @import("file_icons.zig");
     _ = @import("release.zig");
     _ = @import("view.zig");
+    _ = @import("native_menu.zig");
+    _ = @import("tests_ui_split.zig");
+    _ = @import("tests_streaming.zig");
+    _ = @import("tests_ui_streaming_visibility.zig");
+    _ = @import("tests_ui_sidebar_motion.zig");
     _ = @import("markdown.zig");
     _ = @import("markdown_html.zig");
     _ = @import("highlight.zig");
@@ -74,4 +83,12 @@ test {
     _ = @import("dictation.zig");
     _ = @import("app_dictation.zig");
     _ = @import("view_settings_theme_import.zig");
+    _ = @import("profile.zig");
+    _ = @import("tests_ui_input.zig");
+    _ = @import("tests_attachments.zig");
+    _ = @import("tests_ui_feedback.zig");
+    _ = @import("tests_ui_glass.zig");
+    _ = @import("surface_palette.zig");
+    _ = @import("tests_ui_surfaces.zig");
+    _ = @import("tests_browser_native.zig");
 }

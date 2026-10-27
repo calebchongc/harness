@@ -25,12 +25,14 @@ pub const Scope = enum {
     }
 };
 
-pub const TabKind = enum { diffs, file };
+pub const TabKind = enum { diffs, file, subagent, browser };
 
 pub const Tab = struct {
     kind: TabKind,
     /// A file tab's path in the chat's checkout (owned).
     path: []u8 = &.{},
+    agent: ?*@import("app_subagents.zig").Agent = null,
+    browser: ?*@import("app_browser.zig").Browser = null,
 };
 
 /// A diff as last fetched: its files (into `arena`) and totals.
@@ -58,6 +60,10 @@ pub const Panels = struct {
     host_open: bool = false,
     files_open: bool = false,
     tabs: std.ArrayList(Tab) = .empty,
+    /// Closed surfaces remain alive until the frame using their labels ends.
+    retired: std.ArrayList(Tab) = .empty,
+    pending_agent: ?*@import("app_subagents.zig").Agent = null,
+    pending_browser: ?*@import("app_browser.zig").Browser = null,
     active: usize = 0,
     scope: Scope = .workingTree,
     scope_menu: bool = false,
@@ -95,8 +101,12 @@ pub const Panels = struct {
     }
 
     pub fn deinit(p: *Panels) void {
-        for (p.tabs.items) |t| p.gpa.free(t.path);
+        if (p.pending_agent) |s| s.destroy();
+        if (p.pending_browser) |b| b.destroy();
+        for (p.tabs.items) |t| destroyTab(p, t);
+        for (p.retired.items) |t| destroyTab(p, t);
         p.tabs.deinit(p.gpa);
+        p.retired.deinit(p.gpa);
         p.folded.deinit(p.gpa);
         if (p.diff) |*d| d.arena.deinit();
         if (p.diff_error) |e| p.gpa.free(e);
@@ -109,9 +119,18 @@ pub const Panels = struct {
     }
 
     pub fn activeTab(p: *const Panels) ?Tab {
-        return if (p.active < p.tabs.items.len) p.tabs.items[p.active] else null;
+        const t = if (p.active < p.tabs.items.len) p.tabs.items[p.active] else return null;
+        if (t.agent) |s| if (!s.belongsTo(p.chat)) return null;
+        if (t.browser) |b| if (!b.belongsTo(p.chat)) return null;
+        return t;
     }
 };
+
+pub fn destroyTab(p: *Panels, t: Tab) void {
+    p.gpa.free(t.path);
+    if (t.agent) |s| s.destroy();
+    if (t.browser) |b| b.destroy();
+}
 
 pub const GitKind = enum { added, modified, renamed, deleted };
 
@@ -149,7 +168,7 @@ pub fn chatChanged(a: *App) void {
     p.chat = if (a.selected) |s| p.gpa.dupe(u8, s) catch null else null;
     if (a.selected == null) return;
     @import("app_actions.zig").refresh(a);
-    if (p.host_open) openDiffs(a);
+    if (p.host_open) showTab(a, p.active);
     if (p.files_open) openFiles(a);
 }
 
@@ -159,7 +178,9 @@ pub fn chatsArrived(a: *App) void {
     const p = &a.panels;
     if (a.selected == null) return;
     @import("app_actions.zig").refresh(a);
-    if (p.host_open and p.diff == null and !p.diff_loading) openDiffs(a);
+    if (p.host_open and p.diff == null and !p.diff_loading) {
+        if (p.activeTab()) |t| if (t.kind == .diffs) openDiffs(a);
+    }
     if (p.files_open and p.w_git == null) openFiles(a);
 }
 
@@ -167,7 +188,7 @@ pub fn chatsArrived(a: *App) void {
 
 pub fn toggleHost(a: *App) void {
     a.panels.host_open = !a.panels.host_open;
-    if (a.panels.host_open and a.panels.tabs.items.len > 0) openDiffs(a);
+    if (a.panels.host_open) showTab(a, a.panels.active);
     a.redraw();
 }
 
@@ -184,8 +205,12 @@ pub fn addDiffsTab(a: *App) void {
 pub fn closeTab(a: *App, i: usize) void {
     const p = &a.panels;
     if (i >= p.tabs.items.len) return;
+    p.retired.ensureUnusedCapacity(p.gpa, 1) catch return;
     const t = p.tabs.orderedRemove(i);
-    p.gpa.free(t.path);
+    if (t.agent) |s| s.stop();
+    if (comptime @import("builtin").os.tag == .macos) if (t.browser) |b| if (b.native) |n| n.show(false);
+    p.retired.appendAssumeCapacity(t);
+    if (i < p.active) p.active -= 1;
     if (p.active >= p.tabs.items.len) p.active = p.tabs.items.len -| 1;
     showTab(a, p.active);
 }
@@ -198,6 +223,7 @@ pub fn showTab(a: *App, i: usize) void {
     switch (t.kind) {
         .diffs => openDiffs(a),
         .file => readFile(a, t.path),
+        .subagent, .browser => {},
     }
     a.redraw();
 }

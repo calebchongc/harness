@@ -11,6 +11,8 @@ const theme = @import("theme.zig");
 const icons = @import("icons.zig");
 const kit = @import("view_kit.zig");
 const rules = @import("rules.zig");
+const attachments = @import("app_attachments.zig");
+const attachmentStrip = @import("view_composer_attachments.zig").strip;
 const transcript_view = @import("view_transcript.zig");
 const footer_view = @import("view_session_footer.zig");
 const App = @import("app.zig").App;
@@ -38,7 +40,13 @@ pub fn docked(c: *ui.Context, a: *App, k: theme.Colors) void {
         defer q.end();
         return @import("view_question.zig").panel(c, a, k, w);
     }
-    const expanded = std.mem.indexOfScalar(u8, a.composer.text(), '\n') != null;
+    const expanded = attachments.count(a) > 0 or composerFlip(
+        a.view.composer_expanded,
+        c.text.width(a.composer.text(), .{ .size = 14, .line_height = 22.75 }),
+        compactCapacity(c, a, w),
+        std.mem.indexOfScalar(u8, a.composer.text(), '\n') != null,
+    );
+    a.view.composer_expanded = expanded;
     const p = ui.div(c).column().offset(0, lift);
     defer p.end();
     pill(c, a, k, w, if (expanded) .expanded else .compact, 22);
@@ -66,13 +74,42 @@ test "the docked composer is the conversation's width until the pane is narrower
     }
 }
 
+/// The GPUI composer's `composer_flip`: decide against the compact width,
+/// never the wider post-flip field, so resizing/typing cannot oscillate.
+pub fn composerFlip(expanded: bool, text_width: f32, capacity: f32, newline: bool) bool {
+    if (newline or capacity < 200) return true;
+    return if (expanded) text_width >= capacity - 32 else text_width > capacity;
+}
+
+fn compactCapacity(c: *ui.Context, a: *App, w: f32) f32 {
+    const target = a.target();
+    const st: ui.TextStyle = .{ .size = 12, .weight = .medium };
+    var chip_w: f32 = 12 + 16;
+    if (a.models.items.len == 0 and target.model == null) {
+        chip_w += 6 + 56;
+    } else {
+        chip_w += 6 + c.text.width(a.modelLabel(target.model), st);
+        if (target.reasoning) |level| chip_w += 6 + c.text.width(rules.reasoningLabel(level), st);
+    }
+    return @max(0, w - 100 - (if (dictate.shown(a)) @as(f32, 30) else 0) - @min(248, chip_w));
+}
+
+test "composer expansion uses GPUI's width threshold and collapse hysteresis" {
+    try std.testing.expect(!composerFlip(false, 300, 300, false));
+    try std.testing.expect(composerFlip(false, 301, 300, false));
+    try std.testing.expect(composerFlip(true, 280, 300, false));
+    try std.testing.expect(!composerFlip(true, 267, 300, false));
+    try std.testing.expect(composerFlip(false, 0, 199, false));
+    try std.testing.expect(composerFlip(false, 0, 400, true));
+}
+
 pub const Shape = enum { compact, expanded };
 
 pub fn pill(c: *ui.Context, a: *App, k: theme.Colors, w: f32, shape: Shape, radius: f32) void {
     // `border_1` takes its point from inside the box in GPUI: the pill is
     // 49 tall compact (`COMPACT_TOTAL_HEIGHT`), 76 + 42 + 2 expanded
     // (`COMPOSER_MIN_HEIGHT`), its controls a point in from each edge.
-    const p = kit.shadowLg(ui.div(c).w(w).bg(k.composer).border(k.border).borderW(1).rounded(radius).p(1));
+    const p = kit.shadowLg(ui.div(c).w(w).bg(k.composer).border(k.border).borderW(1).rounded(radius).p(1)).bg(k.composer).clip();
     const box = if (shape == .compact) p.row().h(49).px(8 + 1).itemsCenter() else p.column();
     defer box.end();
     if (c.rects.get(c.node(box.index).id)) |r| a.view.composer_anchor = r;
@@ -83,6 +120,7 @@ pub fn pill(c: *ui.Context, a: *App, k: theme.Colors, w: f32, shape: Shape, radi
         send(c, a, k);
         return;
     }
+    attachmentStrip(c, a, k, w);
     {
         // At least 76 tall, as GPUI's text area, growing with its lines.
         const area = ui.div(c).row().wFull();
@@ -112,7 +150,7 @@ const dictate = @import("app_dictation.zig");
 
 fn attachButtons(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (kit.iconButton(c, k, .paperclip, .{ .size = 28, .radius = 14, .icon = 18 }))
-        a.setNotice("Attachments aren't in Harness Nano yet.");
+        attachments.pick(a);
     // The mic shows where the device's Codex voice was found, and while a
     // session is live.
     if (!dictate.shown(a)) return;
@@ -165,7 +203,10 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
         "Edit queued message…"
     else
         "Do anything…";
+    attachments.paste(c, a);
     const at = c.nodes.items.len;
+    const viewport = transcript_view.paneHeight(c, a) orelse c.size.h;
+    const max_lines: u16 = @intFromFloat(@max(1, @min(11, @floor(viewport * 0.35 / 22.75))));
     const r = ui.textField(c, &a.composer, .{
         .placeholder = placeholder,
         .width = .fill,
@@ -175,7 +216,7 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
         .line_height = 22.75,
         .placeholder_color = k.faint,
         .multiline = true,
-        .max_lines = 11,
+        .max_lines = if (shape == .compact) 1 else max_lines,
     });
     // "Send messages with" (Settings › Shortcuts): Enter sends, or starts a
     // new line and ⌘↩ sends (`composerSendBehavior`).
@@ -187,7 +228,7 @@ fn input(c: *ui.Context, a: *App, k: theme.Colors, shape: Shape) void {
             a.composer.want_caret = r.caret + 1;
         }
     }
-    if (!on_enter and std.mem.trim(u8, a.composer.text(), " \n\t").len > 0 and c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true })) a.send();
+    if (!on_enter and (std.mem.trim(u8, a.composer.text(), " \n\t").len > 0 or attachments.count(a) > 0) and c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true })) a.send();
     keepFocus(c, a, c.node(@intCast(at)).id);
     // ⌘↩ with nothing typed sends the newest queued message now.
     if (c.shortcut(.{ .key = ui.Shortcut.enter, .cmd = true }) and std.mem.trim(u8, a.composer.text(), " \n\t").len == 0) {
@@ -219,8 +260,10 @@ fn keepFocus(c: *ui.Context, a: *App, id: u64) void {
 /// The model chip: what the next message runs on.
 fn chip(c: *ui.Context, a: *App, k: theme.Colors) void {
     const t = a.target();
-    var b = ui.div(c).row().h(32).maxW(248).px(6).gap(6).itemsCenter().rounded(8).clip();
-    b = if (a.picker != .none) b.bg(k.hover) else b.hover(k.hover);
+    const base = ui.div(c).row().h(32).maxW(248).px(6).gap(6).itemsCenter().rounded(8).clip();
+    // GPUI's trigger uses on_hover: closing by keyboard doesn't move the
+    // pointer and must not clear the wash until the pointer actually moves.
+    const b = kit.listenerHover(&a.view.hovers, if (a.picker != .none) base.bg(k.hover) else base, k.hover).div;
     defer b.end();
     if (b.clicked()) a.togglePicker();
     if (c.rects.get(c.node(b.index).id)) |r| a.view.chip_anchor = r;
@@ -249,11 +292,11 @@ fn skeleton(c: *ui.Context) void {
 
 /// Send (or queue, while a run goes); Stop with nothing typed mid-run.
 fn send(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const empty = std.mem.trim(u8, a.composer.text(), " \n\t").len == 0;
+    const empty = std.mem.trim(u8, a.composer.text(), " \n\t").len == 0 and attachments.count(a) == 0;
     const running = a.selectedStatus() == .working;
     const stop = running and empty;
     // Dimmed only when it can't send at all; an empty box just does nothing.
-    const blocked = !stop and a.engine.state != .connected;
+    const blocked = !stop and (a.engine.state != .connected or !attachments.ready(a));
     const pad = ui.div(c).row().pl(8);
     defer pad.end();
     var b = ui.div(c).row().size(28, 28).center().roundedFull().bg(k.text);

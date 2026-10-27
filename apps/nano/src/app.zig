@@ -26,6 +26,11 @@ pub const uuid = @import("ids.zig").uuid;
 /// The window's own state, apart from the engine's.
 pub const View = struct {
     sidebar_open: bool = true,
+    /// Effective slot width this frame, shared by chat, header and drop zones.
+    sidebar_width: f32 = 256,
+    /// Focus before a pointer press blurs a control in the sliding sidebar.
+    sidebar_press_frame: u64 = 0,
+    sidebar_press_focus: bool = false,
     /// The project filter: a space's id (owned), or all projects.
     filter: ?[]u8 = null,
     filter_menu: bool = false,
@@ -73,11 +78,16 @@ pub const View = struct {
     shortcut_notice: std.ArrayList(u8) = .empty,
     space_anchor: ?nanoui.ui.Rect = null,
     chip_anchor: ?nanoui.ui.Rect = null,
+    model_picker: @import("model_picker.zig").State = .{},
     composer_anchor: ?nanoui.ui.Rect = null,
+    /// A press in a peer, including its message/control descendants.
+    pane_press: ?struct { tab: usize, pane: usize } = null,
     /// The composer takes the keys when next drawn; its field's id as last
     /// drawn, for keeping them when it moves.
     focus_composer: bool = false,
     composer_id: u64 = 0,
+    /// Stable compact-capacity decision, with the GPUI composer's hysteresis.
+    composer_expanded: bool = false,
     /// The composer's caret as of its last frame: where dictated words go.
     composer_caret: usize = 0,
     /// The prompt rail's hover and glide (view_rail.zig).
@@ -115,6 +125,7 @@ pub const View = struct {
     pub fn deinit(v: *View, gpa: Allocator) void {
         v.github_ci.deinit(gpa);
         v.palette.deinit(gpa);
+        v.model_picker.deinit(gpa);
         v.agents.deinit(gpa);
         v.accounts.deinit(gpa);
         v.archived.deinit(gpa);
@@ -167,8 +178,8 @@ pub const Peer = struct {
     id: []u8,
     transcript: Transcript,
     watch: ?u64 = null,
-    /// Its stream ended: watched again on the next connect, not each frame.
-    ended: bool = false,
+    /// Retry an ended stream after the same delay as the focused one.
+    retry_at: ?f64 = null,
 };
 
 /// A stream the app keeps open, and when to open it again once it ended.
@@ -179,6 +190,36 @@ const Watch = struct {
 
 /// Seconds before a stream that ended is opened again, as the GPUI app.
 const retry_s = 2.0;
+
+/// App-owned rather than part-owned: transcript updates can replace parts
+/// while a full-output request is in flight. The callback context stays put.
+const ToolBlob = struct {
+    app: *App,
+    ref: []u8,
+    status: enum { loading, ready, failed } = .loading,
+    text: []u8 = &.{},
+
+    fn onReply(b: *ToolBlob, _: u64, reply: rpc.Reply) void {
+        b.status = .failed;
+        switch (reply) {
+            .ok => |v| {
+                if (v == .object) if (v.object.get("text")) |text| {
+                    if (text == .string) {
+                        const copy = b.app.gpa.dupe(u8, text.string) catch {
+                            b.app.redraw();
+                            return;
+                        };
+                        b.app.gpa.free(b.text);
+                        b.text = copy;
+                        b.status = .ready;
+                    }
+                };
+            },
+            else => {},
+        }
+        b.app.redraw();
+    }
+};
 
 pub const App = struct {
     gpa: Allocator,
@@ -198,6 +239,10 @@ pub const App = struct {
     selected: ?[]u8 = null,
     space: ?[]u8 = null,
     transcript: Transcript,
+    /// UI-only feedback until the engine echoes a locally submitted message.
+    pending_sends: std.ArrayList(*@import("app_send_feedback.zig").Pending) = .empty,
+    /// Full tool output, keyed by its owned sidecar reference.
+    tool_blobs: std.StringHashMapUnmanaged(*ToolBlob) = .empty,
     /// What `select` let go of: the frame that let go may have drawn it
     /// already, and lays it out after. Freed at the next frame's start
     /// (`reap`).
@@ -210,12 +255,14 @@ pub const App = struct {
     /// Dictation through the device's Codex voice.
     dictation: @import("app_dictation.zig").State = .{},
     composer: nanoui.ui.TextBuffer = .{},
+    attachments: @import("app_attachments.zig").State = .{},
     /// The last error the engine gave, shown under the composer.
     notice: [200]u8 = undefined,
     notice_len: usize = 0,
     /// The view's clock, as of its last frame.
     now: f64 = 0,
     dark: ?bool = null,
+    glass: @import("app_surface.zig").State = .{},
     /// This engine's device: a space added here is this device's folder.
     device_id: ?[]u8 = null,
     /// The agents to pick from, and the models the picked one offers.
@@ -314,7 +361,18 @@ pub const App = struct {
     }
 
     pub fn deinit(a: *App) void {
+        @import("app_surface.zig").deinit(a);
         a.engine.deinit();
+        a.attachments.deinit(a.gpa);
+        @import("app_send_feedback.zig").deinit(a);
+        var blobs = a.tool_blobs.valueIterator();
+        while (blobs.next()) |value| {
+            const b = value.*;
+            a.gpa.free(b.ref);
+            a.gpa.free(b.text);
+            a.gpa.destroy(b);
+        }
+        a.tool_blobs.deinit(a.gpa);
         a.spaces.deinit();
         a.chats.deinit();
         a.sessions.deinit();
@@ -461,6 +519,29 @@ pub const App = struct {
         return a.engine.call(r.method, r.params, h);
     }
 
+    /// One request per reference; failures may be retried explicitly.
+    pub fn fetchToolBlob(a: *App, ref: []const u8) void {
+        if (ref.len == 0) return;
+        const b = a.tool_blobs.get(ref) orelse blk: {
+            const owned_ref = a.gpa.dupe(u8, ref) catch return;
+            const blob = a.gpa.create(ToolBlob) catch {
+                a.gpa.free(owned_ref);
+                return;
+            };
+            blob.* = .{ .app = a, .ref = owned_ref, .status = .failed };
+            a.tool_blobs.put(a.gpa, owned_ref, blob) catch {
+                a.gpa.free(owned_ref);
+                a.gpa.destroy(blob);
+                return;
+            };
+            break :blk blob;
+        };
+        if (b.status != .failed) return;
+        b.status = .loading;
+        if (a.send_(requests.fetchToolBlob(b.ref), .of(ToolBlob, b, ToolBlob.onReply)) == null) b.status = .failed;
+        a.redraw();
+    }
+
     pub fn request(a: *App, r: anytype, h: rpc.Handler) void {
         _ = a.engine.call(r.method, r.params, h);
     }
@@ -488,6 +569,7 @@ pub const App = struct {
         if (@import("app_reauth.zig").tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (@import("app_sandboxes.zig").tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (change_requests.tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
+        if (@import("app_subagents.zig").tick(a, now)) |t| next = if (next) |n| @min(n, t) else t;
         if (a.w_queue.retry_at) |t| if (now >= t) {
             a.w_queue = .{};
             queue_mod.watch(a);
@@ -501,6 +583,12 @@ pub const App = struct {
                 } else next = if (next) |n| @min(n, t) else t;
             }
         }
+        for (a.peers.items) |*p| if (p.retry_at) |t| {
+            if (now >= t) {
+                p.retry_at = null;
+                if (a.engine.state == .connected) a.watchPeer(p);
+            } else next = if (next) |n| @min(n, t) else t;
+        };
         return if (next) |n| @floatCast(n - now) else null;
     }
 
@@ -702,7 +790,7 @@ pub const App = struct {
                 if (w) |x| if (std.mem.eql(u8, x, p.id)) break true;
             } else false;
             if (keep) {
-                if (p.watch == null and !p.ended and live) a.watchPeer(p);
+                if (p.watch == null and p.retry_at == null and live) a.watchPeer(p);
                 i += 1;
                 continue;
             }
@@ -728,17 +816,19 @@ pub const App = struct {
     }
 
     fn onPeerDoc(a: *App, id: u64, r: rpc.Reply) void {
+        // A focus change moves the subscription with its transcript.
+        if (a.w_doc.id == id) return onDoc(a, id, r);
         for (a.peers.items) |*p| if (p.watch == id) {
             switch (r) {
                 .item => |v| p.transcript.apply(v) catch {
-                    // Out of step: the next frame watches it afresh.
+                    // Watch afresh, keeping the last verified rows until
+                    // its authoritative reset arrives.
                     a.engine.cancel(id);
-                    p.transcript.clear();
                     p.watch = null;
                 },
                 .done, .err => {
                     p.watch = null;
-                    p.ended = true;
+                    p.retry_at = if (a.engine.state == .connected) a.now + retry_s else null;
                 },
                 .ok => {},
             }
@@ -786,7 +876,7 @@ pub const App = struct {
     }
 
     fn onDoc(a: *App, id: u64, r: rpc.Reply) void {
-        if (a.w_doc.id != id) return;
+        if (a.w_doc.id != id) return onPeerDoc(a, id, r);
         switch (r) {
             .item => |v| a.transcript.apply(v) catch {
                 // Out of step: start over from a fresh reset.
@@ -866,13 +956,7 @@ pub const App = struct {
         drafts.leave(a);
         defer drafts.enter(a);
         a.view.focus_composer = true;
-        if (a.w_doc.id) |id| a.engine.cancel(id);
-        a.w_doc = .{};
-        // Not freed now: this frame may have drawn it (a split dropped
-        // last, the palette's pick), and its layout still reads it.
-        if (a.retired.append(a.gpa, a.transcript)) |_| {
-            a.transcript = .{ .gpa = a.gpa };
-        } else |_| a.transcript.clear();
+        @import("app_panes.zig").select(a, chat_id);
         a.notice_len = 0;
         queue_mod.stop(a);
         if (a.selected) |s| a.retired_ids.append(a.gpa, s) catch a.gpa.free(s);
@@ -884,7 +968,7 @@ pub const App = struct {
         const chat = a.selected orelse return a.redraw();
         a.request(requests.focusChat(chat), .of(App, a, onNotice));
         a.markSeen(chat);
-        a.watchDoc(true);
+        if (a.w_doc.id == null and a.w_doc.retry_at == null) a.watchDoc(true);
         queue_mod.watch(a);
         @import("app_panels.zig").chatChanged(a);
         a.ensureModels(a.target().harness);
@@ -896,6 +980,8 @@ pub const App = struct {
     /// At a frame's start, before anything is drawn: what `select` let go
     /// of, freed.
     pub fn reap(a: *App) void {
+        @import("app_attachments.zig").reap(a);
+        @import("app_send_feedback.zig").reap(a);
         for (a.retired.items) |*t| t.deinit();
         a.retired.clearRetainingCapacity();
         for (a.retired_ids.items) |s| a.gpa.free(s);
@@ -924,13 +1010,21 @@ pub const App = struct {
 
     pub fn selectedStatus(a: *const App) workspace.Status {
         const id = a.selected orelse return .idle;
+        if (@import("app_send_feedback.zig").active(a, id, &a.transcript) != null) return .working;
         return workspace.statusOf(a.sessions.items, id);
     }
 
     /// Sends what the composer holds: to the open chat, or to a new one.
     pub fn send(a: *App) void {
         if (a.queue_edit != null) return queue_mod.finishEdit(a, .commit);
-        const prompt = std.mem.trim(u8, a.composer.text(), " \n\t");
+        const attachments = @import("app_attachments.zig");
+        const text = std.mem.trim(u8, a.composer.text(), " \n\t");
+        const attached = attachments.prompt(a, text) catch {
+            a.setNotice("Wait for the attachments to finish, or remove/retry the failed file.");
+            return a.redraw();
+        };
+        defer if (attached) |p| a.gpa.free(p);
+        const prompt = attached orelse text;
         // `/resume` is the workspace's, not the agent's: the palette that
         // puts a chat in this tab (`WorkspaceCommand::Resume`).
         if (std.mem.eql(u8, prompt, "/resume")) {
@@ -940,6 +1034,7 @@ pub const App = struct {
         if (prompt.len == 0 or a.engine.state != .connected) return;
         if (a.queues()) {
             queue_mod.queueMessage(a, prompt);
+            attachments.clear(a);
             a.composer.clear();
             return a.redraw();
         }
@@ -972,14 +1067,20 @@ pub const App = struct {
             }), .of(App, a, onNotice));
             break :blk id;
         };
+        const feedback = @import("app_send_feedback.zig");
+        const pending = feedback.begin(a, chat_id, message_id, prompt) catch {
+            a.setNotice("Couldn't prepare the message. Please try again.");
+            return a.redraw();
+        };
         a.request(requests.run(chat_id, message_id, .{
             .prompt = prompt,
             .harness = harness,
             .model = model,
             .reasoning = reasoning,
             .cwd = cwd,
-        }), .of(App, a, onNotice));
+        }), .of(feedback.Pending, pending, feedback.Pending.onReply));
         // Sent: the prompt is no one's draft any more.
+        attachments.clear(a);
         a.composer.clear();
         if (a.selected == null) {
             a.tabs.setCurrent(chat_id);

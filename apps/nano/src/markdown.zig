@@ -25,6 +25,8 @@ pub const Inline = struct {
     /// Pictures (`![alt](src)`): their source, and where their alt text is
     /// in `text` (drawn as a link where the picture can't be shown).
     images: []const Image = &.{},
+    /// Destinations and rendered byte ranges, retained separately from style.
+    links: []const Link = &.{},
     /// Centered, as HTML's `align="center"` asks.
     center: bool = false,
 };
@@ -32,6 +34,7 @@ pub const Inline = struct {
 /// A picture: its source, where its alt text is in the text, and the
 /// width HTML gave it.
 pub const Image = struct { src: []const u8, start: u32, end: u32, width: ?f32 = null };
+pub const Link = struct { url: []const u8, start: u32, end: u32 };
 
 pub const Block = union(enum) {
     paragraph: Inline,
@@ -188,7 +191,7 @@ pub const Parser = struct {
     fn inlines(p: *Parser, src: []const u8) !Inline {
         var b: Builder = .{ .arena = p.arena, .pal = p.pal };
         try b.parse(src, .{});
-        return .{ .text = b.text.items, .spans = b.spans.items, .images = b.images.items };
+        return .{ .text = b.text.items, .spans = b.spans.items, .images = b.images.items, .links = b.links.items };
     }
 
     pub const Builder = struct {
@@ -197,6 +200,7 @@ pub const Parser = struct {
         text: std.ArrayList(u8) = .empty,
         spans: std.ArrayList(Span) = .empty,
         images: std.ArrayList(Image) = .empty,
+        links: std.ArrayList(Link) = .empty,
 
         pub fn emit(b: *Builder, s: []const u8, f: Flags) !void {
             if (s.len == 0) return;
@@ -281,7 +285,8 @@ pub const Parser = struct {
                                 lf.link = true;
                                 const at: u32 = @intCast(b.text.items.len);
                                 try b.parse(src[open + 1 .. close], lf);
-                                if (ch == '!') try b.images.append(b.arena, .{ .src = std.mem.trim(u8, src[close + 2 .. end], " <>"), .start = at, .end = @intCast(b.text.items.len) });
+                                const destination = std.mem.trim(u8, src[close + 2 .. end], " <>");
+                                if (ch == '!') try b.images.append(b.arena, .{ .src = destination, .start = at, .end = @intCast(b.text.items.len) }) else try b.links.append(b.arena, .{ .url = destination, .start = at, .end = @intCast(b.text.items.len) });
                                 i = end + 1;
                                 plain = i;
                                 continue;
@@ -297,14 +302,16 @@ pub const Parser = struct {
                     plain = i;
                     continue;
                 };
-                if (std.mem.startsWith(u8, rest, "https://") or std.mem.startsWith(u8, rest, "http://")) {
+                if (!f.link and (std.mem.startsWith(u8, rest, "https://") or std.mem.startsWith(u8, rest, "http://"))) {
                     var end = i;
                     while (end < src.len and src[end] != ' ' and src[end] != ')' and src[end] != '>') end += 1;
                     while (end > i and std.mem.indexOfScalar(u8, ".,;:!?", src[end - 1]) != null) end -= 1;
                     try b.emit(src[plain..i], f);
                     var lf = f;
                     lf.link = true;
+                    const at: u32 = @intCast(b.text.items.len);
                     try b.emit(src[i..end], lf);
+                    try b.links.append(b.arena, .{ .url = src[i..end], .start = at, .end = @intCast(b.text.items.len) });
                     i = end;
                     plain = i;
                     continue;

@@ -33,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
         .light => false,
         .dark => true,
     };
+    try @import("native_menu.zig").install(app, &a);
     a.window = try app.newWindow(.{
         .title = "Harness",
         .width = 1200,

@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
     defer a.deinit();
     a.offscreen = true;
     a.dark = true;
+    if (init.environ_map.get("HARNESS_NANO_SURFACE")) |s| a.settings.setText("surface", s);
     a.new_harness = try gpa.dupe(u8, "claude-code");
     // The GPUI profile's one project and chat.
     const setup = try json.parseFromSlice(json.Value, gpa,
@@ -47,11 +48,17 @@ pub fn main(init: std.process.Init) !void {
     try a.spaces.replace(setup.value.object.get("spaces").?);
     try a.chats.replace(setup.value.object.get("chats").?);
     a.openChat("profile", null);
+    a.engine.state = .connected;
+    a.sessions.items = try a.sessions.arena.allocator().alloc(@import("workspace.zig").Session, 1);
+    a.sessions.items[0] = replaySession(&a.transcript, a.nowMs());
 
     const size: ui.Size = .{ .w = 1320, .h = 880 };
     var t: ui.Tester = undefined;
     try t.init(gpa, .init(&a, @import("view.zig").view), .{ .width = size.w, .height = size.h, .scale = 2, .dark = true, .theme = theme.ui(true) });
     defer t.deinit();
+    // No active window, as in the GPUI replay: a focused editor must not
+    // keep waking Metal to blink a caret the user cannot see.
+    if (comptime @hasField(@TypeOf(t.ctx.input), "window_active")) t.ctx.input.window_active = false;
     const Draw = struct {
         target: if (has_target) nanoui.objc.Object else void,
         frames: u64 = 0,
@@ -98,6 +105,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("frame {d}: {t}\n", .{ next, e });
                 return e;
             };
+            a.sessions.items[0] = replaySession(&a.transcript, a.nowMs());
             dirty = true;
         }
         if (wake_at) |w| if (elapsed >= w) {
@@ -116,7 +124,7 @@ pub fn main(init: std.process.Init) !void {
             if (has_target) {
                 t.renderer.syncImages(&t.text.images);
                 t.renderer.textures = t.ctx.textures.items;
-                const timing = t.renderer.drawTimed(draw.target, t.instances.items, t.text.texture(), size, t.theme.background);
+                const timing = t.renderer.drawTimed(draw.target, t.instances.items, t.text.texture(), size, t.ctx.theme.background);
                 draw.encode_ms += timing.encode_ms;
                 draw.gpu_ms += timing.gpu_ms;
             }
@@ -140,6 +148,52 @@ pub fn main(init: std.process.Init) !void {
     var path_buf: [1024]u8 = undefined;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&path_buf, "{s}/nano-stats.json", .{out}), .data = stats });
     std.debug.print("{s}", .{stats});
+}
+
+/// The GPUI replay refreshes its session alongside every transcript frame.
+fn replaySession(transcript: *const @import("transcript.zig").Transcript, now: i64) @import("workspace.zig").Session {
+    const streaming = for (transcript.entries.items) |entry| {
+        if (entry.status == .streaming) break true;
+    } else false;
+    return .{ .chat_id = "profile", .status = if (streaming) .working else .idle, .started_ms = now, .updated_ms = now };
+}
+
+fn sessionView(a: *App, c: *ui.Context) void {
+    @import("view_working.zig").trailer(c, a, theme.colors(true), "profile", &a.transcript);
+}
+
+test "resource replay includes GPUI's working animation and stops it when settled" {
+    const testing = std.testing;
+    theme.registerFonts();
+    var a: App = .init(testing.allocator, testing.io, 1);
+    defer a.deinit();
+    a.offscreen = true;
+    a.sessions.items = try a.sessions.arena.allocator().alloc(@import("workspace.zig").Session, 1);
+    a.sessions.items[0] = replaySession(&a.transcript, a.nowMs());
+    var t: ui.Tester = undefined;
+    try t.init(testing.allocator, .init(&a, sessionView), .{ .dark = true, .theme = theme.ui(true) });
+    defer t.deinit();
+    try testing.expectEqual(.idle, a.sessions.items[0].status);
+    try testing.expect(!t.ctx.animating);
+    const streaming = try json.parseFromSlice(json.Value, testing.allocator,
+        \\{"reset":[{"id":"reply","role":"assistant","status":"streaming","parts":[]}]}
+    , .{});
+    defer streaming.deinit();
+    try a.transcript.apply(streaming.value);
+    a.sessions.items[0] = replaySession(&a.transcript, a.nowMs());
+    try testing.expectEqual(.working, a.sessions.items[0].status);
+    t.frame();
+    try testing.expect(!t.ctx.animating);
+    try testing.expectApproxEqAbs(@as(f32, 1.0 / 15.0), t.ctx.frame_in orelse return error.WorkingAnimationNotScheduled, 0.0001);
+    // A finished or interrupted turn must not keep the working animation up.
+    for ([_]@import("transcript.zig").EntryStatus{ .complete, .aborted }) |status| {
+        a.transcript.entries.items[0].status = status;
+        a.sessions.items[0] = replaySession(&a.transcript, a.nowMs());
+        try testing.expectEqual(.idle, a.sessions.items[0].status);
+        t.frame();
+        try testing.expect(!t.ctx.animating);
+        try testing.expect(t.ctx.frame_in == null);
+    }
 }
 
 /// NANO_PROFILE_FRAMES set: why each settled frame was drawn.

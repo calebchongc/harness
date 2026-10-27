@@ -26,6 +26,18 @@ pub fn build(b: *std.Build) void {
         \\
     );
     const fonts = b.createModule(.{ .root_source_file = fonts_root });
+    // The same SVGs the GPUI app draws, rasterized at the screen's density,
+    // not a second, pre-rendered copy of the icon set.
+    const icon_files = b.addWriteFiles();
+    _ = icon_files.addCopyDirectory(b.path("../../crates/ui/assets/icons"), "icons", .{ .include_extensions = &.{".svg"} });
+    const icons_root = icon_files.add("icons_svg.zig",
+        \\pub fn get(comptime name: []const u8) []const u8 {
+        \\    return @embedFile("icons/" ++ name ++ ".svg");
+        \\}
+        \\
+    );
+    const icons_svg = b.createModule(.{ .root_source_file = icons_root });
+    const file_icons_data = @import("file_icons_build.zig").module(b);
     // The built-in themes, the catalog the phones bundle (crates/theme keeps
     // it in lockstep with the GPUI app's registry).
     const theme_files = b.addWriteFiles();
@@ -44,6 +56,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "nanoui", .module = nanoui },
         .{ .name = "http_zig", .module = http_zig },
         .{ .name = "fonts", .module = fonts },
+        .{ .name = "icons_svg", .module = icons_svg },
+        .{ .name = "file_icons_data", .module = file_icons_data },
         .{ .name = "themes_json", .module = themes_json },
     };
 

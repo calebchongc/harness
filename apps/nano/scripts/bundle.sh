@@ -2,7 +2,7 @@
 # Builds harness-nano for release and wraps it as zig-out/Harness Nano.app.
 set -eu
 cd "$(dirname "$0")/.."
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast "$@"
 app="zig-out/Harness Nano.app/Contents"
 mkdir -p "$app/MacOS" "$app/Resources"
 cp zig-out/bin/harness-nano "$app/MacOS/"

@@ -578,7 +578,7 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
 /// `section_card` `mt` below what's above.
 pub fn card(c: *ui.Context, k: theme.Colors, mt: f32) ui.Div {
     set.space(c, mt);
-    return ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(k.shell).clip();
+    return ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(if (k.frosted) k.card else k.shell).clip();
 }
 
 /// The inside of a card padded 16 (`section_card().p(16)`).

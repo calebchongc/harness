@@ -8,6 +8,13 @@ const Color = nanoui.ui.Color;
 
 pub const Colors = struct {
     dark: bool,
+    frosted: bool = false,
+    recommended_frosted: bool = false,
+    /// Original theme roles, before compositing for opaque paint.
+    input_tint: Color = .transparent,
+    overlay: Color = .transparent,
+    card: Color = .transparent,
+    panel: Color = .transparent,
     background: Color,
     /// The window and the main column.
     shell: Color,
@@ -91,6 +98,10 @@ pub fn builtin(dark: bool) Colors {
             .shell = .hex(0x1f1c16),
             .sidebar = .hex(0x292721),
             .raised = .hex(0x2a261e),
+            .input_tint = Color.hex(0x2a261e).alpha(184.0 / 255.0),
+            .overlay = .hex(0x231f19),
+            .card = .hex(0x1f1c16),
+            .panel = .hex(0x1f1c16),
             .text = .hex(0xedeae2),
             .muted = muted,
             .faint = .hex(0x5c564b),
@@ -127,6 +138,10 @@ pub fn builtin(dark: bool) Colors {
         .shell = .hex(0xf0ece3),
         .sidebar = .hex(0xe5e1d9),
         .raised = .hex(0xe7e1d5),
+        .input_tint = .hex(0xf0ece3),
+        .overlay = .hex(0xf0ece3),
+        .card = .hex(0xf0ece3),
+        .panel = .hex(0xf0ece3),
         .text = .hex(0x1a1813),
         .muted = .hex(0x6b6557),
         .faint = .hex(0xa8a090),

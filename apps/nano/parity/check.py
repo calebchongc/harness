@@ -5,6 +5,7 @@ harness-nano, frame by frame, and compared.
     python3 parity/check.py                 # every scene; fails past the budget
     python3 parity/check.py settings-*.json # some of them
     python3 parity/check.py --update        # record today's numbers as the budget
+    python3 parity/check.py --max-changed 0.0005  # every frame, including new ones, within 0.05%
     NANOUI_FORK=~/nanoui python3 parity/check.py   # against a nanoui checkout
 
 Both draw offscreen, with no window and no engine: the GPUI app through its
@@ -35,10 +36,11 @@ from PIL import Image
 
 HERE = pathlib.Path(__file__).resolve().parent
 NANO = HERE.parent
+REPO = NANO.parent.parent
 SCENES = HERE / "scenes"
 BUDGET = HERE / "budget.json"
 GPUI_BIN = pathlib.Path(
-    os.environ.get("HARNESS_UI_SCENES", "~/.cargo/shared-target/app-dev/examples/ui-scenes")
+    os.environ.get("HARNESS_UI_SCENES", REPO / "target/app-dev/examples/ui-scenes")
 ).expanduser()
 SNAP_BIN = NANO / "zig-out/bin/harness-nano-snap"
 # A channel differing by more than this counts the pixel as changed.
@@ -82,7 +84,7 @@ def compare(a_path: pathlib.Path, b_path: pathlib.Path, out: pathlib.Path) -> di
     heat[off] = [255, 40, 40]
     side = np.concatenate([a.astype(np.uint8), b.astype(np.uint8), heat], axis=1)
     Image.fromarray(side).save(out)
-    return {"changed": round(changed, 4), "exact": round(exact, 4), "mae": round(mae, 4)}
+    return {"changed": changed, "exact": exact, "mae": mae}
 
 
 def main() -> None:
@@ -90,7 +92,10 @@ def main() -> None:
     ap.add_argument("scenes", nargs="*", help="scene files or names in parity/scenes (default: all)")
     ap.add_argument("--out", default="/tmp/nano-parity", help="where frames and comparisons go")
     ap.add_argument("--update", action="store_true", help="write these numbers as the budget")
+    ap.add_argument("--max-changed", type=float, help="absolute changed-pixel fraction allowed in every frame, including new scenes")
     args = ap.parse_args()
+    if args.max_changed is not None and not 0 <= args.max_changed <= 1:
+        ap.error("--max-changed must be a finite fraction between 0 and 1")
 
     scenes = [p if (p := pathlib.Path(s)).exists() else SCENES / s for s in args.scenes] or sorted(SCENES.glob("*.json"))
     if not GPUI_BIN.exists():
@@ -123,19 +128,31 @@ def main() -> None:
             r = compare(out / "gpui" / f, out / "nano" / f, out / "compare" / f)
             results[f] = r["changed"]
             limit = budget.get(f)
-            over = limit is not None and r["changed"] > limit + SLACK
+            over = (not args.update and limit is not None and r["changed"] > limit + SLACK) or (
+                args.max_changed is not None and r["changed"] > args.max_changed
+            )
             mark = "  FAIL" if over else ("  new" if limit is None else "")
             budget_s = f"{limit:8.2%}" if limit is not None else f"{'':8}"
             print(f"{f:40} {r['changed']:8.2%} {budget_s} {r.get('exact', 1):8.2%}{mark}  {r.get('error', '')}")
             if over:
                 failed.append(f)
+    report = {
+        "frames": len(results),
+        "meanChanged": sum(results.values()) / len(results) if results else 0,
+        "maxChanged": max(results.values(), default=0),
+        "maxAllowed": args.max_changed,
+        "failed": failed,
+        "changed": results,
+    }
+    (out / "report.json").write_text(json.dumps(report, indent=1) + "\n")
+    print(f"{len(results)} frames; mean {report['meanChanged']:.4%}; max {report['maxChanged']:.4%}")
     print(f"comparisons: {out / 'compare'}")
+    if failed:
+        sys.exit(f"{len(failed)} frame(s) exceed the parity limits: {', '.join(failed)}")
     if args.update:
         budget.update(results)
         BUDGET.write_text(json.dumps(dict(sorted(budget.items())), indent=1) + "\n")
         print(f"budget written: {BUDGET}")
-    elif failed:
-        sys.exit(f"{len(failed)} frame(s) further from the GPUI app than their budget: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

@@ -106,10 +106,13 @@ const Converter = struct {
     italic: u8 = 0,
     code: u8 = 0,
     link: u8 = 0,
+    href: ?[]const u8 = null,
+    link_start: u32 = 0,
     muted: u8 = 0,
 
     fn fresh(c: *Converter) void {
         c.b = .{ .arena = c.arena, .pal = c.pal };
+        c.link_start = 0;
     }
 
     fn marks(c: *Converter) Flags {
@@ -141,7 +144,8 @@ const Converter = struct {
         while (t.len > 0 and (t[t.len - 1] == ' ' or t[t.len - 1] == '\n')) t.len -= 1;
         if (t.len > 0 or c.b.images.items.len > 0) {
             for (c.b.spans.items) |*sp| sp.end = @min(sp.end, @as(u32, @intCast(t.len)));
-            const in: md.Inline = .{ .text = t, .spans = c.b.spans.items, .images = c.b.images.items, .center = c.center };
+            if (c.href) |url| if (c.link_start < t.len) try c.b.links.append(c.arena, .{ .url = url, .start = c.link_start, .end = @intCast(t.len) });
+            const in: md.Inline = .{ .text = t, .spans = c.b.spans.items, .images = c.b.images.items, .links = c.b.links.items, .center = c.center };
             try c.out.append(c.arena, if (c.level > 0) .{ .heading = .{ .level = c.level, .text = in } } else .{ .paragraph = in });
         }
         c.fresh();
@@ -168,6 +172,20 @@ const Converter = struct {
             try c.out.append(c.arena, .rule);
         } else if (eq(n, "br")) {
             try c.b.emit("\n", c.marks());
+        } else if (eq(n, "a")) {
+            if (t.closing) {
+                if (c.href) |url| if (c.link_start < c.b.text.items.len) try c.b.links.append(c.arena, .{ .url = url, .start = c.link_start, .end = @intCast(c.b.text.items.len) });
+                c.href = null;
+                c.link -|= 1;
+            } else {
+                if (attr(t.attrs, "href")) |href| {
+                    var decoded: std.ArrayList(u8) = .empty;
+                    try decode(c.arena, href, &decoded);
+                    c.href = decoded.items;
+                }
+                c.link_start = @intCast(c.b.text.items.len);
+                c.link += 1;
+            }
         } else if (eq(n, "img")) {
             const src = attr(t.attrs, "src") orelse return;
             const alt = attr(t.attrs, "alt") orelse "";

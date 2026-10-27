@@ -184,7 +184,7 @@ fn group(c: *ui.Context, a: *App, k: theme.Colors, comptime g: shortcuts.Group) 
     const box = ui.div(c).column().wFull().gap(8);
     defer box.end();
     set.fieldLabel(c, k, g.label());
-    const cd = ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(k.shell).clip();
+    const cd = ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(if (k.frosted) k.card else k.shell).clip();
     defer cd.end();
     var first_row = true;
     for (shortcuts.all, 0..) |sc, ix| if (sc.group == g) {
@@ -233,7 +233,7 @@ fn fixedGroup(c: *ui.Context, k: theme.Colors) void {
     const box = ui.div(c).column().wFull().gap(8);
     defer box.end();
     set.fieldLabel(c, k, shortcuts.fixed_label);
-    const cd = ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(k.shell).clip();
+    const cd = ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(if (k.frosted) k.card else k.shell).clip();
     defer cd.end();
     for (shortcuts.fixed, 0..) |f, i| {
         if (i > 0) _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.border }, .none, null);

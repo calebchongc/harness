@@ -21,18 +21,27 @@ const cluster_x: f32 = 88;
 const cluster_w: f32 = 24 * 3 + 8 + 2;
 
 pub fn view(a: *App, c: *ui.Context) void {
+    @import("view_picker.zig").prepare(a);
     // The themes Settings › Appearance picked, for every palette drawn now.
     theme.light_id = a.settings.themeId(false);
     theme.dark_id = a.settings.themeId(true);
     const dark = a.dark orelse nanoui.isDark();
     c.theme = theme.ui(dark);
     // The accent Settings › Appearance chose, in place of the theme's.
-    const k = @import("view_settings_appearance.zig").withAccent(theme.colors(dark), a);
+    const base = @import("view_settings_appearance.zig").withAccent(theme.colors(dark), a);
+    const surfaces = @import("surface_palette.zig");
+    const requested = surfaces.requested(a.settings.text("surface"), base.recommended_frosted);
+    const k = surfaces.apply(base, @import("app_surface.zig").sync(a, requested, dark));
+    c.theme.background = if (k.frosted) .transparent else k.shell;
+    c.theme.surface = k.composer;
+    // Context.begin seeded an implicit root before the view resolved its
+    // live theme. It must not leave an opaque sheet under a glass window.
+    c.node(0).style.background = c.theme.background;
     @import("view_transcript.zig").column_w = @import("view_settings_appearance.zig").transcriptWidth(a);
     a.ansi = k.ansi;
     if (a.tick(c.time)) |wait| c.frameIn(wait);
     c.title_bar_height = sidebar.titlebar_h;
-    @import("view_kit.zig").beginFrame(c);
+    @import("view_kit.zig").beginFrame(c, k);
     // Box edges on the device's pixels, a half toward zero, as GPUI's
     // taffy.rs puts them; text keeps the line heights nano gives it.
     if (comptime @hasField(ui.Context, "pixel_snap_text")) {
@@ -68,21 +77,44 @@ pub fn view(a: *App, c: *ui.Context) void {
     if (comptime @hasField(@TypeOf(c.text.*), "baseline_rule")) c.text.baseline_rule = .glyph_box;
     // Last frame's let-go transcript, now nothing drawn reads it.
     a.reap();
+    @import("app_subagents.zig").settleFrame(a);
+    @import("app_browser.zig").settleFrame(a);
     @import("view_settings_theme_import.zig").settleFrame(a);
+    // Capture once, before drawing the search can blur it on a pointer
+    // press. An open but unfocused search must not steal another field.
+    if (c.input.pressed and a.view.sidebar_press_frame != c.frame) {
+        a.view.sidebar_press_frame = c.frame;
+        const focused_sidebar = if (c.rects.get(c.focus)) |r| r.x < a.view.sidebar_width else false;
+        a.view.sidebar_press_focus = @import("view_sidebar_search.zig").hasFocus(a) or focused_sidebar;
+    }
     keys(c, a);
-    @import("view_drag.zig").update(c, a);
     a.syncPeers();
     {
         const root = ui.div(c).row().sizeFull().bg(k.shell);
         defer root.end();
-        if (a.view.settings_open or a.view.sidebar_open) {
-            // The edge is drawn over the sidebar's last column, as the
-            // GPUI app's: on its colour, and the rows keep all 256 points.
-            const side = ui.div(c).row().hFull();
-            defer side.end();
-            if (a.view.settings_open) settings_view.nav(c, a, k) else sidebar.sidebar(c, a, k);
-            ui.div(c).absolute().offset(sidebar.width - 1, 0).size(1, c.size.h).bg(k.border).end();
+        // One retained motion owner, independent of the sidebar's mount state.
+        // CSS ease-out is cubic-bezier(0, 0, 0.58, 1), as GPUI's RESIZE.
+        const animated = ui.motion.number(c, "sidebar-width", if (a.view.sidebar_open or a.view.settings_open) sidebar.width else 0, .{
+            .tween = .{ .duration = 0.2, .ease = .{ .bezier = .{ 0, 0, 0.58, 1 } } },
+        });
+        // Settings navigation stays full width, even when the chat sidebar
+        // was closed (or in flight) when Settings opened.
+        a.view.sidebar_width = if (a.view.settings_open) sidebar.width else animated;
+        @import("view_drag.zig").update(c, a);
+        {
+            ui.key(c, "sidebar-slot");
+            const slot = ui.div(c).w(a.view.sidebar_width).hFull().clip();
+            defer slot.end();
+            if (a.view.sidebar_width > 0) {
+                // Shrink only the viewport: rows retain their layout and slide
+                // left beneath its clip, rather than squeezing their contents.
+                const content = ui.div(c).absolute().offset(a.view.sidebar_width - sidebar.width, 0).w(sidebar.width).hFull();
+                defer content.end();
+                if (a.view.settings_open) settings_view.nav(c, a, k) else sidebar.sidebar(c, a, k);
+                ui.div(c).absolute().offset(sidebar.width - 1, 0).size(1, c.size.h).bg(k.border).end();
+            }
         }
+        ui.key(c, "main-column");
         const main = ui.div(c).row().grow().w(0).hFull();
         defer main.end();
         column: {
@@ -108,16 +140,19 @@ pub fn view(a: *App, c: *ui.Context) void {
         }
     }
     titlebar(c, a, k);
-    trailing(c, a, k);
-    @import("view_diffs.zig").overlays(c, a, k);
-    @import("view_actions.zig").overlays(c, a, k);
-    @import("view_menus.zig").menus(c, a, k);
-    @import("view_sidebar_menus.zig").menus(c, a, k);
-    @import("view_picker.zig").popover(c, a, k);
-    @import("view_drag.zig").overlay(c, a, k);
-    @import("view_chat_menu.zig").overlays(c, a, k);
+    if (c.input.released) a.view.sidebar_press_focus = false;
+    const popup = surfaces.popup(k);
+    trailing(c, a, popup);
+    @import("view_diffs.zig").overlays(c, a, popup);
+    @import("view_actions.zig").overlays(c, a, popup);
+    @import("view_menus.zig").menus(c, a, popup);
+    @import("view_sidebar_menus.zig").menus(c, a, popup);
+    @import("view_picker.zig").popover(c, a, popup);
+    @import("view_drag.zig").overlay(c, a, popup);
+    @import("view_chat_menu.zig").overlays(c, a, popup);
     // Over everything, as the GPUI app's deferred palette (priority 2).
-    @import("view_palette.zig").overlay(c, a, k);
+    @import("view_palette.zig").overlay(c, a, popup);
+    @import("app_browser.zig").syncNative(a, c);
 }
 
 /// The focused pane: its chat's transcript over the composer, or a new
@@ -142,6 +177,8 @@ fn panes(c: *ui.Context, a: *App, k: theme.Colors, s: *tabs.Split) void {
     defer box.end();
     const total: f32 = if (across) transcript_view.mainWidth(c, a) else c.size.h - sidebar.titlebar_h;
     var focus: ?usize = null;
+    const press = a.view.pane_press;
+    if (c.input.pressed or c.input.released) a.view.pane_press = null;
     for (s.panes.items, s.shares.items, 0..) |chat, share, ix| {
         ui.key(c, c.print("pane-{d}", .{ix}));
         if (ix > 0) divider(c, a, k, ix, across, total);
@@ -153,7 +190,14 @@ fn panes(c: *ui.Context, a: *App, k: theme.Colors, s: *tabs.Split) void {
             focused(c, a, k);
             continue;
         }
-        if (pane.clicked()) focus = ix;
+        // A message's hover/copy controls are the top hit, not the pane.
+        // Capture the whole subtree, then finish its action before focus
+        // moves the transcript into the active outlet (as GPUI does).
+        const it = pane.interaction();
+        if (c.input.pressed and it.hovered) a.view.pane_press = .{ .tab = a.tabs.active, .pane = ix };
+        if (c.input.released and it.hovered) if (press) |p| {
+            if (p.tab == a.tabs.active and p.pane == ix) focus = ix;
+        };
         if (neighbor(c, a, k, ix, chat, size)) return;
     }
     if (focus) |ix| a.focusPane(ix);
@@ -235,6 +279,7 @@ fn keys(c: *ui.Context, a: *App) void {
     const palette = @import("view_palette.zig");
     if (c.shortcut(@import("shortcuts.zig").command_palette)) palette.toggle(a, .preserve_tabs);
     palette.keys(c, a);
+    if (a.picker != .none) @import("view_picker.zig").keys(c, a);
     // A dialog has the keys; else an open header menu takes Escape, the
     // arrows and Return.
     const chat_menu = @import("view_chat_menu.zig");
@@ -253,12 +298,9 @@ fn keys(c: *ui.Context, a: *App) void {
         // The session search, while it holds the keys.
         @import("view_sidebar_search.zig").keys(c, a);
     }
-    if (c.shortcut(.{ .key = 'b', .cmd = true })) {
-        a.view.sidebar_open = !a.view.sidebar_open;
-        // A hidden sidebar's search goes with it.
-        if (!a.view.sidebar_open) @import("view_sidebar_search.zig").close(a);
-    }
+    if (c.shortcut(.{ .key = 'b', .cmd = true })) toggleSidebar(c, a, false);
     if (c.shortcut(.{ .key = ',', .cmd = true })) settings_view.open(a);
+    if (c.shortcut(.{ .key = 'l', .cmd = true })) a.view.focus_composer = true;
     if (a.selected != null and c.shortcut(.{ .key = 'e', .cmd = true })) @import("app_files.zig").toggle(a);
     if (a.selected != null and c.shortcut(.{ .key = 'r', .cmd = true })) @import("app_panels.zig").toggleHost(a);
     if (c.shortcut(.{ .key = 't', .cmd = true }) or c.shortcut(.{ .key = 'n', .cmd = true })) a.newTab();
@@ -285,6 +327,25 @@ fn keys(c: *ui.Context, a: *App) void {
     }
 }
 
+/// Mouse and keyboard share search cleanup and return hidden controls' focus
+/// to the composer. Motion is owned entirely by nanoui on the next layout.
+fn toggleSidebar(c: *ui.Context, a: *App, pointer: bool) void {
+    a.view.sidebar_open = !a.view.sidebar_open;
+    if (!a.view.sidebar_open) {
+        // A pointer press on the toggle may already have blurred the search
+        // before its release invokes this helper.
+        const search_focused = @import("view_sidebar_search.zig").hasFocus(a) or (pointer and a.view.sidebar_press_focus);
+        const in_sidebar = if (c.rects.get(c.focus)) |r| r.x < a.view.sidebar_width else false;
+        @import("view_sidebar_search.zig").close(a);
+        a.view.search.focus = false;
+        if (!a.view.settings_open and (search_focused or in_sidebar)) {
+            c.focus = 0;
+            a.view.focus_composer = true;
+        }
+    }
+    a.redraw();
+}
+
 fn titlebar(c: *ui.Context, a: *App, k: theme.Colors) void {
     // With no sidebar in view, a running cloud sandbox (billed until turned
     // off) still shows under the sidebar toggle. The GPUI app hides its
@@ -292,7 +353,7 @@ fn titlebar(c: *ui.Context, a: *App, k: theme.Colors) void {
     if (!a.view.sidebar_open and !a.view.settings_open) @import("view_sandbox_strip.zig").chip(c, a, k);
     const bar = ui.div(c).fixed().offset(cluster_x, 4 + (34 - 24) / 2).row().itemsCenter().layer(3);
     defer bar.end();
-    if (kit.iconButton(c, k, .@"sidebar-minimalistic-left", .{})) a.view.sidebar_open = !a.view.sidebar_open;
+    if (kit.iconButton(c, k, .@"sidebar-minimalistic-left", .{})) toggleSidebar(c, a, true);
     _ = c.leaf(.{ .width = .{ .px = 8 } }, .none, null);
     if (kit.iconButton(c, k, .@"arrow-left", .{ .disabled = !a.tabs.canStep(-1) })) a.showTab(a.tabs.active - 1);
     _ = c.leaf(.{ .width = .{ .px = 2 } }, .none, null);
@@ -327,7 +388,7 @@ fn trailing(c: *ui.Context, a: *App, k: theme.Colors) void {
 /// The chat's identity in the title bar's row: its agent's mark, its title,
 /// and "project @ device" (`shell/tabs.rs`).
 fn header(c: *ui.Context, a: *App, k: theme.Colors) void {
-    const side: f32 = if (a.view.sidebar_open) sidebar.width else 0;
+    const side = a.view.sidebar_width;
     // Clear of the title bar's buttons, and 16 points into the main column.
     const left = @max(side + 16, cluster_x + cluster_w + 12 + 32) - side;
     const bar = ui.div(c).row().wFull().h(sidebar.titlebar_h).pt(4).pl(left).pr(6).gap(6).itemsCenter().clip();

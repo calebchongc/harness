@@ -13,9 +13,9 @@ pub fn runs(buf: []Run, parts: []const tr.Part) []Run {
     var n: usize = 0;
     var i: usize = 0;
     while (i < parts.len and n < buf.len) {
-        if (foldable(parts[i].kind)) {
+        if (foldable(parts[i])) {
             var j = i;
-            while (j < parts.len and foldable(parts[j].kind)) j += 1;
+            while (j < parts.len and foldable(parts[j])) j += 1;
             buf[n] = .{ .start = i, .end = j, .group = true };
             i = j;
         } else {
@@ -27,8 +27,8 @@ pub fn runs(buf: []Run, parts: []const tr.Part) []Run {
     return buf[0..n];
 }
 
-fn foldable(k: tr.PartKind) bool {
-    return k == .tool or k == .reasoning;
+fn foldable(p: tr.Part) bool {
+    return p.kind == .reasoning or (p.kind == .tool and !p.agent and p.saved_view == null);
 }
 
 /// The group's header (`tool_group_label`): its segments joined with " · ",
@@ -142,7 +142,7 @@ pub fn chipContent(arena: std.mem.Allocator, call: std.json.ObjectMap) Chip {
         };
         break :blk .{ "Todo", std.fmt.allocPrint(arena, "{d}/{d} done", .{ done, all }) catch "" };
     } else if (eq(u8, kind, "mcp"))
-        .{ "MCP", std.fmt.allocPrint(arena, "{s} · {s}", .{ S.str(call, "server") orelse "", S.str(call, "tool") orelse "" }) catch "" }
+        (if (@import("agent_link.zig").isAgent(call)) unknownChip(S.str(call, "tool") orelse "") else .{ "MCP", std.fmt.allocPrint(arena, "{s} · {s}", .{ S.str(call, "server") orelse "", S.str(call, "tool") orelse "" }) catch "" })
     else
         unknownChip(S.str(call, "name") orelse "");
     return .{ .label = raw[0], .detail = singleLine(arena, raw[1]) };

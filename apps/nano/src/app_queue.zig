@@ -192,7 +192,14 @@ pub const Finish = enum { commit, cancel, discard };
 pub fn finishEdit(a: *App, action: Finish) void {
     const chat = a.selected orelse return;
     const e = if (a.queue_edit) |*e| e else return;
-    const text = std.mem.trim(u8, a.composer.text(), " \n\t");
+    const attachments = @import("app_attachments.zig");
+    const body = std.mem.trim(u8, a.composer.text(), " \n\t");
+    const attached = if (action == .commit) attachments.prompt(a, body) catch {
+        a.setNotice("Wait for the attachments to finish before saving this edit.");
+        return;
+    } else null;
+    defer if (attached) |text| a.gpa.free(text);
+    const text = attached orelse body;
     const act: Finish = if (action == .commit and text.len == 0) .discard else action;
     e.saving = true;
     a.request(requests.finishEdit(chat, e.row, e.lease, @tagName(act), if (act == .commit) text else null, if (act == .commit) e.base_hash else null, host(a)), .of(App, a, onFinished));
@@ -218,6 +225,7 @@ fn onFinished(a: *App, _: u64, r: rpc.Reply) void {
         else
             "The edit lease changed; your text is still in the editor");
     }
+    @import("app_attachments.zig").clear(a);
     if (a.queue_edit) |*e| e.deinit(a.gpa);
     a.queue_edit = null;
     a.composer.set(a.draft_stash.items);

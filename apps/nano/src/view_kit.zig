@@ -36,11 +36,41 @@ pub fn iconButton(c: *ui.Context, k: theme.Colors, name: icons.Name, o: IconButt
     var b = ui.div(c).row().size(o.size, o.size).center().rounded(o.radius);
     if (o.on) b = b.bg(k.hover) else if (!o.disabled) b = b.hover(k.hover);
     if (o.tip) |t| b = @import("view_tooltip.zig").on(b, k, t);
+    if (!o.disabled) b = pressFeedback(b.control());
     defer b.end();
     const clicked = b.clicked() and !o.disabled;
     const color = o.color orelse k.muted;
     icons.icon(c, name, o.icon, if (o.disabled) color.alpha(0.35) else color, 0);
     return clicked;
+}
+
+/// A short, reversible press without changing layout or the hit target.
+pub fn pressFeedback(d: ui.Div) ui.Div {
+    const held = d.interaction().pressed;
+    const scale = ui.motion.number(d.c, "press-feedback", if (held) 0.98 else 1, .{
+        .tween = .{ .duration = 0.08, .ease = ui.motion.Easing.css_ease_out },
+    });
+    return d.motion(.{ .scale = scale });
+}
+
+/// Active tool labels carry a quiet travelling highlight instead of a
+/// separate loader beside every file. Static/history/reduced-motion rows
+/// neither animate nor keep a frame timer alive.
+pub fn activityText(c: *ui.Context, k: theme.Colors, text: []const u8, st: ui.TextStyle, active: bool) void {
+    if (!active or c.reduced_motion or text.len == 0) return ui.text(c, text, st);
+    const base = st.color orelse k.muted;
+    var spans: std.ArrayList(ui.Span) = .empty;
+    var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+    var at: usize = 0;
+    const phase: f32 = @floatCast(@mod(c.time / 1.8, 1));
+    while (it.nextCodepointSlice()) |cp| {
+        const x = @as(f32, @floatFromInt(at)) / @as(f32, @floatFromInt(text.len));
+        const wave = @max(0, 1 - @abs(x - (phase * 1.6 - 0.3)) / 0.3);
+        spans.append(c.alloc(), .{ .start = @intCast(at), .end = @intCast(at + cp.len), .color = base.mix(k.text, wave * 0.65) }) catch break;
+        at += cp.len;
+    }
+    ui.richText(c, text, spans.items, st);
+    c.frameIn(1.0 / 30.0);
 }
 
 /// `s` in one line at most `max_w` wide: as is when it fits, else cut and
@@ -186,7 +216,7 @@ pub fn truncateAt(c: *ui.Context, s: []const u8, st: ui.TextStyle, max_w: f32) u
 /// tones, lit clockwise at 15 Hz (`loaders.rs`). Asks for its next frame.
 pub fn snake(c: *ui.Context, k: theme.Colors) void {
     const order = [_][2]u8{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 1, 2 }, .{ 0, 2 }, .{ 0, 1 } };
-    const step: usize = @intFromFloat(@mod(@floor(c.time * 15), 6));
+    const step: usize = if (c.reduced_motion) 0 else @intFromFloat(@mod(@floor(c.time * 15), 6));
     const box = ui.div(c).column().size(5, 8).gap(1);
     defer box.end();
     for (0..3) |row| {
@@ -203,7 +233,7 @@ pub fn snake(c: *ui.Context, k: theme.Colors) void {
             _ = c.leaf(.{ .width = .{ .px = 2 }, .height = .{ .px = 2 }, .background = k.glyph[row].alpha(lit) }, .none, null);
         }
     }
-    c.frameIn(1.0 / 15.0);
+    if (!c.reduced_motion) c.frameIn(1.0 / 15.0);
 }
 
 /// A small round dot.
@@ -267,7 +297,8 @@ fn secondary(c: *ui.Context) bool {
 
 /// A new frame: this frame's cards become last frame's, and whether the
 /// pointer moved (or pressed) since the last.
-pub fn beginFrame(c: *ui.Context) void {
+pub fn beginFrame(c: *ui.Context, k: theme.Colors) void {
+    surface_frame = .{ .context = c, .frame = c.frame, .frosted = k.frosted, .overlay = k.overlay };
     cards[0] = cards[1];
     cards_n[0] = cards_n[1];
     cards_n[1] = 0;
@@ -317,9 +348,27 @@ pub fn pressedOutside(c: *ui.Context, trigger: ?ui.Rect) bool {
     return true;
 }
 
+// Frame-local construction data only: completed nodes own their tints.
+// Context/frame guards prevent one window or Tester leaking into another.
+var surface_frame: ?struct { context: *ui.Context, frame: u64, frosted: bool, overlay: ui.Color } = null;
+const glass_shadows = blk: {
+    var shadows = ui.Shadow.lg;
+    if (@hasField(ui.Shadow, "knockout")) for (&shadows) |*s| {
+        s.knockout = true;
+    };
+    break :blk shadows;
+};
+
 pub fn shadowLg(d: ui.Div) ui.Div {
-    if (comptime @hasDecl(ui.Shadow, "lg")) return d.shadows(&ui.Shadow.lg);
-    return d.shadowLg();
+    var pane = d;
+    if (surface_frame) |s| if (s.context == d.c and s.frame == d.c.frame and s.frosted) {
+        pane = pane.bg(s.overlay);
+        // Transparent glass must not reveal the shadow inside its own box.
+        if (comptime @hasField(ui.Shadow, "knockout")) return pane.shadows(&glass_shadows);
+        return pane;
+    };
+    if (comptime @hasDecl(ui.Shadow, "lg")) return pane.shadows(&ui.Shadow.lg);
+    return pane.shadowLg();
 }
 
 /// `gradient_spinner` with 3-point cells: a 3×3 grid tinted per row from

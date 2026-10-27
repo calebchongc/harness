@@ -20,12 +20,18 @@ client codegraff uses. For now it fetches the newest release's manifest.
   went.
 - Composer: Return sends, Shift-Return starts a new line, **Stop** interrupts a
   running turn. A new chat picks its agent and model.
+- Agent rows stay visible and open their live transcript in a side tab without
+  leaving the parent chat. Finished agents use their saved transcript, falling
+  back to the document feed if the snapshot is unavailable.
+- A native Browser side tab opens websites, localhost previews and generated
+  HTML/MCP App pages. Transcript links open there, not in a separate browser.
+  See [the browser's boundaries and checks](../../docs/nano-browser.md).
 
 Also: answering the agent's questions, the message queue, the changes pane
 and file explorer, and project actions with their terminal dock.
 
-Not there yet: typing into the dock, split diffs, editing files, per-type file
-icons, dragging queued messages, attachments and dictation, pins, settings,
+Not there yet: typing into the dock, split diffs, editing files,
+dragging queued messages, attachments and dictation, pins, settings,
 starting an engine when none is running, Linux and Windows.
 
 ## Build and run
@@ -40,6 +46,10 @@ sh scripts/bundle.sh    # release build as zig-out/Harness Nano.app
 zig build snap -- scenes/narrow-panes.json /tmp/nano-snap   # draw a scene offscreen
 open "zig-out/Harness Nano.app"
 ```
+
+The bundler forwards Zig build arguments. When testing a local nanoui fork,
+use the same override for the release app: `sh scripts/bundle.sh --fork=/path/to/nanoui`.
+Otherwise it builds the dependency pinned in `build.zig.zon`.
 
 An engine has to be running. With Harness open, its daemon already is, so
 harness-nano shows your chats. Otherwise start one with `harness headless`.
@@ -90,8 +100,12 @@ bar's buttons, the tab list, the project filter, session rows (status mark,
 agent mark, project monogram, fading title, relative time), the header's
 "project @ device", the transcript column (736 points), folded tool groups
 ("Ran 2 commands"), and the composer pill with its model chip. The icons are
-Harness's own (`crates/ui/assets/icons`), rendered to PNG in `src/icons`;
-the interface icons are Solar Linear by 480 Design (CC BY 4.0).
+Harness's own SVGs (`crates/ui/assets/icons`); the interface icons are Solar
+Linear by 480 Design (CC BY 4.0). File badges, explorer rows, tabs and diffs
+reuse Harness's Symbols artwork and `crates/ui/src/file-icons.json` manifest,
+including exact filenames, compound extensions and named folders. The app
+keeps their authored colors and the GPUI dark palette; the manifest is
+compiled at build time rather than parsed into memory on launch.
 
 ## Layout
 
@@ -124,7 +138,14 @@ the top of `src/snap.zig`; `scenes/` has examples.
 offscreen, the GPUI app through `crates/ui/examples/ui-scenes.rs` (built
 once; the script never builds it) and nano through `harness-nano-snap`,
 and compares them frame by frame. It writes gpui | nano | difference
-images and fails when a frame is further from the GPUI app than its
-budget in `parity/budget.json`; `--update` records new numbers. The budget
-was taken with nanoui's `feat/glyph-dilation` (justrach/nanoui#21):
-`NANOUI_FORK=~/nanoui-svg python3 parity/check.py` until that merges.
+images and `report.json` with unrounded per-frame differences and their mean.
+Use `--max-changed 0.0005` to require every frame, including new scenes, to
+stay within 0.05% changed pixels; the older per-frame budgets alone allow a
+0.5-percentage-point regression and do not constrain new scenes. `--update`
+records new budgets but cannot bypass an explicit ceiling.
+
+Scenes declare the synthetic device's `dictationAvailable` capability
+(default false). Both renderers use it rather than racing a probe of the
+host's installed Codex; the model-picker scenes explicitly exercise the mic.
+Run against the same nanoui revision as the app:
+`NANOUI_FORK=/path/to/nanoui python3 parity/check.py --max-changed 0.0005`.

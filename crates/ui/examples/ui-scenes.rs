@@ -53,6 +53,9 @@ struct Scene {
     /// More devices, after this one ("Studio").
     #[serde(default)]
     devices: Vec<serde_json::Value>,
+    /// Synthetic device capability, never the renderer host's installed CLI.
+    #[serde(default)]
+    dictation_available: bool,
 }
 
 /// One interaction, in points from the window's top left. Keys as
@@ -170,6 +173,7 @@ fn main() -> anyhow::Result<()> {
     let dispatcher = executor.dispatcher().as_bench().unwrap();
 
     for scene in scenes {
+        composer::set_scene_dictation_available(scene.dictation_available);
         *settings::accounts::SCENE_ACCOUNTS.lock().unwrap() = scene.accounts.clone();
         app.update(|cx| {
             appearance::set_mode(

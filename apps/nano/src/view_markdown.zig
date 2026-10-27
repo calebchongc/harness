@@ -19,6 +19,17 @@ var body: ui.TextStyle = .{ .size = 14, .leading = 1.5, .wrap = true };
 
 /// The colors of the Markdown being drawn (the UI thread draws one at a time).
 var k: theme.Colors = undefined;
+const LinkOwner = struct { app: *@import("app.zig").App, parent: []const u8 };
+var link_owner: ?LinkOwner = null;
+
+/// A transcript or workspace preview keeps links in its containing chat,
+/// including when a subagent is drawn beside it.
+pub fn withLinks(c: *ui.Context, colors: theme.Colors, src: []const u8, a: *@import("app.zig").App, parent: ?[]const u8) void {
+    const old = link_owner;
+    defer link_owner = old;
+    link_owner = if (parent) |p| .{ .app = a, .parent = p } else null;
+    markdown(c, colors, src);
+}
 
 /// Draws the Markdown `src`.
 pub fn markdown(c: *ui.Context, colors: theme.Colors, src: []const u8) void {
@@ -49,7 +60,61 @@ fn rich(c: *ui.Context, in: md.Inline, style: ui.TextStyle) void {
     // round (`INLINE_CODE_PAD_X`, `INLINE_CODE_INSET_Y`,
     // `INLINE_CODE_RADIUS`; nanoui's `span_box`).
     if (comptime @hasField(ui.TextStyle, "span_box")) st.span_box = .{ .pad_x = 2, .inset_y = 2, .radius = 4.5 };
+    if (in.links.len == 0 or link_owner == null) return ui.richText(c, in.text, in.spans, st);
+    const area = ui.div(c).column().wFull();
+    defer area.end();
+    const at = c.nodes.items.len;
     ui.richText(c, in.text, in.spans, st);
+    const rect = c.rects.get(c.node(@intCast(at)).id) orelse {
+        c.changed = true;
+        return;
+    };
+    const origin = c.rects.get(c.node(area.index).id) orelse return;
+    const lines = c.text.wrapAttributed(in.text, st, in.spans, rect.w);
+    const line_h = c.text.lineHeight(st);
+    for (in.links, 0..) |link, li| {
+        if (!@import("browser_url.zig").allowedNavigation(link.url)) continue;
+        for (lines, 0..) |line, row| {
+            const start = @max(@as(usize, link.start), line.start);
+            const end = @min(@as(usize, link.end), line.end);
+            if (start >= end) continue;
+            const x = richWidth(c, in, st, line.start, start);
+            const right = richWidth(c, in, st, line.start, end);
+            ui.key(c, c.print("link-{d}-{d}", .{ li, row }));
+            const hit = @import("view_tooltip.zig").on(ui.div(c).absolute().offset(rect.x - origin.x + x, rect.y - origin.y + @as(f32, @floatFromInt(row)) * line_h).size(@max(right - x, 1), line_h), k, .{ .text = link.url });
+            defer hit.end();
+            const action = c.interact(hit.index, .{ .focusable = true });
+            const activate = action.clicked or (action.focused and (c.shortcut(.{ .key = ui.Shortcut.enter }) or c.shortcut(.{ .key = ' ' })));
+            if (activate) {
+                const owner = link_owner.?;
+                @import("app_browser.zig").openLink(owner.app, owner.parent, link.url);
+                c.changed = true;
+            }
+        }
+    }
+}
+
+/// The same styled runs used by richText, including bold labels and code.
+fn richWidth(c: *ui.Context, in: md.Inline, style: ui.TextStyle, start: usize, end: usize) f32 {
+    var at = start;
+    var width: f32 = 0;
+    for (in.spans) |span| {
+        if (span.end <= at or span.start >= end) continue;
+        const before = @min(@as(usize, span.start), end);
+        if (before > at) {
+            width += c.text.width(in.text[at..before], style);
+            at = before;
+        }
+        const stop = @min(@as(usize, span.end), end);
+        var st = style;
+        st.weight = span.weight orelse st.weight;
+        st.italic = span.italic;
+        st.mono = span.mono;
+        width += c.text.width(in.text[at..stop], st);
+        at = stop;
+    }
+    if (at < end) width += c.text.width(in.text[at..end], style);
+    return width;
 }
 
 fn block(c: *ui.Context, b: md.Block, first: bool) void {

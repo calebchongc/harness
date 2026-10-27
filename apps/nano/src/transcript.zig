@@ -39,6 +39,18 @@ pub const Part = struct {
     chip: []const u8 = "Tool",
     /// The file a tool read or changed, for counting distinct files.
     path: []u8 = &.{},
+    /// The engine's tool-result summary, owned independently of the RPC frame.
+    output: []u8 = &.{},
+    /// Lazy full output's owned sidecar reference and optional byte count.
+    output_ref: []u8 = &.{},
+    output_bytes: ?u64 = null,
+    /// Spawn links retain their engine document and lifecycle independently
+    /// of the RPC frame. Ordinary tools never become agents from a stray ref.
+    agent: bool = false,
+    subagent_ref: []u8 = &.{},
+    subagent_title: []u8 = &.{},
+    subagent_status: ?@import("agent_link.zig").Status = null,
+    saved_view: ?@import("saved_view.zig").View = null,
     /// A tool has finished, or an input request was answered.
     resolved: bool = false,
     is_error: bool = false,
@@ -53,6 +65,10 @@ pub const Part = struct {
     fn deinit(p: *Part, gpa: Allocator) void {
         gpa.free(p.id);
         gpa.free(p.path);
+        gpa.free(p.output);
+        gpa.free(p.output_ref);
+        gpa.free(p.subagent_ref);
+        gpa.free(p.subagent_title);
         p.text.deinit(gpa);
         if (p.arena) |a| {
             a.deinit();
@@ -97,42 +113,78 @@ pub const Transcript = struct {
         t.window = null;
     }
 
-    /// Applies one `TranscriptUpdate`.
+    /// Applies one `TranscriptUpdate`, retaining the last verified state on
+    /// failure while the caller resubscribes. Record only changed entries
+    /// and text lengths, never a copy of the whole streaming transcript.
     pub fn apply(t: *Transcript, frame: json.Value) !void {
         const o = switch (frame) {
             .object => |o| o,
             else => return error.Desync,
         };
-        defer if (o.get("contextUsage")) |u| if (u == .object) {
+        try t.applyFrame(o);
+        if (o.get("contextUsage")) |u| if (u == .object) {
             t.tokens = uint(u.object.get("tokens"));
             t.window = uint(u.object.get("window"));
         };
+    }
+
+    fn applyFrame(t: *Transcript, o: json.ObjectMap) !void {
         if (o.get("reset")) |r| {
+            if (r != .array) return error.Desync;
             const pending = if (o.get("historyPending")) |h| h == .bool and h.bool else false;
             // The tail again once the whole history is here: nothing new.
             if (pending and t.complete) return;
-            t.clear();
-            for (array(r)) |v| try t.entries.append(t.gpa, try parseEntry(t.gpa, v));
-            t.complete = !pending;
+            var next: Transcript = .{ .gpa = t.gpa, .complete = !pending };
+            errdefer next.deinit();
+            for (r.array.items) |v| {
+                var entry = try parseEntry(t.gpa, v);
+                errdefer entry.deinit(t.gpa);
+                try next.entries.append(t.gpa, entry);
+            }
+            var old = t.*;
+            t.* = next;
+            old.deinit();
             return;
         }
+        // Ordinary streaming appends need no allocation for their undo log.
+        var buffer: [1024]u8 = undefined;
+        var scratch: std.heap.BufferFirstAllocator = .init(&buffer, t.gpa);
+        const temp = scratch.allocator();
+        var undo: std.ArrayList(Undo) = .empty;
+        defer undo.deinit(temp);
+        errdefer {
+            var i = undo.items.len;
+            while (i > 0) {
+                i -= 1;
+                switch (undo.items[i]) {
+                    .removed => |r| t.entries.insertAssumeCapacity(r.index, r.entry),
+                    .inserted => |at| {
+                        var entry = t.entries.orderedRemove(at);
+                        entry.deinit(t.gpa);
+                    },
+                    .appended => |a| a.part.text.items.len = a.len,
+                }
+            }
+        }
         for (array(o.get("remove"))) |v| if (v == .string) if (t.find(v.string)) |i| {
-            var gone = t.entries.orderedRemove(i);
-            gone.deinit(t.gpa);
+            try undo.append(temp, .{ .removed = .{ .index = i, .entry = t.entries.items[i] } });
+            _ = t.entries.orderedRemove(i);
         };
         for (array(o.get("upsert"))) |u| {
             if (u != .object) return error.Desync;
             var entry = try parseEntry(t.gpa, u.object.get("entry") orelse return error.Desync);
             errdefer entry.deinit(t.gpa);
+            try undo.ensureUnusedCapacity(temp, 2);
+            try t.entries.ensureUnusedCapacity(t.gpa, 1);
             if (t.find(entry.id)) |i| {
-                var old = t.entries.orderedRemove(i);
-                old.deinit(t.gpa);
+                undo.appendAssumeCapacity(.{ .removed = .{ .index = i, .entry = t.entries.orderedRemove(i) } });
             }
             const at: usize = switch (u.object.get("after") orelse .null) {
                 .string => |anchor| (t.find(anchor) orelse return error.Desync) + 1,
                 else => 0,
             };
-            try t.entries.insert(t.gpa, at, entry);
+            t.entries.insertAssumeCapacity(at, entry);
+            undo.appendAssumeCapacity(.{ .inserted = at });
         }
         for (array(o.get("append"))) |a| {
             if (a != .object) return error.Desync;
@@ -142,11 +194,20 @@ pub const Transcript = struct {
             const part = for (t.entries.items[i].parts.items) |*p| {
                 if ((p.kind == .text or p.kind == .reasoning) and std.mem.eql(u8, p.id, part_id)) break p;
             } else return error.Desync;
+            try undo.append(temp, .{ .appended = .{ .part = part, .len = part.text.items.len } });
             try part.text.appendSlice(t.gpa, string(a.object.get("text")) orelse "");
             if (part.text.items.len != uint(a.object.get("len")) orelse return error.Desync) return error.Desync;
         }
         if (o.get("count")) |n| if (t.entries.items.len != uint(n) orelse return error.Desync) return error.Desync;
+        // Only an accepted frame releases the entries it replaced/removed.
+        for (undo.items) |*u| if (u.* == .removed) u.removed.entry.deinit(t.gpa);
     }
+
+    const Undo = union(enum) {
+        removed: struct { index: usize, entry: Entry },
+        inserted: usize,
+        appended: struct { part: *Part, len: usize },
+    };
 
     /// From the back: the target is almost always the live tail entry.
     fn find(t: *Transcript, id: []const u8) ?usize {
@@ -199,6 +260,12 @@ fn parsePart(gpa: Allocator, o: json.ObjectMap) !Part {
             p.resolved = if (o.get("resolved")) |r| r == .bool and r.bool else false;
             p.is_error = if (o.get("isError")) |r| r == .bool and r.bool else false;
             try toolCall(gpa, &p, o.get("call"));
+            if (string(o.get("output"))) |s| p.output = try gpa.dupe(u8, s);
+            if (string(o.get("outputRef"))) |s| p.output_ref = try gpa.dupe(u8, s);
+            p.output_bytes = uint(o.get("outputBytes"));
+            if (string(o.get("subagentRef"))) |s| p.subagent_ref = try gpa.dupe(u8, s);
+            p.subagent_status = std.meta.stringToEnum(@import("agent_link.zig").Status, string(o.get("subagentStatus")) orelse "");
+            if (o.get("view")) |v| p.saved_view = @import("saved_view.zig").View.parse(v);
         },
         .input => {
             p.resolved = if (o.get("resolved")) |r| r == .bool and r.bool else false;
@@ -243,8 +310,10 @@ fn toolCall(gpa: Allocator, p: *Part, call: ?json.Value) !void {
     if (c != .object) return;
     const o = c.object;
     p.tool = std.meta.stringToEnum(ToolKind, string(o.get("kind")) orelse "") orelse .unknown;
-    // The file a write, edit or patch touched, for counting distinct files.
-    if (p.tool == .writeFile or p.tool == .editFile or p.tool == .applyPatch) {
+    p.agent = @import("agent_link.zig").isAgent(o);
+    p.subagent_title = (try @import("agent_link.zig").title(gpa, o)) orelse &.{};
+    // Keep read paths too: file badges need the identity, not just chip text.
+    if (p.tool == .readFile or p.tool == .writeFile or p.tool == .editFile or p.tool == .applyPatch) {
         if (string(o.get("path"))) |f| p.path = try gpa.dupe(u8, f);
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);

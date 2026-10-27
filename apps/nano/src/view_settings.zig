@@ -215,7 +215,7 @@ pub fn fieldLabel(c: *ui.Context, k: theme.Colors, label: []const u8) void {
 /// box pads by its width.
 pub fn card(c: *ui.Context, k: theme.Colors) ui.Div {
     space(c, 24);
-    return ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(k.shell).clip();
+    return ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(if (k.frosted) k.card else k.shell).clip();
 }
 
 /// `card_row`: 20 by 14 inside, a line above all but the first.

@@ -11,6 +11,7 @@ const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
+const file_icons = @import("file_icons.zig");
 const kit = @import("view_kit.zig");
 const tools = @import("tools.zig");
 const tr = @import("transcript.zig");
@@ -30,7 +31,7 @@ pub fn columnWidth(w: f32) f32 {
 
 /// The chat column's width: the window less the sidebar and the panels.
 pub fn mainWidth(c: *ui.Context, a: *const App) f32 {
-    var w = c.size.w - (if (a.view.sidebar_open) sidebar.width else 0);
+    var w = c.size.w - a.view.sidebar_width;
     if (a.selected != null and a.panels.host_open) w -= @import("view_host.zig").width + 1;
     if (a.selected != null and a.panels.files_open) w -= @import("view_files.zig").width + 1;
     return @max(w, 300);
@@ -82,6 +83,9 @@ pub fn entries(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript
 /// `inset_top(TITLEBAR_HEIGHT)`), here as the column's colour laid over
 /// them a point at a time.
 fn topFade(c: *ui.Context, k: theme.Colors) void {
+    // A tint overlay can imitate a solid background, not a native backdrop:
+    // on glass it makes an opaque stripe even when there is no text here.
+    if (k.frosted) return;
     const band: f32 = 24;
     var y: f32 = 0;
     while (y < band) : (y += 1) {
@@ -97,6 +101,10 @@ fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f3
     // while it scrolls, as GPUI's overlay rail.
     var st: ui.Style = .{ .grow = 1, .width = .fill, .padding = .{ .top = top, .bottom = 24 + 24 + 8 }, .align_items = .center, .justify = .end, .follow_end = true };
     if (@hasField(ui.Style, "scrollbar")) st.scrollbar = .{ .overlay = k.faint.alpha(0.5) };
+    const subagent = for (a.panels.tabs.items) |tab| {
+        if (tab.agent) |s| if (&s.transcript == t) break s;
+    } else null;
+    if (subagent != null) st.justify = .start;
     st.scroll = true;
     st.direction = .column;
     const scroll = c.open(st, null);
@@ -107,14 +115,12 @@ fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f3
     defer body.end();
     const entries_ = t.entries.items;
     // The chat these are, for routing a sign-in: the open one's or a pane's.
-    const chat_id: ?[]const u8 = if (t == &a.transcript) a.selected else for (a.peers.items) |*p| {
+    const chat_id: ?[]const u8 = if (subagent) |s| s.parent else if (t == &a.transcript) a.selected else for (a.peers.items) |*p| {
         if (&p.transcript == t) break p.id;
     } else null;
-    // Nothing to show, loading or empty: nothing drawn, as GPUI's.
-    if (entries_.len == 0) {
-        _ = loading;
-        return drawn;
-    }
+    // Loading does not itself imply work; the session row does, even when
+    // no assistant part has arrived yet.
+    _ = loading;
     for (entries_, 0..) |*e, i| {
         ui.key(c, c.print("entry-{s}", .{e.id}));
         // `top_gap_for`: every entry's first row opens a turn (`SPACE_LG`).
@@ -129,6 +135,15 @@ fn rows(c: *ui.Context, a: *App, k: theme.Colors, t: *const tr.Transcript, w: f3
             .assistant => assistant(c, a, k, e, at),
             .system => system(c, a, k, e, at),
         }
+    }
+    if (subagent == null) {
+        if (chat_id) |id| if (@import("app_send_feedback.zig").active(a, id, t)) |pending| {
+            ui.key(c, c.print("pending-{s}", .{pending.message}));
+            if (entries_.len > 0) _ = c.leaf(.{ .height = .{ .px = 16 } }, .none, null);
+            const entry = pending.entry();
+            _ = user(c, k, &entry, col);
+        };
+        @import("view_working.zig").trailer(c, a, k, chat_id, t);
     }
     drawn.ticks = ticks.items;
     return drawn;
@@ -185,18 +200,27 @@ fn assistant(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, at: A
     // Its parts 12 apart; the lane right under the last (the row's
     // `strip`, with no gap of its own).
     const parts_box = ui.div(c).column().wFull().gap(12);
-    var buf: [256]tools.Run = undefined;
-    const rs = tools.runs(&buf, e.parts.items);
-    for (rs, 0..) |r, i| {
+    const buf = c.alloc().alloc(tools.Run, e.parts.items.len) catch {
+        ui.text(c, "Unable to render reply: out of memory", .{ .size = 12, .color = k.danger });
+        parts_box.end();
+        return;
+    };
+    const rs = tools.runs(buf, e.parts.items);
+    for (rs) |r| {
         const p = &e.parts.items[r.start];
         ui.key(c, c.print("run-{s}-{s}", .{ e.id, p.id }));
         if (r.group) {
-            const tail = e.status == .streaming and last and i + 1 == rs.len;
-            group(c, a, k, e, e.parts.items[r.start..r.end], tail);
+            // ACP often creates its answer placeholder before its first
+            // text chunk. An empty placeholder must not hide live work.
+            const tail = e.status == .streaming and last and for (e.parts.items[r.end..]) |next| {
+                if (next.kind != .text or std.mem.trim(u8, next.text.items, " \t\r\n").len > 0) break false;
+            } else true;
+            group(c, a, k, e, e.parts.items[r.start..r.end], tail, at.chat_id);
             continue;
         }
         switch (p.kind) {
-            .text => @import("view_markdown.zig").markdown(c, k, p.text.items),
+            .text => @import("view_markdown.zig").withLinks(c, k, p.text.items, a, at.chat_id),
+            .tool => treeRow(c, a, k, e, p, true, at.chat_id),
             .@"error" => errorPart(c, a, k, e, p, at),
             .image => attachment(c, k, .document, p.text.items),
             .visual => attachment(c, k, .widget, p.text.items),
@@ -219,34 +243,47 @@ const tree_w: f32 = 48;
 
 /// A run of tool calls and reasoning, folded under one line; it opens on
 /// its own while it is the tail of a streaming reply.
-fn group(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, parts: []const tr.Part, tail: bool) void {
+fn group(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, parts: []const tr.Part, tail: bool, parent: ?[]const u8) void {
     const key = c.print("{s}/{s}", .{ e.id, parts[0].id });
     const open = a.view.groupOpen(key, tail);
     const box = ui.div(c).column().wFull();
     defer box.end();
     {
-        const h = ui.div(c).row().h(26).gap(6).pr(4).itemsCenter();
+        const h = kit.pressFeedback(ui.div(c).row().h(26).gap(6).pr(4).itemsCenter().rounded(4).control().hover(k.wash(0.04)));
         defer h.end();
         if (h.clicked()) a.view.toggleGroup(a.gpa, key, tail);
         const slot = ui.div(c).row().size(22, 18).center();
         icons.icon(c, if (open) .@"alt-arrow-down" else .@"alt-arrow-right", 14, k.muted, 0);
         slot.end();
         const lb = c.alloc().alloc(u8, 160) catch return;
-        ui.text(c, tools.label(lb, parts), kit.style(c, 12, 18, .{ .color = if (h.hovered()) k.text else k.muted }));
+        const active = e.status == .streaming and for (parts) |p| {
+            if (p.kind == .reasoning or (p.kind == .tool and !p.resolved)) break true;
+        } else false;
+        kit.activityText(c, k, tools.label(lb, parts), kit.style(c, 12, 18, .{ .color = if (h.hovered()) k.text else k.muted }), active);
     }
     if (!open) return;
+    const reveal = ui.motion.frame(c, (ui.motion.MotionSpec{ .duration_ms = 120, .curve = ui.motion.Easing.css_ease_out }).animate(.{ .opacity = 0.65, .y = -2 }, .{ .opacity = 1, .y = 0 }));
+    const children = ui.div(c).column().wFull().motion(reveal);
+    defer children.end();
     for (parts, 0..) |*p, i| {
         ui.key(c, c.print("tool-{s}", .{p.id}));
-        treeRow(c, k, p, i + 1 == parts.len);
+        treeRow(c, a, k, e, p, i + 1 == parts.len, parent);
     }
 }
 
 /// One call in an open group: the tree's trunk and elbow, its icon, its
 /// chip and what it ran.
-fn treeRow(c: *ui.Context, k: theme.Colors, p: *const tr.Part, last: bool) void {
+fn treeRow(c: *ui.Context, a: *App, k: theme.Colors, e: *const tr.Entry, p: *const tr.Part, last: bool, parent: ?[]const u8) void {
     const line = k.wash(0.12);
-    const r = ui.div(c).row().wFull().gap(8).itemsStart();
+    const agent_linked = p.agent and p.subagent_ref.len > 0 and p.subagent_title.len > 0 and parent != null;
+    const view_linked = p.saved_view != null and parent != null;
+    const linked = agent_linked or view_linked;
+    const base_row = ui.div(c).row().wFull().gap(8).itemsStart().rounded(5);
+    const r = if (linked) kit.pressFeedback(base_row.control().hover(k.wash(0.06))) else base_row;
     defer r.end();
+    if (linked and r.clicked()) {
+        if (agent_linked) @import("app_subagents.zig").open(a, parent.?, p) else @import("app_browser.zig").openSaved(a, parent.?, p.saved_view.?);
+    }
     {
         const g = ui.div(c).column().w(tree_w).h(row_h);
         defer g.end();
@@ -258,36 +295,100 @@ fn treeRow(c: *ui.Context, k: theme.Colors, p: *const tr.Part, last: bool) void 
         defer ic.end();
         icons.icon(c, toolIcon(p), 16, if (p.is_error) k.danger else k.muted, 18);
     }
-    const body = ui.div(c).column().grow().w(0).justifyCenter().gap(4).py(7);
+    // Fill the row's remaining width before measuring wrapped reasoning
+    // and output. A fixed zero width measures them one glyph per line,
+    // leaving phantom height that follow-end scrolls the messages past.
+    // A 22-point file badge still fits GPUI's 32-point tool row.
+    const body = ui.div(c).column().wFull().justifyCenter().gap(4).py(if (p.path.len > 0) 5 else 7);
     defer body.end();
-    const head = ui.div(c).row().gap(8).itemsCenter();
+    const detail_key = c.print("detail/{s}/{s}", .{ e.id, p.id });
+    const has_output = p.output.len > 0 or p.output_ref.len > 0;
+    const base = ui.div(c).row().gap(8).itemsCenter().pr(4).rounded(4);
+    const head = if (!linked and has_output) kit.pressFeedback(base.control().hover(k.wash(0.04))) else base;
     {
         defer head.end();
+        if (!linked and has_output and head.clicked()) a.view.toggleGroup(a.gpa, detail_key, false);
         const chip = if (p.kind == .reasoning) "Thought process" else p.chip;
-        ui.text(c, chip, .{ .size = 12, .weight = .medium, .color = k.text.alpha(0.8) });
+        const active = !p.is_error and (if (p.agent) p.subagent_status == .running else e.status == .streaming and !p.resolved);
+        kit.activityText(c, k, chip, kit.style(c, 12, 18, .{ .weight = if (toolIcon(p) == .bot) .medium else .regular, .color = if (p.is_error) k.danger else k.muted }), active);
         if (p.kind == .tool) {
-            const d = firstLine(p.text.items);
-            kit.fadeText(c, d, .{ .size = 12, .mono = p.tool == .exec, .color = if (p.is_error) k.danger else k.muted }, 560);
-            if (!p.resolved) kit.snake(c, k);
+            const d = firstLine(if (p.agent and p.text.items.len == 0) p.subagent_title else p.text.items);
+            if (p.path.len > 0) fileBadge(c, k, p.path, p.is_error) else kit.fadeText(c, d, .{ .size = 12, .mono = p.tool == .exec, .color = if (p.is_error) k.danger else k.muted }, 560);
+            if (linked) icons.icon(c, .@"arrow-up-right", 12, k.faint, 0);
         }
     }
     if (p.kind == .reasoning) {
-        const lines = limitLines(p.text.items, 24);
-        ui.text(c, lines, kit.style(c, 12, 18, .{ .wrap = true, .italic = true, .color = k.muted }));
+        @import("view_markdown.zig").withLinks(c, k, p.text.items, a, parent);
     }
+    if (!linked and has_output and a.view.groupOpen(detail_key, false)) {
+        const output = ui.div(c).column().wFull().p(8).rounded(6).bg(k.wash(0.04));
+        defer output.end();
+        const blob = a.tool_blobs.get(p.output_ref);
+        const text = if (blob) |b| (if (b.status == .ready) b.text else p.output) else p.output;
+        if (text.len > 0) ui.text(c, text, kit.style(c, 12, 18, .{ .wrap = true, .mono = true, .color = if (p.is_error) k.danger else k.muted }));
+        if (p.output_ref.len > 0 and (blob == null or blob.?.status != .ready)) {
+            const loading = blob != null and blob.?.status == .loading;
+            const action = ui.div(c).row().py(4);
+            defer action.end();
+            ui.text(c, if (loading) "Loading full output…" else if (blob != null and blob.?.status == .failed) "Retry full output" else "Show full output", .{ .size = 12, .color = k.muted });
+            if (!loading and action.clicked()) a.fetchToolBlob(p.output_ref);
+        }
+    }
+}
+
+/// The GPUI tool header's filename badge, including its untinted identity.
+fn fileBadge(c: *ui.Context, k: theme.Colors, path: []const u8, failed: bool) void {
+    const badge = ui.div(c).row().h(22).pl(1).pr(6).gap(6).itemsCenter().rounded(5).bg(k.ink(0.06));
+    defer badge.end();
+    {
+        const well = ui.div(c).row().size(20, 20).center().rounded(4).bg(ui.Color.hex(if (k.dark) 0x000000 else 0xffffff).alpha(0.16));
+        defer well.end();
+        file_icons.icon(c, path, false, k.dark, 14);
+    }
+    kit.fadeText(c, file_icons.basename(path), kit.style(c, 12, 18, .{ .color = if (failed) k.danger else k.text.alpha(0.85) }), 520);
 }
 
 fn toolIcon(p: *const tr.Part) icons.Name {
     if (p.kind == .reasoning) return .@"magic-stick-3";
+    if (p.agent or std.mem.eql(u8, p.chip, "Agent") or std.mem.eql(u8, p.chip, "Waiting on")) return .bot;
     return switch (p.tool) {
         .exec => .terminal,
-        .readFile => .document,
-        .writeFile, .editFile, .applyPatch => .pen,
-        .search, .glob => .magnifer,
-        .webFetch, .webSearch => .globe,
+        .readFile, .applyPatch => .document,
+        .writeFile => .@"document-add",
+        .editFile => .pen,
+        .search => .magnifer,
+        .glob => .@"folder-with-files",
+        .webFetch, .webSearch => .global,
         .todo => .checklist,
-        .mcp, .unknown => .widget,
+        .unknown => icons.namedTool(p.text.items),
+        .mcp => .widget,
     };
+}
+
+test "tool rows use the GPUI transcript's original Harness SVGs" {
+    const cases = .{
+        .{ tr.ToolKind.exec, icons.Name.terminal },
+        .{ tr.ToolKind.readFile, icons.Name.document },
+        .{ tr.ToolKind.applyPatch, icons.Name.document },
+        .{ tr.ToolKind.writeFile, icons.Name.@"document-add" },
+        .{ tr.ToolKind.editFile, icons.Name.pen },
+        .{ tr.ToolKind.search, icons.Name.magnifer },
+        .{ tr.ToolKind.glob, icons.Name.@"folder-with-files" },
+        .{ tr.ToolKind.webFetch, icons.Name.global },
+        .{ tr.ToolKind.webSearch, icons.Name.global },
+        .{ tr.ToolKind.todo, icons.Name.checklist },
+        .{ tr.ToolKind.mcp, icons.Name.widget },
+    };
+    inline for (cases) |case| {
+        const p: tr.Part = .{ .id = &.{}, .kind = .tool, .tool = case[0] };
+        try std.testing.expectEqual(case[1], toolIcon(&p));
+    }
+    for ([_][]const u8{ "Agent", "Waiting on" }) |label| {
+        for ([_]tr.ToolKind{ .unknown, .mcp }) |kind| {
+            const p: tr.Part = .{ .id = &.{}, .kind = .tool, .tool = kind, .chip = label };
+            try std.testing.expectEqual(icons.Name.bot, toolIcon(&p));
+        }
+    }
 }
 
 fn firstLine(s: []const u8) []const u8 {

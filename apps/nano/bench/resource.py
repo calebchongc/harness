@@ -5,7 +5,8 @@ crates/ui/examples/macos-resource-profile.rs; nano: src/profile.zig) while
 scripts/macos-resource-stat.c reads its CPU time, resident size and
 physical footprint every 500 ms, as scripts/resource-profile.mjs does.
 Phases come from the binaries' `phase=replay` / `phase=settled` lines; the
-first 2 s of each are left out, as docs/performance records them.
+first 2 s of each are left out of CPU and wakeup rates. Memory peaks
+include every sample in the phase, including that warmup window.
 
     python3 bench/resource.py [--runs 2] [--out /tmp/nano-resource]
 
@@ -29,7 +30,7 @@ NANO = HERE.parent
 REPO = NANO.parent.parent
 STAT_SRC = REPO / "scripts/macos-resource-stat.c"
 GPUI_BIN = pathlib.Path(os.environ.get(
-    "HARNESS_RESOURCE_PROFILE", "~/.cargo/shared-target/app-dev/examples/macos-resource-profile")).expanduser()
+    "HARNESS_RESOURCE_PROFILE", REPO / "target/app-dev/examples/macos-resource-profile")).expanduser()
 NANO_BIN = NANO / "zig-out/bin/harness-nano-profile"
 SKIP_S = 2.0
 
@@ -37,9 +38,35 @@ SKIP_S = 2.0
 def stat(tool: pathlib.Path, pid: int) -> dict | None:
     try:
         rows = json.loads(subprocess.run([tool, str(pid)], capture_output=True, text=True).stdout)
-        return rows[0] if rows else None
+        # An exiting process can retain historical RSS but report zero
+        # physical footprint. Do not average that teardown row into rest.
+        return rows[0] if rows and rows[0].get("footprintMiB", 0) > 0 else None
     except Exception:
         return None
+
+
+def summarize(samples: list[dict]) -> dict:
+    summary = {}
+    for p in ("replay", "settled"):
+        phase_rows = [s for s in samples if s["phase"] == p]
+        if not phase_rows:
+            continue
+        t0 = phase_rows[0]["at"] + SKIP_S
+        rows = [s for s in phase_rows if s["at"] >= t0] or phase_rows
+        first, last = rows[0], rows[-1]
+        span = max(last["at"] - first["at"], 1e-9)
+        summary[p] = {
+            "durationSeconds": round(span, 2),
+            "cpuPercent": round(100 * (last["cpuSeconds"] - first["cpuSeconds"]) / span, 2),
+            "peakFootprintMiB": round(max(s["footprintMiB"] for s in phase_rows), 1),
+            "endFootprintMiB": round(last["footprintMiB"], 1),
+            "peakRssMiB": round(max(s["rssMiB"] for s in phase_rows), 1),
+            "endRssMiB": round(last["rssMiB"], 1),
+            "idleWakeupsPerSecond": round((last["idleWakeups"] - first["idleWakeups"]) / span, 1),
+        }
+    summary["lifetimePeakFootprintMiB"] = round(max(s["lifetimePeakFootprintMiB"] for s in samples), 1)
+    summary["totalCpuSeconds"] = round(samples[-1]["cpuSeconds"], 2)
+    return summary
 
 
 def profile(name: str, cmd: list, tool: pathlib.Path, out: pathlib.Path) -> dict:
@@ -71,26 +98,7 @@ def profile(name: str, cmd: list, tool: pathlib.Path, out: pathlib.Path) -> dict
     reader.join(timeout=2)
     if proc.returncode != 0:
         sys.exit(f"{name} exited {proc.returncode}")
-    summary = {}
-    for p in ("replay", "settled"):
-        rows = [s for s in samples if s["phase"] == p]
-        if not rows:
-            continue
-        t0 = rows[0]["at"] + SKIP_S
-        rows = [s for s in rows if s["at"] >= t0] or rows
-        first, last = rows[0], rows[-1]
-        span = max(last["at"] - first["at"], 1e-9)
-        summary[p] = {
-            "durationSeconds": round(span, 2),
-            "cpuPercent": round(100 * (last["cpuSeconds"] - first["cpuSeconds"]) / span, 2),
-            "peakFootprintMiB": round(max(s["footprintMiB"] for s in rows), 1),
-            "endFootprintMiB": round(last["footprintMiB"], 1),
-            "peakRssMiB": round(max(s["rssMiB"] for s in rows), 1),
-            "endRssMiB": round(last["rssMiB"], 1),
-            "idleWakeupsPerSecond": round((last["idleWakeups"] - first["idleWakeups"]) / span, 1),
-        }
-    summary["lifetimePeakFootprintMiB"] = round(max(s["lifetimePeakFootprintMiB"] for s in samples), 1)
-    summary["totalCpuSeconds"] = round(samples[-1]["cpuSeconds"], 2)
+    summary = summarize(samples)
     (out / "samples.json").write_text(json.dumps(samples))
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
     return summary

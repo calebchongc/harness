@@ -190,6 +190,11 @@ fn derive(o: json.ObjectMap, dark: bool, curated: bool) ?theme.Colors {
     const base = theme.builtin(dark).syntax;
     return .{
         .dark = dark,
+        .recommended_frosted = std.mem.eql(u8, str(o, "recommendedSurfaceTreatment"), "frosted"),
+        .input_tint = col.get(cs, "input"),
+        .overlay = col.get(cs, "overlay"),
+        .card = col.get(cs, "card"),
+        .panel = shell,
         .background = background,
         .shell = shell,
         .sidebar = over(shell, wash.alpha(0.05)),

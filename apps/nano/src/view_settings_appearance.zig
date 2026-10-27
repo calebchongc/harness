@@ -112,7 +112,7 @@ fn caption(c: *ui.Context, k: theme.Colors, label: []const u8) void {
 
 /// `section_card` with its top margin taken off.
 fn card(c: *ui.Context, k: theme.Colors) ui.Div {
-    return ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(k.shell).clip();
+    return ui.div(c).column().wFull().p(1).rounded(12).border(k.border).borderW(1).bg(if (k.frosted) k.card else k.shell).clip();
 }
 
 // System, Light, Dark.
@@ -204,6 +204,8 @@ fn themeCard(c: *ui.Context, a: *App, k: theme.Colors) void {
             a.view.theme_menu = if (open) null else t[2];
             // A theme the GPUI app added since shows in the menu.
             if (!open) a.view.theme_reload = true;
+            a.view.theme_anchor = rect.at;
+            c.changed = true;
         }
         if (open) a.view.theme_anchor = rect.at;
     }
@@ -270,7 +272,17 @@ pub fn themeMenu(c: *ui.Context, a: *App, k: theme.Colors) void {
         return;
     }
     const w: f32 = 260;
-    const h = a.view.theme_menu_h orelse 300;
+    // Know the menu's height before showing it: using last frame's height
+    // moves its rows between mouse-down and mouse-up on the first pick.
+    var count: usize = 0;
+    for (themes.all()) |v| if (v.dark == dark) {
+        count += 1;
+    };
+    const heading_h = c.text.lineHeight(set.st(c, 10, .{ .weight = .medium })) + 10;
+    const row_h = @max(18, c.text.lineHeight(set.st(c, 13, .{}))) + 12;
+    const rows_h = @as(f32, @floatFromInt(count)) * (row_h + 2) - 2;
+    const rows_max = @max(0, c.size.h - 16 - 10 - heading_h - 2);
+    const h = 10 + heading_h + 2 + @min(rows_h, rows_max);
     const rules = @import("rules.zig");
     // Hung from the trigger's padding box, as GPUI's anchored menus are.
     const x = rules.snapToWindow(at.x + 1, w, c.size.w, 8);
@@ -279,12 +291,13 @@ pub fn themeMenu(c: *ui.Context, a: *App, k: theme.Colors) void {
     const m = @import("view_sidebar_menus.zig").held(kit.shadowLg(ui.div(c).fixed().offset(x, y).w(w).layer(5).column().p(4 + 1).gap(2)
         .bg(k.composer).border(k.border).borderW(1).rounded(12)));
     defer m.end();
-    kit.rememberHeight(c, m, &a.view.theme_menu_h);
     {
         const hd = ui.div(c).row().wFull().px(8).pt(6).pb(4);
         defer hd.end();
         ui.text(c, if (dark) "D\u{200A}A\u{200A}R\u{200A}K\u{200A} \u{200A}T\u{200A}H\u{200A}E\u{200A}M\u{200A}E\u{200A}S" else "L\u{200A}I\u{200A}G\u{200A}H\u{200A}T\u{200A} \u{200A}T\u{200A}H\u{200A}E\u{200A}M\u{200A}E\u{200A}S", set.st(c, 10, .{ .weight = .medium, .color = k.muted }));
     }
+    ui.scroll(c, .{ .width = .fill, .max_height = rows_max, .direction = .column, .gap = 2, .scrollbar = .{ .overlay = k.faint.alpha(0.5) } });
+    defer ui.end(c);
     const picked = a.settings.themeId(dark);
     for (themes.all()) |*v| if (v.dark == dark) {
         ui.key(c, c.print("theme-{s}", .{v.id}));
@@ -306,6 +319,7 @@ pub fn themeMenu(c: *ui.Context, a: *App, k: theme.Colors) void {
         if (row.clicked()) {
             a.settings.setTheme(dark, v.id);
             a.view.theme_menu = null;
+            c.changed = true;
             a.redraw();
         }
     };
@@ -340,10 +354,13 @@ fn windowCard(c: *ui.Context, a: *App, k: theme.Colors) void {
     {
         const r = set.row(c, k, true, false);
         defer r.end();
-        const frosted = if (a.settings.text("surface")) |v| std.mem.eql(u8, v, "frosted") else false;
+        const frosted = @import("surface_palette.zig").requested(a.settings.text("surface"), k.recommended_frosted);
         set.tile(c, k, .widget);
         words(c, k, "Frosted glass", if (frosted) "Blurs and tints what sits behind the window, where supported." else "Solid surfaces in every theme.", 42);
-        if (switch_(c, k, frosted, 10)) a.settings.setText("surface", if (frosted) "opaque" else "frosted");
+        if (switch_(c, k, frosted, 10)) {
+            a.settings.setText("surface", if (frosted) "opaque" else "frosted");
+            c.changed = true;
+        }
     }
     const r = set.row(c, k, false, false);
     defer r.end();

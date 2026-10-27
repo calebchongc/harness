@@ -8,6 +8,7 @@ const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
 const icons = @import("icons.zig");
+const file_icons = @import("file_icons.zig");
 const kit = @import("view_kit.zig");
 const panels = @import("app_panels.zig");
 const diff = @import("diff.zig");
@@ -98,7 +99,7 @@ fn fileBlock(c: *ui.Context, a: *App, k: theme.Colors, f: *const diff.File, firs
         defer h.end();
         if (h.clicked()) panels.toggleFold(a, f.path);
         icons.icon(c, if (folded) .@"alt-arrow-right" else .@"alt-arrow-down", 13, k.muted.alpha(0.7), 0);
-        icons.icon(c, .document, 14, k.muted, 0);
+        file_icons.icon(c, f.path, false, k.dark, 14);
         kit.fadeText(c, f.path, .{ .size = 12, .mono = true, .color = k.text.alpha(0.85) }, host_view.width - 180);
         if (f.binary) ui.text(c, "BIN", .{ .size = 10, .color = k.faint });
         ui.spacer(c);

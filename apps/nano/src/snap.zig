@@ -5,7 +5,7 @@
 //!
 //!     {"width": 1200, "height": 780, "dark": false, "scale": 2,
 //!      "spaces": [...], "chats": [...], "devices": [...], "sessions": [...],
-//!      "open": "chat id",                      // opened from the sidebar
+//!      "open": "chat id", "surface": "frosted", // optional surface treatment
 //!      "workspaceScope": "local", "auth": {...}, "codegraff": {...},
 //!      "transcripts": {"chat id": [entry, ...]},  // as a doc reset's
 //!      "steps": [{"press": "cmd+d"}, {"composer": "hey"}, {"type": "x"},
@@ -53,6 +53,8 @@ pub fn main(init: std.process.Init) !void {
     a.new_harness = try gpa.dupe(u8, str(scene, "harness") orelse "graff");
     const dark = flag(scene, "dark");
     a.dark = dark;
+    a.offscreen = true;
+    if (str(scene, "surface")) |s| a.settings.setText("surface", s);
     inline for (.{ .{ "spaces", &a.spaces }, .{ "chats", &a.chats }, .{ "devices", &a.devices }, .{ "sessions", &a.sessions } }) |l| {
         if (scene.get(l[0])) |v| try l[1].replace(v);
     }
@@ -131,11 +133,15 @@ fn parity(init: std.process.Init, scene: json.ObjectMap, name: []const u8, out: 
     a.settings.path = try std.fs.path.join(gpa, &.{ data, "ui-settings.json" });
     @import("themes.zig").loadLibrary(init.io, data);
     a.env = init.environ_map;
-    @import("app_dictation.zig").probeNow(&a);
+    // Match the scene's synthetic device, not the host's installed Codex or
+    // the completion time of an asynchronous availability probe.
+    a.dictation.probed.store(if (flag(scene, "dictationAvailable")) 1 else 2, .release);
     const dark = !std.mem.eql(u8, str(scene, "appearance") orelse "dark", "light");
     a.dark = dark;
     // As the renderer sets it: the scene's appearance is the chosen one.
     a.settings.setText("appearance", if (dark) "dark" else "light");
+    a.offscreen = true;
+    if (str(scene, "surface")) |s| a.settings.setText("surface", s);
     inline for (.{ .{ "spaces", &a.spaces }, .{ "chats", &a.chats }, .{ "sessions", &a.sessions } }) |l| {
         if (scene.get(l[0])) |v| try l[1].replace(v);
     }

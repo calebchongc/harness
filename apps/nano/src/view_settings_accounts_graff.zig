@@ -76,9 +76,8 @@ pub fn chatgpt(c: *ui.Context, a: *App, k: theme.Colors) void {
         defer cd.end();
         chatgptCard(c, a, k, row);
     }
-    // The row's `border_t` (it isn't the card's first): GPUI clips it to
-    // the card's box, not its corners, so it runs straight across them.
-    ui.div(c).absolute().offset(1, 1).w(set.inner_w - 2).h(1).bg(k.border).end();
+    // graffRow already paints this row's top border inside the card.
+    // Painting an extra rail over it applies the translucent color twice.
 }
 
 fn chatgptCard(c: *ui.Context, a: *App, k: theme.Colors, row: accounts.Chatgpt) void {

@@ -52,6 +52,285 @@ const Harness = struct {
     }
 };
 
+fn sidebarChats(h: *Harness, count: usize) !void {
+    try sidebarRows(h, count, false, false);
+}
+
+fn sidebarRows(h: *Harness, count: usize, branches: bool, grouped: bool) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var rows: std.json.Array = .init(gpa);
+    for (0..count) |i| {
+        const text = try std.fmt.allocPrint(gpa,
+            \\{{"id":"synthetic-{d}","deviceId":"{s}","title":"Synthetic session {d}","cwd":"/synthetic","sourceContext":{{"cwd":"/synthetic","branch":{s}}},"archived":false,"lastMessageAt":"2026-10-03T00:00:00Z"}}
+        , .{ i, if (grouped) try std.fmt.allocPrint(gpa, "device-{d}", .{i}) else "d", i, if (branches and i % 2 != 0) "\"feature\"" else "null" });
+        try rows.append((try std.json.parseFromSlice(std.json.Value, gpa, text, .{})).value);
+    }
+    try h.a.chats.replace(.{ .array = rows });
+    h.t.settle(1);
+}
+
+test "Cmd+L focuses the active composer from the transcript, including a split pane" {
+    for ([_]bool{ false, true }) |split| {
+        var h: Harness = undefined;
+        try h.init();
+        defer h.deinit();
+        if (split) h.press(.{ .key = 'd', .cmd = true });
+        h.t.ctx.focus = 0;
+        h.press(.{ .key = 'l', .cmd = true });
+        try testing.expectEqual(h.a.view.composer_id, h.t.ctx.focus);
+        h.t.typeText("Synthetic focused draft");
+        try testing.expectEqualStrings("Synthetic focused draft", h.a.composer.text());
+    }
+}
+
+test "a live ACP thought remains visible before the empty answer receives text" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"reset":[{"id":"assistant","role":"assistant","status":"streaming","parts":[
+        \\ {"id":"thought","kind":"reasoning","text":"A synthetic live thought"},
+        \\ {"id":"answer","kind":"text","text":""}]}]}
+    , .{});
+    defer parsed.deinit();
+    try h.a.transcript.apply(parsed.value);
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("A synthetic live thought"));
+}
+
+test "an empty sidebar matches GPUI without a Sessions disclosure" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "[]", .{});
+    defer parsed.deinit();
+    try h.a.chats.replace(parsed.value);
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("No sessions yet"));
+    try testing.expect(!h.t.hasText("Sessions"));
+}
+
+test "file tool badges preserve Harness identity colors and reuse their cached SVGs" {
+    for ([_]bool{ false, true }) |dark| {
+        var h: Harness = undefined;
+        try h.init();
+        defer h.deinit();
+        h.a.dark = dark;
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+            \\{"reset":[{"id":"assistant","role":"assistant","status":"complete","parts":[
+            \\ {"id":"read-0","kind":"tool","resolved":true,"call":{"kind":"readFile","path":"/work/demo/README.md"}},
+            \\ {"id":"read-1","kind":"tool","resolved":true,"call":{"kind":"readFile","path":"/work/demo/Cargo.toml"}},
+            \\ {"id":"read-2","kind":"tool","resolved":true,"call":{"kind":"readFile","path":"/work/demo/src/main.rs"}}]}]}
+        , .{});
+        defer parsed.deinit();
+        try h.a.transcript.apply(parsed.value);
+        h.t.settle(1);
+        try h.t.clickText("Read 3 files");
+        h.t.settle(1);
+        h.snap(if (dark) "file-icons-dark" else "file-icons-light");
+        var identities: usize = 0;
+        var previous_y: ?f32 = null;
+        for (h.t.ctx.nodes.items) |node| switch (node.content) {
+            .image => |im| if (im.tint == null) {
+                if (previous_y) |y| try testing.expectApproxEqAbs(@as(f32, 32), node.rect.y - y, 0.01);
+                previous_y = node.rect.y;
+                identities += 1;
+            },
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 3), identities);
+        try testing.expect(h.t.hasText("README.md"));
+        try testing.expect(h.t.hasText("Cargo.toml"));
+        try testing.expect(h.t.hasText("main.rs"));
+        const cached = h.t.text.images.decoded.count();
+        h.t.frame();
+        try testing.expectEqual(cached, h.t.text.images.decoded.count());
+    }
+}
+
+test "ACP tool output is available from its transcript chip" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"reset":[{"id":"assistant","role":"assistant","status":"complete","parts":[
+        \\ {"id":"call","kind":"tool","resolved":true,"isError":false,
+        \\ "call":{"kind":"exec","command":"printf synthetic"},"output":"Synthetic ACP tool output"}]}]}
+    , .{});
+    defer parsed.deinit();
+    try h.a.transcript.apply(parsed.value);
+    h.t.settle(1);
+    try h.t.clickText("Ran 1 command");
+    h.t.settle(1);
+    try h.t.clickText("Run");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Synthetic ACP tool output"));
+}
+
+test "a working chat shows a trailer even before the agent publishes any parts" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"chatId":"a","status":"working","startedAt":"2026-10-26T00:00:00Z","updatedAt":"2026-10-26T00:00:00Z"}]
+    , .{});
+    defer parsed.deinit();
+    try h.a.sessions.replace(parsed.value);
+    h.a.sessions.items[0].updated_ms = h.a.nowMs();
+    h.a.sessions.items[0].started_ms = h.a.nowMs();
+    h.t.settle(1);
+    // The session, not the arrival of a reasoning/text part, drives liveness.
+    var buf: [64]u8 = undefined;
+    const label = try std.fmt.bufPrint(&buf, "{s}…", .{@import("view_working.zig").word("a", 0)});
+    try testing.expect(h.t.hasText(label));
+    h.a.sessions.items[0].status = .idle;
+    h.t.settle(1);
+    try testing.expect(!h.t.hasText(label));
+}
+
+test "an ACP reply with more than 256 runs does not lose its final answer" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(gpa, "{\"reset\":[{\"id\":\"long-turn\",\"role\":\"assistant\",\"status\":\"complete\",\"parts\":[");
+    for (0..130) |i| {
+        try text.appendSlice(gpa, try std.fmt.allocPrint(gpa,
+            \\{{"id":"tool-{d}","kind":"tool","resolved":true,"call":{{"kind":"readFile","path":"synthetic.zig"}}}},
+            \\{{"id":"text-{d}","kind":"text","text":"Synthetic progress"}},
+        , .{ i, i }));
+    }
+    try text.appendSlice(gpa, "{\"id\":\"answer\",\"kind\":\"text\",\"text\":\"The final synthetic answer remains visible\"}]}]}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text.items, .{});
+    try h.a.transcript.apply(parsed.value);
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("The final synthetic answer remains visible"));
+}
+
+test "an ACP chip lazily fetches its full output from the engine" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.a.engine.scene = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"FetchToolBlob":{"text":"Full synthetic ACP tool output"}}
+    , .{});
+    h.a.engine.state = .connected;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"reset":[{"id":"assistant","role":"assistant","status":"complete","parts":[
+        \\ {"id":"call","kind":"tool","resolved":true,"isError":false,
+        \\ "call":{"kind":"exec","command":"printf synthetic"},"outputRef":"a/call","outputBytes":4096}]}]}
+    , .{});
+    defer parsed.deinit();
+    try h.a.transcript.apply(parsed.value);
+    h.t.settle(1);
+    try h.t.clickText("Ran 1 command");
+    h.t.settle(1);
+    try h.t.clickText("Run");
+    h.t.settle(1);
+    try h.t.clickText("Show full output");
+    h.t.settle(1);
+    try testing.expect(h.t.hasText("Full synthetic ACP tool output"));
+    var fetches: usize = 0;
+    for (h.a.engine.sent.items) |request| {
+        if (std.mem.indexOf(u8, request, "\"method\":\"FetchToolBlob\"") != null) fetches += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), fetches);
+}
+
+test "composer keystrokes only build the sidebar rows in view" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.a.view.focus_composer = true;
+    try sidebarChats(&h, 50);
+    h.t.textOps(&.{.{ .insert = "a" }});
+    const small_nodes = h.t.ctx.stats.nodes;
+    const small_ms = h.t.ctx.stats.build_ms + h.t.ctx.stats.layout_ms + h.t.ctx.stats.paint_ms;
+    try sidebarChats(&h, 2000);
+    h.t.textOps(&.{.{ .insert = "b" }});
+    const large_nodes = h.t.ctx.stats.nodes;
+    const large_ms = h.t.ctx.stats.build_ms + h.t.ctx.stats.layout_ms + h.t.ctx.stats.paint_ms;
+    try testing.expectEqualStrings("ab", h.a.composer.text());
+    std.debug.print("\ncomposer sidebar: 50 sessions {d} nodes / {d:.2} ms; 2000 sessions {d} nodes / {d:.2} ms\n", .{ small_nodes, small_ms, large_nodes, large_ms });
+    // A large offscreen history must not turn each key into thousands of
+    // shaped, laid-out and painted rows. Compare the shape, not a tight
+    // wall-clock limit that depends on the machine running the test.
+    try testing.expect(large_nodes <= small_nodes * 2);
+}
+
+test "sidebar culls whole offscreen groups without changing their extent" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.a.settings.setText("sidebarOrganization", "byDevice");
+    try sidebarRows(&h, 50, false, true);
+    const small_nodes = h.t.ctx.stats.nodes;
+    try sidebarRows(&h, 2000, false, true);
+    try testing.expect(h.t.ctx.stats.nodes <= small_nodes * 2);
+    const first = h.t.findText("Synthetic session 0") orelse return error.FirstGroupMissing;
+    // Each group: 12 above, 28 header, 4 body inset, 29 row, 2 gap.
+    h.t.scroll(100, 300, -75 * 1000);
+    const middle = h.t.findText("Synthetic session 1000") orelse return error.JumpGroupMissing;
+    try testing.expectApproxEqAbs(first.y, middle.y, 1);
+    h.t.scroll(100, 300, -75 * 2000);
+    const last = h.t.findText("Synthetic session 1999") orelse return error.LastGroupMissing;
+    try testing.expect(last.y >= 0 and last.y < 780);
+    try testing.expect(h.t.ctx.stats.nodes <= small_nodes * 2);
+}
+
+test "sidebar large wheel jumps and resizes retain mixed-height rows and exact scroll extent" {
+    for (0..3) |mode| {
+        var h: Harness = undefined;
+        try h.init();
+        defer h.deinit();
+        h.a.settings.set(.sidebar_compact, mode == 0);
+        h.a.settings.set(.sidebar_show_project_label, mode != 2);
+        try sidebarRows(&h, 2000, true, false);
+        const first = h.t.findText("Synthetic session 0") orelse return error.FirstRowMissing;
+        try testing.expect(first.y >= 0 and first.y < 780);
+        var rects = h.t.ctx.rects.iterator();
+        var body: u64 = 0;
+        var extent: f32 = 0;
+        while (rects.next()) |entry| {
+            const r = entry.value_ptr.*;
+            if (r.w == 240 and r.h > extent) {
+                body = entry.key_ptr.*;
+                extent = r.h;
+            }
+        }
+        const stride: f32 = switch (mode) {
+            0 => 31,
+            1 => 55, // Alternating 45- and 61-point rows, plus gaps.
+            else => 39, // Without the 16-point project labels.
+        };
+        try testing.expectApproxEqAbs(stride * 2000 - 2, extent, 1);
+        // No settle: the input frame itself must build the destination rows,
+        // even when the toolkit rebuilds before laying out the wheel result.
+        h.t.scroll(100, 300, -stride * 1000);
+        const middle = h.t.findText("Synthetic session 1000") orelse return error.JumpRowMissing;
+        try testing.expectApproxEqAbs(first.y, middle.y, 1);
+        try testing.expectApproxEqAbs(extent, h.t.ctx.rects.get(body).?.h, 1);
+        try testing.expect(h.t.ctx.stats.nodes < 1000);
+        h.t.resize(1200, 980);
+        try testing.expectApproxEqAbs(extent, h.t.ctx.rects.get(body).?.h, 1);
+        h.t.scroll(100, 300, -stride * 2000);
+        const last = h.t.findText("Synthetic session 1999") orelse return error.LastRowMissing;
+        try testing.expect(last.y >= 0 and last.y < 980);
+        try testing.expectApproxEqAbs(extent, h.t.ctx.rects.get(body).?.h, 1);
+        h.t.scroll(100, 300, stride * 4000);
+        const again = h.t.findText("Synthetic session 0") orelse return error.ReturnRowMissing;
+        try testing.expectApproxEqAbs(first.y, again.y, 1);
+        // The keyed destination is still the same chat after it was culled.
+        h.t.click(100, again.y + again.h / 2);
+        try testing.expectEqualStrings("synthetic-0", h.a.selected.?);
+    }
+}
+
 test "⌘D splits the chat to the right, the new pane a new chat with focus; ⌘[ goes back; ⌘W closes the pane" {
     var h: Harness = undefined;
     try h.init();
@@ -462,7 +741,8 @@ fn openRowMenu(h: *Harness, title: []const u8) !void {
     var best: ?ui.Rect = null;
     for (h.t.ctx.nodes.items) |n| switch (n.content) {
         .image => if (n.rect.x < 256 and n.rect.y < r.y + r.h and n.rect.y + n.rect.h > r.y and
-            (best == null or n.rect.x > best.?.x)) {
+            (best == null or n.rect.x > best.?.x))
+        {
             best = n.rect;
         },
         else => {},

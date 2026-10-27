@@ -339,6 +339,16 @@ fn header(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
             p.active = 0;
             if (p.scroll_id != 0) c.scroll.put(c.gpa, p.scroll_id, 0) catch {};
         }
+        // Plain Return arrives through NSTextInputClient, not the shortcut
+        // path. Use the query after this event's edits, and rebuild now so
+        // a theme change is painted without waiting for another input.
+        if (res.submitted) {
+            const list = entries(a, c.alloc(), queryOf(c, a)) catch return;
+            if (list.len > 0) {
+                activate(a, list[@min(p.active, list.len - 1)]);
+                c.changed = true;
+            }
+        }
     }
     _ = w;
     var buf: [32]u8 = undefined;
