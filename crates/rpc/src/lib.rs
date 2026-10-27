@@ -296,6 +296,9 @@ pub mod methods {
     /// Run the release check now instead of waiting for its schedule; the
     /// result arrives on the `UpdateStatus` stream.
     pub const CHECK_FOR_UPDATES: &str = "CheckForUpdates";
+    /// Request one managed-host update, deferred until no chats or terminals
+    /// are active. Never fall back to ApplyUpdate on an older host.
+    pub const QUEUE_UPDATE: &str = "QueueUpdate";
 }
 
 #[derive(Debug, thiserror::Error)]
