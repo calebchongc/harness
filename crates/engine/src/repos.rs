@@ -1257,7 +1257,7 @@ impl Repos {
         task: &str,
     ) -> Result<Worktree, EngineError> {
         let mutation = self.lock_worktree_mutations(repo_path).await?;
-        let base_ref = self.worktree_base_ref(repo_path, branch).await;
+        let base_ref = self.worktree_base_ref(repo_path, branch).await?;
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1338,27 +1338,74 @@ impl Repos {
     /// A branch picker supplies branch names, while recovery supplies a full
     /// object id. Qualify branches so a same-named tag cannot make Git's DWIM
     /// lookup fail, but retain remote refs (and their upstream setup behavior).
-    async fn worktree_base_ref(&self, path: &Path, base: &str) -> String {
+    async fn worktree_base_ref(&self, path: &Path, base: &str) -> Result<String, EngineError> {
         if matches!(base.len(), 40 | 64) && base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             // `git worktree add -b` can prefer a branch named like an object id.
             // Peeling forces object-expression resolution for recorded snapshots.
-            return format!("{base}^{{commit}}");
+            return Ok(format!("{base}^{{commit}}"));
         }
-        if !base.starts_with("refs/") {
-            for namespace in ["refs/heads", "refs/remotes"] {
-                let qualified = format!("{namespace}/{base}");
-                if self
-                    .git(&["show-ref", "--verify", "--quiet", &qualified], Some(path))
-                    .await
-                    .is_ok()
-                {
-                    return qualified;
-                }
+        if base.starts_with("refs/") || base == "HEAD" {
+            return Ok(base.to_string());
+        }
+        for namespace in ["refs/heads", "refs/remotes"] {
+            let qualified = format!("{namespace}/{base}");
+            if self
+                .git(&["show-ref", "--verify", "--quiet", &qualified], Some(path))
+                .await
+                .is_ok()
+            {
+                return Ok(qualified);
             }
         }
-        // Explicit refs/tags, other revision expressions, and invalid inputs
-        // retain their existing Git interpretation and authoritative errors.
-        base.to_string()
+        // The picker strips remote prefixes. Resolve that label before Git
+        // can mistake a same-named tag for the selected remote branch.
+        let remote_refs = self
+            .git(
+                &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+                Some(path),
+            )
+            .await?;
+        let preferred = self
+            .git(&["config", "--get", "checkout.defaultRemote"], Some(path))
+            .await
+            .ok();
+        Ok(
+            Self::pick_remote_worktree_base(base, &remote_refs, preferred.as_deref())?
+                // Other revision expressions and invalid inputs retain Git's
+                // existing interpretation and authoritative errors.
+                .unwrap_or_else(|| base.to_string()),
+        )
+    }
+
+    fn pick_remote_worktree_base(
+        base: &str,
+        remote_refs: &str,
+        preferred: Option<&str>,
+    ) -> Result<Option<String>, EngineError> {
+        let candidates: Vec<_> = remote_refs
+            .lines()
+            .filter(|reference| {
+                reference
+                    .strip_prefix("refs/remotes/")
+                    .and_then(|remote| remote.split_once('/'))
+                    .is_some_and(|(_, branch)| branch == base)
+            })
+            .collect();
+        match candidates.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some((*only).to_string())),
+            _ => {
+                if let Some(remote) = preferred {
+                    let selected = format!("refs/remotes/{remote}/{base}");
+                    if candidates.contains(&selected.as_str()) {
+                        return Ok(Some(selected));
+                    }
+                }
+                Err(EngineError::Other(format!(
+                    "Ambiguous remote branch: {base}. Choose a remote-qualified base or set checkout.defaultRemote."
+                )))
+            }
+        }
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {

@@ -308,11 +308,22 @@ async fn explicit_tags_and_full_snapshot_ids_keep_their_exact_commits() {
     // local branch with the same spelling must not redirect that snapshot.
     git(&repo, &["branch", &old, &current]);
     let hash_named_branch = format!("refs/heads/{old}");
+    add_remote_branch(&repo, "origin", "main", &old);
+    git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
     for (base, expected) in [
         (old.as_str(), &old),
         ("refs/tags/snapshot", &old),
         ("refs/heads/snapshot", &current),
         (hash_named_branch.as_str(), &current),
+        // Remote default-branch aliases must not reinterpret the HEAD revision.
+        ("HEAD", &current),
     ] {
         let tree = repos
             .create_worktree_for_task(&repo, base, "Recover recorded snapshot")
@@ -408,4 +419,219 @@ async fn exhausting_the_name_budget_preserves_existing_directories_and_allows_a_
         .await
         .unwrap();
     assert_eq!(std::fs::read_dir(&base).unwrap().count(), 999);
+}
+
+fn add_remote_branch(repo: &Path, remote: &str, branch: &str, commit: &str) {
+    // Configuration/ref writes only: no clone, fetch, or external API requests.
+    git(repo, &["remote", "add", remote, repo.to_str().unwrap()]);
+    git(
+        repo,
+        &[
+            "update-ref",
+            &format!("refs/remotes/{remote}/{branch}"),
+            commit,
+        ],
+    );
+}
+
+#[tokio::test]
+async fn remote_only_origin_branch_picker_labels_round_trip_to_worktree_creation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let (_, current) = advance_main(&repo);
+    let selected = "feature/login";
+    add_remote_branch(&repo, "origin", selected, &current);
+    let labels = repos.branches(&repo).await.unwrap();
+    assert!(labels.contains(&selected.to_string()));
+    let tree = repos
+        .create_worktree_for_task(&repo, selected, "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(git(Path::new(&tree.path), &["rev-parse", "HEAD"]), current);
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--get",
+                &format!("branch.{}.remote", tree.branch)
+            ]
+        ),
+        "origin"
+    );
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--get",
+                &format!("branch.{}.merge", tree.branch)
+            ]
+        ),
+        "refs/heads/feature/login"
+    );
+    repos
+        .delete_worktree(&repo, Path::new(&tree.path))
+        .await
+        .unwrap();
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/remotes/origin/feature/login"]),
+        current
+    );
+}
+
+#[tokio::test]
+async fn a_unique_non_origin_remote_base_beats_a_same_named_tag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let (old, current) = advance_main(&repo);
+    let selected = "feature/login";
+    add_remote_branch(&repo, "upstream", selected, &current);
+    git(&repo, &["tag", selected, &old]);
+    assert!(
+        repos
+            .branches(&repo)
+            .await
+            .unwrap()
+            .contains(&selected.to_string())
+    );
+    let tree = repos
+        .create_worktree_for_task(&repo, selected, "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(git(Path::new(&tree.path), &["rev-parse", "HEAD"]), current);
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--get",
+                &format!("branch.{}.remote", tree.branch)
+            ]
+        ),
+        "upstream"
+    );
+    repos
+        .delete_worktree(&repo, Path::new(&tree.path))
+        .await
+        .unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "refs/tags/feature/login"]), old);
+}
+
+#[tokio::test]
+async fn ambiguous_remote_picker_labels_fail_closed_instead_of_using_a_tag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let (old, current) = advance_main(&repo);
+    let selected = "feature/login";
+    add_remote_branch(&repo, "origin", selected, &old);
+    add_remote_branch(&repo, "upstream", selected, &current);
+    git(&repo, &["tag", selected, &old]);
+    git(
+        &repo,
+        &[
+            "config",
+            "--local",
+            "checkout.defaultRemote",
+            "synthetic-no-preference",
+        ],
+    );
+    let before = repos.branches(&repo).await.unwrap();
+    let result = repos
+        .create_worktree_for_task(&repo, selected, "Fix login")
+        .await;
+    assert!(
+        result.is_err(),
+        "a picker label shared by remotes must not silently select a tag or arbitrary remote"
+    );
+    assert_eq!(repos.branches(&repo).await.unwrap(), before);
+    assert!(!tmp.path().join("trees/sample-app/fix-login").exists());
+    // An explicit choice must still work after the failed request released its lock.
+    let tree = repos
+        .create_worktree_for_task(&repo, "upstream/feature/login", "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(git(Path::new(&tree.path), &["rev-parse", "HEAD"]), current);
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/remotes/origin/feature/login"]),
+        old
+    );
+    assert_eq!(git(&repo, &["rev-parse", "refs/tags/feature/login"]), old);
+}
+
+#[tokio::test]
+async fn an_explicit_default_remote_disambiguates_a_shared_picker_label() {
+    for preferred in ["origin", "upstream"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, repos) = setup(tmp.path());
+        let (old, current) = advance_main(&repo);
+        let selected = "feature/login";
+        add_remote_branch(&repo, "origin", selected, &old);
+        add_remote_branch(&repo, "upstream", selected, &current);
+        git(
+            &repo,
+            &["config", "--local", "checkout.defaultRemote", preferred],
+        );
+        let tree = repos
+            .create_worktree_for_task(&repo, selected, "Fix login")
+            .await
+            .unwrap();
+        let expected = if preferred == "origin" {
+            &old
+        } else {
+            &current
+        };
+        assert_eq!(
+            git(Path::new(&tree.path), &["rev-parse", "HEAD"]),
+            *expected
+        );
+        assert_eq!(
+            git(
+                &repo,
+                &[
+                    "config",
+                    "--local",
+                    "--get",
+                    &format!("branch.{}.remote", tree.branch)
+                ]
+            ),
+            preferred
+        );
+        repos
+            .delete_worktree(&repo, Path::new(&tree.path))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_existing_local_branch_wins_over_remote_labels_and_tags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let (old, current) = advance_main(&repo);
+    let selected = "feature/login";
+    git(&repo, &["branch", selected, &old]);
+    add_remote_branch(&repo, "origin", selected, &current);
+    git(&repo, &["tag", selected, &current]);
+    let tree = repos
+        .create_worktree_for_task(&repo, selected, "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(git(Path::new(&tree.path), &["rev-parse", "HEAD"]), old);
+    repos
+        .delete_worktree(&repo, Path::new(&tree.path))
+        .await
+        .unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/feature/login"]), old);
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/remotes/origin/feature/login"]),
+        current
+    );
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/tags/feature/login"]),
+        current
+    );
 }
