@@ -1,5 +1,5 @@
 //! Close-and-archive evidence with isolated, synthetic data: Settings →
-//! Archived sessions, then ⌘W with an already-saved close-only preference.
+//! Archived sessions, then the first ⌘W before a close default is chosen.
 //!
 //! `cargo run -p harness-ui --features appshots-fixture --example archive-choice-fixture -- <dir> [light]`
 use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, px, size};
@@ -73,9 +73,8 @@ fn main() -> anyhow::Result<()> {
         .run(move |cx| {
             gpui_tokio::init(cx);
             gpui_base::init(cx);
-            // A previous close chose not to archive; ⌘W must still ask again.
-            let mut settings = settings::UiSettings::default();
-            settings.archive_on_close_chosen = true;
+            // No saved choice: the first ⌘W asks for the close default.
+            let settings = settings::UiSettings::default();
             settings::init(settings.clone(), data.clone(), cx);
             let fonts = typography::register_fonts(cx);
             typography::init(
@@ -166,10 +165,9 @@ fn main() -> anyhow::Result<()> {
                         &output,
                         &format!("archive-chat-{suffix}"),
                     )?;
-                    // ⌘W, the way the menu shortcut dispatches it.
-                    window.update(cx, |_, window, cx| {
-                        window.activate_window();
-                        window.dispatch_action(Box::new(app_menus::CloseTab), cx);
+                    // Exercise the ⌘W close path even without native app focus.
+                    window.update(cx, |shell, window, cx| {
+                        shell.fixture_first_chat_close(window, cx);
                     })?;
                     pause(cx, 900).await;
                     capture(

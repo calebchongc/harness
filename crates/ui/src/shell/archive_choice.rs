@@ -1,6 +1,6 @@
-//! Every ⌘W chat close asks whether to archive the session or just close it.
-//! The answer applies only to that close, not the archive-on-close setting
-//! used by ✕ buttons. The close-without-archiving shortcut (⌘⌥W) never asks.
+//! The first ⌘W chat close asks whether to archive the session or just close it.
+//! The answer becomes the archive-on-close default for ⌘W and ✕ buttons.
+//! The close-without-archiving shortcut (⌘⌥W) and ✕ buttons never ask.
 
 use super::*;
 
@@ -10,33 +10,34 @@ mod tests;
 /// The dialog's copy, given the two shortcuts as displayed.
 pub(super) fn archive_choice_copy(close: &str, close_only: &str) -> (String, String) {
     (
-        format!("Close this chat with {close}?"),
+        format!("What should {close} do when you close a chat?"),
         format!(
             "Just close it to keep it in the sidebar, or archive it to move an idle session \
-             to the archived shelf. This choice applies only to this close. Sessions that \
-             are running, waiting for input, or still open elsewhere are never archived. \
+             to the archived shelf. Your choice becomes the default for closing chats. \
+             You can change it in Settings \u{2192} Archived sessions. Sessions that are \
+             running, waiting for input, or still open elsewhere are never archived. \
              {close_only} always just closes without asking."
         ),
     )
 }
 
 impl Shell {
-    /// ⌘W on a chat pane, tab or the last session always asks first,
-    /// regardless of any saved archive-on-close preference.
+    /// The first ⌘W chat close asks for a default. Later closes follow the
+    /// saved archive-on-close preference without asking again.
     pub(crate) fn close_chat_view_by_shortcut(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.state.read(cx).selected_chat.is_some() {
+        if !settings::archive_on_close_chosen(cx) && self.state.read(cx).selected_chat.is_some() {
             self.archive_choice_prompt = true;
             cx.notify();
             return false;
         }
-        self.close_chat_view_with_archive(false, window, cx)
+        self.close_chat_view_with_archive(settings::archive_sessions_on_close(cx), window, cx)
     }
 
-    /// Apply the answer to this close only; leave the ✕-button setting alone.
+    /// Save the answer as the close default, then apply it to this close.
     pub(crate) fn choose_close_archiving(
         &mut self,
         archive: bool,
@@ -46,6 +47,8 @@ impl Shell {
         if !std::mem::take(&mut self.archive_choice_prompt) {
             return false;
         }
+        settings::set_archive_sessions_on_close(archive, cx);
+        self.sync_independent_settings(cx);
         self.close_chat_view_with_archive(archive, window, cx)
     }
 
