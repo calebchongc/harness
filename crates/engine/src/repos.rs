@@ -138,6 +138,15 @@ struct FileIndex {
 }
 
 type FileIndexCache = std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<FileIndex>>>;
+type WorktreeMutationLocks =
+    std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+static WORKTREE_MUTATIONS: std::sync::OnceLock<WorktreeMutationLocks> = std::sync::OnceLock::new();
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorktreeBranchOwner {
+    git_dir: String,
+    branch: String,
+}
 
 #[derive(Clone)]
 pub struct Repos {
@@ -1169,6 +1178,35 @@ impl Repos {
 
     // ── worktrees ───────────────────────────────────────────────────────────
 
+    /// Serialize ref/config mutations for one repository, including independent
+    /// Repos handles and aliases of its primary or linked checkouts. Other
+    /// repositories do not wait on this lock.
+    async fn lock_worktree_mutations(
+        &self,
+        path: &Path,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, EngineError> {
+        let common = self
+            .git(&["rev-parse", "--git-common-dir"], Some(path))
+            .await?;
+        let key = std::fs::canonicalize(path.join(common))?;
+        let lock = {
+            let mut locks = WORKTREE_MUTATIONS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(key, std::sync::Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        Ok(lock.lock_owned().await)
+    }
+
     /// Create a worktree before a task is available (the legacy RPC path).
     /// Session runs use `create_worktree_for_task` so their branches describe work.
     pub async fn create_worktree(
@@ -1189,18 +1227,21 @@ impl Repos {
         branch: &str,
         task: &str,
     ) -> Result<Worktree, EngineError> {
+        let mutation = self.lock_worktree_mutations(repo_path).await?;
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
         let base = self.inner.worktrees_root.join(&repo_name);
         std::fs::create_dir_all(&base)?;
-        // Never reuse another task's folder or branch.
+        // Ref names can alias by case on macOS/Windows filesystems. Use
+        // portable collision rules even on a case-sensitive host.
         let existing: HashSet<String> = self
             .branches(repo_path)
             .await
             .unwrap_or_default()
             .into_iter()
+            .map(|branch| branch.to_ascii_lowercase())
             .collect();
         let slug = harness_proto::worktree_name::task_slug(task);
         let mut name = None;
@@ -1210,42 +1251,51 @@ impl Repos {
             } else {
                 format!("{slug}-{attempt}")
             };
-            if !base.join(&candidate).exists() && !own_branch_taken(&existing, &candidate) {
-                name = Some(candidate);
-                break;
+            if own_branch_taken(&existing, &candidate) {
+                continue;
+            }
+            // Reserve the directory atomically as well: unrelated repositories
+            // with the same basename may share this worktree root.
+            match std::fs::create_dir(base.join(&candidate)) {
+                Ok(()) => {
+                    name = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
             }
         }
         let name =
             name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
         let path = base.join(&name);
         let branch_name = own_branch(&name);
-        self.git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch_name,
-                &path.to_string_lossy(),
-                branch,
-            ],
-            Some(repo_path),
-        )
-        .await?;
-        // `.agents/linked` + `.agents/prepare` before any agent starts in it.
-        crate::agents_prepare::prepare_worktree(repo_path, &path).await;
+        if let Err(error) = self
+            .git(
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch_name,
+                    &path.to_string_lossy(),
+                    branch,
+                ],
+                Some(repo_path),
+            )
+            .await
+        {
+            // Only release our empty reservation. A failed hook may already
+            // have written real files, which must not be discarded here.
+            let _ = std::fs::remove_dir(&path);
+            return Err(error);
+        }
         let checkout = self.checkout_identity(&path).await?;
-        // Ownership is local metadata, not a brand in the Git branch name.
-        // A user's unrelated task/* branch must never become ours by prefix.
-        self.git(
-            &[
-                "config",
-                "--local",
-                &format!("branch.{branch_name}.harness-worktree"),
-                &checkout.git_dir.to_string_lossy(),
-            ],
-            Some(&path),
-        )
-        .await?;
+        self.record_worktree_branch_owner(&path, &branch_name, &checkout.git_dir)
+            .await?;
+        drop(mutation);
+        // User setup can take arbitrarily long; it must not hold the repository
+        // allocation lock while other independent sessions are starting.
+        crate::agents_prepare::prepare_worktree(repo_path, &path).await;
+        let branch_name = self.current_branch(&path).await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
             path: path.to_string_lossy().to_string(),
@@ -1256,17 +1306,11 @@ impl Repos {
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {
-        self.git(
-            &[
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-            Some(path),
-        )
-        .await
-        .is_ok()
+        self.branches(path).await.is_ok_and(|branches| {
+            branches
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(branch))
+        })
     }
 
     /// Rename a newly created worktree branch after its chat's generated title
@@ -1284,6 +1328,7 @@ impl Repos {
         expected_branch: &str,
         title: &str,
     ) -> Result<String, EngineError> {
+        let _mutation = self.lock_worktree_mutations(worktree_path).await?;
         let current = self.current_branch(worktree_path).await?;
         let folder = worktree_path
             .file_name()
@@ -1319,27 +1364,71 @@ impl Repos {
             Some(worktree_path),
         )
         .await?;
+        // git branch -m copies its config section. Only our own rename updates
+        // the recorded branch name; an external rename therefore relinquishes
+        // automatic cleanup authority even though Git copied the old record.
+        let marked = match self.checkout_identity(worktree_path).await {
+            Ok(checkout) => {
+                self.record_worktree_branch_owner(worktree_path, &target, &checkout.git_dir)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = marked {
+            tracing::warn!(%error, "renamed branch ownership was not updated; cleanup will retain it");
+        }
         self.current_branch(worktree_path).await
     }
 
-    async fn manages_worktree_branch(&self, path: &Path, branch: &str) -> bool {
-        if branch.starts_with(LEGACY_BRANCH_PREFIX) {
-            return true;
-        }
-        let Ok(checkout) = self.checkout_identity(path).await else {
-            return false;
-        };
+    async fn record_worktree_branch_owner(
+        &self,
+        path: &Path,
+        branch: &str,
+        git_dir: &Path,
+    ) -> Result<(), EngineError> {
+        let owner = serde_json::to_string(&WorktreeBranchOwner {
+            git_dir: git_dir.to_string_lossy().into_owned(),
+            branch: branch.into(),
+        })
+        .map_err(|error| EngineError::Other(error.to_string()))?;
         self.git(
             &[
                 "config",
                 "--local",
-                "--get",
                 &format!("branch.{branch}.harness-worktree"),
+                &owner,
             ],
             Some(path),
         )
-        .await
-        .is_ok_and(|owner| owner.trim() == checkout.git_dir.to_string_lossy())
+        .await?;
+        Ok(())
+    }
+
+    async fn manages_worktree_branch(&self, path: &Path, branch: &str) -> bool {
+        let Ok(checkout) = self.checkout_identity(path).await else {
+            return false;
+        };
+        match self
+            .git(
+                &[
+                    "config",
+                    "--local",
+                    "--get",
+                    &format!("branch.{branch}.harness-worktree"),
+                ],
+                Some(path),
+            )
+            .await
+        {
+            Ok(owner) => serde_json::from_str::<WorktreeBranchOwner>(&owner)
+                .ok()
+                .is_some_and(|owner| {
+                    owner.git_dir == checkout.git_dir.to_string_lossy() && owner.branch == branch
+                }),
+            // Legacy checkouts predate ownership records. A present record
+            // always wins, including when an external rename uses harness/.
+            Err(_) => branch.starts_with(LEGACY_BRANCH_PREFIX),
+        }
     }
 
     /// Best-effort worktree removal (if it still exists), then prune stale refs.
@@ -1351,6 +1440,7 @@ impl Repos {
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
+        let _mutation = self.lock_worktree_mutations(repo_path).await?;
         let branch = if worktree_path.exists() {
             self.current_branch(worktree_path).await.unwrap_or_default()
         } else {
@@ -1358,21 +1448,20 @@ impl Repos {
         };
         let managed = self.manages_worktree_branch(worktree_path, &branch).await;
         if worktree_path.exists() {
-            let removed = self
-                .git(
-                    &[
-                        "worktree",
-                        "remove",
-                        "--force",
-                        &worktree_path.to_string_lossy(),
-                    ],
-                    Some(repo_path),
-                )
-                .await;
-            if removed.is_err() {
-                // git refused (or the dir is half-gone) — delete the folder directly.
-                let _ = std::fs::remove_dir_all(worktree_path);
-            }
+            // Git validates that this is a linked worktree belonging to this
+            // repository. Never bypass a refusal with recursive file deletion:
+            // the path may be a primary checkout, an ordinary folder, or a
+            // different repository's worktree.
+            self.git(
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &worktree_path.to_string_lossy(),
+                ],
+                Some(repo_path),
+            )
+            .await?;
         }
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
         if managed {

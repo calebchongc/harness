@@ -208,7 +208,7 @@ async fn graff_chats_run_and_resume_in_graffs_own_worktree() {
         .expect("queue first run");
     wait_for(|| completed_turns(&core) == 1, "first turn").await;
 
-    let name = "fix-login-redirect-after-sign-in-chatgrafftre".to_string();
+    let name = "fix-login-redirect-after-sign-in-1a7188e911beeb31".to_string();
     let tree = GraffWorktree::path_in(&repo_path, &name);
     let first = seen.lock().unwrap()[0].clone();
     assert_eq!(first.cwd, repo_path, "Graff launches from the repo");
@@ -293,9 +293,36 @@ async fn graff_chats_run_and_resume_in_graffs_own_worktree() {
     core.doc_host.queue_command(CHAT, retry).unwrap();
     wait_for(|| completed_turns(&core) == 3, "retry turn").await;
     let retry = seen.lock().unwrap()[2].clone();
+    // Queued directives can carry a stale name. A recorded checkout is the
+    // authority for this conversation, not an old name in another request.
+    core.doc_host
+        .queue_command(
+            CHAT,
+            run(
+                "msg-4",
+                &repo_path,
+                Some(WorktreeSpec {
+                    repo_path: repo_path.clone(),
+                    base: "main".into(),
+                    space_id: None,
+                    agent_name: Some("stale-queued-name".into()),
+                }),
+            ),
+        )
+        .unwrap();
+    wait_for(|| completed_turns(&core) == 4, "retry with a stale name").await;
+    let stale = seen.lock().unwrap()[3].clone();
     core.shutdown().await;
     assert_eq!(retry.agent_name.as_deref(), Some(name.as_str()));
     assert_eq!(retry.cwd, repo_path);
+    assert_eq!(
+        stale.agent_name.as_deref(),
+        Some(name.as_str()),
+        "a stale directive must not move an existing conversation"
+    );
+    assert!(
+        !std::path::Path::new(&GraffWorktree::path_in(&repo_path, "stale-queued-name")).exists()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

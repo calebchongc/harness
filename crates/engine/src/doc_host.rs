@@ -5603,9 +5603,9 @@ impl DocHost {
                         request.cwd = spec.repo_path.clone();
                         request.worktree = Some(harness_proto::WorktreeSpec {
                             agent_name: Some(
-                                spec.agent_name
-                                    .clone()
-                                    .or_else(|| existing_tree.map(|tree| tree.name))
+                                existing_tree
+                                    .map(|tree| tree.name)
+                                    .or_else(|| spec.agent_name.clone())
                                     .unwrap_or_else(|| {
                                         harness_proto::graff_worktree::name_for_task(
                                             chat_id,
