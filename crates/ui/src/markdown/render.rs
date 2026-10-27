@@ -1304,6 +1304,7 @@ pub(super) fn flat_text_presented_element(
                     key: sel_key.clone(),
                     text: flat_text.clone(),
                     layout: layout.clone(),
+                    clip: window.content_mask().bounds,
                     offsets: offsets.clone(),
                     owner: PAINT_OWNER.get(),
                 })
@@ -1401,6 +1402,7 @@ fn paint_text_selection_with_wash(
             key: key.clone(),
             text: text.clone(),
             layout: layout.clone(),
+            clip: window.content_mask().bounds,
             offsets: None,
             owner: PAINT_OWNER.get(),
         })
@@ -1442,16 +1444,69 @@ struct RegEntry {
     key: std::sync::Arc<str>,
     text: SharedString,
     layout: gpui::TextLayout,
+    /// Paint-time clip: collapsed prompts retain their full text layout, but
+    /// hidden lines must not compete with visible replies for pointer events.
+    clip: gpui::Bounds<gpui::Pixels>,
     offsets: Option<super::link_presentation::OffsetMap>,
     /// The transcript that painted it ([`selection_owner_reset`]); 0 for
     /// text painted outside one.
     owner: u64,
 }
 
+impl RegEntry {
+    fn visible_bounds(&self) -> gpui::Bounds<gpui::Pixels> {
+        self.layout.bounds().intersect(&self.clip)
+    }
+
+    fn index_for_position(&self, position: gpui::Point<gpui::Pixels>) -> usize {
+        let position = visible_selection_position(position, self.visible_bounds());
+        let ix = match self.layout.index_for_position(position) {
+            Ok(ix) | Err(ix) => ix,
+        };
+        self.offsets.as_ref().map_or(ix, |map| map.original(ix))
+    }
+}
+
+/// Keep the head on a visible line even when a drag leaves the element. Stay
+/// just inside both edges: TextLayout can resolve an exact line boundary to
+/// the preceding (possibly clipped) line. Within the band, preserve x for
+/// visual-line gutters; beyond it, select through the visible start or end.
+fn visible_selection_position(
+    mut position: gpui::Point<gpui::Pixels>,
+    bounds: gpui::Bounds<gpui::Pixels>,
+) -> gpui::Point<gpui::Pixels> {
+    if position.y < bounds.top() {
+        position.x = bounds.left();
+    } else if position.y >= bounds.bottom() {
+        position.x = bounds.right();
+    }
+    position.y = position
+        .y
+        .max(px(f32::from(bounds.top()).next_up()))
+        .min(px(f32::from(bounds.bottom()).next_down()));
+    position
+}
+
 thread_local! {
     static REGISTRY: RefCell<Vec<RegEntry>> = const { RefCell::new(Vec::new()) };
     /// The transcript painting right now, so its entries carry it.
     static PAINT_OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Locate a synthetic fixture's text without depending on theme or wrap geometry.
+#[cfg(feature = "appshots-fixture")]
+pub fn fixture_selection_position(
+    text: &str,
+    byte_index: usize,
+) -> Option<gpui::Point<gpui::Pixels>> {
+    REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .iter()
+            .find(|entry| entry.text.as_ref() == text)
+            .and_then(|entry| entry.layout.position_for_index(byte_index))
+            .map(|position| position + point(px(0.1), px(8.0)))
+    })
 }
 
 /// Every text element registered this frame: `(key, text, bounds)`.
@@ -1604,7 +1659,14 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
             if selection_scope(&entry.key) != selection_scope(&anchor) || entry.owner != owner {
                 continue;
             }
-            let b = entry.layout.bounds();
+            let b = entry.visible_bounds();
+            if b.is_empty() {
+                continue;
+            }
+            if position.y >= b.top() && position.y < b.bottom() {
+                best = Some((ei, 0.0));
+                break;
+            }
             let dy = if position.y < b.top() {
                 f32::from(b.top() - position.y)
             } else if position.y > b.bottom() {
@@ -1615,18 +1677,9 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
             if best.is_none_or(|(_, d)| dy < d) {
                 best = Some((ei, dy));
             }
-            if dy == 0.0 {
-                break;
-            }
         }
         let (ei, _) = best?;
-        let ix = match reg[ei].layout.index_for_position(position) {
-            Ok(ix) | Err(ix) => ix,
-        };
-        Some((
-            ei,
-            reg[ei].offsets.as_ref().map_or(ix, |map| map.original(ix)),
-        ))
+        Some((ei, reg[ei].index_for_position(position)))
     })
 }
 
@@ -1640,8 +1693,9 @@ pub(crate) fn begin_drag_in_whitespace(owner: u64, position: gpui::Point<gpui::P
         let nearest = reg
             .iter()
             .filter_map(|entry| {
-                let bounds = entry.layout.bounds();
-                if entry.owner != owner
+                let bounds = entry.visible_bounds();
+                if bounds.is_empty()
+                    || entry.owner != owner
                     || !selection_scope(&entry.key).is_empty()
                     || position.y < bounds.top()
                     || position.y >= bounds.bottom()
@@ -1663,11 +1717,7 @@ pub(crate) fn begin_drag_in_whitespace(owner: u64, position: gpui::Point<gpui::P
         };
         // Preserve the layout's visual-line boundary, including soft wraps;
         // whitespace after a line is its END, not its final character.
-        let ix = match entry.layout.index_for_position(position) {
-            Ok(ix) | Err(ix) => ix,
-        };
-        let ix = entry.offsets.as_ref().map_or(ix, |map| map.original(ix));
-        super::selection::begin(&entry.key, ix);
+        super::selection::begin(&entry.key, entry.index_for_position(position));
         true
     })
 }
@@ -1722,12 +1772,14 @@ fn register_selection_listeners(
     use gpui::{DispatchPhase, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
     {
         let (key, text, layout) = (key.clone(), text.clone(), layout.clone());
+        let bounds = layout.bounds().intersect(&window.content_mask().bounds);
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, _cx| {
             if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
                 return;
             }
-            if layout.bounds().contains(&e.position) {
-                let ix = match layout.index_for_position(e.position) {
+            if bounds.contains(&e.position) {
+                let position = visible_selection_position(e.position, bounds);
+                let ix = match layout.index_for_position(position) {
                     Ok(ix) | Err(ix) => ix,
                 };
                 let ix = offsets.as_ref().map_or(ix, |map| map.original(ix));

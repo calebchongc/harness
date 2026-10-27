@@ -1,0 +1,395 @@
+use super::*;
+use crate::markdown::selection;
+
+fn message(id: &str, role: MessageRole, text: &str) -> SessionMessageEntry {
+    SessionMessageEntry {
+        id: id.into(),
+        role,
+        parts: vec![MessagePart::Text {
+            id: "text".into(),
+            text: text.into(),
+        }],
+        created_at: 0,
+        device_id: "fixture".into(),
+        status: Some(MessageStatus::Complete),
+        continuation_of: None,
+        duration_ms: None,
+    }
+}
+
+fn draw(transcript: &Entity<Transcript>, cx: &mut gpui::VisualTestContext) {
+    transcript.update(cx, |this, cx| this.sync(cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+}
+
+fn with_transcript(
+    cx: &mut gpui::TestAppContext,
+    prompt: &str,
+    reply: &str,
+    test: impl FnOnce(Entity<Transcript>, Entity<AppState>, &mut gpui::VisualTestContext),
+) {
+    struct Host(Entity<Transcript>);
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state = cx.update(|cx| {
+        gpui_base::init(cx);
+        cx.set_global(Theme::dark());
+        crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        cx.new(|_| AppState::new())
+    });
+    let (host, cx) =
+        cx.add_window_view(|_, cx| Host(cx.new(|cx| Transcript::new(state.clone(), cx))));
+    cx.simulate_resize(size(px(900.0), px(800.0)));
+    let transcript = host.read_with(cx, |host, _| host.0.clone());
+    state.update(cx, |state, _| {
+        state.selected_chat = Some("clipping-fixture".into());
+        state.transcript_replayed = true;
+        state.transcript = vec![
+            message("prompt", MessageRole::User, prompt),
+            message("reply", MessageRole::Assistant, reply),
+        ];
+        state.transcript_revision += 1;
+    });
+    for _ in 0..3 {
+        draw(&transcript, cx);
+    }
+    test(transcript, state, cx);
+}
+
+fn entry(needle: &str) -> (String, String, gpui::TextLayout) {
+    let (key, text, _) = render::selection_test_entries()
+        .into_iter()
+        .find(|(_, text, _)| text.contains(needle))
+        .unwrap_or_else(|| panic!("missing painted text {needle:?}"));
+    let (_, layout, _) = render::selection_test_snapshot(&key);
+    (key, text, layout)
+}
+
+fn at(layout: &gpui::TextLayout, ix: usize) -> Point<Pixels> {
+    layout.position_for_index(ix).unwrap() + point(px(0.1), px(8.0))
+}
+
+fn drag(
+    cx: &mut gpui::VisualTestContext,
+    key: &str,
+    count: usize,
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    expected: &str,
+) {
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: MouseButton::Left,
+        position: start,
+        click_count: count,
+        ..Default::default()
+    });
+    assert_eq!(selection::anchor_key().as_deref(), Some(key));
+    cx.simulate_event(MouseMoveEvent {
+        position: end,
+        pressed_button: Some(MouseButton::Left),
+        ..Default::default()
+    });
+    assert_eq!(selection::selected_text().as_deref(), Some(expected));
+    cx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: end,
+        ..Default::default()
+    });
+    assert_eq!(selection::selected_text().as_deref(), Some(expected));
+    selection::clear_if_owner(key);
+}
+
+#[gpui::test]
+fn collapsed_prompt_selection_handles_wrap_unicode_reverse_drags_and_resize(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    let prompt = "Hidden prompt content with a wide line for synthetic overlap. ".repeat(40);
+    let reply = "Reply alpha café beta gamma delta epsilon zeta eta theta iota kappa lambda.\n\nSecond paragraph stays selectable.";
+    with_transcript(cx, &prompt, reply, |transcript, _, cx| {
+        for width in [900.0, 320.0, 600.0, 900.0] {
+            cx.simulate_resize(size(px(width), px(800.0)));
+            draw(&transcript, cx);
+            let (key, text, layout) = entry("Reply alpha");
+            let cafe = text.find("café").unwrap();
+            for count in [2, 3] {
+                let expected = if count == 2 { "café" } else { &text };
+                drag(
+                    cx,
+                    &key,
+                    count,
+                    at(&layout, cafe + 1),
+                    at(&layout, cafe + 2),
+                    expected,
+                );
+            }
+            for (from, to) in [(0, text.len()), (text.len(), 0)] {
+                drag(cx, &key, 1, at(&layout, from), at(&layout, to), &text);
+            }
+            let (second_key, second, second_layout) = entry("Second paragraph");
+            drag(
+                cx,
+                &second_key,
+                2,
+                at(&second_layout, 2),
+                at(&second_layout, 2),
+                "Second",
+            );
+            drag(
+                cx,
+                &second_key,
+                3,
+                at(&second_layout, 2),
+                at(&second_layout, 2),
+                &second,
+            );
+        }
+    });
+}
+
+#[gpui::test]
+fn collapsed_prompt_selection_rejects_hidden_blank_hits_and_preserves_gutter_drags(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    let prompt = "Hidden prompt words with enough width to overlap output.\n".repeat(40);
+    with_transcript(cx, &prompt, "Reply alpha beta gamma.", |_, _, cx| {
+        let (key, text, layout) = entry("Reply alpha");
+        let y = at(&layout, 0).y;
+        drag(cx, &key, 1, point(px(1.0), y), at(&layout, 5), &text[..5]);
+        drag(cx, &key, 1, point(px(899.0), y), at(&layout, 5), &text[5..]);
+        let (_, _, prompt_layout) = entry("Hidden prompt");
+        let blank = point(prompt_layout.bounds().left() + px(10.0), y + px(70.0));
+        assert!(prompt_layout.bounds().contains(&blank));
+        for count in [1, 2, 3] {
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: blank,
+                click_count: count,
+                ..Default::default()
+            });
+            assert!(
+                !selection::is_dragging(),
+                "hidden prompt captured blank click {count}"
+            );
+            assert!(selection::selected_text().is_none());
+            cx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: blank,
+                ..Default::default()
+            });
+        }
+    });
+}
+
+#[gpui::test]
+fn collapsed_prompt_selection_refreshes_after_expand_collapse_and_stream_repaint(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _selection = selection::test_state_lock();
+    let prompt = (1..=9)
+        .map(|i| format!("Prompt line {i} with selectable words.\n"))
+        .collect::<String>();
+    let reply = "Reply alpha beta gamma.";
+    with_transcript(cx, &prompt, reply, |transcript, state, cx| {
+        let (prompt_key, _, _) = entry("Prompt line 1");
+        let row: SharedString = prompt_key.strip_suffix(":u").unwrap().to_owned().into();
+        for expanded in [true, false, true, false] {
+            transcript.update(cx, |this, cx| {
+                let row_ix = this.rows.iter().position(|item| item.id == row).unwrap();
+                let full_h = this.user_heights[&row].get();
+                this.toggle_user_fold(row.clone(), row_ix, 132.0, full_h, true);
+                let fold = this.user_folds.get_mut(&row).unwrap();
+                assert_eq!(fold.open, Some(expanded));
+                fold.toggled_at = None; // Check settled fold endpoints deterministically.
+                cx.notify();
+            });
+            draw(&transcript, cx);
+            if expanded {
+                let (key, text, layout) = entry("Prompt line 1");
+                let ix = text.find("line 8").unwrap();
+                drag(
+                    cx,
+                    &key,
+                    2,
+                    at(&layout, ix + 1),
+                    at(&layout, ix + 1),
+                    "line",
+                );
+            }
+            transcript.update(cx, |this, cx| {
+                this.list.scroll_to_end();
+                cx.notify();
+            });
+            for _ in 0..3 {
+                draw(&transcript, cx);
+            }
+            let (key, _, layout) = entry("Reply alpha");
+            assert!(transcript.read_with(cx, |this, _| {
+                this.list.viewport_bounds().contains(&at(&layout, 7))
+            }));
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: at(&layout, 7),
+                click_count: 2,
+                ..Default::default()
+            });
+            assert_eq!(
+                selection::anchor_key().as_deref(),
+                Some(key.as_str()),
+                "expanded={expanded}, reply position={:?}, entries={:?}",
+                at(&layout, 7),
+                render::selection_test_entries(),
+            );
+            state.update(cx, |state, _| {
+                state.transcript[1].status = Some(MessageStatus::Streaming);
+                state.transcript[1].parts = vec![MessagePart::Text {
+                    id: "text".into(),
+                    text: format!("{reply} More streaming output."),
+                }];
+                state.transcript_revision += 1;
+            });
+            draw(&transcript, cx);
+            let (_, _, layout) = entry("Reply alpha");
+            cx.simulate_event(MouseMoveEvent {
+                position: at(&layout, 7),
+                pressed_button: Some(MouseButton::Left),
+                ..Default::default()
+            });
+            cx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: at(&layout, 7),
+                ..Default::default()
+            });
+            assert_eq!(selection::selected_text().as_deref(), Some("alpha"));
+            state.update(cx, |state, _| {
+                state.transcript[1].status = Some(MessageStatus::Complete);
+                state.transcript_revision += 1;
+            });
+            draw(&transcript, cx);
+            assert_eq!(selection::selected_text().as_deref(), Some("alpha"));
+            selection::clear_if_owner(&key);
+        }
+    });
+}
+
+struct ClipHost {
+    height: f32,
+    offset: f32,
+}
+
+impl Render for ClipHost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        div()
+            .size_full()
+            .text_size(px(14.0))
+            .line_height(px(22.0))
+            .child(render::selection_owner_reset(cx.entity_id().as_u64()))
+            .child(div().h(px(40.0)))
+            .child(
+                div().h(px(self.height)).overflow_hidden().child(
+                    div().relative().top(px(self.offset)).child(
+                        render::selectable_autolinked_text(
+                            "clip-prompt".into(),
+                            "first\nsecond\nthird\nfourth\nfifth".into(),
+                            gpui::font(theme.font_sans.clone()),
+                            theme.text,
+                            None,
+                            &theme,
+                        ),
+                    ),
+                ),
+            )
+            .child(div().h(px(120.0)))
+            .child(render::selectable_autolinked_text(
+                "clip-reply".into(),
+                "visible reply".into(),
+                gpui::font(theme.font_sans.clone()),
+                theme.text,
+                None,
+                &theme,
+            ))
+            .child(render::selection_owner_end())
+    }
+}
+
+#[gpui::test]
+fn clipped_selection_drag_clamps_to_visible_lines_above_and_below(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    cx.update(|cx| cx.set_global(Theme::dark()));
+    let (host, cx) = cx.add_window_view(|_, _| ClipHost {
+        height: 44.0,
+        offset: 0.0,
+    });
+    cx.simulate_resize(size(px(500.0), px(400.0)));
+    for (offset, start_ix, end_y, expected) in [
+        (0.0, 0, 92.0, "first\nsecond"),
+        (-22.0, "first\nsecond\nthird".len(), 32.0, "second\nthird"),
+    ] {
+        host.update(cx, |host, cx| {
+            host.offset = offset;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let (key, _, layout) = entry("first\nsecond");
+        // Outside the vertical band, x must not truncate the boundary line.
+        let x = if offset == 0.0 { px(0.0) } else { px(499.0) };
+        drag(
+            cx,
+            &key,
+            1,
+            at(&layout, start_ix),
+            point(x, px(end_y)),
+            expected,
+        );
+    }
+}
+
+#[gpui::test]
+fn fully_clipped_selection_cannot_capture_clicks_or_whitespace(cx: &mut gpui::TestAppContext) {
+    let _selection = selection::test_state_lock();
+    cx.update(|cx| cx.set_global(Theme::dark()));
+    let (host, cx) = cx.add_window_view(|_, _| ClipHost {
+        height: 0.0,
+        offset: 0.0,
+    });
+    cx.simulate_resize(size(px(500.0), px(400.0)));
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    let owner = host.entity_id().as_u64();
+    for count in [1, 2, 3] {
+        for y in [39.9, 40.0, 40.1, 60.0] {
+            let position = point(px(10.0), px(y));
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: count,
+                ..Default::default()
+            });
+            assert!(!selection::is_dragging());
+            assert!(!render::begin_drag_in_whitespace(
+                owner,
+                point(px(499.0), px(y))
+            ));
+            cx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                ..Default::default()
+            });
+        }
+    }
+}
