@@ -1,0 +1,211 @@
+//! Synthetic Git ref-layout and retitling edge cases for task-named worktrees.
+
+use std::path::Path;
+use std::process::Command;
+
+use harness_engine::Repos;
+use sha2::{Digest, Sha256};
+
+fn git(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+fn setup(root: &Path) -> (std::path::PathBuf, Repos) {
+    let repo = root.join("sample-app");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let repos = Repos::with_worktrees_root(&root.join("data"), "test", root.join("trees"));
+    (repo, repos)
+}
+
+#[tokio::test]
+async fn allocation_skips_descendant_ref_conflicts_including_packed_and_case_only_refs() {
+    for packed in [false, true] {
+        for user_branch in ["task/fix-login/review", "TASK/FIX-LOGIN/review"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (repo, repos) = setup(tmp.path());
+            git(&repo, &["branch", user_branch]);
+            if packed {
+                git(&repo, &["pack-refs", "--all"]);
+            }
+            let before = git(&repo, &["rev-parse", user_branch]);
+            let tree = repos
+                .create_worktree_for_task(&repo, "main", "Fix login")
+                .await
+                .unwrap();
+            assert_eq!(tree.branch, "task/fix-login-2");
+            assert_eq!(git(&repo, &["rev-parse", user_branch]), before);
+            assert!(!tmp.path().join("trees/sample-app/fix-login").exists());
+            repos
+                .delete_worktree(&repo, Path::new(&tree.path))
+                .await
+                .unwrap();
+            assert!(
+                repos
+                    .branches(&repo)
+                    .await
+                    .unwrap()
+                    .contains(&user_branch.to_string())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn title_rename_uses_a_suffix_for_a_descendant_ref_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let user_branch = "task/fix-profile/review";
+    git(&repo, &["branch", user_branch]);
+    git(&repo, &["pack-refs", "--all"]);
+    let tree = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    let path = Path::new(&tree.path);
+    let head = git(path, &["rev-parse", "HEAD"]);
+    let renamed = repos
+        .rename_worktree_branch(path, &tree.branch, "Fix profile")
+        .await
+        .unwrap();
+    assert!(renamed.starts_with("task/fix-profile-"));
+    assert_eq!(renamed.len(), "task/fix-profile-".len() + 6);
+    assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+    let owner = git(
+        &repo,
+        &[
+            "config",
+            "--local",
+            "--get",
+            &format!("branch.{renamed}.harness-worktree"),
+        ],
+    );
+    let owner: serde_json::Value = serde_json::from_str(&owner).unwrap();
+    assert_eq!(owner["branch"], renamed);
+    repos.delete_worktree(&repo, path).await.unwrap();
+    assert!(
+        repos
+            .branches(&repo)
+            .await
+            .unwrap()
+            .contains(&user_branch.to_string())
+    );
+}
+
+#[tokio::test]
+async fn both_title_targets_occupied_leave_the_original_branch_and_ownership_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let tree = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    let path = Path::new(&tree.path);
+    let hash = format!("{:x}", Sha256::digest(tree.path.as_bytes()));
+    let preferred = "task/fix-profile";
+    let fallback = format!("{preferred}-{}", &hash[..6]);
+    git(&repo, &["branch", preferred]);
+    git(&repo, &["branch", &fallback]);
+    let key = format!("branch.{}.harness-worktree", tree.branch);
+    let owner = git(&repo, &["config", "--local", "--get", &key]);
+    let head = git(path, &["rev-parse", "HEAD"]);
+    let result = repos
+        .rename_worktree_branch(path, &tree.branch, "Fix profile")
+        .await;
+    assert!(
+        result.is_err(),
+        "neither a user ref nor its stable-suffix collision may be overwritten"
+    );
+    assert_eq!(git(path, &["branch", "--show-current"]), tree.branch);
+    assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&repo, &["config", "--local", "--get", &key]), owner);
+    // A refused title must release its mutation locks and retain cleanup authority.
+    repos.delete_worktree(&repo, path).await.unwrap();
+    assert_eq!(git(&repo, &["rev-parse", preferred]), head);
+    assert_eq!(git(&repo, &["rev-parse", &fallback]), head);
+    assert!(!repos.branches(&repo).await.unwrap().contains(&tree.branch));
+}
+
+#[tokio::test]
+async fn similar_ref_prefixes_do_not_collide_without_a_component_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let sibling = "task/fix-login-extra";
+    git(&repo, &["branch", sibling]);
+    let tree = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    assert_eq!(tree.branch, "task/fix-login");
+    let renamed = repos
+        .rename_worktree_branch(Path::new(&tree.path), &tree.branch, "Fix log")
+        .await
+        .unwrap();
+    assert_eq!(renamed, "task/fix-log");
+    repos
+        .delete_worktree(&repo, Path::new(&tree.path))
+        .await
+        .unwrap();
+    assert!(
+        repos
+            .branches(&repo)
+            .await
+            .unwrap()
+            .contains(&sibling.to_string())
+    );
+}
+
+#[tokio::test]
+async fn detached_checkouts_are_not_retitled_or_used_to_delete_the_old_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, repos) = setup(tmp.path());
+    let tree = repos
+        .create_worktree_for_task(&repo, "main", "Fix login")
+        .await
+        .unwrap();
+    let path = Path::new(&tree.path);
+    let head = git(path, &["rev-parse", "HEAD"]);
+    git(path, &["switch", "--detach"]);
+    let actual = repos
+        .rename_worktree_branch(path, &tree.branch, "Different task")
+        .await
+        .unwrap();
+    assert_eq!(
+        actual, "HEAD",
+        "detached state uses the existing current_branch contract"
+    );
+    assert!(git(path, &["branch", "--show-current"]).is_empty());
+    assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+    repos.delete_worktree(&repo, path).await.unwrap();
+    assert_eq!(git(&repo, &["rev-parse", &tree.branch]), head);
+    assert!(
+        !repos
+            .branches(&repo)
+            .await
+            .unwrap()
+            .contains(&"task/different-task".to_string())
+    );
+}

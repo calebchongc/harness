@@ -1338,7 +1338,7 @@ impl Repos {
         self.branches(path).await.is_ok_and(|branches| {
             branches
                 .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(branch))
+                .any(|existing| ref_names_conflict(existing, branch))
         })
     }
 
@@ -2411,8 +2411,26 @@ pub fn own_branch(name: &str) -> String {
     format!("{OWN_BRANCH_PREFIX}{name}")
 }
 
+/// Git refs are file-like: a leaf cannot coexist with an ancestor/descendant
+/// ref. Compare components, not arbitrary string prefixes, and account for
+/// case-insensitive filesystems even when running on a case-sensitive host.
+fn ref_names_conflict(existing: &str, candidate: &str) -> bool {
+    let existing = existing.to_ascii_lowercase();
+    let candidate = candidate.to_ascii_lowercase();
+    existing == candidate
+        || existing
+            .strip_prefix(&candidate)
+            .is_some_and(|tail| tail.starts_with('/'))
+        || candidate
+            .strip_prefix(&existing)
+            .is_some_and(|tail| tail.starts_with('/'))
+}
+
 fn own_branch_taken(existing: &std::collections::HashSet<String>, candidate: &str) -> bool {
-    existing.contains(&own_branch(candidate))
+    let branch = own_branch(candidate);
+    existing
+        .iter()
+        .any(|existing| ref_names_conflict(existing, &branch))
         || existing.contains(&format!("{LEGACY_BRANCH_PREFIX}{candidate}"))
 }
 
