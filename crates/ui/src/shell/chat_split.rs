@@ -601,10 +601,10 @@ impl Shell {
         self.close_focused_chat_view(window, cx)
     }
 
-    /// The two close shortcuts share view/history handling, not their archive
-    /// policy: ⌘W (`may_archive`) follows the archive-on-close setting like
-    /// the ✕ buttons, and ⌘⌥W never archives. Include the final
-    /// session-to-canvas close in both.
+    /// The two close shortcuts share view/history handling. ⌘W supplies the
+    /// user's per-close archive choice; ⌘⌥W never archives. Neither consults
+    /// or changes the ✕-button preference. Include the final session-to-canvas
+    /// close in both.
     pub(crate) fn close_chat_view_with_archive(
         &mut self,
         may_archive: bool,
@@ -620,7 +620,7 @@ impl Shell {
             && may_archive
             && let Some(chat_id) = closing
         {
-            self.archive_closed_session(chat_id, window, cx);
+            self.archive_closed_session_if_idle(chat_id, window, cx);
         }
         closed
     }
