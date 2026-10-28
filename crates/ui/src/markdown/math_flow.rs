@@ -199,6 +199,9 @@ pub(super) fn render_aligned(
                             .w(px(equation.width))
                             .h(px(equation.height)),
                     )
+                    .when(cfg!(test), |image| {
+                        image.debug_selector(|| "math-flow-equation".into())
+                    })
                     .role(gpui::Role::Image)
                     .aria_label(source.clone());
                 if fragment.runs[0].style.strikethrough {
@@ -283,6 +286,7 @@ pub(super) fn render_aligned(
                 div()
                     .id(SharedString::from(format!("{group}-equation-{next}")))
                     .w_full()
+                    .flex()
                     .my(px(6.0))
                     .overflow_x_scroll()
                     .child(element),
@@ -294,6 +298,9 @@ pub(super) fn render_aligned(
             row = row.child(
                 div()
                     .id(SharedString::from(format!("{group}-word-{next}")))
+                    // A flex viewport keeps the nonshrinking word at its
+                    // intrinsic width, so scroll extent includes all its ink.
+                    .flex()
                     .flex_none()
                     .min_w_0()
                     .max_w_full()

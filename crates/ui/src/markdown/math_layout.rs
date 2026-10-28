@@ -9,7 +9,9 @@
 //!
 //! Explicit math-style declarations and limits/nolimits modifiers are declined:
 //! the current upstream AST discards style declarations and large-operator limit
-//! overrides. Display/inline defaults and ordinary scripts remain supported.
+//! overrides. Barless/style-specific fractions and explicit spaces that disrupt
+//! automatic atom spacing are also declined where upstream loses semantics.
+//! Display/inline defaults, ordinary fractions and zero-glue spacing boundaries remain supported.
 
 use gpui::{Hsla, Image, ImageFormat, Rgba};
 use latex_rust::{
@@ -234,8 +236,21 @@ fn preflight(source: &str) -> Result<(), String> {
                 }
                 // Upstream currently treats \rule as a strut and discards its
                 // width; decline it rather than silently drawing incorrect math.
-                if name == "rule" {
-                    return Err("Unsupported equation command: rule".into());
+                if matches!(
+                    name.as_str(),
+                    "rule"
+                        | "binom"
+                        | "dbinom"
+                        | "tbinom"
+                        | "genfrac"
+                        | "dfrac"
+                        | "tfrac"
+                        | "cfrac"
+                ) {
+                    // Barless and explicit-style fractions collapse to the
+                    // same Fraction AST as ordinary \\frac. Once parsed, their
+                    // missing rule/style intent cannot be recovered reliably.
+                    return Err(format!("Unsupported equation command: {name}"));
                 }
                 // parse_command consumes style declarations without retaining
                 // them; parse_atom retains limit modifiers only on named text
@@ -270,6 +285,64 @@ fn scalar(dim: &Dim) -> Result<f32, String> {
         return Err("Invalid equation dimension".into());
     }
     Ok(value)
+}
+
+// Explicit glue is classless upstream. It can erase automatic glue or
+// reclassify a binary operator as unary. Admit known zero-glue boundaries,
+// including ordinary letters and punctuation/delimiters, but never Bin atoms.
+fn spacing_atom_kind(node: &MathNode) -> Option<latex_rust::AtomKind> {
+    use latex_rust::AtomKind;
+    match node {
+        MathNode::Atom(_, kind) | MathNode::SizedDelim(_, _, kind) => Some(*kind),
+        MathNode::Text(_, _) | MathNode::Ref(_) => Some(AtomKind::Ord),
+        MathNode::Symbol(name) => Some(latex_rust::symbol_atom_kind(name)),
+        MathNode::Row(nodes) if nodes.len() == 1 => spacing_atom_kind(&nodes[0]),
+        MathNode::Row(_) => Some(AtomKind::Ord),
+        MathNode::Superscript(base, _)
+        | MathNode::Subscript(base, _)
+        | MathNode::SubSup(base, _, _)
+        | MathNode::Color(_, base)
+        | MathNode::TextColor(_, base)
+        | MathNode::Phantom(_, base) => spacing_atom_kind(base),
+        _ => None,
+    }
+}
+
+fn zero_implicit_glue(left: &MathNode, right: &MathNode) -> bool {
+    use latex_rust::AtomKind::*;
+    // Zero entries in TeX's inter-atom spacing table, excluding Bin because
+    // a classless neighbor also changes binary reclassification. Unknown
+    // compound atom classes conservatively retain their source instead.
+    matches!(
+        (spacing_atom_kind(left), spacing_atom_kind(right)),
+        (Some(Ord | Close), Some(Ord | Open | Close | Punct))
+            | (
+                Some(Open),
+                Some(Ord | Op | Rel | Open | Close | Punct | Inner)
+            )
+            | (Some(Op), Some(Open | Close | Punct))
+            | (Some(Rel), Some(Rel | Close | Punct))
+            | (Some(Inner), Some(Close))
+    )
+}
+
+fn validate_row_spacing(nodes: &[MathNode]) -> Result<(), String> {
+    let mut previous = None;
+    let mut spaced = false;
+    for node in nodes {
+        if matches!(node, MathNode::Space(_)) {
+            spaced = true;
+            continue;
+        }
+        if let Some(previous) = previous {
+            if spaced && !zero_implicit_glue(previous, node) {
+                return Err("Explicit spacing affecting automatic math glue is unsupported".into());
+            }
+        }
+        previous = Some(node);
+        spaced = false;
+    }
+    Ok(())
 }
 
 // Validate the AST before potentially expensive grid/assembly layout. This also
@@ -312,6 +385,9 @@ fn validate_ast(root: &MathNode) -> Result<(), String> {
             | MathNode::Phantom(_, body)
             | MathNode::Tag { body, .. } => push(body),
             MathNode::Row(nodes) | MathNode::Substack(nodes) => {
+                if matches!(node, MathNode::Row(_)) {
+                    validate_row_spacing(nodes)?;
+                }
                 for node in nodes {
                     push(node);
                 }
@@ -854,6 +930,99 @@ mod tests {
         // allocating a raster image with a large, mostly empty viewport.
         assert!(layout_source(source, false, 96.).is_ok());
         assert!(render_svg(source, false, 96., [0, 0, 0, 255]).is_err());
+    }
+
+    #[test]
+    fn barless_fraction_commands_never_silently_gain_a_fraction_rule() {
+        for source in [
+            r"\binom{n}{k}",
+            r"\dbinom{n}{k}",
+            r"\tbinom{n}{k}",
+            r"\genfrac{}{}{0pt}{}{n}{k}",
+        ] {
+            if let Ok(tree) = layout_source(source, false, 20.) {
+                let mut pending = vec![&tree];
+                while let Some(node) = pending.pop() {
+                    match &node.content {
+                        BoxContent::Rule => panic!("barless coefficient gained a rule: {source}"),
+                        BoxContent::HList(nodes)
+                        | BoxContent::VList(nodes)
+                        | BoxContent::Overlap(nodes) => pending.extend(nodes),
+                        BoxContent::Color(_, inner)
+                        | BoxContent::BackColor(_, inner)
+                        | BoxContent::Frame { inner, .. } => pending.push(inner),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_spacing_never_silently_removes_operator_glue() {
+        for display in [false, true] {
+            for operator in ["+", "=", r"\times", r"\leq"] {
+                let base = layout_source(&format!("a{operator} b"), display, 20.).unwrap();
+                for (spacing, delta) in [
+                    ("0em", 0.),
+                    ("0pt", 0.),
+                    ("1pt", 4. / 3.),
+                    ("-1pt", -4. / 3.),
+                ] {
+                    for source in [
+                        format!(r"a\hspace{{{spacing}}}{operator} b"),
+                        format!(r"a{operator}\hspace{{{spacing}}}b"),
+                    ] {
+                        if let Ok(actual) = layout_source(&source, display, 20.) {
+                            assert!(
+                                (20. * (value(&actual.width) - value(&base.width)) - delta).abs()
+                                    < 0.01,
+                                "spacing must supplement, not replace, automatic glue: {source}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_letter_spacing_remains_typeset_in_styled_and_nested_rows() {
+        for (base, source) in [
+            ("ab", r"a\hspace{1pt}b"),
+            (r"\alpha\beta", r"\alpha\hspace{1pt}\beta"),
+            ("x_i y", r"x_i\hspace{1pt}y"),
+            (r"\text{a}b", r"\text{a}\hspace{1pt}b"),
+            (r"\color{red}{a}b", r"\color{red}{a}\hspace{1pt}b"),
+            ("x^{ab}", r"x^{a\hspace{1pt}b}"),
+            ("(a)b", r"(a)\hspace{1pt}b"),
+            ("a(b)", r"a\hspace{1pt}(b)"),
+            ("(a)", r"(\hspace{1pt}a)"),
+            ("a,b", r"a\hspace{1pt},b"),
+        ] {
+            for display in [false, true] {
+                let base = layout_source(base, display, 20.).unwrap();
+                let spaced = layout_source(source, display, 20.).unwrap();
+                assert!(
+                    (20. * (value(&spaced.width) - value(&base.width)) - 4. / 3.).abs() < 0.01,
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_fraction_style_commands_are_not_silently_ignored() {
+        for (command, display) in [("dfrac", false), ("tfrac", true), ("cfrac", false)] {
+            let source = format!(r"\{command}{{a}}{{b}}");
+            if let Ok(actual) = layout_source(&source, display, 20.) {
+                let default = layout_source(r"\frac{a}{b}", display, 20.).unwrap();
+                assert_ne!(
+                    actual, default,
+                    "explicit fraction style was discarded: {source}"
+                );
+            }
+        }
     }
 
     #[test]

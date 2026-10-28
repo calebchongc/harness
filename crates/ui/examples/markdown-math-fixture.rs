@@ -65,6 +65,19 @@ Trailing negative space: $x\hspace{-0.25em}$.
 Display: \[ \hspace{-0.25em}x+y \]
 "#;
 
+const SEMANTICS_SOURCE: &str = r#"# Typesetting fidelity
+
+Ordinary fraction: $\frac{n}{k}$.
+
+Binomial coefficient (no fraction bar): $\binom{n}{k}$.
+
+Explicit display fraction: $\dfrac{a}{b}$.
+
+Operator spacing control: $a+b$.
+
+Explicit operator spacing: $a\hspace{0em}+b$.
+"#;
+
 struct MathFixture {
     tree: markdown::BlockTree,
 }
@@ -101,7 +114,9 @@ impl Render for MathFixture {
 fn main() -> anyhow::Result<()> {
     let output = PathBuf::from(std::env::args().nth(1).expect("output directory"));
     std::fs::create_dir_all(&output)?;
-    let source = if std::env::args().any(|arg| arg == "--ink") {
+    let source = if std::env::args().any(|arg| arg == "--semantics") {
+        SEMANTICS_SOURCE
+    } else if std::env::args().any(|arg| arg == "--ink") {
         INK_SOURCE
     } else if std::env::args().any(|arg| arg == "--edges") {
         EDGE_SOURCE

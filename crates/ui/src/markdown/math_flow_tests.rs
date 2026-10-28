@@ -68,6 +68,119 @@ fn native_math_flow_long_inline_equation_stays_inside_pane(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn native_math_flow_scrolled_equation_still_selects_atomic_source(cx: &mut TestAppContext) {
+    let _guard = selection::test_state_lock();
+    cx.update(|cx| cx.set_global(Theme::dark()));
+    for display in [false, true] {
+        let delimiter = if display { "$$" } else { "$" };
+        let latex = format!("{delimiter}{}z{delimiter}", "x+".repeat(30));
+        let copied = if display {
+            format!("\n{latex}\n")
+        } else {
+            latex.clone()
+        };
+        let tree = parse_full(&format!("Before {latex} after."));
+        let (_, cx) = cx.add_window_view(|_, _| FlowHarness { tree });
+        cx.simulate_resize(size(px(180.), px(240.)));
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let entries = render::selection_test_entries();
+        let equation = entries.iter().find(|(_, text, _)| text == &copied).unwrap();
+        let key = equation.0.clone();
+        let original = cx.debug_bounds("math-flow-equation").unwrap();
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: equation.2.center(),
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: equation.2.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(-10000.), px(0.))),
+            ..Default::default()
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let scrolled = cx.debug_bounds("math-flow-equation").unwrap();
+        assert!(
+            scrolled.left() < original.left() - px(100.),
+            "the probe must actually scroll"
+        );
+        let entries = render::selection_test_entries();
+        let equation = entries
+            .iter()
+            .find(|(candidate, _, _)| candidate == &key)
+            .unwrap();
+        assert!(equation.2.left() >= px(0.) && equation.2.right() <= px(180.));
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: equation.2.center(),
+            click_count: 2,
+            ..Default::default()
+        });
+        assert_eq!(selection::selected_text().as_deref(), Some(copied.as_str()));
+        selection::end_active_drag();
+        selection::clear_if_owner(&key);
+    }
+}
+
+#[gpui::test]
+fn native_math_flow_reverse_drag_preserves_unicode_and_hard_break_copy(cx: &mut TestAppContext) {
+    let _guard = selection::test_state_lock();
+    cx.update(|cx| cx.set_global(Theme::dark()));
+    let tree = parse_full("前置 $x_i$ café.  \n終了 $y^2$ tail.");
+    let (_, cx) = cx.add_window_view(|_, _| FlowHarness { tree });
+    cx.simulate_resize(size(px(200.), px(240.)));
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    let entries = render::selection_test_entries();
+    let first = entries.iter().find(|(_, text, _)| text == "前置 ").unwrap();
+    let last = entries.iter().find(|(_, text, _)| text == "tail.").unwrap();
+    // The transcript's right-gutter path anchors after the last glyph. A
+    // click inside the final glyph correctly anchors before that character.
+    assert!(render::begin_drag_in_whitespace(
+        0,
+        point(last.2.right() + px(1.), last.2.center().y)
+    ));
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position: point(first.2.left(), first.2.center().y),
+        pressed_button: Some(gpui::MouseButton::Left),
+        ..Default::default()
+    });
+    assert_eq!(
+        selection::selected_text().as_deref(),
+        Some("前置 $x_i$ café.\n終了 $y^2$ tail.")
+    );
+    selection::end_active_drag();
+    selection::clear_if_owner(&last.0);
+}
+
+#[gpui::test]
+fn native_math_flow_tiny_viewports_keep_visible_hit_bounds_clipped(cx: &mut TestAppContext) {
+    let _guard = selection::test_state_lock();
+    for width in [1., 12., 24.] {
+        let entries = entries(cx, "Prose $\\frac{1}{x}$ tail.", width);
+        assert!(
+            entries
+                .iter()
+                .any(|(_, text, bounds)| text.starts_with('$') && bounds.size.width > px(0.))
+        );
+        for (_, text, bounds) in entries {
+            if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
+                assert!(
+                    bounds.left() >= px(0.) && bounds.right() <= px(width),
+                    "{text}: {bounds:?}"
+                );
+            }
+        }
+    }
+}
+
+#[gpui::test]
 fn native_math_flow_right_aligned_table_keeps_alignment(cx: &mut TestAppContext) {
     let _guard = selection::test_state_lock();
     let entries = entries(cx, "| Formula |\n|---:|\n| $x^2$ |", 320.);
@@ -149,6 +262,41 @@ fn inline_math_flow_unsupported_input_preserves_literal_source() {
         "unsupported commands must not silently render different math"
     );
     assert_eq!(formula.runs[0].text, r"$\def\x{bad}\x$");
+}
+
+#[test]
+fn inline_math_flow_lossy_upstream_forms_keep_literal_source_and_bold_style() {
+    for source in [
+        r"\binom{n}{k}",
+        r"\genfrac{}{}{0pt}{}{n}{k}",
+        r"\dfrac{a}{b}",
+        r"\tfrac{a}{b}",
+        r"a\hspace{0em}+b",
+        r"a\,=b",
+        r"a=\!b",
+        r"x^{a\quad+b}",
+    ] {
+        let tree = parse_full(&format!("**${source}$**"));
+        let crate::markdown::Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!()
+        };
+        let words = fragments(runs, 14., &Theme::dark());
+        let formula = words
+            .iter()
+            .flatten()
+            .find(|fragment| fragment.copy.is_some())
+            .unwrap();
+        assert!(
+            formula.equation.is_none(),
+            "lossy equation must remain literal: {source}"
+        );
+        assert_eq!(
+            formula.copy.as_deref(),
+            Some(format!("${source}$").as_str())
+        );
+        assert_eq!(formula.runs[0].text, format!("${source}$"));
+        assert!(formula.runs[0].style.bold);
+    }
 }
 
 #[gpui::test]
