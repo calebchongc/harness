@@ -14070,7 +14070,7 @@ mod tests {
                 );
             });
             let captured = composer.pickers.read(cx).resolved(cx);
-            composer.send("First prompt".into(), false, cx);
+            composer.send("First prompt".into(), false, None, cx);
             captured
         });
         cx.run_until_parked();
