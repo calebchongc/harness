@@ -1865,16 +1865,33 @@ fn register_selection_listeners(
                     offsets.as_ref().map_or(ix, |map| map.original(ix))
                 };
                 match e.click_count {
-                    2 => {
-                        let range = if atomic_bounds.is_some() {
-                            0..text.len()
-                        } else {
-                            super::selection::word_range(&text, ix)
-                        };
-                        super::selection::begin_with_span(&key, &text, range);
-                    }
-                    n if n >= 3 => {
+                    2 if atomic_bounds.is_some() => {
                         super::selection::begin_with_span(&key, &text, 0..text.len());
+                    }
+                    n if n >= 2 => {
+                        REGISTRY.with(|registry| {
+                            let registry = registry.borrow();
+                            let Some(owner) = registry
+                                .iter()
+                                .find(|entry| entry.key == key)
+                                .map(|entry| entry.owner)
+                            else {
+                                return;
+                            };
+                            let elements: Vec<_> = registry
+                                .iter()
+                                .filter(|entry| {
+                                    entry.owner == owner
+                                        && selection_scope(&entry.key) == selection_scope(&key)
+                                })
+                                .map(|entry| (entry.key.as_ref(), entry.text.as_ref()))
+                                .collect();
+                            if n == 2 {
+                                super::selection::begin_word(&key, ix, &elements);
+                            } else {
+                                super::selection::begin_paragraph(&key, &elements);
+                            }
+                        });
                     }
                     _ => super::selection::begin(&key, ix),
                 }

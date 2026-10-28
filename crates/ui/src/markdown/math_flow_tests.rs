@@ -246,6 +246,82 @@ fn native_math_flow_linked_equation_retains_link_interaction(cx: &mut TestAppCon
     selection::clear_if_owner(&equation.0);
 }
 
+#[gpui::test]
+fn native_math_flow_double_click_keeps_styled_unicode_words_whole(cx: &mut TestAppContext) {
+    let _guard = selection::test_state_lock();
+    for (source, expected, targets) in [
+        ("**na**ïve $x$", "naïve", ["na", "ïve "]),
+        ("$x$ co**ordi**nate", "coordinate", ["co", "ordi"]),
+    ] {
+        for target in targets {
+            cx.update(|cx| cx.set_global(Theme::dark()));
+            let tree = parse_full(source);
+            let (_, cx) = cx.add_window_view(|_, _| FlowHarness { tree });
+            cx.simulate_resize(size(px(320.), px(200.)));
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            let entries = render::selection_test_entries();
+            let clicked = entries.iter().find(|(_, text, _)| text == target).unwrap();
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position: clicked.2.center(),
+                click_count: 2,
+                ..Default::default()
+            });
+            assert_eq!(
+                selection::selected_text().as_deref(),
+                Some(expected),
+                "{source}, target={target}"
+            );
+            selection::end_active_drag();
+            selection::clear_if_owner(&clicked.0);
+        }
+    }
+}
+
+#[gpui::test]
+fn native_math_flow_triple_click_selects_the_logical_paragraph(cx: &mut TestAppContext) {
+    let _guard = selection::test_state_lock();
+    for width in [160., 400.] {
+        for target in ["Before ", "$x_i$", "after."] {
+            cx.update(|cx| cx.set_global(Theme::dark()));
+            let tree = parse_full("Previous paragraph.\n\nBefore $x_i$ after.\n\nNext paragraph.");
+            let (_, cx) = cx.add_window_view(|_, _| FlowHarness { tree });
+            cx.simulate_resize(size(px(width), px(400.)));
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            let entries = render::selection_test_entries();
+            let clicked = entries.iter().find(|(_, text, _)| text == target).unwrap();
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position: clicked.2.center(),
+                click_count: 3,
+                ..Default::default()
+            });
+            assert_eq!(
+                selection::selected_text().as_deref(),
+                Some("Before $x_i$ after."),
+                "width={width}, target={target}: triple-click must not select only one flow fragment"
+            );
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: clicked.2.center(),
+                pressed_button: Some(gpui::MouseButton::Left),
+                ..Default::default()
+            });
+            assert_eq!(
+                selection::selected_text().as_deref(),
+                Some("Before $x_i$ after.")
+            );
+            selection::end_active_drag();
+            selection::clear_if_owner(&clicked.0);
+        }
+    }
+}
+
 #[test]
 fn inline_math_flow_bold_style_is_not_discarded() {
     let tree = parse_full("$x_i$ **$x_i$**");

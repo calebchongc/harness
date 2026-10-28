@@ -718,12 +718,12 @@ fn render_svg(
     rgba: [u8; 4],
 ) -> Result<VectorEquation, String> {
     let tree = layout_source(source, display, size)?;
-    let ink_width = scalar(&tree.width)? * size;
-    let ascent = scalar(&tree.height)? * size + PADDING;
-    let depth = scalar(&tree.depth)? * size + PADDING;
-    let width = ink_width + 2.0 * PADDING;
-    let height = ascent + depth;
-    if ink_width <= 0.0
+    let advance_width = scalar(&tree.width)? * size;
+    let mut ascent = scalar(&tree.height)? * size + PADDING;
+    let mut depth = scalar(&tree.depth)? * size + PADDING;
+    let mut width = advance_width + 2.0 * PADDING;
+    let mut height = ascent + depth;
+    if advance_width <= 0.0
         || ascent < PADDING
         || depth < PADDING
         || width > MAX_WIDTH
@@ -749,17 +749,44 @@ fn render_svg(
         .rfind("</svg>")
         .ok_or_else(|| "Invalid generated equation SVG".to_string())?;
     // Replace the upstream pt viewport with logical px without changing its
-    // point-based path coordinates. Padding protects edge antialiasing and
-    // modest italic overhang, and is included in both baseline distances.
-    let svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{} {} {} {}" opacity="{}">{}</svg>"#,
-        -PADDING * 0.75,
-        -PADDING * 0.75,
-        width * 0.75,
-        height * 0.75,
-        f32::from(rgba[3]) / 255.0,
-        &generated[start..end],
-    );
+    // point-based path coordinates. Advance bounds are not ink bounds: italic
+    // bearings and negative glue can put paths outside a positive-width box.
+    let wrap = |left: f32, top: f32, width: f32, height: f32, opacity: f32| {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{} {} {} {}" opacity="{opacity}">{}</svg>"#,
+            (-PADDING - left) * 0.75,
+            (-PADDING - top) * 0.75,
+            width * 0.75,
+            height * 0.75,
+            &generated[start..end],
+        )
+    };
+    // Measure only the trusted, bounded path/rule output, at full opacity so
+    // transparent equations keep identical geometry. This runs on cache misses.
+    let measured =
+        usvg::Tree::from_str(&wrap(0., 0., width, height, 1.), &usvg::Options::default())
+            .map_err(|error| format!("Invalid generated equation SVG: {error}"))?;
+    let ink = measured.root().abs_stroke_bounding_box();
+    let padding = |overflow: f32| {
+        if overflow > 0. {
+            overflow + PADDING
+        } else {
+            0.
+        }
+    };
+    let left = padding(-ink.left());
+    let right = padding(ink.right() - width);
+    let top = padding(-ink.top());
+    let bottom = padding(ink.bottom() - height);
+    width += left + right;
+    ascent += top;
+    depth += bottom;
+    height = ascent + depth;
+    // Reapply allocation limits after expanding for the actual ink extent.
+    if width > MAX_WIDTH || height > MAX_HEIGHT || width * height > MAX_AREA {
+        return Err("Equation exceeds image dimension limit or has no visible size".into());
+    }
+    let svg = wrap(left, top, width, height, f32::from(rgba[3]) / 255.0);
     if svg.len() > MAX_SVG_BYTES {
         return Err("Equation exceeds SVG size limit".into());
     }
@@ -782,6 +809,51 @@ mod tests {
 
     fn value(dim: &Dim) -> f32 {
         scalar(dim).unwrap()
+    }
+
+    #[test]
+    fn equation_viewports_contain_negative_bearings_and_leading_glue() {
+        for source in [
+            r"\hspace{-0.25em}x",
+            "y",
+            r"x\hspace{-0.25em}",
+            r"\hspace{-0.3em}\frac{a}{b}\hspace{-0.1em}",
+            r"\boxed{y}",
+        ] {
+            for size in [12., 20., 40., 96.] {
+                for display in [false, true] {
+                    let equation = render_svg(source, display, size, [0, 0, 0, 255]).unwrap();
+                    let svg =
+                        usvg::Tree::from_str(&equation.svg, &usvg::Options::default()).unwrap();
+                    let ink = svg.root().abs_stroke_bounding_box();
+                    assert!(ink.left() >= -0.001, "{source}: {ink:?}");
+                    assert!(ink.right() <= equation.width + 0.001, "{source}: {ink:?}");
+                    assert!(ink.top() >= -0.001, "{source}: {ink:?}");
+                    assert!(ink.bottom() <= equation.height + 0.001, "{source}: {ink:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ink_expansion_preserves_transparent_geometry_and_allocation_limits() {
+        let source = r"\hspace{-0.25em}y";
+        let opaque = render_svg(source, false, 96., [10, 20, 30, 255]).unwrap();
+        let transparent = render_svg(source, false, 96., [10, 20, 30, 0]).unwrap();
+        assert_eq!(
+            (opaque.width, opaque.height, opaque.ascent, opaque.depth),
+            (
+                transparent.width,
+                transparent.height,
+                transparent.ascent,
+                transparent.depth
+            )
+        );
+        let source = r"\hspace{-40em}\frac{a}{b}\hspace{40em}";
+        // Advance size alone fits; ink expansion must be checked again before
+        // allocating a raster image with a large, mostly empty viewport.
+        assert!(layout_source(source, false, 96.).is_ok());
+        assert!(render_svg(source, false, 96., [0, 0, 0, 255]).is_err());
     }
 
     #[test]

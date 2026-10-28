@@ -54,6 +54,17 @@ Unsupported input stays literal: $\unsupported{x}$.
 Absolute spacing: $x\hspace{1pt}x$ and $x\hspace{1bp}x$.
 "#;
 
+const INK_SOURCE: &str = r#"# Equation ink boundaries
+
+Controls: $x$ and $y$.
+
+Leading negative space: $\hspace{-0.25em}x$.
+
+Trailing negative space: $x\hspace{-0.25em}$.
+
+Display: \[ \hspace{-0.25em}x+y \]
+"#;
+
 struct MathFixture {
     tree: markdown::BlockTree,
 }
@@ -90,7 +101,9 @@ impl Render for MathFixture {
 fn main() -> anyhow::Result<()> {
     let output = PathBuf::from(std::env::args().nth(1).expect("output directory"));
     std::fs::create_dir_all(&output)?;
-    let source = if std::env::args().any(|arg| arg == "--edges") {
+    let source = if std::env::args().any(|arg| arg == "--ink") {
+        INK_SOURCE
+    } else if std::env::args().any(|arg| arg == "--edges") {
         EDGE_SOURCE
     } else {
         SOURCE
