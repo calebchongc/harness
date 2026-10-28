@@ -111,7 +111,7 @@ impl Shell {
                     .justify_end()
                     .gap(px(8.0))
                     .child(
-                        popover::btn_primary(theme, "Archive it")
+                        popover::btn_ghost(theme, "Archive it", "archive-choice-archive")
                             .id("archive-choice-archive")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.choose_close_archiving(true, window, cx);

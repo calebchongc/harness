@@ -3,7 +3,8 @@
 
 The fixture uses a fixed 1100 x 720 logical-pixel viewport. Sample padding
 inside each choice button, away from its label, corners, and border. Compare
-both rendered fills to each other and to the installed theme's solid role.
+Just close it to the theme's solid role, and Archive it to the unfilled
+card background.
 """
 
 import argparse
@@ -28,12 +29,15 @@ def check(directory):
         assert image.height == round(720 * scale), case["file"]
         samples = [
             image.getpixel((round(x * scale), round(y * scale)))
-            for x, y in [(563, 443.5), (658, 443.5)]
+            for x, y in [(563, 443.5), (658, 443.5), (480, 443.5)]
         ]
-        if samples[0] != samples[1] or any(
+        secondary, primary, background = samples
+        if secondary == primary or any(
             abs(actual - expected) > 1
-            for sample in samples
-            for actual, expected in zip(sample, case["fill"])
+            for actual, expected in zip(primary, case["fill"])
+        ) or any(
+            abs(actual - expected) > 1
+            for actual, expected in zip(secondary, background)
         ):
             failures.append((case["file"], samples, case["fill"]))
         crop = image.crop(tuple(round(n * scale) for n in (368, 224.5, 732.5, 496)))
@@ -42,7 +46,7 @@ def check(directory):
         tile.paste(crop, ((560 - crop.width) // 2, 25))
         ImageDraw.Draw(tile).text((8, 6), case["theme"], fill="black")
         sheets.setdefault(case["surface"], []).append(tile)
-    assert not failures, "Rendered button fills differ: {!r}".format(failures)
+    assert not failures, "Incorrect primary/secondary button fills: {!r}".format(failures[:3])
     for surface, tiles in sheets.items():
         sheet = Image.new("RGB", (560 * 3, 425 * ((len(tiles) + 2) // 3)), "#d0d0d0")
         for i, tile in enumerate(tiles):
@@ -50,7 +54,8 @@ def check(directory):
         sheet.save(directory / ("contact-" + surface.lower() + ".png"))
     print(
         "PASS: {} bundled + {} synthetic custom themes; {} rendered cases with "
-        "matching theme-correct fills; {} contrast checks; minimum {:.2f}:1".format(
+        "theme-correct primary and unfilled secondary buttons; {} primary-label "
+        "contrast checks; minimum {:.2f}:1".format(
             report["builtin_variants"],
             report["synthetic_custom_variants"],
             len(report["captures"]),
