@@ -63,10 +63,15 @@ message without changing that default. When steering is unavailable, the
 effective action is Queue and the composer explains why. iOS holds active-turn
 messages until turn end and has no Queue/Steer preference.
 
-Ctrl+Alt+Enter (Cmd+Option+Enter on macOS) uses the opposite follow-up behaviour
-for one message while a turn is active. It does nothing on an empty composer.
-Shift+Enter still inserts a newline. Escape dismisses the follow-up menu before
-the optional stop-agent shortcut can run.
+With Enter-to-send and text in the composer, Ctrl+Enter (Cmd+Enter on macOS)
+uses the opposite follow-up behaviour for one message while a turn is active;
+Ctrl+Alt+Enter (Cmd+Option+Enter on macOS) remains a backwards-compatible alias.
+On an empty composer, Ctrl+Enter (Cmd+Enter on macOS) still activates the newest
+queued message, while the alias does nothing. With modifier-to-send and text in
+the composer, Ctrl+Alt+Enter (Cmd+Option+Enter on macOS) uses the opposite
+follow-up behaviour; it does nothing on an empty composer. Shift+Enter still
+inserts a newline. Escape dismisses the follow-up menu before the optional
+stop-agent shortcut can run.
 
 The normal queue drain never steers. Composer steering first enqueues a durable
 row, then explicitly asks the host to steer that row. If the host cannot promote

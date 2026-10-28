@@ -1654,6 +1654,21 @@ fn message_enter_bindings(
     }
 }
 
+fn modified_submit_follow_up(
+    behavior: ComposerSendBehavior,
+    follow_up_behavior: crate::settings::FollowUpBehavior,
+    has_content: bool,
+    is_following_up: bool,
+) -> Option<follow_up::FollowUpAction> {
+    if behavior != ComposerSendBehavior::Enter || !has_content || !is_following_up {
+        return None;
+    }
+    Some(match follow_up::opposite_follow_up(follow_up_behavior) {
+        crate::settings::FollowUpBehavior::Queue => follow_up::FollowUpAction::Queue,
+        crate::settings::FollowUpBehavior::Steer => follow_up::FollowUpAction::Steer,
+    })
+}
+
 fn message_input_context(wizard_active: bool) -> &'static str {
     if wizard_active {
         GENERIC_COMPOSER_CONTEXT
@@ -8677,9 +8692,10 @@ impl Composer {
             )
     }
 
-    /// Cmd/Ctrl+Enter remains an ordinary submit while the composer carries
-    /// content. With a truly empty composer it instead activates the most
-    /// recently queued row, and never turns an empty chord into Stop.
+    /// With content, Mod+Enter is a conditional follow-up shortcut in the
+    /// Enter-to-send profile and an ordinary submit in the Mod+Enter profile.
+    /// With an empty composer it activates the most recently queued row, and
+    /// never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
         if self.commit_queue_edit(cx) {
             return;
@@ -8689,6 +8705,21 @@ impl Composer {
             self.staged().len() + self.staged_appshots().len(),
             self.staged_comments(cx).len(),
         );
+        let send_behavior =
+            crate::settings::with_current(cx, |settings| settings.composer_send_behavior);
+        let follow_up_behavior =
+            crate::settings::with_current(cx, |settings| settings.follow_up_behavior);
+        if modified_submit_follow_up(
+            send_behavior,
+            follow_up_behavior,
+            has_content,
+            self.button_mode(cx) == SendButtonMode::Queue,
+        )
+        .is_some()
+        {
+            self.on_follow_up_shortcut(cx);
+            return;
+        }
         match modified_submit_target(has_content) {
             ModifiedSubmitTarget::SubmitContent => self.on_submit(cx),
             ModifiedSubmitTarget::ActivateLatestQueued => {
@@ -15550,6 +15581,79 @@ mod tests {
                         },
                     ]
                 );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn modified_enter_steers_from_enter_profile_through_real_key_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        cx.update(|cx| crate::composer::init(cx, ComposerSendBehavior::Enter));
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.selected_chat = Some("running-chat".into());
+                    state.begin_pending_send("running-chat", "running-turn", chrono::Utc::now());
+                });
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Keep this draft", cx));
+                window.focus(&composer.input.focus_handle(cx), cx);
+            })
+            .unwrap();
+
+        cx.simulate_keystrokes(handle.into(), &platform_combo("mod-enter"));
+
+        handle
+            .read_with(cx, |composer, cx| {
+                assert_eq!(composer.input.read(cx).text(), "Keep this draft");
+                assert!(!composer.is_sending());
+                assert_eq!(
+                    composer.failure.as_deref(),
+                    Some("Update Harness on this device and the chat host to use this action")
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn modified_enter_routes_follow_up_only_for_enter_send_profile_while_busy_with_content() {
+        for behavior in [ComposerSendBehavior::Enter, ComposerSendBehavior::ModEnter] {
+            for has_content in [false, true] {
+                for is_following_up in [false, true] {
+                    for saved in [
+                        crate::settings::FollowUpBehavior::Queue,
+                        crate::settings::FollowUpBehavior::Steer,
+                    ] {
+                        let expected = match (behavior, saved, has_content, is_following_up) {
+                            (
+                                ComposerSendBehavior::Enter,
+                                crate::settings::FollowUpBehavior::Queue,
+                                true,
+                                true,
+                            ) => Some(follow_up::FollowUpAction::Steer),
+                            (
+                                ComposerSendBehavior::Enter,
+                                crate::settings::FollowUpBehavior::Steer,
+                                true,
+                                true,
+                            ) => Some(follow_up::FollowUpAction::Queue),
+                            _ => None,
+                        };
+                        assert_eq!(
+                            modified_submit_follow_up(
+                                behavior,
+                                saved,
+                                has_content,
+                                is_following_up,
+                            ),
+                            expected,
+                            "send={behavior:?}, saved={saved:?}, content={has_content}, busy={is_following_up}"
+                        );
+                    }
+                }
             }
         }
     }

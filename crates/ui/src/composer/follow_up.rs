@@ -466,6 +466,7 @@ mod tests {
             crate::settings::init(crate::settings::UiSettings::default(), directory.path(), cx);
             crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
                 settings.follow_up_behavior = FollowUpBehavior::Queue;
+                settings.composer_send_behavior = crate::settings::ComposerSendBehavior::Enter;
             });
         });
         let (out, mut requests) = tokio::sync::mpsc::channel::<String>(32);
@@ -505,7 +506,7 @@ mod tests {
                 .input
                 .update(cx, |input, cx| input.set_text("Keep this draft", cx));
             assert_eq!(composer.button_mode(cx), SendButtonMode::Queue);
-            composer.on_follow_up_shortcut(cx);
+            composer.on_modified_submit(cx);
             assert_eq!(
                 composer.failure.as_deref(),
                 Some("This agent does not support steering during a turn")

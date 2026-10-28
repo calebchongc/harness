@@ -634,6 +634,23 @@ pub fn modifier_send_label(is_macos: bool) -> &'static str {
     if is_macos { "⌘ Enter" } else { "Ctrl Enter" }
 }
 
+fn follow_up_hint(behavior: ComposerSendBehavior, is_macos: bool) -> String {
+    let (primary, legacy_alias) = match (behavior, is_macos) {
+        (ComposerSendBehavior::Enter, true) => ("Cmd+Enter", Some("Cmd+Option+Enter")),
+        (ComposerSendBehavior::Enter, false) => ("Ctrl+Enter", Some("Ctrl+Alt+Enter")),
+        (ComposerSendBehavior::ModEnter, true) => ("Cmd+Option+Enter", None),
+        (ComposerSendBehavior::ModEnter, false) => ("Ctrl+Alt+Enter", None),
+    };
+    match legacy_alias {
+        Some(alias) => format!(
+            "With text: {primary} uses the opposite behaviour; {alias} is an alias. Empty: {primary} sends the newest queued message; the alias does nothing."
+        ),
+        None => format!(
+            "With text: {primary} uses the opposite behaviour. Empty composer: no action."
+        ),
+    }
+}
+
 /// The page's sections, in display order. [`group`] is a total match, so every
 /// [`ShortcutId::ALL`] entry lands in exactly one — a shortcut added later
 /// extends the match and appears on the page by construction
@@ -931,11 +948,10 @@ impl Render for ShortcutsPage {
                     ),
             );
 
-        let follow_up_chord = if cfg!(target_os = "macos") {
-            "Cmd+Option+Enter"
-        } else {
-            "Ctrl+Alt+Enter"
-        };
+        let follow_up_hint = follow_up_hint(
+            self.composer_send_behavior,
+            cfg!(target_os = "macos"),
+        );
         let follow_up_behavior_row = widgets::section_card(&theme)
             .child(
                 widgets::card_row(&theme, true)
@@ -958,7 +974,7 @@ impl Render for ShortcutsPage {
                                     .line_height(px(17.0))
                                     .text_color(theme.text_muted.opacity(0.65))
                                     .child(SharedString::from(format!(
-                                        "Queue waits until the current turn finishes. Steer adds your message to the current turn. For one message, {follow_up_chord} uses the opposite behaviour.",
+                                        "Queue waits until the current turn finishes. Steer adds your message to the current turn. {follow_up_hint}",
                                     ))),
                             ),
                     )
@@ -1420,6 +1436,26 @@ mod tests {
     fn modifier_send_labels_are_platform_specific() {
         assert_eq!(modifier_send_label(true), "⌘ Enter");
         assert_eq!(modifier_send_label(false), "Ctrl Enter");
+    }
+
+    #[test]
+    fn follow_up_hint_tracks_the_composer_send_profile() {
+        assert_eq!(
+            follow_up_hint(ComposerSendBehavior::Enter, false),
+            "With text: Ctrl+Enter uses the opposite behaviour; Ctrl+Alt+Enter is an alias. Empty: Ctrl+Enter sends the newest queued message; the alias does nothing."
+        );
+        assert_eq!(
+            follow_up_hint(ComposerSendBehavior::Enter, true),
+            "With text: Cmd+Enter uses the opposite behaviour; Cmd+Option+Enter is an alias. Empty: Cmd+Enter sends the newest queued message; the alias does nothing."
+        );
+        assert_eq!(
+            follow_up_hint(ComposerSendBehavior::ModEnter, false),
+            "With text: Ctrl+Alt+Enter uses the opposite behaviour. Empty composer: no action."
+        );
+        assert_eq!(
+            follow_up_hint(ComposerSendBehavior::ModEnter, true),
+            "With text: Cmd+Option+Enter uses the opposite behaviour. Empty composer: no action."
+        );
     }
 
     #[test]
