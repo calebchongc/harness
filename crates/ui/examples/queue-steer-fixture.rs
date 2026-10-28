@@ -2,7 +2,8 @@
 //! Uses an isolated EngineCore over local IPC and never sends an agent command.
 //!
 //! `cargo run -p harness-ui --features appshots-fixture --example queue-steer-fixture -- before 900 <dir>`
-//! Modes: `before`, `after-pending`, `after-confirmed`. Widths: `900`, `360`.
+//! Modes: `before`, `after-queued`, `after-pending`, `after-confirmed`, `settings`.
+//! Widths: `900`, `360`.
 use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, px, size};
 use harness_ui::*;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -124,13 +125,13 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mode = args
         .next()
-        .expect("mode: before, after-pending or after-confirmed");
+        .expect("mode: before, after-queued, after-pending, after-confirmed or settings");
     anyhow::ensure!(
         matches!(
             mode.as_str(),
-            "before" | "after-pending" | "after-confirmed"
+            "before" | "after-queued" | "after-pending" | "after-confirmed" | "settings"
         ),
-        "mode must be before, after-pending or after-confirmed"
+        "mode must be before, after-queued, after-pending, after-confirmed or settings"
     );
     let width: f32 = args.next().expect("window width: 900 or 360").parse()?;
     anyhow::ensure!(width == 900.0 || width == 360.0, "width must be 900 or 360");
@@ -262,6 +263,30 @@ fn main() -> anyhow::Result<()> {
             cx.activate(true);
             cx.spawn(async move |cx| {
                 let run: anyhow::Result<()> = async {
+                    if mode == "settings" {
+                        // Help opens the production Shortcuts settings section, which contains
+                        // the Queue/Steer preference. This exercises the public composer route.
+                        pause(cx, 1400).await;
+                        window.update(cx, |shell, _, cx| shell.fixture_help(cx))?;
+                        pause(cx, 1000).await;
+                        #[cfg(windows)]
+                        {
+                            std::fs::write(
+                                output.join("ready.json"),
+                                serde_json::to_vec_pretty(&serde_json::json!({
+                                    "status": "ready",
+                                    "mode": mode,
+                                    "state": "settings",
+                                    "width": width,
+                                    "processId": std::process::id()
+                                }))?,
+                            )?;
+                            pause(cx, 40_000).await;
+                        }
+                        #[cfg(not(windows))]
+                        capture(window.into(), cx, &output, &format!("queue-steer-{mode}-{width}"))?;
+                        return Ok(());
+                    }
                     // Let the selected chat watch settle before replacing its UI-only queue.
                     pause(cx, 1400).await;
                     state.update(cx, |state, cx| {
@@ -293,7 +318,7 @@ fn main() -> anyhow::Result<()> {
                     composer.update(cx, |composer, cx| composer.fixture_set_draft("", cx));
                     pause(cx, 900).await;
 
-                    if mode != "before" {
+                    if matches!(mode.as_str(), "after-pending" | "after-confirmed") {
                         let echo: harness_doc::SessionMessageEntry = serde_json::from_value(
                             serde_json::json!({
                                 "id": QUEUE_ID,
@@ -334,6 +359,7 @@ fn main() -> anyhow::Result<()> {
                     #[cfg(windows)]
                     let state_name = match mode.as_str() {
                         "before" => "queued",
+                        "after-queued" => "queued",
                         "after-pending" => "pending",
                         _ => "confirmed",
                     };
