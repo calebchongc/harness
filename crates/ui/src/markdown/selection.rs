@@ -19,7 +19,7 @@ use std::sync::{Mutex, OnceLock};
 /// One element's slice of the selection, in document order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
-    /// Element key (`{row_key}:{element ix}`).
+    /// Element key (`{row_key}:{element ix}`, or [`inline_fragment_key`]).
     pub key: String,
     /// Selected byte range of the element's flat text.
     pub range: Range<usize>,
@@ -58,6 +58,27 @@ pub(crate) fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Reserved suffix separating an inline fragment's paragraph key and index.
+const INLINE_FRAGMENT_SUFFIX: &str = "\u{1f}inline-fragment:";
+
+/// Make a unique selection key for one fragment of a logical paragraph.
+///
+/// Use the same document-unique `group` for every prose and equation fragment
+/// in that paragraph, and a distinct `index` for each fragment. Consecutive
+/// selected fragments in the same group copy without an inserted newline;
+/// paragraph boundaries and ordinary element keys retain their newlines.
+/// `group` is opaque and may itself contain the reserved suffix.
+pub fn inline_fragment_key(group: &str, index: usize) -> String {
+    format!("{group}{INLINE_FRAGMENT_SUFFIX}{index}")
+}
+
+fn inline_fragment_group(key: &str) -> Option<&str> {
+    let (group, index) = key.rsplit_once(INLINE_FRAGMENT_SUFFIX)?;
+    // Only recognize complete keys made by the API, not lookalike suffixes.
+    let parsed = index.parse::<usize>().ok()?;
+    (index == parsed.to_string()).then_some(group)
 }
 
 /// Resolve the spans for a selection between `a` and `b`, each an
@@ -306,11 +327,17 @@ pub fn selected_text() -> Option<String> {
 }
 
 fn join_spans(spans: &[Span]) -> String {
-    spans
-        .iter()
-        .map(|s| &s.text[s.range.clone()])
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut joined = String::new();
+    let mut previous_group = None;
+    for (index, span) in spans.iter().enumerate() {
+        let group = inline_fragment_group(&span.key);
+        if index > 0 && (group.is_none() || group != previous_group) {
+            joined.push('\n');
+        }
+        joined.push_str(&span.text[span.range.clone()]);
+        previous_group = group;
+    }
+    joined
 }
 
 /// Word range around `ix` for double-click selection: an alphanumeric/`_`
@@ -387,6 +414,91 @@ mod tests {
         let spans = resolve_spans(&elements, (0, 0), (2, 5));
         assert_eq!(spans.len(), 3);
         assert_eq!(join_spans(&spans), "first\n\nthird");
+    }
+
+    #[test]
+    fn inline_prose_math_and_prose_copy_as_one_paragraph() {
+        let keys = [
+            inline_fragment_key("row:p1", 0),
+            inline_fragment_key("row:p1", 1),
+            inline_fragment_key("row:p1", 2),
+        ];
+        let elements = [
+            (keys[0].as_str(), "The ratio is "),
+            (keys[1].as_str(), r"$\frac{a}{b}$"),
+            (keys[2].as_str(), " today."),
+        ];
+        let spans = resolve_spans(&elements, (0, 0), (2, elements[2].1.len()));
+        assert_eq!(join_spans(&spans), r"The ratio is $\frac{a}{b}$ today.");
+    }
+
+    #[test]
+    fn inline_fragments_keep_newlines_between_paragraphs_and_normal_elements() {
+        let keys = [
+            inline_fragment_key("row:p1", 0),
+            inline_fragment_key("row:p1", 1),
+            inline_fragment_key("row:p2", 0),
+            inline_fragment_key("row:p2", 1),
+        ];
+        let elements = [
+            (keys[0].as_str(), "First "),
+            (keys[1].as_str(), "$x$."),
+            (keys[2].as_str(), "Next "),
+            (keys[3].as_str(), "$y$."),
+            ("row:p3", "Ordinary paragraph."),
+        ];
+        let spans = resolve_spans(&elements, (0, 0), (4, elements[4].1.len()));
+        assert_eq!(
+            join_spans(&spans),
+            "First $x$.\nNext $y$.\nOrdinary paragraph."
+        );
+    }
+
+    #[test]
+    fn inline_fragments_preserve_unicode_partial_ranges_in_both_directions() {
+        let keys = [
+            inline_fragment_key("row:unicode", 0),
+            inline_fragment_key("row:unicode", 1),
+            inline_fragment_key("row:unicode", 2),
+        ];
+        let elements = [
+            (keys[0].as_str(), "前置 café "),
+            (keys[1].as_str(), "$α²$"),
+            (keys[2].as_str(), " naïve 終了"),
+        ];
+        let start = (0, "前置 ".len());
+        let end = (2, " naïve".len());
+        let spans = resolve_spans(&elements, start, end);
+        assert_eq!(join_spans(&spans), "café $α²$ naïve");
+        assert_eq!(resolve_spans(&elements, end, start), spans);
+    }
+
+    #[test]
+    fn inline_fragment_keys_are_unambiguous_and_reject_malformed_suffixes() {
+        let group = format!("row{INLINE_FRAGMENT_SUFFIX}3");
+        assert_eq!(
+            inline_fragment_group(&inline_fragment_key(&group, usize::MAX)),
+            Some(group.as_str())
+        );
+        assert_ne!(inline_fragment_key("row", 1), inline_fragment_key("row", 2));
+        for suffix in ["", "-1", "+1", "01", "1:extra", "184467440737095516160"] {
+            let key = format!("row{INLINE_FRAGMENT_SUFFIX}{suffix}");
+            assert_eq!(inline_fragment_group(&key), None);
+            let elements = [(key.as_str(), "first"), (key.as_str(), "second")];
+            let spans = resolve_spans(&elements, (0, 0), (1, 6));
+            assert_eq!(join_spans(&spans), "first\nsecond");
+        }
+    }
+
+    #[test]
+    fn ordinary_code_lines_keep_newlines_and_unicode_partial_ranges() {
+        let elements = [
+            ("code:0", "let café = 1;"),
+            ("code:1", ""),
+            ("code:2", "print(café);"),
+        ];
+        let spans = resolve_spans(&elements, (0, 4), (2, "print(café)".len()));
+        assert_eq!(join_spans(&spans), "café = 1;\n\nprint(café)");
     }
 
     #[test]

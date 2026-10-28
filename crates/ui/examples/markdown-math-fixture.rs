@@ -7,24 +7,51 @@ use gpui::{
 use harness_ui::{appearance, icons, markdown, settings, theme, theme_library, typography};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-const SOURCE: &str = r#"# Inline equations and ordinary prices
+const SOURCE: &str = r#"# Mathematical layout
 
-The sample mean has variance $\operatorname{Var}(\bar X)=\sigma^2/m$.
+Inline: $\frac{a+b}{n}$ and $\sqrt{x^2+y^2}$ stay with prose.
 
-- **$x_i$** and $\alpha + \beta$ keep their surrounding Markdown styles.
-- Standard error: $\sigma/\sqrt m$; fraction: $\frac{a+b}{n}$.
+\[ \hat{\mu}=\frac{1}{n}\sum_{i=1}^{n}x_i \]
 
-Prices stay literal: $5 and $10; $5–$10; $.50–$.75; escaped \$5.
+\[ M=\begin{bmatrix}a & b\\ c & d\end{bmatrix} \]
 
-Code stays literal: `$x^2$`.
+\[ \underbrace{wx}_{\text{weighted input}}+\underbrace{b}_{\text{bias}} \]
+
+- Nested fraction: $\frac{1}{1+\frac{1}{x}}$; **$x_i^2$**.
 
 | Quantity | Formula |
 |---|---|
-| Sample mean | $\bar X$ |
-| Standard error | $\sigma/\sqrt m$ |
+| Standard error | $\frac{\sigma}{\sqrt{m}}$ |
 
-Existing display-math control:
-\[ y=\frac{a+b}{n} \]
+Prices stay literal: $5 and $10; $.50–$.75; escaped \$5.
+
+Code stays literal: `$x^2$`.
+"#;
+
+const EDGE_SOURCE: &str = r#"# Math edge cases
+
+Plain $x_i$ and **bold $x_i$**; [linked $x^2$](https://example.com/equation).
+
+Decorations: ~~$x^2$~~ and **~~$\frac{a}{b}$~~**.
+
+Nonbreaking: long token and narrow space beside $x$.
+
+Long inline: $a+b+c+d+e+f+g+h+i+j+k+l+m+n+o+p+q+r+s+t+u+v+w+x+y+z$ then ordinary prose.
+
+| Left | Center | Right |
+|:---|:---:|---:|
+| $x^2$ | $x^2$ | $x^2$ |
+
+| Formula and media |
+|---:|
+| $x^2$ ![synthetic](synthetic.png) |
+
+First line $x$ ends here.\
+Next line $y$ begins here.
+
+Unsupported input stays literal: $\unsupported{x}$.
+
+Absolute spacing: $x\hspace{1pt}x$ and $x\hspace{1bp}x$.
 "#;
 
 struct MathFixture {
@@ -34,6 +61,17 @@ struct MathFixture {
 impl Render for MathFixture {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme::Theme::of(cx);
+        let mut opts = markdown::render::RenderOptions::settled("math-fixture".into());
+        opts.media = Some(markdown::render::MediaUi {
+            diagram: None,
+            image: std::rc::Rc::new(|_, _, theme| {
+                div()
+                    .w(px(18.))
+                    .h(px(18.))
+                    .bg(theme.accent)
+                    .into_any_element()
+            }),
+        });
         div()
             .size_full()
             .p(px(24.0))
@@ -41,7 +79,7 @@ impl Render for MathFixture {
             .text_color(theme.text)
             .child(markdown::render::render_tree(
                 &self.tree,
-                &markdown::render::RenderOptions::settled("math-fixture".into()),
+                &opts,
                 &theme,
                 window,
                 &|_| None,
@@ -52,6 +90,11 @@ impl Render for MathFixture {
 fn main() -> anyhow::Result<()> {
     let output = PathBuf::from(std::env::args().nth(1).expect("output directory"));
     std::fs::create_dir_all(&output)?;
+    let source = if std::env::args().any(|arg| arg == "--edges") {
+        EDGE_SOURCE
+    } else {
+        SOURCE
+    };
     let data = tempfile::tempdir()?;
     let runtime = tokio::runtime::Runtime::new()?;
     let _runtime = runtime.enter();
@@ -100,7 +143,7 @@ fn main() -> anyhow::Result<()> {
                                 },
                                 |_, cx| {
                                     cx.new(|_| MathFixture {
-                                        tree: markdown::parse_full(SOURCE),
+                                        tree: markdown::parse_full(source),
                                     })
                                 },
                             )
